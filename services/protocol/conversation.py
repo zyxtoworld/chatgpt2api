@@ -409,8 +409,7 @@ def sanitize_output_text(text: str) -> str:
                 return value
         return ""
 
-    def replace_annotation(match: re.Match[str]) -> str:
-        payload = match.group(1)
+    def annotation_text(payload: str) -> str:
         parts = [part.strip() for part in payload.split("\ue202")]
         kind = (parts[0] if parts else "").lower()
         data = parts[1:]
@@ -424,12 +423,20 @@ def sanitize_output_text(text: str) -> str:
             return readable_annotation_part(data)
         return readable_annotation_part(data)
 
+    def replace_annotation(match: re.Match[str]) -> str:
+        return annotation_text(match.group(1))
+
+    def replace_annotation_before_punctuation(match: re.Match[str]) -> str:
+        leading_space = match.group(1)
+        replacement = annotation_text(match.group(2))
+        return f"{leading_space}{replacement}" if replacement else ""
+
     # ChatGPT web sometimes returns rich annotation markers using private-use
     # characters. API clients cannot render those. Preserve readable labels
     # from entity/link annotations, while removing internal citation pointers.
+    text = re.sub(r"(\s*)\ue200([^\ue201]*)\ue201(?=[.,;:!?])", replace_annotation_before_punctuation, text)
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
-    text = re.sub(r"\s+([.,;:!?])", r"\1", text)
     return text
 
 
