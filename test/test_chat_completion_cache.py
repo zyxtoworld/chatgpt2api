@@ -284,6 +284,119 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual("".join(deltas), "Repo: chatgpt2api done.")
         self.assertFalse(any("\ue200" in delta or "\ue202" in delta or "\ue201" in delta for delta in deltas))
 
+    def test_stream_ignores_internal_tool_recipient_messages(self) -> None:
+        events = [
+            {
+                "message": {
+                    "author": {"role": "assistant"},
+                    "content": {
+                        "content_type": "code",
+                        "text": 'search("\\u56fd\\u5bb6\\u6d77\\u6d0b")',
+                    },
+                    "recipient": "web",
+                    "status": "finished_successfully",
+                },
+            },
+            {
+                "message": {
+                    "author": {"name": "web.run", "role": "tool"},
+                    "content": {"content_type": "text", "parts": [""]},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                },
+            },
+            {
+                "v": {
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {
+                            "content_type": "code",
+                            "text": '{"aspect_ratio":"16:9","query":["museum"],"num_per_query":2}',
+                        },
+                        "recipient": "web",
+                        "status": "finished_successfully",
+                    },
+                },
+            },
+            {
+                "message": {
+                    "author": {"role": "assistant"},
+                    "channel": "final",
+                    "content": {"content_type": "text", "parts": ["Final answer."]},
+                    "recipient": "all",
+                    "status": "finished_successfully",
+                },
+            },
+            "[DONE]",
+        ]
+        payloads = [json.dumps(event, ensure_ascii=False) if isinstance(event, dict) else event for event in events]
+        deltas = [
+            str(event.get("delta") or "")
+            for event in iter_conversation_payloads(iter(payloads))
+            if event.get("type") == "conversation.delta"
+        ]
+
+        self.assertEqual("".join(deltas), "Final answer.")
+
+    def test_stream_ignores_hidden_and_non_final_assistant_messages(self) -> None:
+        events = [
+            {
+                "message": {
+                    "author": {"role": "assistant"},
+                    "channel": "final",
+                    "content": {"content_type": "text", "parts": ["Hidden text."]},
+                    "metadata": {"is_visually_hidden_from_conversation": True},
+                    "recipient": "all",
+                },
+            },
+            {
+                "message": {
+                    "author": {"role": "assistant"},
+                    "channel": "analysis",
+                    "content": {"content_type": "text", "parts": ["Private reasoning."]},
+                    "recipient": "all",
+                },
+            },
+            {
+                "message": {
+                    "author": {"role": "assistant"},
+                    "channel": "final",
+                    "content": {"content_type": "text", "parts": ["Visible text."]},
+                    "recipient": "all",
+                },
+            },
+            "[DONE]",
+        ]
+        payloads = [json.dumps(event, ensure_ascii=False) if isinstance(event, dict) else event for event in events]
+        deltas = [
+            str(event.get("delta") or "")
+            for event in iter_conversation_payloads(iter(payloads))
+            if event.get("type") == "conversation.delta"
+        ]
+
+        self.assertEqual("".join(deltas), "Visible text.")
+
+    def test_stream_preserves_user_visible_code_messages(self) -> None:
+        events = [
+            {
+                "message": {
+                    "author": {"role": "assistant"},
+                    "channel": "final",
+                    "content": {"content_type": "code", "text": 'print("hello")'},
+                    "recipient": "all",
+                },
+            },
+            "[DONE]",
+        ]
+        payloads = [json.dumps(event, ensure_ascii=False) if isinstance(event, dict) else event for event in events]
+        deltas = [
+            str(event.get("delta") or "")
+            for event in iter_conversation_payloads(iter(payloads))
+            if event.get("type") == "conversation.delta"
+        ]
+
+        self.assertEqual("".join(deltas), 'print("hello")')
+
     def test_responses_tools_add_honest_no_tool_guard(self) -> None:
         model, messages = openai_v1_response.text_response_parts({
             "model": "auto",
