@@ -807,8 +807,15 @@ def _get_detailed_error_from_tasks(
         return ""
 
 
-def _remove_image_conversation_later(backend: OpenAIBackendAPI, conversation_id: str) -> None:
-    if not config.image_remove_conversation_after_result or not conversation_id:
+def _remove_image_conversation_later(
+        backend: OpenAIBackendAPI,
+        conversation_id: str,
+        *,
+        success: bool,
+) -> None:
+    if not conversation_id:
+        return
+    if not (config.image_remove_conversation_always or (success and config.image_remove_conversation_after_result)):
         return
 
     def _run() -> None:
@@ -849,6 +856,7 @@ def stream_image_outputs(
                 total=total,
                 text=str(event.get("delta") or ""),
                 upstream_event_type="conversation.delta",
+                conversation_id=str(event.get("conversation_id") or ""),
             )
             continue
         if event.get("type") == "conversation.event":
@@ -860,6 +868,7 @@ def stream_image_outputs(
                 index=index,
                 total=total,
                 upstream_event_type=raw_type,
+                conversation_id=str(event.get("conversation_id") or ""),
             )
 
     conversation_id = str(last.get("conversation_id") or "")
@@ -1001,7 +1010,6 @@ def stream_image_outputs(
             int(time.time()),
         )["data"]
         if data:
-            _remove_image_conversation_later(backend, conversation_id)
             yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
         return
 
@@ -1099,7 +1107,6 @@ def stream_image_outputs(
                         int(time.time()),
                     )["data"]
                     if data:
-                        _remove_image_conversation_later(backend, conversation_id)
                         yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                         return
         elif is_text_reply:
@@ -1212,7 +1219,6 @@ def stream_image_outputs(
                     int(time.time()),
                 )["data"]
                 if data:
-                    _remove_image_conversation_later(backend, conversation_id)
                     yield ImageOutput(kind="result", model=request.model, index=index, total=total, data=data, conversation_id=conversation_id)
                     return
         
@@ -1336,22 +1342,31 @@ def _generate_single_image(
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
-            for output in stream_fn(backend, request, index, total):
-                if account_email and not output.account_email:
-                    output.account_email = account_email
-                if output.kind == "message" and request.message_as_error:
-                    raise ImageGenerationError(
-                        output.text or "Image generation was rejected by upstream policy.",
-                        status_code=400,
-                        error_type="invalid_request_error",
-                        code="content_policy_violation",
-                        account_email=account_email,
-                        conversation_id=output.conversation_id,
-                    )
-                emitted_for_token = True
-                returned_message = output.kind == "message"
-                returned_result = returned_result or output.kind == "result"
-                outputs.append(output)
+            last_conversation_id = ""
+            try:
+                for output in stream_fn(backend, request, index, total):
+                    last_conversation_id = output.conversation_id or last_conversation_id
+                    if account_email and not output.account_email:
+                        output.account_email = account_email
+                    if output.kind == "message" and request.message_as_error:
+                        raise ImageGenerationError(
+                            output.text or "Image generation was rejected by upstream policy.",
+                            status_code=400,
+                            error_type="invalid_request_error",
+                            code="content_policy_violation",
+                            account_email=account_email,
+                            conversation_id=output.conversation_id,
+                        )
+                    emitted_for_token = True
+                    returned_message = output.kind == "message"
+                    returned_result = returned_result or output.kind == "result"
+                    outputs.append(output)
+            except Exception as exc:
+                # 异常路径（内容政策拒绝、轮询超时等）会话 ID 只挂在异常上
+                last_conversation_id = last_conversation_id or str(getattr(exc, "conversation_id", "") or "")
+                raise
+            finally:
+                _remove_image_conversation_later(backend, last_conversation_id, success=returned_result)
             if returned_message:
                 account_service.mark_image_result(token, False)
                 return outputs

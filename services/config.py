@@ -454,6 +454,11 @@ class ConfigStore:
         return bool(value)
 
     @property
+    def image_remove_conversation_always(self) -> bool:
+        """无论是否出图，画图请求结束后都异步隐藏 ChatGPT 本地对话记录。"""
+        return _normalize_bool(self.data.get("image_remove_conversation_always"), False)
+
+    @property
     def image_settle_secs(self) -> float:
         """二次确认等待时间（秒）。"""
         try:
@@ -556,6 +561,7 @@ class ConfigStore:
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
+        data["image_remove_conversation_always"] = self.image_remove_conversation_always
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
         data["auto_remove_rate_limited_accounts"] = self.auto_remove_rate_limited_accounts
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh

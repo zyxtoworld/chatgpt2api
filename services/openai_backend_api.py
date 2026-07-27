@@ -33,11 +33,19 @@ class InvalidAccessTokenError(RuntimeError):
     pass
 
 
-class ImagePollTimeoutError(RuntimeError):
+class ImageTaskError(RuntimeError):
+    """图片生成异常基类，携带上游会话 ID 供调用方清理对话。"""
+
+    def __init__(self, message: str = "", conversation_id: str = "") -> None:
+        super().__init__(message)
+        self.conversation_id = conversation_id
+
+
+class ImagePollTimeoutError(ImageTaskError):
     pass
 
 
-class ImageContentPolicyError(RuntimeError):
+class ImageContentPolicyError(ImageTaskError):
     """Raised when image generation is blocked by content policy moderation."""
     pass
 
@@ -2244,7 +2252,7 @@ class OpenAIBackendAPI:
                         "attempt": attempt,
                         "error_msg": policy_msg[:200],
                     })
-                    raise ImageContentPolicyError(policy_msg)
+                    raise ImageContentPolicyError(policy_msg, conversation_id or "")
 
             logger.debug({"event": "image_poll_check", "conversation_id": conversation_id, "attempt": attempt,
                           "file_ids": file_ids, "sediment_ids": sediment_ids})
@@ -2290,11 +2298,11 @@ class OpenAIBackendAPI:
         exc = ImagePollTimeoutError(
             f"ChatGPT 生图超时（已等待 {timeout_secs} 秒）。"
             f"当前超时阈值可在 config.json 中调大 image_poll_timeout_secs，"
-            f"也可能是账号被限流或生图队列拥堵导致。"
+            f"也可能是账号被限流或生图队列拥堵导致。",
+            conversation_id or "",
         )
         if last_task_error:
             setattr(exc, "task_error", last_task_error)
-        setattr(exc, "conversation_id", conversation_id or "")
         raise exc
 
     def _get_file_download_url(self, file_id: str) -> str:
@@ -2504,7 +2512,7 @@ class OpenAIBackendAPI:
                 task_error = getattr(exc, "task_error", "")
                 if not file_ids and not sediment_ids:
                     if task_error:
-                        raise ImageContentPolicyError(task_error) from exc
+                        raise ImageContentPolicyError(task_error, conversation_id or "") from exc
                     raise
                 logger.warning({
                     "event": "image_resolve_poll_partial_timeout",
