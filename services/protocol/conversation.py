@@ -461,7 +461,7 @@ def sanitize_output_text(text: str) -> str:
     # ChatGPT web sometimes returns rich annotation markers using private-use
     # characters. API clients cannot render those. Preserve readable labels
     # from entity/link annotations, while removing internal citation pointers.
-    text = re.sub(r"(\s*)\ue200([^\ue201]*)\ue201(?=[.,;:!?])", replace_annotation_before_punctuation, text)
+    text = re.sub(r"([ \t]*)\ue200([^\ue201]*)\ue201(?=[.,;:!?])", replace_annotation_before_punctuation, text)
     text = re.sub(r"\ue200([^\ue201]*)\ue201", replace_annotation, text)
     text = re.sub(r"\ue200[^\ue201]*$", "", text)
     return text
@@ -820,10 +820,15 @@ def _remove_image_conversation_later(
         return
     if not (config.image_remove_conversation_always or (success and config.image_remove_conversation_after_result)):
         return
+    access_token = str(getattr(backend, "access_token", "") or "").strip()
+    if not access_token:
+        return
 
     def _run() -> None:
+        cleanup_backend = None
         try:
-            backend.delete_conversation(conversation_id)
+            cleanup_backend = OpenAIBackendAPI(access_token=access_token)
+            cleanup_backend.delete_conversation(conversation_id)
             logger.info({"event": "image_conversation_removed", "conversation_id": conversation_id})
         except Exception as exc:
             logger.warning({
@@ -831,6 +836,9 @@ def _remove_image_conversation_later(
                 "conversation_id": conversation_id,
                 "error": str(exc),
             })
+        finally:
+            if cleanup_backend is not None:
+                cleanup_backend.close()
 
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 

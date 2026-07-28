@@ -2621,9 +2621,9 @@ class OpenAIBackendAPI:
         timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
         try:
             for payload in iter_sse_payloads(response):
-                yield payload
                 if time.monotonic() >= deadline:
                     raise ImageStreamHardTimeoutError(timeout_message)
+                yield payload
         except ImageStreamHardTimeoutError:
             raise
         except Exception as exc:
