@@ -706,8 +706,8 @@ def conversation_events(
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
 
-def text_backend() -> OpenAIBackendAPI:
-    return OpenAIBackendAPI(access_token=account_service.get_text_access_token())
+def text_backend(model: str = "auto") -> OpenAIBackendAPI:
+    return OpenAIBackendAPI(access_token=account_service.get_text_access_token(model=model))
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
@@ -745,7 +745,10 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
                     token = refreshed_token
                 else:
                     account_service.remove_invalid_token(token, "text_stream")
-                    token = account_service.get_text_access_token(attempted_tokens)
+                    token = account_service.get_text_access_token(
+                        excluded_tokens=set(attempted_tokens),
+                        model=request.model,
+                    )
                 if token:
                     continue
             raise
