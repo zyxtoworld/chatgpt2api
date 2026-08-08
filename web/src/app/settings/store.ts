@@ -122,6 +122,9 @@ function normalizeThirdPartyApps(value: unknown): ThirdPartyAppsSettings {
 }
 
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
+  const defaultThinkingEffort = ["standard", "extended", "max"].includes(String(config.default_thinking_effort))
+    ? config.default_thinking_effort as "standard" | "extended" | "max"
+    : "auto";
   const imageStorage = typeof config.image_storage === "object" && config.image_storage
     ? config.image_storage as ImageStorageSettings
     : {
@@ -182,6 +185,8 @@ function normalizeConfig(config: SettingsConfig): SettingsConfig {
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     base_url: typeof config.base_url === "string" ? config.base_url : "",
     global_system_prompt: String(config.global_system_prompt || ""),
+    default_upstream_model_name: String(config.default_upstream_model_name || "gpt-5-5"),
+    default_thinking_effort: defaultThinkingEffort,
     sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
     ai_review: {
       enabled: Boolean(config.ai_review?.enabled),
@@ -303,6 +308,8 @@ type SettingsStore = {
   setProxy: (value: string) => void;
   setBaseUrl: (value: string) => void;
   setGlobalSystemPrompt: (value: string) => void;
+  setDefaultUpstreamModelName: (value: string) => void;
+  setDefaultThinkingEffort: (value: "auto" | "standard" | "extended" | "max") => void;
   setSensitiveWordsText: (value: string) => void;
   setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
   setImageStorageField: (key: keyof ImageStorageSettings, value: string | boolean) => void;
@@ -428,6 +435,10 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         proxy: config.proxy.trim(),
         base_url: String(config.base_url || "").trim(),
         global_system_prompt: String(config.global_system_prompt || "").trim(),
+        default_upstream_model_name: String(config.default_upstream_model_name || "gpt-5-5").trim() || "gpt-5-5",
+        default_thinking_effort: ["standard", "extended", "max"].includes(String(config.default_thinking_effort))
+          ? config.default_thinking_effort
+          : "auto",
         sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
         ai_review: {
           enabled: Boolean(config.ai_review?.enabled),
@@ -599,6 +610,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setGlobalSystemPrompt: (value) => {
     set((state) => state.config ? { config: { ...state.config, global_system_prompt: value } } : {});
+  },
+
+  setDefaultUpstreamModelName: (value) => {
+    set((state) => state.config ? { config: { ...state.config, default_upstream_model_name: value } } : {});
+  },
+
+  setDefaultThinkingEffort: (value) => {
+    set((state) => state.config ? { config: { ...state.config, default_thinking_effort: value } } : {});
   },
 
   setSensitiveWordsText: (value) => {
