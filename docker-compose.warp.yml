@@ -4,8 +4,9 @@ services:
     container_name: chatgpt2api-warp-init
     working_dir: /app
     volumes:
-      # Mount the parent directory so init and ConfigStore share the same file.
-      - ./:/app/config_mount
+      # Mount only the dedicated config directory so init and ConfigStore share
+      # the file without exposing the project root, .env, backups, or services.
+      - ./chatgpt2api-config:/app/config_mount
       - ./scripts:/app/scripts:ro
     environment:
       CHATGPT2API_CONFIG_FILE: /app/config_mount/config.json
@@ -101,8 +102,9 @@ services:
       - "${CHATGPT2API_PORT:-3000}:80"
     volumes:
       - ./data:/app/data
-      # Mount the parent directory so ConfigStore can atomically replace config.json.
-      - ./:/app/config_mount
+      # Mount only the dedicated config directory so atomic replacement cannot
+      # expose the project root, .env, backups, or other services.
+      - ./chatgpt2api-config:/app/config_mount
     environment:
       STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
       DATABASE_URL: ${DATABASE_URL:-}

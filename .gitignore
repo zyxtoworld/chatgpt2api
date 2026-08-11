@@ -11,6 +11,7 @@ web_dist
 .idea
 data
 config.json
+/chatgpt2api-config/
 edit
 
 docker-compose-local.yml

@@ -43,11 +43,18 @@ def test_config_file_path_can_be_selected_for_a_directory_mount(tmp_path: Path) 
 
 
 def test_compose_mounts_config_parent_directory_for_atomic_replacement() -> None:
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "/chatgpt2api-config/" in gitignore
+    dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+    assert "chatgpt2api-config/" in dockerignore
+
     for compose_file in COMPOSE_FILES:
         text = compose_file.read_text(encoding="utf-8")
         assert "./config.json:/app/config.json" not in text
         assert "/app/config_mount/config.json" in text
-        assert "./:/app/config_mount" in text
+        assert "./chatgpt2api-config:/app/config_mount" in text
+        assert "./:/app/config_mount" not in text
+        assert "/opt/services:/app/config_mount" not in text
 
 
 def test_settings_endpoint_persists_global_proxy_through_real_config_store(tmp_path: Path) -> None:

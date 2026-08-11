@@ -11,4 +11,5 @@ web/.next
 web/node_modules
 
 assets
+chatgpt2api-config/
 README.md

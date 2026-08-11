@@ -9,8 +9,9 @@ services:
       - "8000:80"
     volumes:
       - ./data:/app/data
-      # Mount the parent directory so ConfigStore can atomically replace config.json.
-      - ./:/app/config_mount
+      # Mount only the dedicated config directory so atomic replacement cannot
+      # expose the project root, .env, backups, or other services.
+      - ./chatgpt2api-config:/app/config_mount
     environment:
       STORAGE_BACKEND: sqlite
       DATABASE_URL: sqlite:////app/data/accounts.db
