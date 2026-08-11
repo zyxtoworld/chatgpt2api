@@ -19,7 +19,8 @@ from services.url_utils import redact_url_credentials as _redact_url_credentials
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
-CONFIG_FILE = BASE_DIR / "config.json"
+_CONFIG_FILE_ENV = os.getenv("CHATGPT2API_CONFIG_FILE", "").strip()
+CONFIG_FILE = Path(_CONFIG_FILE_ENV) if _CONFIG_FILE_ENV else BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 

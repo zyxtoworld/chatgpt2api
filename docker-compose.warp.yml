@@ -4,10 +4,11 @@ services:
     container_name: chatgpt2api-warp-init
     working_dir: /app
     volumes:
-      - ./config.json:/app/config.json
+      # Mount the parent directory so init and ConfigStore share the same file.
+      - ./:/app/config_mount
       - ./scripts:/app/scripts:ro
     environment:
-      CHATGPT2API_CONFIG_FILE: /app/config.json
+      CHATGPT2API_CONFIG_FILE: /app/config_mount/config.json
       CHATGPT2API_PROXY_RUNTIME_ENABLED: ${CHATGPT2API_PROXY_RUNTIME_ENABLED:-true}
       CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE: ${CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE:-single_proxy}
       CHATGPT2API_PROXY_RUNTIME_PROXY_URL: ${CHATGPT2API_PROXY_RUNTIME_PROXY_URL:-http://privoxy:8118}
@@ -100,9 +101,11 @@ services:
       - "${CHATGPT2API_PORT:-3000}:80"
     volumes:
       - ./data:/app/data
-      - ./config.json:/app/config.json
+      # Mount the parent directory so ConfigStore can atomically replace config.json.
+      - ./:/app/config_mount
     environment:
       STORAGE_BACKEND: ${STORAGE_BACKEND:-json}
       DATABASE_URL: ${DATABASE_URL:-}
       CHATGPT2API_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
       CHATGPT2API_BASE_URL: ${CHATGPT2API_BASE_URL:-}
+      CHATGPT2API_CONFIG_FILE: /app/config_mount/config.json

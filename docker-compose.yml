@@ -7,10 +7,12 @@ services:
       - "3000:80"
     volumes:
       - ./data:/app/data
-      - ./config.json:/app/config.json
+      # Mount the parent directory so ConfigStore can atomically replace config.json.
+      - ./:/app/config_mount
     environment:
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
        - STORAGE_BACKEND=json
+       - CHATGPT2API_CONFIG_FILE=/app/config_mount/config.json
       
       # 数据库配置 (当 STORAGE_BACKEND=sqlite/postgres 时使用)
       # - DATABASE_URL=postgresql://user:password@host:5432/dbname
