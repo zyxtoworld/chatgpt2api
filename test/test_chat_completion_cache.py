@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 import unittest
 from unittest import mock
 import json
 import base64
 
+from fastapi import HTTPException
+
 from services.config import config
+from services.log_service import run_ai_in_threadpool
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
@@ -16,6 +21,48 @@ PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADUlEQVR4nGP8z8BQDwAFgwJ/luzl4wAAAABJRU5ErkJggg=="
 )
 PNG_1X1_DATA_URL = "data:image/png;base64," + base64.b64encode(PNG_1X1).decode("ascii")
+
+
+def native_search_events(text: str, url: str) -> list[dict[str, object]]:
+    search_item = {
+        "id": "ws_1",
+        "type": "web_search_call",
+        "status": "completed",
+        "action": {"type": "search", "query": "query"},
+    }
+    message = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{
+            "type": "output_text",
+            "text": text,
+            "annotations": [{
+                "type": "url_citation",
+                "url": url,
+                "title": "Example",
+                "start_index": 0,
+                "end_index": len(text),
+            }],
+        }],
+    }
+    response = {
+        "id": "resp_search",
+        "object": "response",
+        "created_at": 123,
+        "model": "gpt-5.5",
+        "status": "completed",
+        "output": [search_item, message],
+        "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+    }
+    return [
+        {"type": "response.created", "response": {"id": "resp_search", "model": "gpt-5.5"}},
+        {"type": "response.output_item.done", "output_index": 0, "item": search_item},
+        {"type": "response.output_text.delta", "item_id": "msg_1", "delta": text},
+        {"type": "response.output_item.done", "output_index": 1, "item": message},
+        {"type": "response.completed", "response": response},
+    ]
 
 
 class ChatCompletionCacheTests(unittest.TestCase):
@@ -78,6 +125,49 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertNotEqual(default_key, reasoning_key)
         self.assertNotEqual(thinking_key, reasoning_key)
 
+    def test_cache_key_distinguishes_stream_usage_framing(self) -> None:
+        messages = [{"role": "user", "content": "same streamed prompt"}]
+        base = {"model": "auto", "messages": messages, "stream": True}
+
+        without_usage = cache_key(base, messages, stream=True)
+        with_usage = cache_key(
+            {**base, "stream_options": {"include_usage": True}},
+            messages,
+            stream=True,
+        )
+
+        self.assertNotEqual(without_usage, with_usage)
+
+    def test_chat_stream_include_usage_emits_official_terminal_usage_chunk(self) -> None:
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "count this prompt"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch(
+                "services.protocol.openai_v1_chat_complete.stream_text_deltas",
+                return_value=iter(["count ", "this answer"]),
+            ),
+        ):
+            chunks = list(openai_v1_chat_complete.handle(body))
+
+        self.assertGreaterEqual(len(chunks), 3)
+        for chunk in chunks[:-1]:
+            self.assertIsNone(chunk["usage"])
+            self.assertTrue(chunk["choices"])
+        usage_chunk = chunks[-1]
+        self.assertEqual(usage_chunk["choices"], [])
+        self.assertGreater(usage_chunk["usage"]["prompt_tokens"], 0)
+        self.assertGreater(usage_chunk["usage"]["completion_tokens"], 0)
+        self.assertEqual(
+            usage_chunk["usage"]["total_tokens"],
+            usage_chunk["usage"]["prompt_tokens"] + usage_chunk["usage"]["completion_tokens"],
+        )
+
     def test_chat_completion_reasoning_effort_reaches_conversation_request(self) -> None:
         captured_efforts: list[str] = []
 
@@ -97,7 +187,70 @@ class ChatCompletionCacheTests(unittest.TestCase):
         ):
             openai_v1_chat_complete.handle(body)
 
-        self.assertEqual(captured_efforts, ["extended"])
+        self.assertEqual(captured_efforts, ["xhigh"])
+
+    def test_supported_reasoning_efforts_are_forwarded_without_default_override(self) -> None:
+        captured_chat_efforts: list[str] = []
+        captured_response_efforts: list[str] = []
+
+        def fake_collect_text(_backend, request):
+            captured_chat_efforts.append(request.thinking_effort)
+            return "ok"
+
+        def fake_stream_text_deltas(_backend, request):
+            captured_response_efforts.append(request.thinking_effort)
+            yield "ok"
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", side_effect=fake_collect_text),
+        ):
+            openai_v1_chat_complete.handle({
+                "model": "auto",
+                "reasoning_effort": "max",
+                "messages": [{"role": "user", "content": "use maximum reasoning"}],
+            })
+            openai_v1_chat_complete.handle({
+                "model": "auto",
+                "reasoning_effort": "none",
+                "messages": [{"role": "user", "content": "disable reasoning"}],
+            })
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_response.stream_text_deltas", side_effect=fake_stream_text_deltas),
+        ):
+            openai_v1_response.handle({
+                "model": "auto",
+                "input": "use maximum reasoning",
+                "reasoning": {"effort": "max"},
+            })
+            openai_v1_response.handle({
+                "model": "auto",
+                "input": "disable reasoning",
+                "reasoning": {"effort": "none"},
+            })
+
+        self.assertEqual(captured_chat_efforts, ["max", "auto"])
+        self.assertEqual(captured_response_efforts, ["max", "auto"])
+
+    def test_native_chat_forwards_supported_official_reasoning_effort(self) -> None:
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "use maximum reasoning"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }],
+            "reasoning_effort": "max",
+        }
+
+        result = openai_v1_chat_complete.chat_codex_response_body(body)
+
+        self.assertEqual(result["reasoning"], {"effort": "max"})
 
     def test_responses_reasoning_effort_reaches_conversation_request(self) -> None:
         captured_efforts: list[str] = []
@@ -118,7 +271,7 @@ class ChatCompletionCacheTests(unittest.TestCase):
         ):
             openai_v1_response.handle(body)
 
-        self.assertEqual(captured_efforts, ["extended"])
+        self.assertEqual(captured_efforts, ["xhigh"])
 
     def test_repeated_stream_text_completion_replays_cached_chunks(self) -> None:
         calls = 0
@@ -149,6 +302,82 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(first, second)
         content = "".join(str(chunk["choices"][0]["delta"].get("content") or "") for chunk in second)
         self.assertEqual(content, "streamed answer")
+
+    def test_stream_cache_followers_do_not_starve_the_owner_ai_worker(self) -> None:
+        owner_can_finish = threading.Event()
+        followers_entered = threading.Event()
+        entered_count = 0
+        entered_lock = threading.Lock()
+        follower_compute_calls = 0
+
+        def owner_compute():
+            yield {"type": "owner.started"}
+            if not owner_can_finish.wait(timeout=5):
+                raise AssertionError("owner was not released")
+            yield {"type": "owner.completed"}
+
+        def follower_compute():
+            nonlocal follower_compute_calls
+            follower_compute_calls += 1
+            yield {"type": "follower.started"}
+
+        owner = chat_completion_cache.get_or_compute_stream("same-stream", owner_compute)
+        self.assertEqual(next(owner), {"type": "owner.started"})
+        followers = [
+            chat_completion_cache.get_or_compute_stream("same-stream", follower_compute)
+            for _ in range(32)
+        ]
+
+        def next_follower(iterator):
+            nonlocal entered_count
+            with entered_lock:
+                entered_count += 1
+                if entered_count == len(followers):
+                    followers_entered.set()
+            return next(iterator)
+
+        async def run_pressure() -> tuple[dict[str, str], list[dict[str, str]]]:
+            follower_tasks = [
+                asyncio.create_task(run_ai_in_threadpool(next_follower, iterator))
+                for iterator in followers
+            ]
+            owner_task = None
+            try:
+                self.assertTrue(
+                    await asyncio.to_thread(followers_entered.wait, 3),
+                    "followers did not occupy the AI worker baseline",
+                )
+                owner_task = asyncio.create_task(run_ai_in_threadpool(next, owner))
+                owner_can_finish.set()
+                owner_result = await asyncio.wait_for(asyncio.shield(owner_task), timeout=0.5)
+                follower_results = await asyncio.gather(*follower_tasks)
+                self.assertEqual(await run_ai_in_threadpool(lambda: list(owner)), [])
+                return owner_result, follower_results
+            finally:
+                owner_can_finish.set()
+                if owner_task is not None and not owner_task.done():
+                    owner.close()
+                await asyncio.gather(*follower_tasks, return_exceptions=True)
+                if owner_task is not None:
+                    await asyncio.gather(owner_task, return_exceptions=True)
+                for iterator in followers:
+                    iterator.close()
+                owner.close()
+
+        owner_result, follower_results = asyncio.run(run_pressure())
+
+        self.assertEqual(owner_result, {"type": "owner.completed"})
+        self.assertEqual(follower_compute_calls, 32)
+        self.assertEqual(follower_results, [{"type": "follower.started"}] * 32)
+
+        def unexpected_late_compute():
+            raise AssertionError("completed owner stream was not cached")
+            yield
+
+        self.assertEqual(
+            list(chat_completion_cache.get_or_compute_stream("same-stream", unexpected_late_compute)),
+            [{"type": "owner.started"}, {"type": "owner.completed"}],
+        )
 
     def test_adjacent_duplicate_messages_are_removed_before_upstream_call(self) -> None:
         captured_messages = []
@@ -402,35 +631,45 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         self.assertEqual("".join(deltas), 'print("hello")')
 
-    def test_responses_tools_add_honest_no_tool_guard(self) -> None:
-        model, messages = openai_v1_response.text_response_parts({
-            "model": "auto",
-            "input": "run echo hi",
-            "tools": [{"type": "function", "name": "shell"}],
-        })
+    def test_responses_rejects_tools_that_have_no_execution_path(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            openai_v1_response.text_response_parts({
+                "model": "auto",
+                "input": "inspect the file",
+                "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+            })
 
-        self.assertEqual(model, "auto")
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertIn("cannot execute local tools", str(messages[0]["content"]))
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_chat_rejects_tools_that_have_no_execution_path(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            openai_v1_chat_complete.text_chat_parts({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "inspect the file"}],
+                "tools": [{"type": "custom", "custom": {"name": "shell"}}],
+            })
+
+        self.assertEqual(raised.exception.status_code, 400)
 
     def test_responses_web_search_tool_returns_search_output(self) -> None:
-        search_result = {
-            "answer": "Latest answer.",
-            "sources": [{"title": "Example", "url": "https://example.com/news", "snippet": "Snippet"}],
-        }
         body = {
             "model": "auto",
             "input": "latest example news",
             "tools": [{"type": "web_search"}],
         }
 
-        with mock.patch("services.protocol.openai_v1_response.run_web_search", return_value=search_result) as search:
+        with (
+            mock.patch.object(
+                openai_v1_response,
+                "stream_codex_response",
+                return_value=iter(native_search_events("Latest answer.", "https://example.com/news")),
+            ) as native,
+        ):
             response = openai_v1_response.handle(body)
 
-        search.assert_called_once_with("latest example news")
+        native.assert_called_once_with(body)
         self.assertEqual(response["output"][0]["type"], "web_search_call")
         self.assertEqual(response["output"][0]["status"], "completed")
-        self.assertEqual(response["output"][0]["action"]["query"], "latest example news")
         message = response["output"][1]
         self.assertEqual(message["type"], "message")
         content = message["content"][0]
@@ -439,10 +678,6 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(content["annotations"][0]["url"], "https://example.com/news")
 
     def test_responses_web_search_tool_streams_search_events(self) -> None:
-        search_result = {
-            "answer": "Streamed search answer.",
-            "sources": [{"title": "Example", "url": "https://example.com/stream", "snippet": ""}],
-        }
         body = {
             "model": "auto",
             "stream": True,
@@ -450,70 +685,68 @@ class ChatCompletionCacheTests(unittest.TestCase):
             "tools": [{"type": "web_search_preview"}],
         }
 
-        with mock.patch("services.protocol.openai_v1_response.run_web_search", return_value=search_result):
+        with mock.patch.object(
+            openai_v1_response,
+            "stream_codex_response",
+            return_value=iter(native_search_events("Streamed search answer.", "https://example.com/stream")),
+        ):
             events = list(openai_v1_response.handle(body))
 
         event_types = [event["type"] for event in events]
-        self.assertIn("response.web_search_call.in_progress", event_types)
-        self.assertIn("response.web_search_call.searching", event_types)
-        self.assertIn("response.web_search_call.completed", event_types)
+        self.assertIn("response.output_item.done", event_types)
         completed = events[-1]["response"]
         self.assertEqual(completed["output"][0]["type"], "web_search_call")
         self.assertEqual(completed["output"][1]["type"], "message")
 
     def test_responses_versioned_web_search_tool_returns_search_output(self) -> None:
-        search_result = {
-            "answer": "Versioned search answer.",
-            "sources": [{"title": "Example", "url": "https://example.com/versioned", "snippet": ""}],
-        }
         body = {
             "model": "auto",
             "input": "versioned search",
             "tools": [{"type": "web_search_preview_2025_03_11"}],
         }
 
-        with mock.patch("services.protocol.openai_v1_response.run_web_search", return_value=search_result) as search:
-            response = openai_v1_response.handle(body)
+        payload = openai_v1_response.codex_response_payload(body)
 
-        search.assert_called_once_with("versioned search")
-        self.assertEqual(response["output"][0]["type"], "web_search_call")
-        self.assertIn("Versioned search answer.", response["output"][1]["content"][0]["text"])
+        self.assertEqual(payload["tools"], [{"type": "web_search"}])
 
     def test_chat_completions_web_search_tool_returns_search_answer(self) -> None:
-        search_result = {
-            "answer": "Chat search answer.",
-            "sources": [{"title": "Example", "url": "https://example.com/chat", "snippet": ""}],
-        }
         body = {
             "model": "auto",
             "messages": [{"role": "user", "content": "search chat"}],
             "tools": [{"type": "web_search"}],
         }
 
-        with mock.patch("services.protocol.openai_v1_chat_complete.run_web_search", return_value=search_result) as search:
+        with mock.patch.object(
+            openai_v1_chat_complete.openai_v1_response,
+            "stream_codex_response",
+            return_value=iter(native_search_events("Chat search answer.", "https://example.com/chat")),
+        ) as native:
             response = openai_v1_chat_complete.handle(body)
 
-        search.assert_called_once_with("search chat")
+        self.assertEqual(native.call_args.args[0]["tools"], [{"type": "web_search"}])
         message = response["choices"][0]["message"]
         self.assertIn("Chat search answer.", message["content"])
         self.assertEqual(message["annotations"][0]["type"], "url_citation")
         self.assertEqual(message["annotations"][0]["url_citation"]["url"], "https://example.com/chat")
 
     def test_chat_completions_web_search_options_trigger_search(self) -> None:
-        search_result = {
-            "answer": "Options search answer.",
-            "sources": [{"title": "Example", "url": "https://example.com/options", "snippet": ""}],
-        }
         body = {
             "model": "auto",
             "messages": [{"role": "user", "content": "search options"}],
             "web_search_options": {"search_context_size": "low"},
         }
 
-        with mock.patch("services.protocol.openai_v1_chat_complete.run_web_search", return_value=search_result) as search:
+        with mock.patch.object(
+            openai_v1_chat_complete.openai_v1_response,
+            "stream_codex_response",
+            return_value=iter(native_search_events("Options search answer.", "https://example.com/options")),
+        ) as native:
             response = openai_v1_chat_complete.handle(body)
 
-        search.assert_called_once_with("search options")
+        self.assertEqual(
+            native.call_args.args[0]["tools"],
+            [{"type": "web_search", "search_context_size": "low"}],
+        )
         self.assertIn("Options search answer.", response["choices"][0]["message"]["content"])
 
     def test_chat_completions_search_model_triggers_search(self) -> None:
@@ -549,31 +782,64 @@ class ChatCompletionCacheTests(unittest.TestCase):
         search.assert_not_called()
         self.assertIn("plain text answer", response["choices"][0]["message"]["content"])
 
-    def test_chat_completions_accepts_remote_image_url(self) -> None:
-        class FakeImageResponse:
-            status_code = 200
-            headers = {"content-type": "image/png", "content-length": str(len(PNG_1X1))}
-            content = PNG_1X1
+    def test_chat_completions_rejects_remote_image_url_without_network(self) -> None:
+        with mock.patch("services.remote_image.requests.Session") as session:
+            with self.assertRaises(HTTPException) as raised:
+                openai_v1_chat_complete.text_chat_parts({
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this"},
+                            {"type": "image_url", "image_url": {"url": "http://127.0.0.1/image.png"}},
+                        ],
+                    }],
+                })
 
-        with mock.patch("utils.helper.requests.get", return_value=FakeImageResponse()) as request_get:
-            model, messages = openai_v1_chat_complete.text_chat_parts({
-                "model": "auto",
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Describe this"},
-                        {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
-                    ],
-                }],
-            })
+        self.assertNotIn("127.0.0.1", str(raised.exception.detail))
+        session.assert_not_called()
 
-        request_get.assert_called_once()
-        self.assertEqual(model, "auto")
-        content = messages[0]["content"]
-        self.assertEqual(content[0], {"type": "text", "text": "Describe this"})
-        self.assertEqual(content[1]["type"], "image")
-        self.assertEqual(content[1]["data"], PNG_1X1)
-        self.assertEqual(content[1]["mime"], "image/png")
+    def _assert_chat_and_response_reject_inline_image(self, image_url: str) -> None:
+        chat_body = {
+            "model": "auto",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this"},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }],
+        }
+        response_body = {
+            "model": "auto",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this"},
+                    {"type": "input_image", "image_url": {"url": image_url}},
+                ],
+            }],
+        }
+        for parser, body in (
+            (openai_v1_chat_complete.text_chat_parts, chat_body),
+            (openai_v1_response.text_response_parts, response_body),
+        ):
+            with self.subTest(parser=parser.__module__, image_url=image_url[:40]):
+                with self.assertRaises(HTTPException) as raised:
+                    parser(body)
+                self.assertEqual(raised.exception.status_code, 400)
+
+    def test_chat_and_responses_reject_malformed_inline_image_without_network(self) -> None:
+        self._assert_chat_and_response_reject_inline_image("data:image/png;base64,not-base64")
+
+    def test_chat_and_responses_reject_non_image_inline_mime_without_network(self) -> None:
+        encoded = base64.b64encode(b"not an image").decode("ascii")
+        self._assert_chat_and_response_reject_inline_image(f"data:text/plain;base64,{encoded}")
+
+    def test_chat_and_responses_reject_oversized_inline_image_without_network(self) -> None:
+        oversized = base64.b64encode(b"x" * (10 * 1024 * 1024 + 1)).decode("ascii")
+        self._assert_chat_and_response_reject_inline_image(f"data:image/png;base64,{oversized}")
 
     def test_responses_text_request_preserves_input_image(self) -> None:
         captured = {}
@@ -604,31 +870,23 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(content[1]["data"], PNG_1X1)
         self.assertGreater(response["usage"]["input_tokens_details"]["image_tokens"], 0)
 
-    def test_responses_text_request_accepts_remote_input_image_url(self) -> None:
-        class FakeImageResponse:
-            status_code = 200
-            headers = {"content-type": "image/png", "content-length": str(len(PNG_1X1))}
-            content = PNG_1X1
+    def test_responses_rejects_remote_input_image_url_without_network(self) -> None:
+        with mock.patch("services.remote_image.requests.Session") as session:
+            with self.assertRaises(HTTPException) as raised:
+                openai_v1_response.text_response_parts({
+                    "model": "auto",
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Describe this"},
+                            {"type": "input_image", "image_url": {"url": "https://localhost/image.png"}},
+                        ],
+                    }],
+                })
 
-        with mock.patch("utils.helper.requests.get", return_value=FakeImageResponse()) as request_get:
-            _model, messages = openai_v1_response.text_response_parts({
-                "model": "auto",
-                "input": [{
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "Describe this"},
-                        {"type": "input_image", "image_url": {"url": "https://example.test/image.png"}},
-                    ],
-                }],
-            })
-
-        request_get.assert_called_once()
-        content = messages[0]["content"]
-        self.assertEqual(content[0], {"type": "text", "text": "Describe this"})
-        self.assertEqual(content[1]["type"], "image")
-        self.assertEqual(content[1]["data"], PNG_1X1)
-        self.assertEqual(content[1]["mime"], "image/png")
+        self.assertNotIn("localhost", str(raised.exception.detail))
+        session.assert_not_called()
 
     def test_image_extractor_supports_extra_image_object_shapes(self) -> None:
         encoded = base64.b64encode(PNG_1X1).decode("ascii")

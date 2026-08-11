@@ -1,14 +1,41 @@
 from __future__ import annotations
 
+import threading
+from functools import partial
+
+import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from api.image_inputs import parse_image_edit_request, read_image_sources
-from api.support import require_identity, resolve_image_base_url
-from services.content_filter import check_request
-from services.image_task_service import image_task_service
+from api.support import require_identity_async, resolve_image_base_url
+from services.content_filter import check_request_async
+from services.image_task_service import (
+    ImageTaskNotFoundError,
+    ImageTaskResumeConflictError,
+    image_task_service,
+)
 from services.log_service import LoggedCall
+from services.protocol.error_response import exception_log_message, public_exception_message
+
+
+_IMAGE_TASK_IO_CAPACITY = 8
+_IMAGE_TASK_IO_STATE = threading.local()
+
+
+def _image_task_io_limiter() -> anyio.CapacityLimiter:
+    limiter = getattr(_IMAGE_TASK_IO_STATE, "limiter", None)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(_IMAGE_TASK_IO_CAPACITY)
+        _IMAGE_TASK_IO_STATE.limiter = limiter
+    return limiter
+
+
+async def run_image_task_io(func, *args, **kwargs):
+    return await anyio.to_thread.run_sync(
+        partial(func, *args, **kwargs),
+        limiter=_image_task_io_limiter(),
+    )
 
 
 class ImageGenerationTaskRequest(BaseModel):
@@ -29,9 +56,9 @@ def _parse_task_ids(value: str) -> list[str]:
 
 async def filter_or_log(call: LoggedCall, text: str) -> None:
     try:
-        await run_in_threadpool(check_request, text)
+        await check_request_async(text)
     except HTTPException as exc:
-        call.log("调用失败", status="failed", error=str(exc.detail))
+        await call.log_async("调用失败", status="failed", error=exception_log_message(exc))
         raise
 
 
@@ -43,8 +70,8 @@ def create_router() -> APIRouter:
         ids: str = Query(default=""),
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
-        return await run_in_threadpool(image_task_service.list_tasks, identity, _parse_task_ids(ids))
+        identity = await require_identity_async(authorization)
+        return await run_image_task_io(image_task_service.list_tasks, identity, _parse_task_ids(ids))
 
     @router.post("/api/image-tasks/generations")
     async def create_generation_task(
@@ -52,10 +79,10 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await require_identity_async(authorization)
         await filter_or_log(LoggedCall(identity, "/api/image-tasks/generations", body.model, "文生图任务", request_text=body.prompt), body.prompt)
         try:
-            return await run_in_threadpool(
+            return await run_image_task_io(
                 image_task_service.submit_generation,
                 identity,
                 client_task_id=body.client_task_id,
@@ -66,14 +93,17 @@ def create_router() -> APIRouter:
                 base_url=resolve_image_base_url(request),
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "image task request failed")},
+            ) from exc
 
     @router.post("/api/image-tasks/edits")
     async def create_edit_task(
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await require_identity_async(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
         client_task_id = str(payload.get("client_task_id") or "").strip()
         if not client_task_id:
@@ -84,7 +114,7 @@ def create_router() -> APIRouter:
         images = await read_image_sources(image_sources)
         masks = await read_image_sources(mask_sources) if mask_sources else None
         try:
-            return await run_in_threadpool(
+            return await run_image_task_io(
                 image_task_service.submit_edit,
                 identity,
                 client_task_id=client_task_id,
@@ -97,7 +127,10 @@ def create_router() -> APIRouter:
                 masks=masks,
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "image task request failed")},
+            ) from exc
 
     @router.post("/api/image-tasks/{task_id}/resume-poll")
     async def resume_image_poll(
@@ -106,15 +139,28 @@ def create_router() -> APIRouter:
         request: Request,
         authorization: str | None = Header(default=None),
     ):
-        identity = require_identity(authorization)
+        identity = await require_identity_async(authorization)
         try:
-            return await run_in_threadpool(
+            return await run_image_task_io(
                 image_task_service.resume_poll,
                 identity,
                 task_id,
                 body.extra_timeout_secs,
             )
+        except ImageTaskNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": public_exception_message(exc, "task not found")},
+            ) from exc
+        except ImageTaskResumeConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": public_exception_message(exc, "task cannot be resumed")},
+            ) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "image task resume failed")},
+            ) from exc
 
     return router

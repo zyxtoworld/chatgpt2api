@@ -1,17 +1,17 @@
 import base64
 import hashlib
 import json
-import mimetypes
 import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
-from services.proxy_service import proxy_settings
+from services.image_payload import ImagePayloadError, validate_image_payload
+from services.protocol.error_response import PUBLIC_SERVER_ERROR_MESSAGE
+from services.remote_image import download_remote_image
 from utils.log import logger
 
 BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
@@ -29,7 +29,6 @@ SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "imag
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
-REMOTE_IMAGE_TIMEOUT_SECONDS = 20
 
 
 def _image_extension(mime_type: str) -> str:
@@ -46,8 +45,12 @@ def _decode_json_image_string(value: str, index: int, filename: str | None = Non
         resolved_mime = (match.group("mime") or "image/png").lower()
         encoded = match.group("data")
     else:
-        if text.startswith(("http://", "https://")):
-            raise HTTPException(status_code=400, detail={"error": "remote image URLs are not supported"})
+        if text.lower().startswith(("http://", "https://")):
+            image_data, downloaded_filename, downloaded_mime = download_remote_image(
+                text,
+                max_bytes=MAX_JSON_IMAGE_BYTES,
+            )
+            return image_data, filename or downloaded_filename, downloaded_mime
         resolved_mime = (mime_type or "image/png").lower()
         encoded = text
     if resolved_mime == "image/jpg":
@@ -62,7 +65,11 @@ def _decode_json_image_string(value: str, index: int, filename: str | None = Non
         raise HTTPException(status_code=400, detail={"error": "image file is empty"})
     if len(image_data) > MAX_JSON_IMAGE_BYTES:
         raise HTTPException(status_code=400, detail={"error": "image file is too large"})
-    return image_data, filename or f"image_{index}.{_image_extension(resolved_mime)}", resolved_mime
+    try:
+        info = validate_image_payload(image_data, resolved_mime)
+    except ImagePayloadError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid image data"}) from exc
+    return image_data, filename or f"image_{index}.{_image_extension(info.mime_type)}", info.mime_type
 
 
 def _extract_json_image_value(item: object) -> tuple[str, str | None, str | None]:
@@ -200,13 +207,48 @@ def sse_json_stream(items) -> Iterator[str]:
         logger.warning({
             "event": "sse_stream_error",
             "error_type": exc.__class__.__name__,
-            "error": str(exc),
         })
-        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
-            "error": {"message": str(exc), "type": exc.__class__.__name__}
-        }
+        try:
+            from services.protocol.conversation import ImageGenerationError
+        except Exception:
+            ImageGenerationError = ()
+        if isinstance(exc, ImageGenerationError):
+            try:
+                error = exc.to_openai_error()
+            except Exception:
+                error = None
+        else:
+            error = None
+        if not isinstance(error, dict):
+            error = {
+                "error": {
+                    "message": PUBLIC_SERVER_ERROR_MESSAGE,
+                    "type": "server_error",
+                }
+            }
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+def responses_sse_stream(items) -> Iterator[str]:
+    try:
+        for item in items:
+            event_type = str(item.get("type") or "error") if isinstance(item, dict) else "error"
+            yield f"event: {event_type}\n"
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        logger.warning({
+            "event": "responses_sse_stream_error",
+            "error_type": exc.__class__.__name__,
+        })
+        error = {
+            "type": "error",
+            "code": "server_error",
+            "message": PUBLIC_SERVER_ERROR_MESSAGE,
+            "param": None,
+        }
+        yield "event: error\n"
+        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
 
 def anthropic_sse_stream(items) -> Iterator[str]:
@@ -219,9 +261,14 @@ def anthropic_sse_stream(items) -> Iterator[str]:
         logger.warning({
             "event": "anthropic_sse_stream_error",
             "error_type": exc.__class__.__name__,
-            "error": str(exc),
         })
-        error = {"type": "error", "error": {"type": exc.__class__.__name__, "message": str(exc)}}
+        error = {
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": PUBLIC_SERVER_ERROR_MESSAGE,
+            },
+        }
         yield "event: error\n"
         yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
 
@@ -328,45 +375,13 @@ def _message_image_url(value: object) -> str:
 
 def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
     source = _message_image_url(value)
-    if source.startswith("data:"):
-        header, _, data = source.partition(",")
-        mime = header.split(";")[0].removeprefix("data:") or "image/png"
-        return base64.b64decode(data), mime
-    if not source.startswith(("http://", "https://")):
-        return None
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        return None
-
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api vision fetcher"},
-            timeout=REMOTE_IMAGE_TIMEOUT_SECONDS,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = str(response.headers.get("content-length") or "").strip()
-    if content_length.isdigit() and int(content_length) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    image_data = response.content
-    if not image_data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(image_data) > MAX_JSON_IMAGE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 10MB limit"})
-    mime = str(response.headers.get("content-type") or "image/png").split(";", 1)[0].lower()
-    guessed_mime = mimetypes.guess_type(parsed.path)[0] or ""
-    if mime and not mime.startswith("image/") and mime not in {"application/octet-stream", "binary/octet-stream"}:
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-    if not mime.startswith("image/") and guessed_mime.startswith("image/"):
-        mime = guessed_mime
-    if not mime.startswith("image/"):
-        mime = "image/png"
-    return image_data, mime
+    if source.lower().startswith("data:"):
+        image_data, _, mime = _decode_json_image_string(source, 1)
+        return image_data, mime
+    if source.lower().startswith(("http://", "https://")):
+        image_data, _, mime = _decode_json_image_string(source, 1)
+        return image_data, mime
+    return None
 
 
 def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] | None:
@@ -448,8 +463,10 @@ def extract_chat_prompt(body: dict[str, object]) -> str:
 
 
 def parse_image_count(raw_value: object) -> int:
+    if raw_value is None or raw_value == "":
+        return 1
     try:
-        value = int(raw_value or 1)
+        value = int(raw_value)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
     if value < 1 or value > 4:

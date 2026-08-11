@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import json
-import re
 import threading
 import time
 from typing import Callable, Mapping
@@ -14,6 +13,7 @@ from urllib.parse import quote, urlparse
 from curl_cffi.requests import Session
 
 from services.config import config
+from services.protocol.error_response import public_exception_message
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
@@ -532,13 +532,8 @@ def _find_header_key(headers: Mapping[str, object], name: str) -> str | None:
     return None
 
 
-def _redact_url_credentials(text: str) -> str:
-    return re.sub(
-        r"((?:https?|socks5h?|socks)://)([^\s/@:]+):([^\s/@]+)@",
-        r"\1[REDACTED]@",
-        str(text or ""),
-        flags=re.IGNORECASE,
-    )
+PROXY_TEST_ERROR_MESSAGE = "代理测试失败，请稍后重试"
+CLEARANCE_TEST_ERROR_MESSAGE = "通关测试失败，请稍后重试"
 
 
 def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
@@ -587,7 +582,7 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
             "ok": False,
             "status": 0,
             "latency_ms": latency_ms,
-            "error": _redact_url_credentials(str(exc) or exc.__class__.__name__),
+            "error": public_exception_message(exc, PROXY_TEST_ERROR_MESSAGE),
             **result_base,
         }
     finally:
@@ -618,7 +613,7 @@ def test_clearance(target_url: str = "https://chatgpt.com") -> dict:
             "latency_ms": latency_ms,
             "has_cookies": False,
             "user_agent": "",
-            "error": _redact_url_credentials(str(exc) or exc.__class__.__name__),
+            "error": public_exception_message(exc, CLEARANCE_TEST_ERROR_MESSAGE),
             "runtime": proxy_settings.get_runtime_status(),
         }
 

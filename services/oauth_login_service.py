@@ -33,9 +33,10 @@ from services.openai_oauth import (
     user_agent,
 )
 from services.proxy_service import proxy_settings
+from services.protocol.error_response import PublicSafeError
 
 
-class OAuthLoginError(Exception):
+class OAuthLoginError(PublicSafeError):
     """OAuth 桥流程中的可预期错误，会被 API 层翻译成 400。"""
 
 
@@ -131,12 +132,11 @@ class OAuthLoginService:
             try:
                 parsed = parse_qs(urlparse(raw).query)
             except Exception as exc:
-                raise OAuthLoginError(f"无法解析 callback URL: {exc}") from exc
+                raise OAuthLoginError("无法解析 callback URL，请检查格式") from exc
             code = str((parsed.get("code") or [""])[0]).strip()
             state = str((parsed.get("state") or [""])[0]).strip()
             if not code:
-                err = str((parsed.get("error_description") or parsed.get("error") or [""])[0]).strip()
-                raise OAuthLoginError(err or "callback URL 中没有 code 参数")
+                raise OAuthLoginError("callback URL 中没有可用的 code 参数")
             return code, state
         # 用户可能直接粘了 code 字符串
         return raw, ""
@@ -216,7 +216,11 @@ class OAuthLoginService:
                 timeout=60,
             )
         except Exception as exc:
-            raise OAuthLoginError(f"换 token 网络异常: {exc}") from exc
+            print(
+                f"[oauth-login] token exchange network error: {exc.__class__.__name__}",
+                flush=True,
+            )
+            raise OAuthLoginError("换 token 网络异常，请稍后重试") from exc
         finally:
             session.close()
 
@@ -226,24 +230,13 @@ class OAuthLoginService:
             data = {}
 
         if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
-            detail = ""
-            if isinstance(data, dict):
-                detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
-            if not detail:
-                try:
-                    detail = str(response.text or "")[:300]
-                except Exception:
-                    detail = ""
-            # 打到 docker logs 方便排错——OAuth 换 token 的失败原因往往只有这里能看到
+            # 只记录状态，不记录 callback/code 或上游响应体。
             print(
                 f"[oauth-login] /api/accounts/oauth/token rejected: "
-                f"status={response.status_code} detail={detail!r} "
-                f"raw_body={(getattr(response, 'text', '') or '')[:500]!r}",
+                f"status={response.status_code}",
                 flush=True,
             )
-            raise OAuthLoginError(
-                f"OpenAI 拒绝换 token (HTTP {response.status_code}){': ' + detail if detail else ''}"
-            )
+            raise OAuthLoginError(f"OpenAI 拒绝换 token (HTTP {response.status_code})")
 
         access_token = str(data.get("access_token") or "").strip()
         refresh_token = str(data.get("refresh_token") or "").strip()

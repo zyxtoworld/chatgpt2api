@@ -362,7 +362,7 @@ class ProxyServiceTests(unittest.TestCase):
             )
 
         self.assertFalse(result["ok"])
-        self.assertIn("[REDACTED]", result["error"])
+        self.assertEqual(result["error"], "代理测试失败，请稍后重试")
         self.assertNotIn("user:pass", result["error"])
 
     def test_concurrent_flaresolverr_refresh_uses_single_flight_per_proxy_and_host(self) -> None:

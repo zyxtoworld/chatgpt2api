@@ -19,7 +19,7 @@ class FakeStorage:
         return {"type": "json"}
 
     def health_check(self) -> dict[str, object]:
-        return {"ok": True}
+        return {"status": "healthy"}
 
 
 class FakeConfig:
@@ -50,7 +50,11 @@ class FakeConfig:
 
 
 class FakeProxySettings:
+    def __init__(self) -> None:
+        self.runtime_calls = 0
+
     def get_runtime_status(self) -> dict[str, object]:
+        self.runtime_calls += 1
         return {
             "enabled": True,
             "egress_mode": "single_proxy",
@@ -59,7 +63,12 @@ class FakeProxySettings:
             "clearance_enabled": True,
             "clearance_mode": "flaresolverr",
             "has_clearance_bundle": False,
-            "cached_clearance_hosts": [],
+            "cached_clearance_hosts": ["internal-target.sentinel.example"],
+            "proxy_url": "http://proxy-runtime.sentinel.example:8080",
+            "cookies": "opaque-cookie-sentinel",
+            "user_agent": "opaque-user-agent-sentinel",
+            "error": "opaque-error-sentinel",
+            "future_field": "proxy-runtime-future-sentinel",
         }
 
 
@@ -111,7 +120,11 @@ class ProxyRuntimeApiTests(unittest.TestCase):
 
         self.patchers = [
             mock.patch.object(system_module, "config", self.fake_config),
-            mock.patch.object(system_module, "require_admin", lambda _authorization: {"role": "admin"}),
+            mock.patch.object(
+                system_module,
+                "require_admin_async",
+                mock.AsyncMock(return_value={"role": "admin"}),
+            ),
             mock.patch.object(system_module, "test_proxy", fake_test_proxy),
             mock.patch.object(system_module, "test_clearance", fake_test_clearance, create=True),
             mock.patch.object(system_module, "proxy_settings", self.fake_proxy_settings, create=True),
@@ -173,7 +186,54 @@ class ProxyRuntimeApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
         self.assertEqual(payload["version"], "9.9.9-test")
-        self.assertEqual(payload["proxy_runtime"]["clearance_mode"], "flaresolverr")
+        self.assertEqual(
+            payload["proxy_runtime"],
+            {"enabled": True, "clearance_enabled": True},
+        )
+
+    def test_public_health_projects_proxy_runtime_without_operational_details(self) -> None:
+        self.fake_proxy_settings.runtime_calls = 0
+        json_response = self.client.get("/health?format=json")
+
+        self.assertEqual(json_response.status_code, 200, json_response.text)
+        self.assertEqual(self.fake_proxy_settings.runtime_calls, 1)
+        payload = json_response.json()
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["healthy"])
+        self.assertEqual(
+            payload["proxy_runtime"],
+            {"enabled": True, "clearance_enabled": True},
+        )
+        for sentinel in (
+            "internal-target.sentinel.example",
+            "proxy-runtime.sentinel.example",
+            "opaque-cookie-sentinel",
+            "opaque-user-agent-sentinel",
+            "opaque-error-sentinel",
+            "proxy-runtime-future-sentinel",
+            "proxy_source",
+            "cached_clearance_hosts",
+            "future_field",
+        ):
+            self.assertNotIn(sentinel, json_response.text)
+
+        self.fake_proxy_settings.runtime_calls = 0
+        html_response = self.client.get("/health")
+
+        self.assertEqual(html_response.status_code, 200, html_response.text)
+        self.assertEqual(self.fake_proxy_settings.runtime_calls, 1)
+        for sentinel in (
+            "internal-target.sentinel.example",
+            "proxy-runtime.sentinel.example",
+            "opaque-cookie-sentinel",
+            "opaque-user-agent-sentinel",
+            "opaque-error-sentinel",
+            "proxy-runtime-future-sentinel",
+            "proxy_source",
+            "cached_clearance_hosts",
+            "future_field",
+        ):
+            self.assertNotIn(sentinel, html_response.text)
 
 
 if __name__ == "__main__":

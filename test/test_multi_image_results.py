@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import base64
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest import mock
 
+import services.protocol.conversation as conversation_module
 from services.config import config
 from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ImageOutput, extract_conversation_ids
+from services.protocol.conversation import ConversationRequest, ImageOutput, extract_conversation_ids, stream_image_events
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -50,6 +55,98 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_concurrent_multi_image_requests_share_a_bounded_worker_pool(self) -> None:
+        condition = threading.Condition()
+        release = threading.Event()
+        active = 0
+        max_active = 0
+
+        def generate(_request, index, total):
+            nonlocal active, max_active
+            with condition:
+                active += 1
+                max_active = max(max_active, active)
+                condition.notify_all()
+            try:
+                if not release.wait(timeout=5):
+                    raise AssertionError("image worker was not released")
+                return [
+                    ImageOutput(
+                        kind="result",
+                        model="gpt-image-2",
+                        index=index,
+                        total=total,
+                        data=[{"b64_json": "aW1hZ2U="}],
+                    )
+                ]
+            finally:
+                with condition:
+                    active -= 1
+                    condition.notify_all()
+
+        request = ConversationRequest(model="gpt-image-2", prompt="cat", n=10)
+        with (
+            mock.patch.object(conversation_module, "_generate_single_image", side_effect=generate),
+            mock.patch.object(
+                conversation_module,
+                "config",
+                SimpleNamespace(image_parallel_generation=True),
+            ),
+            ThreadPoolExecutor(max_workers=4) as callers,
+        ):
+            futures = [
+                callers.submit(lambda: list(conversation_module.stream_image_outputs_with_pool(request)))
+                for _ in range(4)
+            ]
+            try:
+                deadline = time.monotonic() + 3
+                with condition:
+                    while max_active < 32 and time.monotonic() < deadline:
+                        condition.wait(timeout=0.05)
+                    self.assertGreaterEqual(max_active, 32, "parallel image workers did not reach the test baseline")
+                    overflow_deadline = time.monotonic() + 0.5
+                    while max_active <= 32 and time.monotonic() < overflow_deadline:
+                        condition.wait(timeout=0.02)
+                    observed_max = max_active
+            finally:
+                release.set()
+            for future in futures:
+                future.result(timeout=5)
+
+        self.assertLessEqual(observed_max, 32)
+
+    def test_image_api_stream_emits_only_official_completed_events(self) -> None:
+        usage = {
+            "input_tokens": 2,
+            "output_tokens": 3,
+            "total_tokens": 5,
+            "input_tokens_details": {"text_tokens": 2, "image_tokens": 0},
+        }
+        outputs = [
+            ImageOutput(kind="progress", model="gpt-image-2", index=1, total=1, text="working"),
+            ImageOutput(
+                kind="result",
+                model="gpt-image-2",
+                index=1,
+                total=1,
+                created=1_700_000_003,
+                data=[{"b64_json": "ZmFrZQ==", "revised_prompt": "revised"}],
+            ),
+        ]
+
+        events = list(stream_image_events(outputs, lambda _items: usage))
+
+        self.assertEqual(events, [{
+            "type": "image_generation.completed",
+            "b64_json": "ZmFrZQ==",
+            "background": "auto",
+            "created_at": 1_700_000_003,
+            "output_format": "png",
+            "quality": "auto",
+            "size": "auto",
+            "usage": usage,
+        }])
+
     def test_stream_id_extractor_keeps_full_file_ids(self) -> None:
         payload = (
             '{"conversation_id":"conv-1"} '
@@ -119,7 +216,16 @@ class MultiImageResultTests(unittest.TestCase):
         ])
 
         with (
-            mock.patch.dict(config.data, {"image_poll_initial_wait_secs": 0, "image_poll_interval_secs": 0.5}),
+            mock.patch.dict(
+                config.data,
+                {
+                    "image_poll_initial_wait_secs": 0,
+                    "image_poll_interval_secs": 0.5,
+                    "image_settle_enabled": True,
+                    "image_check_before_hit_enabled": True,
+                    "image_settle_secs": 0.5,
+                },
+            ),
             mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
         ):
             file_ids, sediment_ids = backend._poll_image_results("conv-1", timeout_secs=10)
@@ -127,6 +233,30 @@ class MultiImageResultTests(unittest.TestCase):
         self.assertEqual(file_ids, ["file-one", "file-two"])
         self.assertEqual(sediment_ids, ["sed-one"])
         self.assertEqual(backend.calls, 3)
+
+    def test_poll_returns_first_hit_when_settle_is_disabled(self) -> None:
+        backend = FakeBackend([
+            _conversation(["file-one"]),
+            _conversation(["file-one", "file-two"], ["sed-one"]),
+        ])
+
+        with (
+            mock.patch.dict(
+                config.data,
+                {
+                    "image_poll_initial_wait_secs": 0,
+                    "image_poll_interval_secs": 0.5,
+                    "image_settle_enabled": False,
+                    "image_check_before_hit_enabled": True,
+                },
+            ),
+            mock.patch("services.openai_backend_api.time.sleep", lambda _seconds: None),
+        ):
+            file_ids, sediment_ids = backend._poll_image_results("conv-1", timeout_secs=10)
+
+        self.assertEqual(file_ids, ["file-one"])
+        self.assertEqual(sediment_ids, [])
+        self.assertEqual(backend.calls, 1)
 
     def test_resolver_uses_file_and_sediment_urls(self) -> None:
         backend = FakeBackend()

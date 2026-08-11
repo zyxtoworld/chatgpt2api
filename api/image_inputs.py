@@ -3,25 +3,71 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import mimetypes
 import re
-from pathlib import PurePosixPath
+import threading
 from typing import Any, TypeGuard
-from urllib.parse import unquote, unquote_to_bytes, urlparse
+from urllib.parse import unquote_to_bytes
 
-from curl_cffi import requests
+import anyio
 from fastapi import HTTPException, Request
-from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
-from services.proxy_service import proxy_settings
+from services.image_payload import ImagePayloadError, inspect_image_payload, validate_image_payload
+from services.remote_image import download_remote_image
+from services.protocol.error_response import PublicSafeValueError
+from services.protocol.image_options import (
+    normalize_image_output_compression,
+    normalize_image_output_format,
+    normalize_image_quality,
+    normalize_image_size,
+    normalize_supported_image_background,
+    normalize_supported_image_moderation,
+    normalize_supported_partial_images,
+)
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
+MAX_IMAGE_EDIT_INPUTS = 16
+_REMOTE_IMAGE_THREAD_CAPACITY = 4
+_REMOTE_IMAGE_THREAD_STATE = threading.local()
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
+IMAGE_EDIT_OPTION_FIELDS = {
+    "background",
+    "client_task_id",
+    "input_fidelity",
+    "model",
+    "moderation",
+    "n",
+    "output_compression",
+    "output_format",
+    "partial_images",
+    "prompt",
+    "quality",
+    "response_format",
+    "size",
+    "stream",
+    "style",
+    "user",
+}
+IMAGE_EDIT_REQUEST_FIELDS = IMAGE_EDIT_OPTION_FIELDS | IMAGE_REFERENCE_FIELDS | MASK_REFERENCE_FIELDS
+_IMAGE_EDIT_JSON_STRING_FIELDS = {
+    "background",
+    "client_task_id",
+    "input_fidelity",
+    "model",
+    "moderation",
+    "output_format",
+    "prompt",
+    "quality",
+    "response_format",
+    "size",
+    "style",
+    "user",
+}
+_IMAGE_EDIT_JSON_INTEGER_FIELDS = {"n", "output_compression", "partial_images"}
 
 
 def _clean(value: object, default: str = "") -> str:
@@ -50,14 +96,73 @@ def _parse_bool(value: object) -> bool | None:
 
 
 def _parse_count(value: object) -> int:
-    """解析生成数量：保持图片接口的 1 到 4 限制。"""
+    """解析生成数量：遵循官方图片接口的 1 到 10 限制。"""
+    if value is None or value == "":
+        return 1
     try:
-        count = int(value or 1)
+        count = int(value)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if count < 1 or count > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
+    if count < 1 or count > 10:
+        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 10"})
     return count
+
+
+def _parse_optional_int(value: object, field: str) -> int | None:
+    if value is None or value == "":
+        return None
+    if type(value) is int:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    raise HTTPException(status_code=400, detail={"error": f"{field} must be an integer"})
+
+
+def _validate_json_edit_option_types(fields: dict[str, Any]) -> None:
+    for field in _IMAGE_EDIT_JSON_STRING_FIELDS:
+        value = fields.get(field)
+        if value is not None and not isinstance(value, str):
+            raise HTTPException(status_code=400, detail={"error": f"{field} must be a string"})
+    for field in _IMAGE_EDIT_JSON_INTEGER_FIELDS:
+        value = fields.get(field)
+        if value is not None and type(value) is not int:
+            raise HTTPException(status_code=400, detail={"error": f"{field} must be an integer"})
+    stream = fields.get("stream")
+    if stream is not None and type(stream) is not bool:
+        raise HTTPException(status_code=400, detail={"error": "stream must be a boolean"})
+
+
+def validate_image_api_options(payload: dict[str, Any], *, editing: bool = False) -> dict[str, Any]:
+    output_compression = _parse_optional_int(payload.get("output_compression"), "output_compression")
+    partial_images = _parse_optional_int(payload.get("partial_images"), "partial_images")
+    try:
+        payload["quality"] = normalize_image_quality(payload.get("quality"))
+        payload["size"] = normalize_image_size(payload.get("size"), editing=editing)
+        payload["output_format"] = normalize_image_output_format(payload.get("output_format"))
+        payload["output_compression"] = normalize_image_output_compression(
+            output_compression,
+            payload["output_format"],
+        )
+        payload["background"] = normalize_supported_image_background(payload.get("background"))
+        payload["moderation"] = normalize_supported_image_moderation(payload.get("moderation"))
+        payload["partial_images"] = normalize_supported_partial_images(partial_images)
+    except PublicSafeValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": exc.public_safe_message()}) from exc
+
+    if payload.get("style") is not None:
+        raise HTTPException(status_code=400, detail={"error": "style is not supported by the configured image models"})
+    if editing and payload.get("input_fidelity") is not None:
+        raise HTTPException(status_code=400, detail={"error": "input_fidelity is not supported by the upstream image backend"})
+    if payload.get("user") is not None:
+        raise HTTPException(status_code=400, detail={"error": "user is not supported by the upstream image backend"})
+
+    response_format = _clean(payload.get("response_format"), "b64_json")
+    if response_format not in {"b64_json", "url"}:
+        raise HTTPException(status_code=400, detail={"error": "response_format must be b64_json or url"})
+    if payload.get("stream") and response_format != "b64_json":
+        raise HTTPException(status_code=400, detail={"error": "streaming image responses require base64 output"})
+    payload["response_format"] = response_format
+    return payload
 
 
 def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
@@ -73,10 +178,18 @@ def _payload_from_fields(fields: dict[str, Any]) -> dict[str, Any]:
         "quality": _clean(fields.get("quality"), "auto"),
         "response_format": _clean(fields.get("response_format"), "b64_json"),
         "stream": _parse_bool(fields.get("stream")),
+        "background": fields.get("background"),
+        "input_fidelity": fields.get("input_fidelity"),
+        "moderation": fields.get("moderation"),
+        "output_compression": fields.get("output_compression"),
+        "output_format": fields.get("output_format"),
+        "partial_images": fields.get("partial_images"),
+        "style": fields.get("style"),
+        "user": fields.get("user"),
     }
     if "client_task_id" in fields:
         payload["client_task_id"] = _clean(fields.get("client_task_id"))
-    return payload
+    return validate_image_api_options(payload, editing=True)
 
 
 def _json_reference_value(value: object) -> object:
@@ -101,7 +214,7 @@ def _decode_base64_image(value: object, filename: str, mime_type: str) -> ImageI
         raise HTTPException(status_code=400, detail={"error": "image file is empty"})
     if len(data) > MAX_IMAGE_REFERENCE_BYTES:
         raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
-    return data, filename, mime_type
+    return _validated_image_input(data, filename, mime_type)
 
 
 def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
@@ -166,8 +279,15 @@ def _json_mask_sources(body: dict[str, Any]) -> list[ImageSource]:
     return []
 
 
+def _validate_edit_reference_counts(images: list[ImageSource], masks: list[ImageSource]) -> None:
+    if len(images) > MAX_IMAGE_EDIT_INPUTS:
+        raise HTTPException(status_code=400, detail={"error": "images must contain at most 16 items"})
+    if len(masks) > 1:
+        raise HTTPException(status_code=400, detail={"error": "mask must contain at most one image"})
+
+
 async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], list[ImageSource], list[ImageSource]]:
-    """解析图片编辑请求：同时支持 multipart 上传和官方 JSON 图片 URL。
+    """解析图片编辑请求：同时支持 multipart 上传和 JSON 图片引用。
     
     返回 (payload, image_sources, mask_sources)
     """
@@ -179,11 +299,19 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
             raise HTTPException(status_code=400, detail={"error": "invalid JSON body"}) from exc
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail={"error": "JSON body must be an object"})
-        return _payload_from_fields(body), _json_image_sources(body), _json_mask_sources(body)
+        if any(value is not None and key not in IMAGE_EDIT_REQUEST_FIELDS for key, value in body.items()):
+            raise HTTPException(status_code=400, detail={"error": "parameter is not supported by the image edit endpoint"})
+        _validate_json_edit_option_types(body)
+        images = _json_image_sources(body)
+        masks = _json_mask_sources(body)
+        _validate_edit_reference_counts(images, masks)
+        return _payload_from_fields(body), images, masks
 
     form = await request.form()
+    if any(key not in IMAGE_EDIT_REQUEST_FIELDS for key, _value in form.multi_items()):
+        raise HTTPException(status_code=400, detail={"error": "parameter is not supported by the image edit endpoint"})
     fields: dict[str, Any] = {}
-    for key in ("client_task_id", "prompt", "model", "n", "size", "quality", "response_format", "stream"):
+    for key in IMAGE_EDIT_OPTION_FIELDS:
         value = form.get(key)
         if isinstance(value, str):
             fields[key] = value
@@ -194,6 +322,7 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
             sources.extend(_sources_from_value(value))
         elif key in MASK_REFERENCE_FIELDS:
             mask_sources.extend(_sources_from_value(value))
+    _validate_edit_reference_counts(sources, mask_sources)
     return _payload_from_fields(fields), sources, mask_sources
 
 
@@ -203,16 +332,6 @@ def _extension_from_mime(mime_type: str) -> str:
     if subtype == "jpeg":
         return "jpg"
     return re.sub(r"[^a-z0-9]+", "", subtype.lower()) or "png"
-
-
-def _safe_filename(name: str, mime_type: str, fallback: str) -> str:
-    """生成安全文件名：清理 URL 文件名并补齐扩展名。"""
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
-    if not cleaned:
-        cleaned = fallback
-    if "." not in cleaned:
-        cleaned = f"{cleaned}.{_extension_from_mime(mime_type)}"
-    return cleaned
 
 
 def _decode_data_url(url: str) -> ImageInput:
@@ -231,64 +350,43 @@ def _decode_data_url(url: str) -> ImageInput:
         raise HTTPException(status_code=400, detail={"error": "image URL is empty"})
     if len(data) > MAX_IMAGE_REFERENCE_BYTES:
         raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
-    return data, f"image_url.{_extension_from_mime(mime_type)}", mime_type
+    return _validated_image_input(data, f"image_url.{_extension_from_mime(mime_type)}", mime_type)
 
 
-def _response_mime_type(response: requests.Response, parsed_path: str) -> str:
-    """识别下载图片类型：优先响应头，必要时按 URL 后缀推断。"""
-    header_type = str(response.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
-    guessed_type = mimetypes.guess_type(parsed_path)[0] or ""
-    if header_type.startswith("image/"):
-        return header_type
-    if header_type and header_type not in {"application/octet-stream", "binary/octet-stream"}:
-        raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-    if guessed_type.startswith("image/"):
-        return guessed_type
-    if not header_type or header_type in {"application/octet-stream", "binary/octet-stream"}:
-        return "image/png"
-    raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-
-
-def _filename_from_url(parsed_path: str, mime_type: str) -> str:
-    """生成 URL 图片文件名：从链接路径提取名称并做安全化。"""
-    raw_name = PurePosixPath(unquote(parsed_path)).name
-    return _safe_filename(raw_name, mime_type, "image_url")
+def _validated_image_input(data: bytes, filename: str, mime_type: str) -> ImageInput:
+    try:
+        info = validate_image_payload(data, mime_type)
+    except ImagePayloadError as exc:
+        raise HTTPException(status_code=400, detail={"error": "image data is invalid"}) from exc
+    return data, filename, info.mime_type
 
 
 def _download_image_url(url: str) -> ImageInput:
-    """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
+    """下载远程图片；data URL 保持本地解码，HTTP(S) 复用统一安全下载器。"""
     source = _clean(url)
-    if source.startswith("data:"):
+    if source.lower().startswith("data:"):
         return _decode_data_url(source)
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
-            timeout=60,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = _clean(response.headers.get("content-length"))
-    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    data = response.content
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    mime_type = _response_mime_type(response, parsed.path)
-    return data, _filename_from_url(parsed.path, mime_type), mime_type
+    return download_remote_image(source, max_bytes=MAX_IMAGE_REFERENCE_BYTES)
+
+
+def _remote_image_thread_limiter() -> anyio.CapacityLimiter:
+    limiter = getattr(_REMOTE_IMAGE_THREAD_STATE, "limiter", None)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(_REMOTE_IMAGE_THREAD_CAPACITY)
+        _REMOTE_IMAGE_THREAD_STATE.limiter = limiter
+    return limiter
+
+
+async def _run_remote_image_io(url: str) -> ImageInput:
+    return await anyio.to_thread.run_sync(
+        _download_image_url,
+        url,
+        limiter=_remote_image_thread_limiter(),
+    )
 
 
 async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
-    """读取图片来源：上传文件直接读取，URL 下载后统一返回图片元组。"""
+    """读取图片来源：上传文件或 data URL 解码后统一返回图片元组。"""
     images: list[ImageInput] = []
     for source in sources:
         if isinstance(source, tuple):
@@ -301,9 +399,19 @@ async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
                 await source.close()
             if not image_data:
                 raise HTTPException(status_code=400, detail={"error": "image file is empty"})
-            images.append((image_data, source.filename or "image.png", source.content_type or "image/png"))
+            if len(image_data) > MAX_IMAGE_REFERENCE_BYTES:
+                raise HTTPException(status_code=400, detail={"error": "image file exceeds 50MB limit"})
+            content_type = str(source.content_type or "").split(";", 1)[0].strip().lower()
+            try:
+                if content_type in {"", "application/octet-stream"}:
+                    info = inspect_image_payload(image_data)
+                else:
+                    info = validate_image_payload(image_data, content_type)
+            except ImagePayloadError as exc:
+                raise HTTPException(status_code=400, detail={"error": "image data is invalid"}) from exc
+            images.append((image_data, source.filename or "image.png", info.mime_type))
             continue
-        images.append(await run_in_threadpool(_download_image_url, source))
+        images.append(await _run_remote_image_io(source))
     if not images:
         raise HTTPException(status_code=400, detail={"error": "image file or image_url is required"})
     return images

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 from services.account_service import AccountService
 from services.model_service import ModelCatalogService
@@ -118,6 +119,90 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(self.calls.count("free-good"), 1)
         self.assertEqual(self.calls.count("plus"), 1)
         self.assertEqual(self.calls.count("pro"), 1)
+
+    def test_cold_concurrent_readers_wait_for_one_refresh(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "cold-reader-accounts.json")
+        )
+        refresh_started = Event()
+        release_refresh = Event()
+        calls: list[int] = []
+
+        class BlockingColdBackend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self) -> dict:
+                calls.append(len(calls) + 1)
+                refresh_started.set()
+                if not release_refresh.wait(timeout=2):
+                    raise TimeoutError("test did not release model refresh")
+                return model_list("cold-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(accounts, backend_factory=BlockingColdBackend)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(catalog.route_for_model, "cold-model")
+            self.assertTrue(refresh_started.wait(timeout=1))
+            second = executor.submit(catalog.route_for_model, "cold-model")
+            self.assertFalse(second.done())
+            release_refresh.set()
+            first_route = first.result(timeout=2)
+            second_route = second.result(timeout=2)
+
+        self.assertTrue(first_route.allow_anonymous)
+        self.assertEqual(second_route, first_route)
+        self.assertEqual(calls, [1])
+
+    def test_expired_refresh_does_not_block_readers_of_last_successful_snapshot(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "stale-reader-accounts.json")
+        )
+        refresh_started = Event()
+        release_refresh = Event()
+        calls: list[int] = []
+        now = [0.0]
+
+        class BlockingRefreshBackend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self) -> dict:
+                calls.append(len(calls) + 1)
+                if len(calls) == 1:
+                    return model_list("cached-model")
+                refresh_started.set()
+                if not release_refresh.wait(timeout=2):
+                    raise TimeoutError("test did not release model refresh")
+                return model_list("fresh-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=BlockingRefreshBackend,
+            cache_ttl_seconds=1,
+            clock=lambda: now[0],
+        )
+        self.assertTrue(catalog.route_for_model("cached-model").allow_anonymous)
+        now[0] = 2.0
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            refresh = executor.submit(catalog.route_for_model, "cached-model")
+            self.assertTrue(refresh_started.wait(timeout=1))
+            stale_reader = executor.submit(catalog.route_for_model, "cached-model")
+            try:
+                stale_route = stale_reader.result(timeout=0.2)
+            finally:
+                release_refresh.set()
+            refreshed_route = refresh.result(timeout=2)
+
+        self.assertTrue(stale_route.allow_anonymous)
+        self.assertFalse(refreshed_route.allow_anonymous)
+        self.assertEqual(calls, [1, 2])
 
     def test_failed_refresh_keeps_last_successful_models_for_that_type(self) -> None:
         self.catalog.list_models()

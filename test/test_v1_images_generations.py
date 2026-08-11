@@ -68,15 +68,12 @@ class ImageGenerationsTests(unittest.TestCase):
             if not text.startswith("data:"):
                 continue
             payload = text[5:].strip()
-            if payload == "[DONE]":
-                break
             try:
                 chunk = json.loads(payload)
             except Exception:
                 continue
-            data = chunk.get("data")
-            if isinstance(data, list):
-                image_items.extend(item for item in data if isinstance(item, dict))
+            if chunk.get("type") == "image_generation.completed" and chunk.get("b64_json"):
+                image_items.append({"b64_json": chunk["b64_json"]})
 
         saved_paths = []
         for index, item in enumerate(image_items, start=1):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -14,6 +13,13 @@ from curl_cffi.requests import Session
 
 from services.account_service import account_service
 from services.config import DATA_DIR
+from services.protocol.error_response import (
+    PublicSafeValueError,
+    exception_log_message,
+    sanitize_import_job_errors,
+)
+from services.storage.base import StorageConflictError, StorageDataError, make_storage_snapshot
+from services.task_executor import reserve_background_task
 
 
 SUB2API_CONFIG_FILE = DATA_DIR / "sub2api_config.json"
@@ -52,11 +58,11 @@ def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
         "skipped": int(raw.get("skipped") or 0),
         "refreshed": int(raw.get("refreshed") or 0),
         "failed": int(raw.get("failed") or 0),
-        "errors": raw.get("errors") if isinstance(raw.get("errors"), list) else [],
+        "errors": sanitize_import_job_errors(raw.get("errors")),
     }
 
 
-def _normalize_server(raw: dict) -> dict:
+def _normalize_server(raw: dict, *, fail_unfinished: bool = True) -> dict:
     return {
         "id": _clean(raw.get("id")) or _new_id(),
         "name": _clean(raw.get("name")),
@@ -65,7 +71,7 @@ def _normalize_server(raw: dict) -> dict:
         "password": _clean(raw.get("password")),
         "api_key": _clean(raw.get("api_key")),
         "group_id": _clean(raw.get("group_id")),
-        "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=True),
+        "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=fail_unfinished),
     }
 
 
@@ -74,31 +80,71 @@ class Sub2APIConfig:
         self._store_file = store_file
         self._lock = Lock()
         self._servers: list[dict] = self._load()
+        self._snapshot_revision = make_storage_snapshot(self._servers).revision
 
-    def _load(self) -> list[dict]:
+    def _load(self, *, fail_unfinished: bool = True) -> list[dict]:
         if not self._store_file.exists():
             return []
         try:
             raw = json.loads(self._store_file.read_text(encoding="utf-8"))
-            if isinstance(raw, list):
-                return [_normalize_server(item) for item in raw if isinstance(item, dict)]
+            if not isinstance(raw, list):
+                raise StorageDataError()
+            servers: list[dict] = []
+            seen_ids: set[str] = set()
+            for item in raw:
+                if not isinstance(item, dict):
+                    raise StorageDataError()
+                server = _normalize_server(item, fail_unfinished=fail_unfinished)
+                if not server["base_url"] or server["id"] in seen_ids:
+                    raise StorageDataError()
+                seen_ids.add(server["id"])
+                servers.append(server)
+            return servers
+        except StorageDataError:
+            raise
+        except Exception as exc:
+            raise StorageDataError() from exc
+
+    def _reload_locked(self) -> None:
+        servers = self._load(fail_unfinished=False)
+        self._servers = servers
+        self._snapshot_revision = make_storage_snapshot(servers).revision
+
+    def _commit_locked(self, servers: list[dict]) -> None:
+        previous = self._servers
+        self._servers = servers
+        try:
+            self._save()
         except Exception:
-            pass
-        return []
+            self._servers = previous
+            raise
 
     def _save(self) -> None:
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        self._store_file.write_text(
-            json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        current_revision = make_storage_snapshot(self._load(fail_unfinished=False)).revision
+        if current_revision != self._snapshot_revision:
+            raise StorageConflictError()
+        payload = (json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        temp_path = self._store_file.with_suffix(self._store_file.suffix + ".tmp")
+        try:
+            temp_path.write_bytes(payload)
+            temp_path.replace(self._store_file)
+        except Exception:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        self._snapshot_revision = make_storage_snapshot(self._servers).revision
 
     def list_servers(self) -> list[dict]:
         with self._lock:
+            self._reload_locked()
             return [dict(server) for server in self._servers]
 
     def get_server(self, server_id: str) -> dict | None:
         with self._lock:
+            self._reload_locked()
             for server in self._servers:
                 if server["id"] == server_id:
                     return dict(server)
@@ -124,20 +170,22 @@ class Sub2APIConfig:
             "group_id": group_id,
         })
         with self._lock:
-            self._servers.append(server)
-            self._save()
+            self._reload_locked()
+            self._commit_locked([*self._servers, server])
         _token_cache.pop(server["id"], None)
         return dict(server)
 
     def update_server(self, server_id: str, updates: dict) -> dict | None:
         with self._lock:
+            self._reload_locked()
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
                 merged = {**server, **{k: v for k, v in updates.items() if v is not None}, "id": server_id}
-                self._servers[index] = _normalize_server(merged)
-                self._save()
-                result = dict(self._servers[index])
+                next_servers = list(self._servers)
+                next_servers[index] = _normalize_server(merged)
+                self._commit_locked(next_servers)
+                result = dict(next_servers[index])
                 break
             else:
                 return None
@@ -146,29 +194,50 @@ class Sub2APIConfig:
 
     def delete_server(self, server_id: str) -> bool:
         with self._lock:
+            self._reload_locked()
             before = len(self._servers)
-            self._servers = [server for server in self._servers if server["id"] != server_id]
-            removed = len(self._servers) < before
+            next_servers = [server for server in self._servers if server["id"] != server_id]
+            removed = len(next_servers) < before
             if removed:
-                self._save()
+                self._commit_locked(next_servers)
         if removed:
             _token_cache.pop(server_id, None)
         return removed
 
     def set_import_job(self, server_id: str, import_job: dict | None) -> dict | None:
         with self._lock:
+            self._reload_locked()
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
                 next_server = dict(server)
                 next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=False)
-                self._servers[index] = next_server
-                self._save()
+                next_servers = list(self._servers)
+                next_servers[index] = next_server
+                self._commit_locked(next_servers)
+                return dict(next_server)
+        return None
+
+    def begin_import_job(self, server_id: str, import_job: dict) -> dict | None:
+        with self._lock:
+            self._reload_locked()
+            for index, server in enumerate(self._servers):
+                if server["id"] != server_id:
+                    continue
+                current_job = server.get("import_job")
+                if isinstance(current_job, dict) and current_job.get("status") in {"pending", "running"}:
+                    raise PublicSafeValueError("import is already running")
+                next_server = dict(server)
+                next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=False)
+                next_servers = list(self._servers)
+                next_servers[index] = next_server
+                self._commit_locked(next_servers)
                 return dict(next_server)
         return None
 
     def get_import_job(self, server_id: str) -> dict | None:
         with self._lock:
+            self._reload_locked()
             for server in self._servers:
                 if server["id"] == server_id:
                     job = server.get("import_job")
@@ -192,7 +261,7 @@ def _login(base_url: str, email: str, password: str) -> tuple[str, float]:
             timeout=30,
         )
         if not response.ok:
-            raise RuntimeError(f"sub2api login failed: HTTP {response.status_code} {response.text[:200]}")
+            raise RuntimeError(f"sub2api login failed: HTTP {response.status_code}")
         payload = response.json()
     finally:
         session.close()
@@ -297,7 +366,7 @@ def list_remote_accounts(server: dict) -> list[dict]:
                 timeout=30,
             )
             if not response.ok:
-                raise RuntimeError(f"sub2api list failed: HTTP {response.status_code} {response.text[:200]}")
+                raise RuntimeError(f"sub2api list failed: HTTP {response.status_code}")
             payload = response.json()
 
             data, total = _extract_paged_items(payload)
@@ -353,7 +422,7 @@ def list_remote_groups(server: dict) -> list[dict]:
                 timeout=30,
             )
             if not response.ok:
-                raise RuntimeError(f"sub2api groups failed: HTTP {response.status_code} {response.text[:200]}")
+                raise RuntimeError(f"sub2api groups failed: HTTP {response.status_code}")
             payload = response.json()
 
             data, total = _extract_paged_items(payload)
@@ -438,9 +507,10 @@ class Sub2APIImportService:
     def start_import(self, server: dict, account_ids: list[str]) -> dict:
         ids = [_clean(item) for item in account_ids if _clean(item)]
         if not ids:
-            raise ValueError("account ids is required")
+            raise PublicSafeValueError("account ids is required")
 
         server_id = _clean(server.get("id"))
+        reservation = reserve_background_task()
         job = {
             "job_id": uuid.uuid4().hex,
             "status": "pending",
@@ -454,17 +524,22 @@ class Sub2APIImportService:
             "failed": 0,
             "errors": [],
         }
-        saved = self._config.set_import_job(server_id, job)
+        try:
+            saved = self._config.begin_import_job(server_id, job)
+        except Exception:
+            reservation.cancel()
+            raise
         if saved is None:
-            raise ValueError("server not found")
-
-        thread = threading.Thread(
-            target=self._run_import,
-            args=(server_id, server, ids),
-            name=f"sub2api-import-{server_id}",
-            daemon=True,
-        )
-        thread.start()
+            reservation.cancel()
+            raise PublicSafeValueError("server not found")
+        try:
+            reservation.submit(self._run_import, server_id, server, ids)
+        except Exception:
+            self._config.set_import_job(
+                server_id,
+                {**job, "status": "failed", "failed": len(ids), "errors": []},
+            )
+            raise
         return dict(saved.get("import_job") or job)
 
     def _update_job(self, server_id: str, **updates) -> None:
@@ -488,7 +563,7 @@ class Sub2APIImportService:
         try:
             tokens, errors = _fetch_access_tokens_for_accounts(server, account_ids)
         except Exception as exc:
-            message = str(exc) or "unknown error"
+            message = exception_log_message(exc)
             for account_id in account_ids:
                 self._append_error(server_id, account_id, message)
             tokens = []

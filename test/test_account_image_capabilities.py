@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
+os.environ.setdefault("CHATGPT2API_AUTH_KEY", "chatgpt2api")
 
 from services.account_service import AccountService
 from services.auth_service import AuthService
@@ -67,6 +67,26 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertIsNotNone(updated)
             self.assertEqual(updated["quota"], 0)
             self.assertEqual(updated["status"], "限流")
+
+    def test_mark_text_used_does_not_persist_the_whole_account_snapshot_per_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            backend = JSONStorageBackend(Path(tmp_dir) / "accounts.json")
+            service = AccountService(backend)
+            service.add_accounts(["token-1"])
+
+            with patch.object(service, "_save_accounts") as save_accounts:
+                for _ in range(25):
+                    service.mark_text_used("token-1")
+
+            save_accounts.assert_not_called()
+            last_used_at = service.get_account("token-1")["last_used_at"]
+            self.assertIsNotNone(last_used_at)
+
+            # Usage metadata remains part of the in-memory snapshot and is
+            # persisted by the next real account mutation.
+            service.update_account("token-1", {"status": "正常"})
+            reloaded = AccountService(backend)
+            self.assertEqual(reloaded.get_account("token-1")["last_used_at"], last_used_at)
 
     def test_split_image_model_supports_plan_type_prefix(self) -> None:
         self.assertEqual(split_image_model("gpt-image-2"), (None, "gpt-image-2"))

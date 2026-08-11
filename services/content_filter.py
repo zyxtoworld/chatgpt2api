@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import re
+import threading
 
+import anyio
 from curl_cffi import requests
 from fastapi import HTTPException
 
 from services.config import config
+from services.protocol.error_response import exception_log_message
 from services.proxy_service import proxy_settings
 from utils.log import logger
 
 DEFAULT_REVIEW_PROMPT = "判断用户请求是否允许。只回答 ALLOW 或 REJECT。"
+CONTENT_FILTER_REJECTION_MESSAGE = "检测到敏感词，拒绝本次任务"
 
 # Strip base64 image data URIs before review: a text-only review model can't
 # analyze image bytes, and a single inlined image easily blows past the token
@@ -21,6 +25,16 @@ _BASE64_DATA_URI = re.compile(r"data:[\w/.+;-]+;base64,[A-Za-z0-9+/=]+")
 # the system prompt and the most recent user message survive.
 _MAX_REVIEW_TEXT_LEN = 100_000
 _TRUNCATION_MARKER = "\n…[truncated]…\n"
+_CONTENT_REVIEW_THREAD_CAPACITY = 8
+_CONTENT_REVIEW_THREAD_STATE = threading.local()
+
+
+async def check_request_async(text: str) -> None:
+    limiter = getattr(_CONTENT_REVIEW_THREAD_STATE, "limiter", None)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(_CONTENT_REVIEW_THREAD_CAPACITY)
+        _CONTENT_REVIEW_THREAD_STATE.limiter = limiter
+    await anyio.to_thread.run_sync(check_request, text, limiter=limiter)
 
 
 def _text(value: object) -> str:
@@ -154,7 +168,7 @@ def check_request(text: str) -> None:
     # Local sensitive-word match runs on the raw text (cheap, no network).
     for word in config.sensitive_words:
         if word in text:
-            raise HTTPException(status_code=400, detail={"error": "检测到敏感词，拒绝本次任务"})
+            raise HTTPException(status_code=400, detail={"error": CONTENT_FILTER_REJECTION_MESSAGE})
     review = config.ai_review
     if not review.get("enabled"):
         return
@@ -200,7 +214,7 @@ def check_request(text: str) -> None:
     except Exception as exc:
         _on_failure({
             "event": "ai_review_request_failed",
-            "error": str(exc),
+            "error": exception_log_message(exc),
             "error_type": exc.__class__.__name__,
             "review_text_len": len(review_text),
             "original_text_len": len(text),
@@ -208,35 +222,41 @@ def check_request(text: str) -> None:
         return
 
     try:
-        data = response.json()
-    except Exception as exc:
-        _on_failure({
-            "event": "ai_review_response_not_json",
-            "status_code": response.status_code,
-            "body_preview": str(response.text or "")[:200],
-            "error": str(exc),
-        })
-        return
+        try:
+            data = response.json()
+        except Exception as exc:
+            _on_failure({
+                "event": "ai_review_response_not_json",
+                "status_code": response.status_code,
+                "error": exception_log_message(exc),
+            })
+            return
 
-    decision = _extract_review_decision(data)
-    if decision is None:
+        decision = _extract_review_decision(data)
+        if decision is None:
+            _on_failure({
+                "event": "ai_review_malformed_response",
+                "status_code": response.status_code,
+                "review_text_len": len(review_text),
+                "original_text_len": len(text),
+            })
+            return
+
+        if _is_allow_decision(decision):
+            return
+        if _is_reject_decision(decision):
+            raise HTTPException(status_code=400, detail={"error": "AI 审核未通过，拒绝本次任务"})
+        # Ambiguous decisions (e.g. "MAYBE", empty content) fall back to fail-open policy.
         _on_failure({
-            "event": "ai_review_malformed_response",
-            "status_code": response.status_code,
-            "body_preview": str(data)[:300],
+            "event": "ai_review_ambiguous_decision",
+            "decision": decision[:100],
             "review_text_len": len(review_text),
-            "original_text_len": len(text),
         })
         return
-
-    if _is_allow_decision(decision):
-        return
-    if _is_reject_decision(decision):
-        raise HTTPException(status_code=400, detail={"error": "AI 审核未通过，拒绝本次任务"})
-    # Ambiguous decisions (e.g. "MAYBE", empty content) fall back to fail-open policy.
-    _on_failure({
-        "event": "ai_review_ambiguous_decision",
-        "decision": decision[:100],
-        "review_text_len": len(review_text),
-    })
-    return
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass

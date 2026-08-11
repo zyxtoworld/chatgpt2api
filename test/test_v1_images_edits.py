@@ -3,35 +3,27 @@ from __future__ import annotations
 import json
 import time
 import unittest
-from pathlib import Path
 
 import requests
 
+from test.fixtures.image_inputs import image_fixture_bytes
 from test.utils import save_image
 from utils.log import logger
 
 AUTH_KEY = "chatgpt2api"
 BASE_URL = "http://localhost:8000"
-ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
 
 def load_asset_bytes(name: str) -> bytes:
-    return (ASSETS_DIR / name).read_bytes()
+    return image_fixture_bytes(name)
 
 
 def summarize_chunk(chunk: dict[str, object]) -> dict[str, object]:
-    data = chunk.get("data")
-    data_items = data if isinstance(data, list) else []
     return {
-        "object": chunk.get("object"),
-        "index": chunk.get("index"),
-        "total": chunk.get("total"),
-        "created": chunk.get("created"),
-        "finish_reason": chunk.get("finish_reason"),
-        "progress_text": chunk.get("progress_text"),
-        "upstream_event_type": chunk.get("upstream_event_type"),
-        "data_count": len(data_items),
-        "has_b64_json": any(isinstance(item, dict) and bool(item.get("b64_json")) for item in data_items),
+        "type": chunk.get("type"),
+        "partial_image_index": chunk.get("partial_image_index"),
+        "has_b64_json": bool(chunk.get("b64_json")),
+        "usage": chunk.get("usage"),
     }
 
 
@@ -106,23 +98,20 @@ class ImageEditsTests(unittest.TestCase):
                 if not text.startswith("data:"):
                     continue
                 payload = text[5:].strip()
-                if payload == "[DONE]":
-                    break
                 try:
                     chunk = json.loads(payload)
                 except Exception:
                     continue
                 elapsed = time.time() - started_at
-                if isinstance(chunk.get("error"), dict):
-                    stream_errors.append(chunk["error"])
+                if chunk.get("type") == "error":
+                    stream_errors.append(chunk)
                 logger.info({
                     "event": "test_images_edits_stream_chunk",
                     "elapsed_seconds": round(elapsed, 2),
                     "chunk": summarize_chunk(chunk),
                 })
-                data = chunk.get("data")
-                if isinstance(data, list):
-                    image_items.extend(item for item in data if isinstance(item, dict))
+                if chunk.get("type") == "image_edit.completed" and chunk.get("b64_json"):
+                    image_items.append({"b64_json": chunk["b64_json"]})
         finally:
             response.close()
 

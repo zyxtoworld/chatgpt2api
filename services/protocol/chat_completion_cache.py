@@ -21,6 +21,7 @@ CACHEABLE_TEXT_KEYS = {
     "response_format",
     "seed",
     "stop",
+    "stream_options",
     "temperature",
     "thinking_effort",
     "tool_choice",
@@ -202,13 +203,14 @@ class ChatCompletionCache:
                 owner = False
 
         if not owner:
-            with inflight.condition:
-                while not inflight.done:
-                    inflight.condition.wait()
-                if inflight.error:
-                    raise inflight.error
-                yield from self._copy(inflight.value)
-                return
+            # A streaming owner must reacquire the bounded AI worker for every
+            # chunk. Waiting followers would hold those same workers until the
+            # owner completes and can therefore starve it permanently. Let
+            # concurrent followers compute independently; only the first
+            # request writes this cache entry, and later requests still replay
+            # its completed stream.
+            yield from compute()
+            return
 
         chunks: list[dict[str, Any]] = []
         try:

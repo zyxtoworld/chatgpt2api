@@ -192,6 +192,7 @@ export type BackupInclude = {
   config: boolean;
   cpa: boolean;
   sub2api: boolean;
+  ccload: boolean;
   logs: boolean;
   image_tasks: boolean;
   accounts_snapshot: boolean;
@@ -861,6 +862,61 @@ export async function startSub2APIImport(serverId: string, accountIds: string[])
 
 export async function fetchSub2APIImportJob(serverId: string) {
   return httpRequest<{ import_job: CPAImportJob | null }>(`/api/sub2api/servers/${serverId}/import`);
+}
+
+// ── ccLoad preview ─────────────────────────────────────────────────
+
+export type CCLoadServer = {
+  id: string;
+  name: string;
+  base_url: string;
+  has_password: boolean;
+  import_job?: CPAImportJob | null;
+};
+
+export type CCLoadChannel = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  plan_type: string;
+  subscription_active_until: string;
+  models: string[];
+};
+
+export async function fetchCCLoadServers() {
+  return httpRequest<{ servers: CCLoadServer[] }>("/api/ccload/servers");
+}
+
+export async function createCCLoadServer(server: { name: string; base_url: string; password: string }) {
+  return httpRequest<{ server: CCLoadServer; servers: CCLoadServer[] }>("/api/ccload/servers", {
+    method: "POST",
+    body: server,
+  });
+}
+
+export async function updateCCLoadServer(
+  serverId: string,
+  updates: { name?: string; base_url?: string; password?: string },
+) {
+  return httpRequest<{ server: CCLoadServer; servers: CCLoadServer[] }>(`/api/ccload/servers/${serverId}`, {
+    method: "POST",
+    body: updates,
+  });
+}
+
+export async function deleteCCLoadServer(serverId: string) {
+  return httpRequest<{ servers: CCLoadServer[] }>(`/api/ccload/servers/${serverId}`, { method: "DELETE" });
+}
+
+export async function fetchCCLoadChannels(serverId: string) {
+  return httpRequest<{ server_id: string; channels: CCLoadChannel[] }>(`/api/ccload/servers/${serverId}/channels`);
+}
+
+export async function startCCLoadImport(serverId: string, channelIds: string[]) {
+  return httpRequest<{ import_job: CPAImportJob | null }>(`/api/ccload/servers/${serverId}/import`, {
+    method: "POST",
+    body: { channel_ids: channelIds },
+  });
 }
 
 // ── Upstream proxy ────────────────────────────────────────────────

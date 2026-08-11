@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import base64
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
+from api.errors import install_exception_handlers
+from services.image_task_service import ImageTaskNotFoundError, ImageTaskResumeConflictError
+from services.task_executor import BackgroundTaskQueueFullError
+from test.fixtures.image_inputs import image_fixture_bytes
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
-PNG_BYTES = b"\x89PNG\r\n\x1a\n"
+PNG_BYTES = image_fixture_bytes("image.png")
+PNG_SECOND_BYTES = image_fixture_bytes("image_edit.png")
 DATA_IMAGE_URL = f"data:image/png;base64,{base64.b64encode(PNG_BYTES).decode('ascii')}"
 
 
@@ -19,6 +25,8 @@ class FakeImageTaskService:
     def __init__(self):
         self.generation_calls = []
         self.edit_calls = []
+        self.resume_calls = []
+        self.resume_error = None
 
     def submit_generation(self, identity, **kwargs):
         self.generation_calls.append((identity, kwargs))
@@ -58,6 +66,12 @@ class FakeImageTaskService:
             "missing_ids": [task_id for task_id in ids if task_id == "missing"],
         }
 
+    def resume_poll(self, identity, task_id, extra_timeout_secs):
+        self.resume_calls.append((identity, task_id, extra_timeout_secs))
+        if self.resume_error is not None:
+            raise self.resume_error
+        return {"id": task_id, "status": "running"}
+
 
 class ImageTasksApiTests(unittest.TestCase):
     def setUp(self):
@@ -66,6 +80,7 @@ class ImageTasksApiTests(unittest.TestCase):
         self.service_patcher.start()
         self.addCleanup(self.service_patcher.stop)
         app = FastAPI()
+        install_exception_handlers(app)
         app.include_router(image_tasks_module.create_router())
         self.client = TestClient(app)
 
@@ -82,6 +97,17 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(payload["status"], "success")
         self.assertEqual(len(self.fake_service.generation_calls), 1)
 
+    def test_generation_uses_relative_image_url_for_untrusted_host(self):
+        with mock.patch("api.support.config", SimpleNamespace(base_url="", auth_key="chatgpt2api")):
+            response = self.client.post(
+                "/api/image-tasks/generations",
+                headers={**AUTH_HEADERS, "Host": "attacker.example"},
+                json={"client_task_id": "host-poison", "prompt": "cat", "model": "gpt-image-2"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["data"][0]["url"], "/images/fake.png")
+
     def test_create_edit_task_accepts_multiple_images(self):
         """测试图片编辑任务接口支持多个上传图片。"""
         response = self.client.post(
@@ -89,8 +115,8 @@ class ImageTasksApiTests(unittest.TestCase):
             headers=AUTH_HEADERS,
             data={"client_task_id": "edit-1", "prompt": "edit", "model": "gpt-image-2"},
             files=[
-                ("image", ("one.png", b"one", "image/png")),
-                ("image", ("two.png", b"two", "image/png")),
+                ("image", ("one.png", PNG_BYTES, "image/png")),
+                ("image", ("two.png", PNG_SECOND_BYTES, "image/png")),
             ],
         )
 
@@ -125,6 +151,87 @@ class ImageTasksApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual([item["id"] for item in payload["items"]], ["task-1"])
         self.assertEqual(payload["missing_ids"], ["missing"])
+
+    def test_resume_poll_maps_missing_or_foreign_task_to_not_found(self):
+        self.fake_service.resume_error = ImageTaskNotFoundError("task not found")
+
+        response = self.client.post(
+            "/api/image-tasks/foreign-task/resume-poll",
+            headers=AUTH_HEADERS,
+            json={"extra_timeout_secs": 5},
+        )
+
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertNotIn("foreign-task", response.text)
+
+    def test_resume_poll_maps_invalid_task_state_to_conflict(self):
+        self.fake_service.resume_error = ImageTaskResumeConflictError("task is not in error state")
+
+        response = self.client.post(
+            "/api/image-tasks/task-1/resume-poll",
+            headers=AUTH_HEADERS,
+            json={"extra_timeout_secs": 5},
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+
+    def test_generation_does_not_echo_untrusted_value_error(self):
+        secret = "opaque-image-task-secret owner@example.com"
+        self.fake_service.submit_generation = mock.Mock(side_effect=ValueError(secret))
+
+        response = self.client.post(
+            "/api/image-tasks/generations",
+            headers=AUTH_HEADERS,
+            json={"client_task_id": "secret-generation", "prompt": "cat", "model": "gpt-image-2"},
+        )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn(secret, response.text)
+
+    def test_generation_queue_full_returns_retryable_public_error(self):
+        self.fake_service.submit_generation = mock.Mock(
+            side_effect=BackgroundTaskQueueFullError("background task queue is full; try again later")
+        )
+
+        response = self.client.post(
+            "/api/image-tasks/generations",
+            headers=AUTH_HEADERS,
+            json={"client_task_id": "queue-full", "prompt": "cat", "model": "gpt-image-2"},
+        )
+
+        self.assertEqual(response.status_code, 429, response.text)
+        self.assertEqual(response.headers.get("Retry-After"), "1")
+        self.assertEqual(
+            response.json(),
+            {"detail": {"error": "background task queue is full; try again later"}},
+        )
+
+    def test_edit_does_not_echo_untrusted_value_error(self):
+        secret = "opaque-edit-task-secret owner@example.com"
+        self.fake_service.submit_edit = mock.Mock(side_effect=ValueError(secret))
+
+        response = self.client.post(
+            "/api/image-tasks/edits",
+            headers=AUTH_HEADERS,
+            data={"client_task_id": "secret-edit", "prompt": "edit", "model": "gpt-image-2"},
+            files=[("image", ("one.png", PNG_BYTES, "image/png"))],
+        )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn(secret, response.text)
+
+    def test_resume_does_not_echo_untrusted_domain_error(self):
+        secret = "opaque-resume-secret owner@example.com"
+        self.fake_service.resume_error = ImageTaskNotFoundError(secret)
+
+        response = self.client.post(
+            "/api/image-tasks/secret-resume/resume-poll",
+            headers=AUTH_HEADERS,
+            json={"extra_timeout_secs": 5},
+        )
+
+        self.assertEqual(response.status_code, 404, response.text)
+        self.assertNotIn(secret, response.text)
 
 
 if __name__ == "__main__":

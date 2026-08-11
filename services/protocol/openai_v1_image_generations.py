@@ -6,7 +6,7 @@ from services.protocol.conversation import (
     ConversationRequest,
     collect_image_outputs,
     count_text_tokens,
-    stream_image_chunks,
+    stream_image_events,
     stream_image_outputs_with_pool,
 )
 from utils.image_tokens import count_image_output_items_tokens, image_usage
@@ -19,6 +19,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     size = body.get("size")
     quality = str(body.get("quality") or "auto")
     response_format = str(body.get("response_format") or "b64_json")
+    output_format = str(body.get("output_format") or "png")
+    output_compression = body.get("output_compression")
+    background = str(body.get("background") or "auto")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
     outputs = stream_image_outputs_with_pool(ConversationRequest(
@@ -28,15 +31,36 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         size=size,
         quality=quality,
         response_format=response_format,
+        output_format=output_format,
+        output_compression=output_compression,
+        background=background,
         base_url=base_url,
         message_as_error=True,
         progress_callback=progress_callback,
     ))
     if body.get("stream"):
-        return stream_image_chunks(outputs)
+        return stream_image_events(
+            outputs,
+            lambda items: image_usage(
+                input_text_tokens=count_text_tokens(prompt, model),
+                output_tokens=count_image_output_items_tokens(items, size, quality),
+            ),
+            event_type="image_generation.completed",
+            background=background,
+            output_format=output_format,
+            quality=quality,
+            size=size or "auto",
+        )
     result = collect_image_outputs(outputs)
     result["usage"] = image_usage(
         input_text_tokens=count_text_tokens(prompt, model),
         output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
     )
+    result.update({
+        "background": background,
+        "output_format": output_format,
+        "quality": quality,
+    })
+    if size:
+        result["size"] = size
     return result

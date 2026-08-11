@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -11,7 +12,13 @@ from typing import Any
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
+from services.account_service import account_service
+from services.openai_backend_api import ImagePollTimeoutError
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.protocol.error_response import PublicSafeError, public_exception_message
+from services.protocol.image_options import normalize_image_quality, normalize_image_size
+from services.storage.base import StorageConflictError, StorageDataError, make_storage_snapshot
+from services.task_executor import reserve_background_task
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -19,6 +26,27 @@ TASK_STATUS_SUCCESS = "success"
 TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
+_KEEP_RESUME_CREDENTIAL = object()
+_TASK_FILE_LOCKS_GUARD = threading.Lock()
+_TASK_FILE_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _task_file_lock(path: Path) -> threading.RLock:
+    key = os.path.normcase(os.path.abspath(path))
+    with _TASK_FILE_LOCKS_GUARD:
+        lock = _TASK_FILE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _TASK_FILE_LOCKS[key] = lock
+        return lock
+
+
+class ImageTaskNotFoundError(ValueError):
+    pass
+
+
+class ImageTaskResumeConflictError(ValueError):
+    pass
 
 
 def _now_iso() -> str:
@@ -110,9 +138,13 @@ class ImageTaskService:
         self.edit_handler = edit_handler
         self.retention_days_getter = retention_days_getter or (lambda: config.image_retention_days)
         self._lock = threading.RLock()
+        self._path_lock = _task_file_lock(path)
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._snapshot_revision = make_storage_snapshot([]).revision
+        # 续轮询凭据仅存活于当前进程，按 owner/task 隔离，绝不写入 image_tasks.json。
+        self._resume_credentials: dict[str, str] = {}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
+        with self._lock, self._path_lock:
             self._tasks = self._load_locked()
             changed = self._recover_unfinished_locked()
             changed = self._cleanup_locked() or changed
@@ -130,6 +162,8 @@ class ImageTaskService:
         quality: str = "auto",
         base_url: str = "",
     ) -> dict[str, Any]:
+        size = normalize_image_size(size)
+        quality = normalize_image_quality(quality)
         payload = {
             "prompt": prompt,
             "model": model,
@@ -154,6 +188,8 @@ class ImageTaskService:
         images: list[tuple[bytes, str, str]] | None = None,
         masks: list[tuple[bytes, str, str]] | None = None,
     ) -> dict[str, Any]:
+        size = normalize_image_size(size, editing=True)
+        quality = normalize_image_quality(quality)
         payload = {
             "prompt": prompt,
             "images": images or [],
@@ -205,7 +241,6 @@ class ImageTaskService:
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
         now = _now_iso()
-        should_start = False
         with self._lock:
             cleaned = self._cleanup_locked()
             task = self._tasks.get(key)
@@ -213,6 +248,7 @@ class ImageTaskService:
                 if cleaned:
                     self._save_locked()
                 return _public_task(task)
+            reservation = reserve_background_task()
             task = {
                 "id": task_id,
                 "owner_id": owner,
@@ -226,17 +262,25 @@ class ImageTaskService:
                 "created_ts": time.time(),
             }
             self._tasks[key] = task
-            self._save_locked()
-            should_start = True
-
-        if should_start:
-            thread = threading.Thread(
-                target=self._run_task,
-                args=(key, mode, payload, dict(identity), _clean(payload.get("model"), "gpt-image-2")),
-                name=f"image-task-{task_id[:16]}",
-                daemon=True,
-            )
-            thread.start()
+            try:
+                self._save_locked()
+            except Exception:
+                self._tasks.pop(key, None)
+                reservation.cancel()
+                raise
+            try:
+                reservation.submit(
+                    self._run_task,
+                    key,
+                    mode,
+                    payload,
+                    dict(identity),
+                    _clean(payload.get("model"), "gpt-image-2"),
+                )
+            except Exception:
+                self._tasks.pop(key, None)
+                self._save_locked()
+                raise
         return _public_task(task)
 
     def _run_task(
@@ -248,7 +292,10 @@ class ImageTaskService:
         model: str,
     ) -> None:
         started = time.time()
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        try:
+            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+        except StorageConflictError:
+            return
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
@@ -262,20 +309,19 @@ class ImageTaskService:
             if not isinstance(result, dict):
                 raise RuntimeError("image task returned streaming result unexpectedly")
             data = result.get("data")
-            account_email = _clean(result.get("_account_email") or result.get("account_email"))
             if not isinstance(data, list) or not data:
-                upstream = _clean(result.get("message"))
-                if upstream:
-                    message = upstream
-                else:
-                    message = "号池中没有可用账号或所有账号均被限流，请检查号池状态（账号额度、是否被封禁、是否到达生图上限）"
-                error = RuntimeError(message)
-                if account_email:
-                    setattr(error, "account_email", account_email)
-                raise error
+                raise PublicSafeError("图片任务未生成图片，请稍后重试")
             usage = result.get("usage")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms)
+            self._transition_task(
+                key,
+                resume_credential=None,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                usage=usage,
+                error="",
+                duration_ms=duration_ms,
+            )
             self._log_call(
                 identity,
                 mode,
@@ -284,16 +330,31 @@ class ImageTaskService:
                 "调用完成",
                 request_preview=request_text(payload.get("prompt")),
                 urls=_collect_image_urls(data),
-                account_email=account_email,
             )
+        except StorageConflictError:
+            return
         except Exception as exc:
-            error_message = str(exc) or "image task failed"
-            account_email = _clean(getattr(exc, "account_email", ""))
+            error_message = public_exception_message(exc, "image task failed")
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            access_token = _clean(getattr(exc, "access_token", ""))
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
-                              duration_ms=duration_ms,
-                              **({"conversation_id": conversation_id} if conversation_id else {}))
+            resume_credential = (
+                access_token
+                if isinstance(exc, ImagePollTimeoutError) and access_token and conversation_id
+                else None
+            )
+            try:
+                self._transition_task(
+                    key,
+                    resume_credential=resume_credential,
+                    status=TASK_STATUS_ERROR,
+                    error=error_message,
+                    data=[],
+                    duration_ms=duration_ms,
+                    **({"conversation_id": conversation_id} if conversation_id else {}),
+                )
+            except StorageConflictError:
+                return
             self._log_call(
                 identity,
                 mode,
@@ -303,7 +364,6 @@ class ImageTaskService:
                 request_preview=request_text(payload.get("prompt")),
                 status="failed",
                 error=error_message,
-                account_email=account_email,
             )
 
     def _log_call(
@@ -318,7 +378,6 @@ class ImageTaskService:
         status: str = "success",
         error: str = "",
         urls: list[str] | None = None,
-        account_email: str = "",
     ) -> None:
         endpoint = "/v1/images/edits" if mode == "edit" else "/v1/images/generations"
         summary_prefix = "图生图" if mode == "edit" else "文生图"
@@ -337,8 +396,6 @@ class ImageTaskService:
             detail["request_text"] = request_preview
         if error:
             detail["error"] = error
-        if account_email:
-            detail["account_email"] = account_email
         if urls:
             detail["urls"] = list(dict.fromkeys(urls))
         try:
@@ -347,41 +404,142 @@ class ImageTaskService:
             pass
 
     def _update_task(self, key: str, **updates: Any) -> None:
+        self._transition_task(key, **updates)
+
+    def _set_resume_credential_locked(self, key: str, value: object) -> None:
+        if isinstance(value, str) and value:
+            self._resume_credentials[key] = value
+        else:
+            self._resume_credentials.pop(key, None)
+
+    def _restore_resume_credential_locked(self, key: str, previous: object) -> None:
+        if previous is _KEEP_RESUME_CREDENTIAL:
+            self._resume_credentials.pop(key, None)
+        else:
+            self._resume_credentials[key] = previous  # type: ignore[assignment]
+
+    @staticmethod
+    def _same_persisted_task(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        return all(
+            left.get(field) == right.get(field)
+            for field in ("id", "owner_id", "status", "updated_at", "updated_ts")
+        )
+
+    def _merge_task_transition_locked(
+        self,
+        key: str,
+        expected_task: dict[str, Any],
+        resume_credential: object,
+        updates: dict[str, Any],
+    ) -> None:
+        # A different request may have persisted an unrelated task. Reload and
+        # merge only when this exact task version is unchanged; never overwrite
+        # a concurrent transition of the same task.
+        with self._path_lock:
+            latest_tasks = self._load_locked()
+            latest_task = latest_tasks.get(key)
+            self._tasks = latest_tasks
+            if latest_task is None or not self._same_persisted_task(expected_task, latest_task):
+                if latest_task is None or latest_task.get("status") in TERMINAL_STATUSES:
+                    self._resume_credentials.pop(key, None)
+                raise StorageConflictError()
+
+            previous_task = dict(latest_task)
+            previous_credential = self._resume_credentials.get(key, _KEEP_RESUME_CREDENTIAL)
+            if resume_credential is not _KEEP_RESUME_CREDENTIAL:
+                self._set_resume_credential_locked(key, resume_credential)
+            latest_task.update(updates)
+            latest_task["updated_at"] = _now_iso()
+            latest_task["updated_ts"] = time.time()
+            try:
+                self._save_locked()
+            except Exception:
+                latest_task.clear()
+                latest_task.update(previous_task)
+                self._restore_resume_credential_locked(key, previous_credential)
+                raise
+
+    def _transition_task(
+        self,
+        key: str,
+        *,
+        resume_credential: object = _KEEP_RESUME_CREDENTIAL,
+        **updates: Any,
+    ) -> None:
+        """Publish task state and its in-memory resume credential atomically."""
         with self._lock:
             task = self._tasks.get(key)
             if task is None:
                 return
+            previous = dict(task)
+            previous_credential = self._resume_credentials.get(key, _KEEP_RESUME_CREDENTIAL)
+            if resume_credential is not _KEEP_RESUME_CREDENTIAL:
+                self._set_resume_credential_locked(key, resume_credential)
             task.update(updates)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
-            self._save_locked()
+            try:
+                self._save_locked()
+            except StorageConflictError:
+                task.clear()
+                task.update(previous)
+                self._restore_resume_credential_locked(key, previous_credential)
+                self._merge_task_transition_locked(key, previous, resume_credential, updates)
+            except Exception:
+                task.clear()
+                task.update(previous)
+                self._restore_resume_credential_locked(key, previous_credential)
+                raise
 
-    def _load_locked(self) -> dict[str, dict[str, Any]]:
+    def _read_items_locked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
-            return {}
+            return []
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        raw_items = raw.get("tasks") if isinstance(raw, dict) else raw
-        if not isinstance(raw_items, list):
-            return {}
+            raw_items = raw.get("tasks") if isinstance(raw, dict) else raw
+            return make_storage_snapshot(raw_items).records
+        except StorageDataError:
+            raise
+        except Exception as exc:
+            raise StorageDataError() from exc
+
+    def _load_locked(self) -> dict[str, dict[str, Any]]:
+        raw_items = self._read_items_locked()
+        snapshot = make_storage_snapshot(raw_items)
         tasks: dict[str, dict[str, Any]] = {}
-        for item in raw_items:
-            if not isinstance(item, dict):
-                continue
-            task_id = _clean(item.get("id"))
-            owner = _clean(item.get("owner_id"))
+        for item in snapshot.records:
+            task_id_value = item.get("id")
+            owner_value = item.get("owner_id")
+            if not isinstance(task_id_value, str) or not isinstance(owner_value, str):
+                raise StorageDataError()
+            task_id = task_id_value.strip()
+            owner = owner_value.strip()
             if not task_id or not owner:
-                continue
-            status = _clean(item.get("status"))
-            if status not in {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}:
+                raise StorageDataError()
+            status_value = item.get("status")
+            if status_value in (None, ""):
                 status = TASK_STATUS_ERROR
+            elif isinstance(status_value, str) and status_value in {
+                TASK_STATUS_QUEUED,
+                TASK_STATUS_RUNNING,
+                TASK_STATUS_SUCCESS,
+                TASK_STATUS_ERROR,
+            }:
+                status = status_value
+            else:
+                raise StorageDataError()
+            mode_value = item.get("mode")
+            if mode_value in (None, ""):
+                mode = "generate"
+            elif isinstance(mode_value, str) and mode_value in {"edit", "generate"}:
+                mode = mode_value
+            else:
+                raise StorageDataError()
             task = {
                 "id": task_id,
                 "owner_id": owner,
                 "status": status,
-                "mode": "edit" if item.get("mode") == "edit" else "generate",
+                "mode": mode,
                 "model": _clean(item.get("model"), "gpt-image-2"),
                 "size": _clean(item.get("size")),
                 "quality": _clean(item.get("quality"), "auto"),
@@ -393,22 +551,46 @@ class ImageTaskService:
                 "duration_ms": item.get("duration_ms"),
             }
             data = item.get("data")
-            if isinstance(data, list):
+            if data is not None and not isinstance(data, list):
+                raise StorageDataError()
+            if data is not None:
                 task["data"] = data
             usage = item.get("usage")
-            if isinstance(usage, dict):
+            if usage is not None and not isinstance(usage, dict):
+                raise StorageDataError()
+            if usage is not None:
                 task["usage"] = usage
-            error = _clean(item.get("error"))
+            raw_error = item.get("error")
+            if raw_error is not None and not isinstance(raw_error, str):
+                raise StorageDataError()
+            error = _clean(raw_error)
             if error:
                 task["error"] = error
-            tasks[_task_key(owner, task_id)] = task
+            key = _task_key(owner, task_id)
+            if key in tasks:
+                raise StorageDataError()
+            tasks[key] = task
+        self._snapshot_revision = snapshot.revision
         return tasks
 
     def _save_locked(self) -> None:
-        items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(self.path)
+        with self._path_lock:
+            items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            current_revision = make_storage_snapshot(self._read_items_locked()).revision
+            if current_revision != self._snapshot_revision:
+                raise StorageConflictError()
+            next_snapshot = make_storage_snapshot(items)
+            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+            try:
+                tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                tmp_path.replace(self.path)
+            except Exception:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                raise
+            self._snapshot_revision = next_snapshot.revision
 
     def _recover_unfinished_locked(self) -> bool:
         changed = False
@@ -433,6 +615,7 @@ class ImageTaskService:
         ]
         for key in removed_keys:
             self._tasks.pop(key, None)
+            self._resume_credentials.pop(key, None)
         return bool(removed_keys)
 
     def resume_poll(
@@ -447,28 +630,42 @@ class ImageTaskService:
         with self._lock:
             task = self._tasks.get(key)
             if task is None:
-                raise ValueError("task not found")
+                raise ImageTaskNotFoundError("task not found")
             if task.get("status") != TASK_STATUS_ERROR:
-                raise ValueError("task is not in error state")
+                raise ImageTaskResumeConflictError("task is not in error state")
             error_msg = _clean(task.get("error"))
             if "超时" not in error_msg:
-                raise ValueError("task error is not a timeout error")
+                raise ImageTaskResumeConflictError("task error is not a timeout error")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
-                raise ValueError("task has no conversation_id")
+                raise ImageTaskResumeConflictError("task has no conversation_id")
+            access_token = _clean(self._resume_credentials.get(key))
+            if not access_token:
+                raise ImageTaskResumeConflictError("task resume credentials unavailable; task must be retried")
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
+            reservation = reserve_background_task()
             # 将任务状态重置为 running
-            self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            try:
+                self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+            except Exception:
+                reservation.cancel()
+                raise
 
-        # 启动新线程继续轮询
-        thread = threading.Thread(
-            target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
-            name=f"image-resume-{_clean(task_id)[:16]}",
-            daemon=True,
-        )
-        thread.start()
+        try:
+            reservation.submit(
+                self._run_resume_poll,
+                key,
+                conversation_id,
+                extra_timeout_secs,
+                access_token,
+                dict(identity),
+                mode,
+                model,
+            )
+        except Exception:
+            self._transition_task(key, status=TASK_STATUS_ERROR, error=error_msg)
+            raise
         return _public_task(task)
 
     def _run_resume_poll(
@@ -476,6 +673,7 @@ class ImageTaskService:
         key: str,
         conversation_id: str,
         extra_timeout_secs: float,
+        access_token: str,
         identity: dict[str, object],
         mode: str,
         model: str,
@@ -487,7 +685,14 @@ class ImageTaskService:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
+            access_token = account_service.refresh_access_token(
+                access_token,
+                event="image_resume_poll",
+            ) or access_token
+            with self._lock:
+                if key in self._resume_credentials:
+                    self._resume_credentials[key] = access_token
+            backend = OpenAIBackendAPI(access_token=access_token)
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
@@ -519,7 +724,14 @@ class ImageTaskService:
                 "",
                 int(time.time()),
             )["data"]
-            self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, error="", duration_ms=int((time.time() - started) * 1000))
+            self._transition_task(
+                key,
+                resume_credential=None,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                error="",
+                duration_ms=int((time.time() - started) * 1000),
+            )
             self._log_call(
                 identity,
                 mode,
@@ -529,10 +741,22 @@ class ImageTaskService:
                 status="success",
                 urls=_collect_image_urls(data),
             )
+        except StorageConflictError:
+            return
         except Exception as exc:
-            error_message = str(exc) or "resume poll failed"
+            error_message = public_exception_message(exc, "resume poll failed")
             duration_ms = int((time.time() - started) * 1000)
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[], duration_ms=duration_ms)
+            try:
+                self._transition_task(
+                    key,
+                    resume_credential=access_token if isinstance(exc, ImagePollTimeoutError) else None,
+                    status=TASK_STATUS_ERROR,
+                    error=error_message,
+                    data=[],
+                    duration_ms=duration_ms,
+                )
+            except StorageConflictError:
+                return
             self._log_call(
                 identity,
                 mode,

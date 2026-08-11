@@ -6,10 +6,11 @@ import secrets
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock, Thread
-from typing import Any
+from threading import Condition, Lock
+from typing import Any, Iterator
 from urllib.parse import urlencode
 
 from services.config import config
@@ -17,13 +18,140 @@ from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
-from services.storage.base import StorageBackend
+from services.protocol.error_response import exception_log_message
+from services.storage.base import (
+    StorageBackend,
+    StorageDataError,
+    StorageSnapshot,
+    make_storage_snapshot,
+)
+from services.task_executor import BackgroundTaskQueueFullError, reserve_background_task
 from utils.helper import anonymize_token
+
+
+ACCOUNT_REFRESH_WORKERS = 10
+_ACCOUNT_REFRESH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=ACCOUNT_REFRESH_WORKERS,
+    thread_name_prefix="account-refresh",
+)
+TOKEN_REFRESH_ERROR_FALLBACK = "refresh_failed"
+TOKEN_REFRESH_ERROR_CODES = frozenset(
+    {
+        TOKEN_REFRESH_ERROR_FALLBACK,
+        "app_session_terminated",
+        "network_error",
+        "invalid_response",
+        "http_4xx",
+        "http_5xx",
+    }
+)
+INVALID_TOKEN_ERROR_MESSAGE = "账号访问令牌无效"
+RELOGIN_ERROR_FALLBACK = "relogin_failed"
+RELOGIN_ERROR_CODES = frozenset(
+    {
+        "password_verify_failed_403",
+        "rate_limit_exceeded",
+        "unsupported_country_region_territory",
+        "invalid_state",
+        "invalid_password",
+        "need_verification_code",
+        "no_auth_code",
+        "token_exchange_failed",
+        "authorize_redirect_error",
+    }
+)
+_PROGRESS_RETENTION_SECONDS = 15 * 60
+_PROGRESS_UNFINISHED_RETENTION_SECONDS = 60 * 60
+_PROGRESS_MAX_COMPLETED_ENTRIES = 128
+
+
+def _normalize_token_refresh_error_code(value: object) -> str | None:
+    if value is None:
+        return None
+    code = value if isinstance(value, str) else ""
+    code = code.strip()
+    if not code:
+        return None
+    return code if code in TOKEN_REFRESH_ERROR_CODES else TOKEN_REFRESH_ERROR_FALLBACK
+
+
+def _normalize_relogin_error_code(value: object) -> str:
+    if not isinstance(value, str):
+        return RELOGIN_ERROR_FALLBACK
+    code = value.strip()
+    return code if code in RELOGIN_ERROR_CODES else RELOGIN_ERROR_FALLBACK
+
+
+def _prune_progress_locked(progress_store: dict[str, dict], *, now: float | None = None) -> None:
+    current = time.monotonic() if now is None else now
+    expired: list[str] = []
+    completed: list[tuple[float, str]] = []
+    for progress_id, progress in progress_store.items():
+        if not isinstance(progress, dict):
+            expired.append(progress_id)
+            continue
+        created_at = progress.get("_created_ts")
+        if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+            created_at = current
+            progress["_created_ts"] = created_at
+        last_activity_at = progress.get("_last_activity_ts")
+        if not isinstance(last_activity_at, (int, float)) or isinstance(last_activity_at, bool):
+            last_activity_at = current
+            progress["_last_activity_ts"] = last_activity_at
+        finished_at = progress.get("_finished_ts")
+        if isinstance(finished_at, (int, float)) and not isinstance(finished_at, bool):
+            if current - finished_at >= _PROGRESS_RETENTION_SECONDS:
+                expired.append(progress_id)
+            else:
+                completed.append((float(finished_at), progress_id))
+        elif progress.get("done") is True:
+            # Old in-memory entries had no finish timestamp. Treat the first
+            # observation as completion time so they do not become immortal.
+            finished_at = current
+            progress["_finished_ts"] = finished_at
+            completed.append((float(finished_at), progress_id))
+        elif current - last_activity_at >= _PROGRESS_UNFINISHED_RETENTION_SECONDS:
+            expired.append(progress_id)
+    for progress_id in expired:
+        progress_store.pop(progress_id, None)
+    completed.sort()
+    for _, progress_id in completed[: max(0, len(completed) - _PROGRESS_MAX_COMPLETED_ENTRIES)]:
+        progress_store.pop(progress_id, None)
+
+
+def _public_progress(progress: dict) -> dict:
+    return {key: value for key, value in progress.items() if not str(key).startswith("_")}
+
+
+class TokenRefreshError(RuntimeError):
+    """Refresh failure with a bounded code and no upstream message."""
+
+    def __init__(self, code: str) -> None:
+        self.code = _normalize_token_refresh_error_code(code) or TOKEN_REFRESH_ERROR_FALLBACK
+        super().__init__(self.code)
+
+
+def _payload_has_error_code(payload: object, expected: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    candidates: list[object] = [
+        payload.get("code"),
+        payload.get("error_code"),
+        payload.get("error_description"),
+        payload.get("error"),
+    ]
+    nested_error = payload.get("error")
+    if isinstance(nested_error, dict):
+        candidates.extend(
+            [nested_error.get("code"), nested_error.get("error_code"), nested_error.get("type")]
+        )
+    return any(isinstance(candidate, str) and candidate.strip().lower() == expected for candidate in candidates)
 
 
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
+    _ACCOUNT_STATUSES = frozenset({"正常", "限流", "异常", "禁用"})
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
@@ -49,13 +177,27 @@ class AccountService:
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
         self._lock = Lock()
-        self._token_refresh_lock = Lock()
+        self._token_refresh_condition = Condition(Lock())
+        self._active_token_refreshes: set[str] = set()
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
+
+    @contextmanager
+    def _token_refresh_slot(self, token: str) -> Iterator[None]:
+        with self._token_refresh_condition:
+            while token in self._active_token_refreshes:
+                self._token_refresh_condition.wait()
+            self._active_token_refreshes.add(token)
+        try:
+            yield
+        finally:
+            with self._token_refresh_condition:
+                self._active_token_refreshes.discard(token)
+                self._token_refresh_condition.notify_all()
 
     def _get_cumulative_file(self) -> Path:
         from services.config import DATA_DIR
@@ -118,23 +260,88 @@ class AccountService:
         return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz).isoformat()
 
     def _load_accounts(self) -> dict[str, dict]:
-        accounts = self.storage.load_accounts()
-        return {
-            normalized["access_token"]: normalized
-            for item in accounts
-            if (normalized := self._normalize_account(item)) is not None
-        }
+        load_snapshot = getattr(self.storage, "load_accounts_snapshot", None)
+        if callable(load_snapshot):
+            snapshot = load_snapshot()
+            if not isinstance(snapshot, StorageSnapshot):
+                raise StorageDataError()
+            accounts = snapshot.records
+        else:
+            accounts = self.storage.load_accounts()
+            snapshot = make_storage_snapshot(accounts)
+        if not isinstance(accounts, list):
+            raise StorageDataError()
+        normalized_accounts: dict[str, dict] = {}
+        migrated_items: list[dict] = []
+        seen_access_tokens: set[str] = set()
+        migration_needed = False
+        for item in accounts:
+            if not isinstance(item, dict):
+                raise StorageDataError()
+            try:
+                normalized = self._normalize_account(item)
+            except Exception as exc:
+                raise StorageDataError() from exc
+            if normalized is None:
+                raise StorageDataError()
+            access_token = normalized.get("access_token")
+            if not isinstance(access_token, str) or not access_token.strip():
+                raise StorageDataError()
+            if access_token in seen_access_tokens:
+                raise StorageDataError()
+            seen_access_tokens.add(access_token)
+            migrated_item = dict(item)
+            safe_invalid_error = normalized.get("last_refresh_error")
+            if migrated_item.get("last_refresh_error") != safe_invalid_error:
+                migrated_item["last_refresh_error"] = safe_invalid_error
+                migration_needed = True
+            safe_error = normalized.get("last_token_refresh_error")
+            if migrated_item.get("last_token_refresh_error") != safe_error:
+                migrated_item["last_token_refresh_error"] = safe_error
+                migration_needed = True
+            migrated_items.append(migrated_item)
+            normalized_accounts[normalized["access_token"]] = normalized
+        if migration_needed:
+            save_if_revision = getattr(self.storage, "save_accounts_if_revision", None)
+            if callable(save_if_revision) and isinstance(snapshot, StorageSnapshot):
+                saved_snapshot = save_if_revision(snapshot, migrated_items)
+                self._accounts_snapshot = (
+                    saved_snapshot
+                    if isinstance(saved_snapshot, StorageSnapshot)
+                    else make_storage_snapshot(migrated_items)
+                )
+            else:
+                self.storage.save_accounts(migrated_items)
+        else:
+            self._accounts_snapshot = snapshot
+        return normalized_accounts
 
     def _save_accounts(self) -> None:
-        self.storage.save_accounts(list(self._accounts.values()))
+        accounts = list(self._accounts.values())
+        expected_accounts = getattr(self, "_accounts_snapshot", None)
+        save_if_revision = getattr(self.storage, "save_accounts_if_revision", None)
+        if callable(save_if_revision) and isinstance(expected_accounts, StorageSnapshot):
+            saved_snapshot = save_if_revision(expected_accounts, accounts)
+            self._accounts_snapshot = (
+                saved_snapshot
+                if isinstance(saved_snapshot, StorageSnapshot)
+                else make_storage_snapshot(accounts)
+            )
+        else:
+            # Structural fakes used by integrations may not implement the CAS helper.
+            self.storage.load_accounts()
+            self.storage.save_accounts(accounts)
+            self._accounts_snapshot = make_storage_snapshot(accounts)
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
         if not isinstance(account, dict):
             return False
-        if account.get("status") in {"禁用", "限流", "异常"}:
+        status = account.get("status")
+        if not isinstance(status, str) or status.strip() != "正常":
             return False
-        return int(account.get("quota") or 0) > 0
+        quota = account.get("quota")
+        return type(quota) is int and quota > 0
 
     @classmethod
     def _account_matches_plan_type(cls, account: dict, plan_type: str | None = None) -> bool:
@@ -169,6 +376,15 @@ class AccountService:
         return str(value or "web").strip().lower() or "web"
 
     @staticmethod
+    def _normalize_counter(item: dict, field: str) -> int | None:
+        if field not in item:
+            return 0
+        value = item.get(field)
+        if type(value) is not int or value < 0:
+            return None
+        return value
+
+    @staticmethod
     def _normalize_account_type(value: object) -> str | None:
         raw = str(value or "").strip()
         if not raw:
@@ -185,6 +401,24 @@ class AccountService:
             "enterprise": "Enterprise",
         }
         return aliases.get(compact) or aliases.get(key) or raw
+
+    @classmethod
+    def _account_type_from_token_claims(cls, item: dict) -> str | None:
+        for token_field in ("access_token", "id_token"):
+            token = item.get(token_field)
+            if not isinstance(token, str) or not token.strip():
+                continue
+            payload = cls._decode_jwt_payload(token)
+            auth_claim = payload.get("https://api.openai.com/auth")
+            if not isinstance(auth_claim, dict):
+                continue
+            raw_plan_type = auth_claim.get("chatgpt_plan_type")
+            if not isinstance(raw_plan_type, str):
+                continue
+            plan_type = cls._normalize_account_type(raw_plan_type)
+            if plan_type:
+                return plan_type
+        return None
 
     def _search_account_type(self, payload: object) -> str | None:
         if isinstance(payload, dict):
@@ -212,12 +446,36 @@ class AccountService:
         normalized = dict(item)
         normalized.pop("accessToken", None)
         normalized["access_token"] = access_token
-        if str(normalized.get("type") or "").strip().lower() == "codex":
+
+        if "type" not in item:
+            account_type = "free"
+        else:
+            raw_type = item.get("type")
+            if not isinstance(raw_type, str) or not raw_type.strip():
+                return None
+            account_type = raw_type.strip()
+        normalized["type"] = account_type
+        if account_type.lower() == "codex":
             normalized["export_type"] = "codex"
-            normalized.pop("type", None)
-        normalized["type"] = normalized.get("type") or "free"
-        normalized["status"] = normalized.get("status") or "正常"
-        normalized["quota"] = max(0, int(normalized.get("quota") if normalized.get("quota") is not None else 0))
+            normalized["type"] = "free"
+
+        if "status" not in item:
+            status = "正常"
+        else:
+            raw_status = item.get("status")
+            if not isinstance(raw_status, str):
+                return None
+            status = raw_status.strip()
+            if status not in self._ACCOUNT_STATUSES:
+                return None
+        normalized["status"] = status
+
+        for field in ("quota", "success", "fail", "invalid_count"):
+            counter = self._normalize_counter(item, field)
+            if counter is None:
+                return None
+            normalized[field] = counter
+
         normalized["email"] = normalized.get("email") or None
         normalized["user_id"] = normalized.get("user_id") or None
         normalized["proxy"] = str(normalized.get("proxy") or "").strip()
@@ -229,15 +487,18 @@ class AccountService:
         normalized["limits_progress"] = limits_progress if isinstance(limits_progress, list) else []
         normalized["default_model_slug"] = normalized.get("default_model_slug") or None
         normalized["restore_at"] = normalized.get("restore_at") or None
-        normalized["success"] = int(normalized.get("success") or 0)
-        normalized["fail"] = int(normalized.get("fail") or 0)
-        normalized["invalid_count"] = int(normalized.get("invalid_count") or 0)
         normalized["last_used_at"] = normalized.get("last_used_at")
         normalized["last_invalid_at"] = normalized.get("last_invalid_at") or None
-        normalized["last_refresh_error"] = normalized.get("last_refresh_error") or None
+        normalized["last_refresh_error"] = (
+            INVALID_TOKEN_ERROR_MESSAGE
+            if normalized.get("last_refresh_error")
+            else None
+        )
         normalized["last_refresh_error_at"] = normalized.get("last_refresh_error_at") or None
         normalized["last_token_refresh_at"] = normalized.get("last_token_refresh_at") or None
-        normalized["last_token_refresh_error"] = normalized.get("last_token_refresh_error") or None
+        normalized["last_token_refresh_error"] = _normalize_token_refresh_error_code(
+            normalized.get("last_token_refresh_error")
+        )
         normalized["last_token_refresh_error_at"] = normalized.get("last_token_refresh_error_at") or None
         normalized["created_at"] = normalized.get("created_at") or AccountService._now()
         return normalized
@@ -300,7 +561,8 @@ class AccountService:
             account = self._accounts.get(resolved)
             return resolved, dict(account) if account else None
 
-    def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
+    def _record_token_refresh_error(self, access_token: str, event: str, error_code: str) -> None:
+        safe_code = _normalize_token_refresh_error_code(error_code) or TOKEN_REFRESH_ERROR_FALLBACK
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             resolved = self._resolve_access_token_locked(access_token)
@@ -308,7 +570,7 @@ class AccountService:
             if current is None:
                 return
             next_item = dict(current)
-            next_item["last_token_refresh_error"] = str(error or "refresh token failed")
+            next_item["last_token_refresh_error"] = safe_code
             next_item["last_token_refresh_error_at"] = now
             account = self._normalize_account(next_item)
             if account is not None:
@@ -317,7 +579,7 @@ class AccountService:
         log_service.add(
             LOG_TYPE_ACCOUNT,
             "refresh_token 刷新 access_token 失败",
-            {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+            {"source": event, "token": anonymize_token(access_token), "error": safe_code},
         )
 
     def _recent_token_refresh_error(self, account: dict) -> bool:
@@ -356,36 +618,58 @@ class AccountService:
         from curl_cffi import requests
         from services.proxy_service import proxy_settings
 
-        session = requests.Session(**proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True))
+        session = None
         try:
-            response = session.post(
-                self._OAUTH_TOKEN_URL,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": self._OAUTH_USER_AGENT,
-                },
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": self._OAUTH_CLIENT_ID,
-                },
-                timeout=60,
-            )
-            data = response.json() if response.text else {}
+            try:
+                session = requests.Session(
+                    **proxy_settings.build_session_kwargs(account=account, impersonate="chrome110", verify=True)
+                )
+            except Exception as exc:
+                raise TokenRefreshError("network_error") from exc
+            try:
+                response = session.post(
+                    self._OAUTH_TOKEN_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": self._OAUTH_USER_AGENT,
+                    },
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": self._OAUTH_CLIENT_ID,
+                    },
+                    timeout=60,
+                )
+            except Exception as exc:
+                raise TokenRefreshError("network_error") from exc
+            try:
+                data = response.json() if response.text else {}
+            except Exception as exc:
+                raise TokenRefreshError("invalid_response") from exc
             if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
-                detail = ""
-                if isinstance(data, dict):
-                    detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
-                detail = detail or self._safe_response_text(response)
-                raise RuntimeError(f"oauth_refresh_http_{response.status_code}{': ' + detail if detail else ''}")
+                if _payload_has_error_code(data, "app_session_terminated"):
+                    raise TokenRefreshError("app_session_terminated")
+                if isinstance(response.status_code, int) and response.status_code >= 500:
+                    raise TokenRefreshError("http_5xx")
+                if isinstance(response.status_code, int) and 400 <= response.status_code < 500:
+                    raise TokenRefreshError("http_4xx")
+                raise TokenRefreshError("invalid_response")
             return {
                 "access_token": str(data.get("access_token") or "").strip(),
                 "refresh_token": str(data.get("refresh_token") or refresh_token).strip(),
                 "id_token": str(data.get("id_token") or "").strip(),
             }
+        except TokenRefreshError:
+            raise
+        except Exception as exc:
+            raise TokenRefreshError(TOKEN_REFRESH_ERROR_FALLBACK) from exc
         finally:
-            session.close()
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
     def _apply_refreshed_tokens(self, old_access_token: str, token_data: dict, event: str) -> str:
         now = datetime.now(timezone.utc).isoformat()
@@ -437,7 +721,8 @@ class AccountService:
     def refresh_access_token(self, access_token: str, *, force: bool = False, event: str = "refresh_access_token") -> str:
         if not access_token:
             return ""
-        with self._token_refresh_lock:
+        resolved_token, _ = self._get_account_for_token(access_token)
+        with self._token_refresh_slot(resolved_token or access_token):
             resolved_token, account = self._get_account_for_token(access_token)
             if not account:
                 return access_token
@@ -451,24 +736,59 @@ class AccountService:
                 return active_token
             try:
                 token_data = self._request_access_token_refresh(refresh_token, account)
-            except Exception as exc:
-                error_str = str(exc or "")
-                self._record_token_refresh_error(active_token, event, error_str)
+            except TokenRefreshError as exc:
+                self._record_token_refresh_error(active_token, event, exc.code)
                 # 如果是 app_session_terminated 错误，尝试密码重新登录
-                if "app_session_terminated" in error_str.lower():
+                if exc.code == "app_session_terminated":
                     # 获取账号信息（email, password）
                     email = str(account.get("email") or "").strip()
                     password = str(account.get("password") or "").strip()
                     if email and password:
-                        # 创建新线程执行密码重新登录
-                        t = Thread(
-                            target=self._password_re_login_thread,
-                            args=(active_token, email, password, event),
-                            daemon=True,
-                        )
-                        t.start()
+                        self._schedule_password_relogin(active_token, email, password, event)
+                return active_token
+            except Exception:
+                self._record_token_refresh_error(active_token, event, TOKEN_REFRESH_ERROR_FALLBACK)
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+
+    def _schedule_password_relogin(
+        self,
+        access_token: str,
+        email: str,
+        password: str,
+        event: str,
+        progress_id: str | None = None,
+    ) -> bool:
+        try:
+            reservation = reserve_background_task()
+        except BackgroundTaskQueueFullError:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "重新登录任务未启动",
+                {"source": event, "status": "queue_full"},
+            )
+            if progress_id:
+                self.update_relogin_progress(progress_id, access_token, "跳过", "relogin_queue_full")
+            return False
+        try:
+            reservation.submit(
+                self._password_re_login_thread,
+                access_token,
+                email,
+                password,
+                event,
+                progress_id,
+            )
+        except Exception:
+            log_service.add(
+                LOG_TYPE_ACCOUNT,
+                "重新登录任务未启动",
+                {"source": event, "status": "submit_failed"},
+            )
+            if progress_id:
+                self.update_relogin_progress(progress_id, access_token, "异常", RELOGIN_ERROR_FALLBACK)
+            return False
+        return True
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -504,7 +824,6 @@ class AccountService:
                         "source": event,
                         "old_token": anonymize_token(access_token),
                         "new_token": anonymize_token(new_access_token),
-                        "email": email,
                         "status": "成功",
                     },
                 )
@@ -512,7 +831,7 @@ class AccountService:
                     self.update_relogin_progress(progress_id, access_token, "成功")
             else:
                 # 登录失败
-                error_type = result.get("error", "")
+                error_type = _normalize_relogin_error_code(result.get("error"))
                 if error_type == "password_verify_failed_403" and isinstance(result.get("detail"), dict):
                     log_service.add(
                         LOG_TYPE_ACCOUNT,
@@ -520,10 +839,8 @@ class AccountService:
                         {
                             "source": event,
                             "token": anonymize_token(access_token),
-                            "email": email,
                             "status": "失败",
                             "error": error_type,
-                            "detail": result.get("detail", {}),
                         },
                     )
                     detail_error = result["detail"].get("error", {})
@@ -537,8 +854,6 @@ class AccountService:
                             {
                                 "source": event,
                                 "token": anonymize_token(access_token),
-                                "email": email,
-                                "detail": result.get("detail", {}),
                             },
                         )
                         if progress_id:
@@ -555,10 +870,8 @@ class AccountService:
                         {
                             "source": event,
                             "token": anonymize_token(access_token),
-                            "email": email,
                             "status": "失败",
                             "error": error_type,
-                            "detail": result.get("detail", {}),
                         },
                     )
                     # 永久故障：将账号标记为异常（或自动移除）
@@ -572,15 +885,14 @@ class AccountService:
                 {
                     "source": event,
                     "token": anonymize_token(access_token),
-                    "email": email,
                     "status": "异常",
-                    "error": str(exc),
+                    "error": exception_log_message(exc),
                 },
             )
             # 将账号标记为异常（或自动移除）
             self.remove_invalid_token(access_token, f"{event}:password_relogin_exception", quiet=True)
             if progress_id:
-                self.update_relogin_progress(progress_id, access_token, "异常", str(exc))
+                self.update_relogin_progress(progress_id, access_token, "异常", exception_log_message(exc))
 
     def _login_with_password(self, email: str, password: str) -> dict:
         """通过邮箱+密码登录，返回 {access_token, refresh_token, id_token, ...}"""
@@ -653,7 +965,12 @@ class AccountService:
             )
             
             if resp.status_code not in (200, 302):
-                return {"ok": False, "error": f"authorize_failed_{resp.status_code}", "detail": {"url": resp.url, "text": resp.text[:500]}}
+                status_code = resp.status_code if isinstance(resp.status_code, int) else 0
+                return {
+                    "ok": False,
+                    "error": f"authorize_failed_{status_code}",
+                    "detail": {"status": status_code},
+                }
             
             # 检测最终 URL 是否指向错误页面
             final_url = str(resp.url)
@@ -669,8 +986,12 @@ class AccountService:
                         return {"ok": False, "error": "rate_limit_exceeded", "detail": error_payload}
                     else:
                         return {"ok": False, "error": f"authorize_error_{error_code}", "detail": error_payload}
-                except Exception as e:
-                    return {"ok": False, "error": "authorize_redirect_error", "detail": {"url": final_url, "parse_error": str(e)}}
+                except Exception:
+                    return {
+                        "ok": False,
+                        "error": "authorize_redirect_error",
+                        "detail": {"parse_error": "invalid authorize redirect payload"},
+                    }
             
             # ③ 提交密码验证
             login_headers = {
@@ -866,10 +1187,11 @@ class AccountService:
             before = self.resolve_access_token(access_token)
             after = self.refresh_access_token(before, force=True, event="refresh_token_keepalive")
             account = self.get_account(after)
-            if account and str(account.get("last_token_refresh_error") or "").strip():
+            error_code = _normalize_token_refresh_error_code(account.get("last_token_refresh_error")) if account else None
+            if error_code:
                 errors.append({
                     "token": anonymize_token(before),
-                    "error": str(account.get("last_token_refresh_error") or "refresh token failed"),
+                    "error": error_code,
                 })
                 continue
             if account:
@@ -1001,9 +1323,11 @@ class AccountService:
             self,
             excluded_tokens: set[str] | None = None,
             model: str = "auto",
+            source_type: str | None = None,
     ) -> str:
         excluded = set(excluded_tokens or set())
         requested_model = str(model or "auto").strip() or "auto"
+        requested_source = self._normalize_source_type(source_type) if source_type else None
         route = None
         if requested_model != "auto":
             from services.model_service import model_catalog_service
@@ -1018,10 +1342,15 @@ class AccountService:
                        route is None
                        or self._normalize_account_type(account.get("type")) in route.account_types
                    )
+                   and self._account_matches_source_type(account, requested_source)
                    and (token := account.get("access_token") or "")
                    and token not in excluded
             ]
             if not candidates:
+                if requested_source:
+                    from services.model_service import ModelUnavailableError
+
+                    raise ModelUnavailableError("no active account is available for the requested source")
                 if route is None or route.allow_anonymous:
                     return ""
                 from services.model_service import ModelUnavailableError
@@ -1031,7 +1360,14 @@ class AccountService:
                 )
             access_token = candidates[self._index % len(candidates)]
             self._index += 1
-        return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
+        resolved_token = self.refresh_access_token(access_token, event="get_text_access_token") or access_token
+        if requested_source:
+            resolved_account = self.get_account(resolved_token)
+            if not self._account_matches_source_type(resolved_account or {}, requested_source):
+                from services.model_service import ModelUnavailableError
+
+                raise ModelUnavailableError("refreshed account does not match the requested source")
+        return resolved_token
 
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
@@ -1047,7 +1383,10 @@ class AccountService:
             if account is None:
                 return
             self._accounts[access_token] = account
-            self._save_accounts()
+            # This is hot-path telemetry, not an account mutation. Persisting
+            # the full snapshot here serializes every completed text request
+            # behind the account lock and storage backend. The in-memory value
+            # is included by the next real account mutation.
 
     def remove_invalid_token(self, access_token: str, event: str, quiet: bool = False) -> bool:
         if not config.auto_remove_invalid_accounts:
@@ -1215,8 +1554,8 @@ class AccountService:
             merged["created_at"] = min(dated_values, key=lambda value: value[0])[1]
         return merged
 
-    @staticmethod
-    def _prepare_account_payload(item: dict) -> dict | None:
+    @classmethod
+    def _prepare_account_payload(cls, item: dict) -> dict | None:
         if not isinstance(item, dict):
             return None
         access_token = AccountService._account_payload_token(item)
@@ -1232,8 +1571,14 @@ class AccountService:
             payload.pop("type", None)
         if str(payload.get("export_type") or "").strip().lower() == "codex":
             payload["source_type"] = "codex"
-        if payload.get("plan_type") and not payload.get("type"):
-            payload["type"] = str(payload.get("plan_type") or "").strip()
+        if not payload.get("type"):
+            raw_plan_type = payload.get("plan_type")
+            if isinstance(raw_plan_type, str):
+                payload["type"] = cls._normalize_account_type(raw_plan_type)
+        if not payload.get("type"):
+            claimed_plan_type = cls._account_type_from_token_claims(payload)
+            if claimed_plan_type:
+                payload["type"] = claimed_plan_type
         return payload
 
     def add_account_items(self, items: list[dict]) -> dict:
@@ -1248,10 +1593,16 @@ class AccountService:
         tokens = list(dict.fromkeys(token for token in tokens if token))
         if not tokens:
             return {"added": 0, "skipped": 0, "items": self.list_accounts()}
-        return self._add_account_payloads([
-            {"access_token": token, "source_type": self._normalize_source_type(source_type)}
+        payloads = [
+            payload
             for token in tokens
-        ])
+            if (
+                payload := self._prepare_account_payload(
+                    {"access_token": token, "source_type": self._normalize_source_type(source_type)}
+                )
+            ) is not None
+        ]
+        return self._add_account_payloads(payloads)
 
     def _add_account_payloads(self, payloads: list[dict]) -> dict:
         deduped: dict[tuple[str, str], dict] = {}
@@ -1436,7 +1787,7 @@ class AccountService:
             next_item = dict(current)
             next_item["invalid_count"] = int(next_item.get("invalid_count") or 0) + 1
             next_item["last_invalid_at"] = now.isoformat()
-            next_item["last_refresh_error"] = str(error or "invalid access token")
+            next_item["last_refresh_error"] = INVALID_TOKEN_ERROR_MESSAGE
             next_item["last_refresh_error_at"] = now.isoformat()
             account = self._normalize_account(next_item)
             if account is not None:
@@ -1446,7 +1797,11 @@ class AccountService:
                 log_service.add(
                     LOG_TYPE_ACCOUNT,
                     "暂缓标记异常账号",
-                    {"source": event, "token": anonymize_token(access_token), "error": str(error or "")},
+                    {
+                        "source": event,
+                        "token": anonymize_token(access_token),
+                        "reason": "invalid_access_token",
+                    },
                 )
                 return False
         return True
@@ -1515,7 +1870,7 @@ class AccountService:
                     if self._record_invalid_token_seen(
                         refreshed_token,
                         event,
-                        str(retry_exc),
+                        exception_log_message(retry_exc),
                         defer_invalid_removal=defer_invalid_removal,
                     ):
                         self.remove_invalid_token(refreshed_token, event)
@@ -1525,11 +1880,19 @@ class AccountService:
                 if self._record_invalid_token_seen(
                     active_token,
                     event,
-                    str(exc),
+                    exception_log_message(exc),
                     defer_invalid_removal=defer_invalid_removal,
                 ):
                     self.remove_invalid_token(active_token, event)
                 raise
+        claimed_plan_type = self._account_type_from_token_claims(
+            {
+                "access_token": active_token,
+                "id_token": (self.get_account(active_token) or {}).get("id_token"),
+            }
+        )
+        if claimed_plan_type:
+            result = {**result, "type": claimed_plan_type}
         self._record_refresh_success(active_token)
         return self.update_account(active_token, result)
 
@@ -1538,6 +1901,8 @@ class AccountService:
     def init_refresh_progress(self, progress_id: str, total: int) -> None:
         """初始化刷新进度记录。"""
         with self._refresh_progress_lock:
+            now = time.monotonic()
+            _prune_progress_locked(self._refresh_progress, now=now)
             self._refresh_progress[progress_id] = {
                 "total": total,
                 "processed": 0,
@@ -1545,6 +1910,8 @@ class AccountService:
                 "error": None,
                 "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
                 "total_quota": 0,
+                "_created_ts": now,
+                "_last_activity_ts": now,
             }
 
     def update_refresh_progress(self, progress_id: str, token: str) -> None:
@@ -1554,9 +1921,12 @@ class AccountService:
         quota = max(0, int(account.get("quota") or 0)) if account else 0
 
         with self._refresh_progress_lock:
+            now = time.monotonic()
+            _prune_progress_locked(self._refresh_progress, now=now)
             progress = self._refresh_progress.get(progress_id)
             if progress is None:
                 return
+            progress["_last_activity_ts"] = now
             progress["processed"] += 1
             progress["status_counts"][status] = progress["status_counts"].get(status, 0) + 1
             progress["total_quota"] += quota
@@ -1564,19 +1934,24 @@ class AccountService:
     def finish_refresh_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
         """标记刷新完成。"""
         with self._refresh_progress_lock:
+            now = time.monotonic()
+            _prune_progress_locked(self._refresh_progress, now=now)
             progress = self._refresh_progress.get(progress_id)
             if progress is None:
                 return
             progress["done"] = True
             progress["result"] = result
+            progress["_finished_ts"] = now
+            progress["_last_activity_ts"] = now
             if error:
                 progress["error"] = error
 
     def get_refresh_progress(self, progress_id: str) -> dict | None:
         """查询刷新进度。"""
         with self._refresh_progress_lock:
+            _prune_progress_locked(self._refresh_progress, now=time.monotonic())
             progress = self._refresh_progress.get(progress_id)
-            return dict(progress) if progress else None
+            return _public_progress(progress) if progress else None
 
     def clean_refresh_progress(self, progress_id: str) -> None:
         """清理过期进度记录。"""
@@ -1588,20 +1963,27 @@ class AccountService:
     def init_relogin_progress(self, progress_id: str, total: int) -> None:
         """初始化重新登录进度记录。"""
         with self._relogin_progress_lock:
+            now = time.monotonic()
+            _prune_progress_locked(self._relogin_progress, now=now)
             self._relogin_progress[progress_id] = {
                 "total": total,
                 "processed": 0,
                 "done": False,
                 "error": None,
                 "results": [],
+                "_created_ts": now,
+                "_last_activity_ts": now,
             }
 
     def update_relogin_progress(self, progress_id: str, token: str, status: str, error: str | None = None) -> None:
         """更新单个重新登录进度。当所有账号处理完毕时自动标记完成。"""
         with self._relogin_progress_lock:
+            now = time.monotonic()
+            _prune_progress_locked(self._relogin_progress, now=now)
             progress = self._relogin_progress.get(progress_id)
             if progress is None:
                 return
+            progress["_last_activity_ts"] = now
             progress["processed"] += 1
             progress["results"].append({
                 "token": anonymize_token(token),
@@ -1610,23 +1992,29 @@ class AccountService:
             })
             if progress["processed"] >= progress["total"]:
                 progress["done"] = True
+                progress["_finished_ts"] = now
 
     def finish_relogin_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
         """标记重新登录完成。"""
         with self._relogin_progress_lock:
+            now = time.monotonic()
+            _prune_progress_locked(self._relogin_progress, now=now)
             progress = self._relogin_progress.get(progress_id)
             if progress is None:
                 return
             progress["done"] = True
             progress["result"] = result
+            progress["_finished_ts"] = now
+            progress["_last_activity_ts"] = now
             if error:
                 progress["error"] = error
 
     def get_relogin_progress(self, progress_id: str) -> dict | None:
         """查询重新登录进度。"""
         with self._relogin_progress_lock:
+            _prune_progress_locked(self._relogin_progress, now=time.monotonic())
             progress = self._relogin_progress.get(progress_id)
-            return dict(progress) if progress else None
+            return _public_progress(progress) if progress else None
 
     def clean_relogin_progress(self, progress_id: str) -> None:
         """清理过期进度记录。"""
@@ -1654,43 +2042,47 @@ class AccountService:
 
         refreshed = 0
         errors = []
-        max_workers = min(10, len(access_tokens))
 
         if progress_id:
             self.init_refresh_progress(progress_id, len(access_tokens))
 
-        executor = ThreadPoolExecutor(max_workers=max_workers)
+        current_futures = {}
         try:
-            futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts", defer_invalid_removal): token
-                for token in access_tokens
-            }
-            for future in as_completed(futures):
-                token = futures[future]
-                try:
-                    account = future.result()
-                except (KeyboardInterrupt, SystemExit):
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    raise
-                except Exception as exc:
-                    error_str = str(exc)
-                    # TLS/代理连接错误是网络问题，不计入账号失败
-                    from services.protocol.conversation import is_tls_connection_error
-                    if not is_tls_connection_error(error_str):
-                        errors.append({"token": anonymize_token(token), "error": error_str})
-                else:
-                    if account is not None:
-                        refreshed += 1
+            for offset in range(0, len(access_tokens), ACCOUNT_REFRESH_WORKERS):
+                batch = access_tokens[offset:offset + ACCOUNT_REFRESH_WORKERS]
+                current_futures = {
+                    _ACCOUNT_REFRESH_EXECUTOR.submit(
+                        self.fetch_remote_info,
+                        token,
+                        "refresh_accounts",
+                        defer_invalid_removal,
+                    ): token
+                    for token in batch
+                }
+                for future in as_completed(current_futures):
+                    token = current_futures[future]
+                    try:
+                        account = future.result()
+                    except (KeyboardInterrupt, SystemExit):
+                        raise
+                    except Exception as exc:
+                        error_str = str(exc)
+                        # TLS/代理连接错误是网络问题，不计入账号失败
+                        from services.protocol.conversation import is_tls_connection_error
+                        if not is_tls_connection_error(error_str):
+                            errors.append({"token": anonymize_token(token), "error": exception_log_message(exc)})
+                    else:
+                        if account is not None:
+                            refreshed += 1
 
-                if progress_id:
-                    self.update_refresh_progress(progress_id, token)
+                    if progress_id:
+                        self.update_refresh_progress(progress_id, token)
         except (KeyboardInterrupt, SystemExit):
             if progress_id:
                 self.finish_refresh_progress(progress_id, error="cancelled")
-            executor.shutdown(wait=False, cancel_futures=True)
+            for future in current_futures:
+                future.cancel()
             raise
-        else:
-            executor.shutdown(wait=True, cancel_futures=True)
 
         # 自动重新登录异常账号（仅当配置开启时）
         relogined = 0
@@ -1706,13 +2098,13 @@ class AccountService:
                 password = str(account.get("password") or "").strip()
                 if not email or not password:
                     continue
-                t = Thread(
-                    target=self._password_re_login_thread,
-                    args=(token, email, password, "auto_relogin_after_refresh"),
-                    daemon=True,
-                )
-                t.start()
-                relogined += 1
+                if self._schedule_password_relogin(
+                    token,
+                    email,
+                    password,
+                    "auto_relogin_after_refresh",
+                ):
+                    relogined += 1
 
         result = {
             "refreshed": refreshed,
@@ -1762,14 +2154,10 @@ class AccountService:
                     self.update_relogin_progress(progress_id, token, "跳过", "无邮箱密码")
                 continue
 
-            # 在新线程中执行密码重新登录
-            t = Thread(
-                target=self._password_re_login_thread,
-                args=(token, email, password, "manual_relogin", progress_id),
-                daemon=True,
-            )
-            t.start()
-            relogined += 1
+            if self._schedule_password_relogin(token, email, password, "manual_relogin", progress_id):
+                relogined += 1
+            else:
+                skipped += 1
 
         result = {
             "relogined": relogined,

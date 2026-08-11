@@ -38,7 +38,10 @@ class RemoveImageConversationGateTests(unittest.TestCase):
         cleanup_backend = FakeBackend(access_token=source_backend.access_token)
         with mock.patch.object(conversation, "OpenAIBackendAPI", return_value=cleanup_backend):
             _remove_image_conversation_later(source_backend, "conv-1", success=success)
-            return cleanup_backend.called.wait(2.0)
+            called = cleanup_backend.called.wait(2.0)
+            if called:
+                self.assertTrue(cleanup_backend.closed.wait(2.0))
+            return called
 
     def test_both_off_never_removes(self) -> None:
         self.assertFalse(self._removed(after_result=False, always=False, success=True))
@@ -75,6 +78,60 @@ class RemoveImageConversationGateTests(unittest.TestCase):
 
         self.assertFalse(source_backend.called.is_set())
         backend_factory.assert_called_once_with(access_token="source-token")
+
+    def test_cleanup_workers_and_pending_queue_are_bounded(self) -> None:
+        config.data = dict(self._saved, image_remove_conversation_always=True)
+        condition = threading.Condition()
+        release = threading.Event()
+        active = 0
+        max_active = 0
+        finished = 0
+
+        class BlockingCleanupBackend:
+            def __init__(self, *, access_token: str) -> None:
+                self.access_token = access_token
+
+            def delete_conversation(self, _conversation_id: str) -> dict:
+                nonlocal active, max_active, finished
+                with condition:
+                    active += 1
+                    max_active = max(max_active, active)
+                    condition.notify_all()
+                try:
+                    if not release.wait(timeout=5):
+                        raise AssertionError("cleanup worker was not released")
+                    return {}
+                finally:
+                    with condition:
+                        active -= 1
+                        finished += 1
+                        condition.notify_all()
+
+            def close(self) -> None:
+                pass
+
+        source_backend = FakeBackend()
+        with mock.patch.object(conversation, "OpenAIBackendAPI", BlockingCleanupBackend):
+            try:
+                for index in range(24):
+                    _remove_image_conversation_later(
+                        source_backend,
+                        f"bounded-cleanup-{index}",
+                        success=False,
+                    )
+
+                with condition:
+                    self.assertTrue(
+                        condition.wait_for(lambda: active >= 4, timeout=2),
+                        "cleanup workers did not reach the bounded baseline",
+                    )
+                    self.assertLessEqual(max_active, 4)
+            finally:
+                release.set()
+                with condition:
+                    condition.wait_for(lambda: finished >= 16, timeout=3)
+
+        self.assertEqual(finished, 16)
 
 
 if __name__ == "__main__":

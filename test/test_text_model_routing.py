@@ -75,6 +75,25 @@ class TextAccountRoutingTests(unittest.TestCase):
         ), self.assertRaisesRegex(ModelUnavailableError, "team-only"):
             self.service.get_text_access_token(model="team-only")
 
+    def test_codex_source_selection_never_falls_back_to_web_or_anonymous(self) -> None:
+        self.service.add_account_items(
+            [{"access_token": "codex-plus", "type": "Plus", "status": "正常", "source_type": "codex"}]
+        )
+
+        token = self.service.get_text_access_token(model="auto", source_type="codex")
+
+        self.assertEqual(token, "codex-plus")
+
+        web_only = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "web-only-accounts.json")
+        )
+        web_only.add_account_items(
+            [{"access_token": "web-plus", "type": "Plus", "status": "正常", "source_type": "web"}]
+        )
+        web_only.refresh_access_token = lambda token, **_kwargs: token
+        with self.assertRaises(ModelUnavailableError):
+            web_only.get_text_access_token(model="auto", source_type="codex")
+
 
 class TextProtocolRoutingTests(unittest.TestCase):
     def test_text_backend_passes_requested_model_to_account_selector(self) -> None:
@@ -170,6 +189,31 @@ class TextProtocolRoutingTests(unittest.TestCase):
             excluded_tokens={"bad"},
             model="pro-only",
         )
+
+    def test_empty_upstream_stream_fails_closed_and_is_not_marked_success(self) -> None:
+        initial_close = mock.Mock()
+        active_close = mock.Mock()
+        initial_backend = SimpleNamespace(access_token="pro", close=initial_close)
+        request = conversation.ConversationRequest(
+            model="gpt-5-6-luna-wm",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        with (
+            mock.patch.object(
+                conversation,
+                "OpenAIBackendAPI",
+                return_value=SimpleNamespace(access_token="pro", close=active_close),
+            ),
+            mock.patch.object(conversation, "conversation_events", return_value=iter(())),
+            mock.patch.object(conversation.account_service, "mark_text_used") as mark_used,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "without visible assistant output"):
+                list(conversation.stream_text_deltas(initial_backend, request))
+
+        mark_used.assert_not_called()
+        active_close.assert_called_once_with()
+        initial_close.assert_called_once_with()
 
 
 if __name__ == "__main__":

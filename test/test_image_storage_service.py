@@ -16,15 +16,24 @@ def png_bytes() -> bytes:
     return path.read_bytes()
 
 
+def jpeg_bytes() -> bytes:
+    path = Path(tempfile.gettempdir()) / "chatgpt2api-test-image.jpg"
+    Image.new("RGB", (2, 2), color=(0, 255, 0)).save(path, format="JPEG")
+    return path.read_bytes()
+
+
 class FakeWebDAVClient:
     uploaded: dict[str, bytes] = {}
     deleted: list[str] = []
+    closed: int = 0
+    content_types: dict[str, str] = {}
 
     def __init__(self, _settings):
         pass
 
-    def put(self, rel: str, payload: bytes) -> str:
+    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
         self.uploaded[rel] = payload
+        self.content_types[rel] = content_type
         return f"https://dav.example.test/{rel}"
 
     def get(self, rel: str) -> bytes:
@@ -39,6 +48,9 @@ class FakeWebDAVClient:
         self.put(".chatgpt2api_webdav_test.txt", b"chatgpt2api webdav test\n")
         self.delete(".chatgpt2api_webdav_test.txt")
         return {"ok": True, "status": 200, "error": None}
+
+    def close(self) -> None:
+        type(self).closed += 1
 
 
 class ImageStorageServiceTests(unittest.TestCase):
@@ -65,6 +77,8 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.mock_config.get_image_storage_settings.side_effect = lambda: dict(self.settings)
         FakeWebDAVClient.uploaded = {}
         FakeWebDAVClient.deleted = []
+        FakeWebDAVClient.closed = 0
+        FakeWebDAVClient.content_types = {}
 
     def service(self) -> ImageStorageService:
         return ImageStorageService(self.data_dir / "image_index.json")
@@ -75,6 +89,36 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertEqual(stored.storage, "local")
         self.assertTrue((self.images_dir / stored.rel).is_file())
         self.assertEqual(stored.url, f"http://app.test/images/{stored.rel}")
+
+    def test_save_uses_detected_jpeg_extension_and_webdav_content_type(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "both",
+            "webdav_url": "https://dav.example.test",
+        })
+        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            stored = self.service().save(jpeg_bytes(), "http://app.test")
+
+        self.assertTrue(stored.rel.endswith(".jpg"), stored.rel)
+        self.assertEqual(FakeWebDAVClient.content_types[stored.rel], "image/jpeg")
+
+    def test_public_url_without_explicit_base_url_is_relative(self):
+        rel = "2026/05/07/image.png"
+
+        self.assertEqual(self.service()._public_url(rel, ""), f"/images/{rel}")
+
+    def test_public_base_url_rejects_credentials_query_fragment_and_malformed_authority(self):
+        rel = "2026/05/07/image.png"
+        for public_base_url in (
+            "https://user:secret@cdn.example.test/images",
+            "https://cdn.example.test/images?secret=1",
+            "https://cdn.example.test/images#secret",
+            "https://[::1/images",
+            "https://cdn.example.test:bad/images",
+        ):
+            with self.subTest(public_base_url=public_base_url):
+                self.settings["public_base_url"] = public_base_url
+                self.assertEqual(self.service()._public_url(rel, ""), f"/images/{rel}")
 
     def test_webdav_mode_uploads_without_local_file(self):
         self.settings.update({
@@ -91,6 +135,39 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertFalse((self.images_dir / stored.rel).exists())
         self.assertIn(stored.rel, FakeWebDAVClient.uploaded)
         self.assertEqual(payload, FakeWebDAVClient.uploaded[stored.rel])
+
+    def test_webdav_clients_are_closed_after_storage_operations(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "webdav",
+            "webdav_url": "https://dav.example.test",
+            "webdav_password": "secret",
+        })
+        service = self.service()
+        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            stored = service.save(png_bytes(), "http://app.test")
+            service.get_bytes(stored.rel)
+            service.delete(stored.rel)
+
+        self.assertEqual(FakeWebDAVClient.closed, 3)
+
+    def test_webdav_sync_closes_client_after_batch(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "both",
+            "webdav_url": "https://dav.example.test",
+            "webdav_password": "secret",
+        })
+        rel = "2026/05/07/sync.png"
+        image_path = self.images_dir / rel
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(png_bytes())
+
+        with mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            result = self.service().sync_all()
+
+        self.assertEqual(result["uploaded"], 1)
+        self.assertEqual(FakeWebDAVClient.closed, 1)
 
     def test_list_items_ignores_non_image_files(self):
         image = png_bytes()

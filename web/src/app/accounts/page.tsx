@@ -93,13 +93,6 @@ const metricCards = [
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
-function formatCompact(value: number) {
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(1)}k`;
-  }
-  return String(value);
-}
-
 function formatQuota(account: Account) {
   return String(Math.max(0, account.quota));
 }
@@ -130,7 +123,7 @@ function formatRestoreAt(value?: string | null) {
 
 function formatQuotaSummary(accounts: Account[]) {
   const availableAccounts = accounts.filter((account) => account.status === "正常");
-  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+  return availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0);
 }
 
 function maskToken(token?: string) {
@@ -423,7 +416,7 @@ function AccountsPageContent() {
                 limited: runningLimited,
                 abnormal: runningAbnormal,
                 disabled: runningDisabled,
-                quota: formatCompact(baseQuotaNum + (p.total_quota ?? 0)),
+                quota: baseQuotaNum + (p.total_quota ?? 0),
               });
             }
           } catch (err) {
@@ -858,9 +851,7 @@ function AccountsPageContent() {
                     <Icon className="size-4 text-stone-400" />
                   </div>
                   <div className={cn("text-[1.75rem] font-semibold tracking-tight", item.color)}>
-                    <span className={typeof value === "number" ? "" : "text-[1.1rem]"}>
-                      {typeof value === "number" ? formatCompact(value) : value}
-                    </span>
+                    <span>{value}</span>
                   </div>
                 </CardContent>
               </Card>

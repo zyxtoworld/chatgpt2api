@@ -8,6 +8,7 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 
 import { BackupSettingsCard } from "./components/backup-settings-card";
 import { ApiDocsCard } from "./components/api-docs-card";
+import { CCLoadConnections } from "./components/ccload-connections";
 import { ConfigCard } from "./components/config-card";
 import { CPAPoolDialog } from "./components/cpa-pool-dialog";
 import { CPAPoolsCard } from "./components/cpa-pools-card";
@@ -28,6 +29,7 @@ const settingsTabs = [
   { value: "proxy", title: "FlareSolverr" },
   { value: "cpa", title: "CPA" },
   { value: "sub2api", title: "Sub2API" },
+  { value: "ccload", title: "ccLoad" },
 ];
 
 function SettingsDataController() {
@@ -112,6 +114,9 @@ function SettingsPageContent() {
         </TabsContent>
         <TabsContent value="sub2api">
           <Sub2APIConnections />
+        </TabsContent>
+        <TabsContent value="ccload">
+          <CCLoadConnections />
         </TabsContent>
       </Tabs>
       <CPAPoolDialog />

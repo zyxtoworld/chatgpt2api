@@ -2,6 +2,7 @@ import base64
 import json
 import unittest
 from typing import Any
+from unittest import mock
 
 from services.account_service import AccountService
 
@@ -112,6 +113,50 @@ class AccountExportTests(unittest.TestCase):
         self.assertEqual(account["export_type"], "codex")
         self.assertEqual(account["refresh_token"], "rt_test")
         self.assertEqual(account["account_id"], "acct_123")
+
+    def test_codex_import_uses_plan_type_from_access_token_claims(self) -> None:
+        access_token = make_jwt(
+            {
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct_team",
+                    "chatgpt_plan_type": "team",
+                }
+            }
+        )
+        service = AccountService(MemoryStorage())
+
+        result = service.add_accounts([access_token], source_type="codex")
+
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(service.get_account(access_token)["type"], "Team")
+
+    def test_refresh_does_not_replace_token_team_plan_with_default_free_plan(self) -> None:
+        access_token = make_jwt(
+            {
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "acct_team",
+                    "chatgpt_plan_type": "business",
+                }
+            }
+        )
+        service = AccountService(MemoryStorage())
+        service.add_accounts([access_token], source_type="codex")
+
+        backend = mock.Mock()
+        backend.get_user_info.return_value = {
+            "type": "free",
+            "status": "正常",
+            "quota": 1,
+        }
+        with (
+            mock.patch.object(service, "refresh_access_token", return_value=access_token),
+            mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend),
+        ):
+            result = service.fetch_remote_info(access_token)
+
+        self.assertEqual(result["type"], "Team")
+        self.assertEqual(service.get_account(access_token)["type"], "Team")
+        backend.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

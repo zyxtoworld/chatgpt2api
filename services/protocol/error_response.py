@@ -5,6 +5,124 @@ from typing import Any
 from fastapi.responses import JSONResponse
 
 
+PUBLIC_SERVER_ERROR_MESSAGE = "The upstream request failed. Please try again later."
+
+_SAFE_IMPORT_JOB_ERROR_MESSAGES = frozenset(
+    {
+        "invalid request",
+        "invalid payload",
+        "missing access_token",
+        "unknown error",
+    }
+)
+_IMPORT_JOB_ERROR_FALLBACK = "import failed"
+
+
+def sanitize_import_job_errors(raw: object) -> list[dict[str, str]]:
+    """Project persisted import errors to bounded, provenance-free diagnostics."""
+    if not isinstance(raw, list):
+        return []
+
+    safe_errors: list[dict[str, str]] = []
+    for index, item in enumerate(raw[:100]):
+        if not isinstance(item, dict):
+            continue
+        value = item.get("error")
+        message = value if isinstance(value, str) else ""
+        if message in _SAFE_IMPORT_JOB_ERROR_MESSAGES:
+            safe_message = message
+        else:
+            prefix, separator, suffix = message.partition(" ")
+            if prefix == "HTTP" and separator and suffix.isdecimal():
+                status = int(suffix)
+                safe_message = f"HTTP {status}" if 100 <= status <= 599 else _IMPORT_JOB_ERROR_FALLBACK
+            else:
+                safe_message = _IMPORT_JOB_ERROR_FALLBACK
+        safe_errors.append({"name": f"item-{index + 1}", "error": safe_message})
+    return safe_errors
+
+
+class PublicSafeErrorMarker:
+    """Marker contract for domain errors allowed to expose a controlled message."""
+
+    def public_safe_message(self) -> str:
+        raise NotImplementedError
+
+
+class PublicSafeError(RuntimeError, PublicSafeErrorMarker):
+    """领域错误 whose message is explicitly safe for task/API diagnostics."""
+
+    def __init__(self, public_message: str) -> None:
+        message = str(public_message or "").strip()
+        if not message:
+            raise ValueError("public_message is required")
+        self._public_safe_message = message
+        super().__init__(message)
+
+    def public_safe_message(self) -> str:
+        return self._public_safe_message
+
+
+class PublicSafeValueError(ValueError, PublicSafeErrorMarker):
+    """A validation error whose message was explicitly approved for clients."""
+
+    def __init__(self, public_message: str) -> None:
+        message = str(public_message or "").strip()
+        if not message:
+            raise ValueError("public_message is required")
+        self._public_safe_message = message
+        super().__init__(message)
+
+    def public_safe_message(self) -> str:
+        return self._public_safe_message
+
+
+def project_public_responses_event(event: object, *, model: str) -> object:
+    """Project untrusted upstream Responses failures to a fixed public contract."""
+    if not isinstance(event, dict):
+        return event
+    event_type = event.get("type")
+    if event_type not in {"response.failed", "error"}:
+        return event
+
+    projected: dict[str, Any] = {"type": event_type}
+    sequence_number = event.get("sequence_number")
+    if type(sequence_number) is int and sequence_number >= 0:
+        projected["sequence_number"] = sequence_number
+
+    if event_type == "error":
+        projected.update(
+            {
+                "code": "server_error",
+                "message": PUBLIC_SERVER_ERROR_MESSAGE,
+                "param": None,
+            }
+        )
+        return projected
+
+    response = event.get("response")
+    response = response if isinstance(response, dict) else {}
+    created_at = response.get("created_at")
+    if type(created_at) is not int or created_at < 0:
+        created_at = 0
+    public_model = model if isinstance(model, str) and model.strip() else "auto"
+    projected["response"] = {
+        "id": "resp_failed",
+        "object": "response",
+        "created_at": created_at,
+        "status": "failed",
+        "error": {
+            "code": "upstream_error",
+            "message": PUBLIC_SERVER_ERROR_MESSAGE,
+        },
+        "incomplete_details": None,
+        "model": public_model,
+        "output": [],
+        "parallel_tool_calls": False,
+    }
+    return projected
+
+
 def _message_from_value(value: object) -> str:
     if isinstance(value, str):
         return value
@@ -34,6 +152,27 @@ def error_message_from_detail(detail: object) -> str:
         if message:
             return message
     return str(detail or "").strip()
+
+
+def public_exception_message(exc: BaseException, fallback: str) -> str:
+    """Return only an explicitly marked domain message; fail closed otherwise."""
+    safe_message = ""
+    if isinstance(exc, PublicSafeErrorMarker):
+        try:
+            safe_message = exc.public_safe_message()
+        except Exception:
+            safe_message = ""
+    if isinstance(safe_message, str) and safe_message.strip():
+        return safe_message.strip()
+    return str(fallback or "").strip() or PUBLIC_SERVER_ERROR_MESSAGE
+
+
+def exception_log_message(exc: BaseException) -> str:
+    """Return a diagnostic exception summary without its message/body."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return f"{exc.__class__.__name__} (status={status_code})"
+    return exc.__class__.__name__
 
 
 def _default_error_type(status_code: int) -> str:
@@ -68,6 +207,15 @@ def openai_error_payload(
     code: object | None = None,
     param: object | None = None,
 ) -> dict[str, Any]:
+    if status_code >= 500:
+        return {
+            "error": {
+                "message": PUBLIC_SERVER_ERROR_MESSAGE,
+                "type": error_type or _default_error_type(status_code),
+                "param": param,
+                "code": code if code is not None else _default_error_code(status_code),
+            }
+        }
     error_detail = detail.get("error") if isinstance(detail, dict) else None
     if isinstance(error_detail, dict):
         return {
@@ -117,7 +265,11 @@ def anthropic_error_response(
             "type": "error",
             "error": {
                 "type": error_type,
-                "message": error_message_from_detail(detail) or "request failed",
+                "message": (
+                    PUBLIC_SERVER_ERROR_MESSAGE
+                    if status_code >= 500
+                    else error_message_from_detail(detail) or "request failed"
+                ),
             },
         },
         headers=headers,

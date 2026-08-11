@@ -7,6 +7,7 @@ from services.storage.base import StorageBackend
 from services.storage.database_storage import DatabaseStorageBackend
 from services.storage.git_storage import GitStorageBackend
 from services.storage.json_storage import JSONStorageBackend
+from services.url_utils import redact_url_credentials
 
 
 def create_storage_backend(data_dir: Path) -> StorageBackend:
@@ -79,19 +80,8 @@ def create_storage_backend(data_dir: Path) -> StorageBackend:
 
 
 def _mask_password(url: str) -> str:
-    """隐藏数据库连接字符串中的密码"""
-    if "://" not in url:
-        return url
-    try:
-        protocol, rest = url.split("://", 1)
-        if "@" in rest:
-            credentials, host = rest.split("@", 1)
-            if ":" in credentials:
-                username, _ = credentials.split(":", 1)
-                return f"{protocol}://{username}:****@{host}"
-        return url
-    except Exception:
-        return url
+    """隐藏数据库连接字符串中的完整 userinfo。"""
+    return redact_url_credentials(url)
 
 
 def _mask_token(url: str) -> str:

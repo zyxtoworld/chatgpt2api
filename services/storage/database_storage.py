@@ -7,7 +7,12 @@ from sqlalchemy import Column, String, Text, create_engine, Integer, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-from services.storage.base import StorageBackend
+from services.storage.base import (
+    STORAGE_HEALTH_ERROR_MESSAGE,
+    StorageBackend,
+    StorageDataError,
+)
+from services.url_utils import redact_url_credentials
 
 Base = declarative_base()
 
@@ -43,21 +48,12 @@ class DatabaseStorageBackend(StorageBackend):
         Base.metadata.create_all(self.engine)
         self.Session = sessionmaker(bind=self.engine)
 
+    def _mutation_identity(self) -> str:
+        return f"database:{self.database_url}"
+
     def load_accounts(self) -> list[dict[str, Any]]:
         """从数据库加载账号数据"""
-        session = self.Session()
-        try:
-            accounts = []
-            for row in session.query(AccountModel).all():
-                try:
-                    account_data = json.loads(row.data)
-                    if isinstance(account_data, dict):
-                        accounts.append(account_data)
-                except json.JSONDecodeError:
-                    continue
-            return accounts
-        finally:
-            session.close()
+        return self._load_rows(AccountModel)
 
     def save_accounts(self, accounts: list[dict[str, Any]]) -> None:
         """保存账号数据到数据库"""
@@ -78,10 +74,11 @@ class DatabaseStorageBackend(StorageBackend):
             for row in session.query(model).all():
                 try:
                     item_data = json.loads(row.data)
-                    if isinstance(item_data, dict):
-                        items.append(item_data)
-                except json.JSONDecodeError:
-                    continue
+                except Exception as exc:
+                    raise StorageDataError() from exc
+                if not isinstance(item_data, dict):
+                    raise StorageDataError()
+                items.append(item_data)
             return items
         finally:
             session.close()
@@ -140,24 +137,23 @@ class DatabaseStorageBackend(StorageBackend):
         try:
             session = self.Session()
             try:
-                # 尝试执行简单查询
                 session.execute(text("SELECT 1"))
-                count = session.query(AccountModel).count()
-                auth_key_count = session.query(AuthKeyModel).count()
-                return {
-                    "status": "healthy",
-                    "backend": "database",
-                    "database_url": self._mask_password(self.database_url),
-                    "account_count": count,
-                    "auth_key_count": auth_key_count,
-                }
             finally:
                 session.close()
-        except Exception as e:
+            accounts = self.load_accounts()
+            auth_keys = self.load_auth_keys()
+            return {
+                "status": "healthy",
+                "backend": "database",
+                "database_url": self._mask_password(self.database_url),
+                "account_count": len(accounts),
+                "auth_key_count": len(auth_keys),
+            }
+        except Exception:
             return {
                 "status": "unhealthy",
                 "backend": "database",
-                "error": str(e),
+                "error": STORAGE_HEALTH_ERROR_MESSAGE,
             }
 
     def get_backend_info(self) -> dict[str, Any]:
@@ -179,16 +175,5 @@ class DatabaseStorageBackend(StorageBackend):
 
     @staticmethod
     def _mask_password(url: str) -> str:
-        """隐藏数据库连接字符串中的密码"""
-        if "://" not in url:
-            return url
-        try:
-            protocol, rest = url.split("://", 1)
-            if "@" in rest:
-                credentials, host = rest.split("@", 1)
-                if ":" in credentials:
-                    username, _ = credentials.split(":", 1)
-                    return f"{protocol}://{username}:****@{host}"
-            return url
-        except Exception:
-            return url
+        """隐藏数据库连接字符串中的完整 userinfo。"""
+        return redact_url_credentials(url)

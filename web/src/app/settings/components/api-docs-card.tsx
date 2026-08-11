@@ -29,7 +29,7 @@ const docs: ApiDoc[] = [
       ["Authorization", "header", "Bearer <auth-key>。"],
     ],
     output: [
-      ["data", "array", "模型列表，包含 id、object、created、owned_by。"],
+      ["data", "array", "模型列表；上游公布时包含 supported_reasoning_efforts。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/models \\
   -H "Authorization: Bearer ${key}"`,
@@ -41,8 +41,17 @@ const docs: ApiDoc[] = [
     icon: FileText,
     input: [
       ["model", "string", "模型名，例如 gpt-5-mini，也可用于图片兼容场景。"],
-      ["messages", "array", "OpenAI 兼容消息数组。"],
+      ["messages", "array", "支持文本、图片、developer 与 wav/mp3 input_audio；消息级 name 和未知字段会返回 400。"],
       ["stream", "boolean", "可选，是否流式返回。"],
+      ["stream_options", "object", "流式请求可用 include_usage 返回终态 usage chunk，并支持 include_obfuscation=false。"],
+      ["reasoning_effort / thinking_effort", "string", "按所选模型上游能力归一化；不支持的值回退到该模型最强档。"],
+      ["tools", "array", "支持官方嵌套 function 定义；工具结果续轮可仅提交历史 tool_calls / tool 消息。"],
+      ["tool_choice", "string", "固定 Codex 上游当前仅支持 auto；省略时同样使用 auto。"],
+      ["parallel_tool_calls", "boolean", "原生工具链原值透传；省略时默认 true。"],
+      ["web_search_options", "object", "可选，映射为 Codex 原生 web_search 工具。"],
+      ["response_format", "object", "支持 text 与可映射的 json_schema；无需同时声明工具。"],
+      ["verbosity", "string", "可选，low、medium 或 high，映射到 Codex Responses。"],
+      ["prompt_cache_key / service_tier", "string", "可选，传入时使用 Codex Responses 原生链路。"],
       ["n", "number", "可选，图片兼容场景会解析为生成数量。"],
     ],
     output: [
@@ -61,10 +70,20 @@ const docs: ApiDoc[] = [
     path: "/v1/responses",
     icon: FileText,
     input: [
-      ["model", "string", "模型名。"],
-      ["input", "string | array | object", "用户输入，图片生成会从中解析提示词。"],
-      ["tools", "array", "可选，Responses 工具定义。"],
+      ["model", "string", "Responses 编排模型；图片模型由 image_generation.model 指定，默认 gpt-image-2。"],
+      ["input", "string | array | object", "用户输入；EasyInputMessage 可省略 type，支持 user/assistant/system/developer，phase 仅用于 assistant；原生历史 item 严格校验。顶层多模态 part 会规范化为用户 message；input_file、file_id、caller、content part 缓存断点及未知/畸形 item/part 返回 400。"],
+      ["instructions", "string", "可选顶层指令；文本及 Codex 原生工具链会透传给上游，图片工具请求传入时返回 400。"],
+      ["context_management", "array", "Codex 文本/原生工具支持 compaction；compact_threshold 至少为 1000。"],
+      ["tools", "array", "支持扁平 function、web_search 和 image_generation；工具输出续轮无需重复定义 tools，函数/自定义工具输出支持字符串或固定 Codex 可表达的文本、图片、音频、加密内容数组。"],
+      ["web_search 控制", "object", "支持上下文大小、位置、最多 100 个无协议前缀的 allowed_domains、外网访问开关及 text/image 搜索类型。"],
+      ["include", "array", "支持返回 web_search_call.action.sources 与 web_search_call.results。"],
+      ["tool_choice", "string", "固定 Codex 上游当前仅支持 auto；其他值返回 400。"],
+      ["parallel_tool_calls", "boolean", "原生工具链原值透传；省略时默认 true。"],
+      ["reasoning", "object", "effort 按模型能力归一化；summary/context 单独传入即可触发 Codex 原生链。"],
+      ["text", "object", "支持 verbosity 与可映射的 json_schema；无需同时声明工具。"],
+      ["prompt_cache_key / service_tier", "string", "单独传入即可使用 Codex Responses 原生链。"],
       ["stream", "boolean", "可选，是否流式返回。"],
+      ["stream_options", "object", "支持 include_obfuscation=false；reasoning_summary_delivery=sequential_cutoff 走原生链。"],
     ],
     output: [
       ["id", "string", "响应 ID。"],
@@ -74,7 +93,7 @@ const docs: ApiDoc[] = [
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/responses \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
-  -d '{"model":"gpt-5-mini","input":"生成一张未来城市图片"}'`,
+  -d '{"model":"gpt-5-mini","input":"生成一张未来城市图片","tools":[{"type":"image_generation","model":"gpt-image-2"}]}'`,
   },
   {
     title: "搜索",
@@ -87,7 +106,6 @@ const docs: ApiDoc[] = [
     output: [
       ["answer", "string", "搜索后的回答内容，具体字段以返回结果为准。"],
       ["sources", "array", "可选，搜索引用来源。"],
-      ["_account_email", "string", "本次使用的账号邮箱。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/search \\
   -H "Content-Type: application/json" \\
@@ -102,15 +120,21 @@ const docs: ApiDoc[] = [
     input: [
       ["prompt", "string", "图片生成提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
-      ["n", "number", "可选，生成数量，当前限制 1-4。"],
-      ["size", "string", "可选，图片尺寸。"],
-      ["quality", "string", "可选，默认 auto。"],
+      ["n", "number", "可选，生成数量，官方范围 1-10。"],
+      ["size", "string", "可选，auto、标准尺寸或合法 WIDTHxHEIGHT；gpt-image-2 最大支持 3840x2160 边界。"],
+      ["quality", "string", "可选，auto（默认）、low、medium 或 high。"],
       ["response_format", "string", "可选，默认 b64_json。"],
+      ["output_format", "string", "可选，png（默认）、jpeg 或 webp。"],
+      ["output_compression", "number", "可选，jpeg/webp 压缩质量，范围 0-100。"],
+      ["stream", "boolean", "可选，返回 image_generation.completed 类型化 SSE，不发送 [DONE]。"],
+      ["partial_images", "number", "当前只接受省略或 0；上游没有真实局部位图能力。"],
+      ["background / moderation", "string", "当前上游只支持 auto；其他值明确返回 400。"],
     ],
     output: [
       ["data", "array", "图片结果列表。"],
       ["data[].b64_json", "string", "base64 图片内容。"],
       ["data[].url", "string", "部分配置下返回图片 URL。"],
+      ["image_generation.completed", "SSE event", "流式完成事件，包含 b64_json、输出元数据与 usage。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/generations \\
   -H "Content-Type: application/json" \\
@@ -123,17 +147,24 @@ const docs: ApiDoc[] = [
     path: "/v1/images/edits",
     icon: FileArchive,
     input: [
-      ["image", "file | file[] | URL", "参考图，支持 multipart 上传，也支持 JSON 图片链接。"],
+      ["image / images", "file | file[] | reference[]", "参考图，支持上传、data URL 或经 SSRF 校验的公开 HTTP(S) URL，最多 16 张。"],
+      ["mask", "file | reference", "可选单张遮罩；须与第一张输入图格式、尺寸一致并包含 alpha 通道。"],
       ["prompt", "string", "编辑提示词。"],
       ["model", "string", "可选，默认 gpt-image-2。"],
-      ["n", "number", "可选，生成数量，当前限制 1-4。"],
-      ["size", "string", "可选，图片尺寸。"],
-      ["quality", "string", "可选，默认 auto。"],
+      ["n", "number", "可选，生成数量，官方范围 1-10。"],
+      ["size", "string", "可选，auto、1024x1024、1536x1024 或 1024x1536。"],
+      ["quality", "string", "可选，auto（默认）、low、medium 或 high。"],
+      ["response_format", "string", "可选，b64_json（默认）或 url；流式请求只支持 b64_json。"],
+      ["output_format", "string", "可选，png（默认）、jpeg 或 webp。"],
+      ["output_compression", "number", "可选，jpeg/webp 压缩质量，范围 0-100。"],
+      ["stream", "boolean", "可选，返回 image_edit.completed 类型化 SSE，不发送 [DONE]。"],
+      ["input_fidelity", "string", "当前上游不支持，传入时明确返回 400。"],
     ],
     output: [
       ["data", "array", "编辑后的图片结果列表。"],
       ["data[].b64_json", "string", "base64 图片内容。"],
       ["data[].url", "string", "部分配置下返回图片 URL。"],
+      ["image_edit.completed", "SSE event", "流式完成事件，包含 b64_json、输出元数据与 usage。"],
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/edits \\
   -H "Authorization: Bearer ${key}" \\

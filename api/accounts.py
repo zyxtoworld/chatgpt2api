@@ -4,34 +4,85 @@ import asyncio
 import io
 import json
 import re
+import threading
 import uuid
 import zipfile
 from datetime import datetime
+from functools import partial
 from typing import Any, Literal
 
+import anyio
 from fastapi import APIRouter, Header, HTTPException
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from services.auth_service import auth_service
 
 from api.support import (
-    require_admin,
+    require_admin_async,
+    sanitize_ccload_server,
+    sanitize_ccload_servers,
     sanitize_cpa_pool,
     sanitize_cpa_pools,
     sanitize_sub2api_server,
     sanitize_sub2api_servers,
 )
 from services.account_service import account_service
+from services.ccload_service import (
+    ccload_config,
+    ccload_import_service,
+    list_remote_channels as ccload_list_remote_channels,
+)
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.oauth_login_service import OAuthLoginError, oauth_login_service
+from services.protocol.error_response import (
+    PUBLIC_SERVER_ERROR_MESSAGE,
+    PublicSafeValueError,
+    exception_log_message,
+    public_exception_message,
+)
 from services.sub2api_service import (
     list_remote_accounts as sub2api_list_remote_accounts,
     list_remote_groups as sub2api_list_remote_groups,
     sub2api_config,
     sub2api_import_service,
 )
+from services.task_executor import reserve_background_task
+
+
+_MANAGEMENT_THREAD_CAPACITY = 4
+_MANAGEMENT_THREAD_STATE = threading.local()
+
+
+def _management_thread_limiter() -> anyio.CapacityLimiter:
+    limiter = getattr(_MANAGEMENT_THREAD_STATE, "limiter", None)
+    if limiter is None:
+        limiter = anyio.CapacityLimiter(_MANAGEMENT_THREAD_CAPACITY)
+        _MANAGEMENT_THREAD_STATE.limiter = limiter
+    return limiter
+
+
+async def run_management_io(func, *args, **kwargs):
+    return await anyio.to_thread.run_sync(
+        partial(func, *args, **kwargs),
+        limiter=_management_thread_limiter(),
+    )
+
+
+def _schedule_management_task(task_factory) -> None:
+    reservation = reserve_background_task()
+
+    async def _run() -> None:
+        try:
+            await task_factory()
+        finally:
+            reservation.release()
+
+    try:
+        asyncio.create_task(_run())
+    except Exception:
+        reservation.release()
+        raise
 
 
 
@@ -109,6 +160,22 @@ class Sub2APIImportRequest(BaseModel):
     account_ids: list[str] = Field(default_factory=list)
 
 
+class CCLoadServerCreateRequest(BaseModel):
+    name: str = ""
+    base_url: str = ""
+    password: str = ""
+
+
+class CCLoadServerUpdateRequest(BaseModel):
+    name: str | None = None
+    base_url: str | None = None
+    password: str | None = None
+
+
+class CCLoadImportRequest(BaseModel):
+    channel_ids: list[str] = Field(default_factory=list)
+
+
 class OAuthLoginStartRequest(BaseModel):
     """起始 OAuth 桥。email_hint 可选，仅用于让 OpenAI 登录页预填邮箱。"""
     email_hint: str = ""
@@ -157,22 +224,74 @@ def _account_zip_bytes(items: list[dict[str, str]]) -> bytes:
     return buf.getvalue()
 
 
+def _build_account_export_file(
+    access_tokens: list[str],
+    export_format: Literal["json", "zip"],
+) -> tuple[bytes, str, str] | None:
+    items = account_service.build_export_items(access_tokens)
+    if not items:
+        return None
+    timestamp = _download_timestamp()
+    if export_format == "zip":
+        return (
+            _account_zip_bytes(items),
+            "application/zip",
+            f"codex-accounts-{timestamp}.zip",
+        )
+    payload: dict[str, str] | list[dict[str, str]] = items[0] if len(items) == 1 else items
+    return (
+        (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        "application/json",
+        f"codex-accounts-{timestamp}.json",
+    )
+
+
+def _create_accounts_and_refresh(
+    account_payloads: list[dict[str, Any]],
+    tokens: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if account_payloads:
+        result = account_service.add_account_items(account_payloads)
+        payload_token_set = set(_unique_tokens([_account_payload_token(item) for item in account_payloads]))
+        extra_tokens = [token for token in tokens if token not in payload_token_set]
+        if extra_tokens:
+            extra_result = account_service.add_accounts(extra_tokens)
+            result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
+            result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
+    else:
+        result = account_service.add_accounts(tokens)
+    return result, account_service.refresh_accounts(tokens)
+
+
 def create_router() -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/auth/users")
     async def list_user_keys(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"items": auth_service.list_keys(role="user")}
+        await require_admin_async(authorization)
+        return {"items": await run_management_io(auth_service.list_keys, role="user")}
 
     @router.post("/api/auth/users")
     async def create_user_key(body: UserKeyCreateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         try:
-            item, raw_key = auth_service.create_key(role="user", name=body.name)
+            item, raw_key = await run_management_io(
+                auth_service.create_key,
+                role="user",
+                name=body.name,
+            )
+        except PublicSafeValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "user key request failed")},
+            ) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-        return {"item": item, "key": raw_key, "items": auth_service.list_keys(role="user")}
+            raise HTTPException(status_code=400, detail={"error": "user key request failed"}) from exc
+        return {
+            "item": item,
+            "key": raw_key,
+            "items": await run_management_io(auth_service.list_keys, role="user"),
+        }
 
     @router.post("/api/auth/users/{key_id}")
     async def update_user_key(
@@ -180,7 +299,7 @@ def create_router() -> APIRouter:
             body: UserKeyUpdateRequest,
             authorization: str | None = Header(default=None),
     ):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         updates = {
             key: value
             for key, value in {
@@ -193,44 +312,46 @@ def create_router() -> APIRouter:
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
         try:
-            item = auth_service.update_key(key_id, updates, role="user")
+            item = await run_management_io(auth_service.update_key, key_id, updates, role="user")
+        except PublicSafeValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "user key request failed")},
+            ) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=400, detail={"error": "user key request failed"}) from exc
         if item is None:
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"item": item, "items": auth_service.list_keys(role="user")}
+        return {
+            "item": item,
+            "items": await run_management_io(auth_service.list_keys, role="user"),
+        }
 
     @router.delete("/api/auth/users/{key_id}")
     async def delete_user_key(key_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        if not auth_service.delete_key(key_id, role="user"):
+        await require_admin_async(authorization)
+        if not await run_management_io(auth_service.delete_key, key_id, role="user"):
             raise HTTPException(status_code=404, detail={"error": "这条用户密钥不存在，可能已经被删除"})
-        return {"items": auth_service.list_keys(role="user")}
+        return {"items": await run_management_io(auth_service.list_keys, role="user")}
 
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         return {"items": account_service.list_accounts()}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         account_payloads = [item for item in body.accounts if isinstance(item, dict)]
         payload_tokens = [_account_payload_token(item) for item in account_payloads]
         tokens = _unique_tokens([*body.tokens, *payload_tokens])
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        if account_payloads:
-            result = account_service.add_account_items(account_payloads)
-            payload_token_set = set(_unique_tokens(payload_tokens))
-            extra_tokens = [token for token in tokens if token not in payload_token_set]
-            if extra_tokens:
-                extra_result = account_service.add_accounts(extra_tokens)
-                result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
-                result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
-        else:
-            result = account_service.add_accounts(tokens)
-        refresh_result = account_service.refresh_accounts(tokens)
+        result, refresh_result = await run_management_io(
+            _create_accounts_and_refresh,
+            account_payloads,
+            tokens,
+        )
         return {
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
@@ -240,15 +361,15 @@ def create_router() -> APIRouter:
 
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return account_service.delete_accounts(tokens)
+        return await run_management_io(account_service.delete_accounts, tokens)
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
         if not access_tokens:
             access_tokens = account_service.list_tokens()
@@ -259,17 +380,17 @@ def create_router() -> APIRouter:
 
         async def _do_refresh():
             try:
-                await run_in_threadpool(account_service.refresh_accounts, access_tokens, progress_id, False)
+                await run_management_io(account_service.refresh_accounts, access_tokens, progress_id, False)
             except Exception as e:
-                account_service.finish_refresh_progress(progress_id, error=str(e))
+                account_service.finish_refresh_progress(progress_id, error=exception_log_message(e))
 
-        asyncio.create_task(_do_refresh())
+        _schedule_management_task(_do_refresh)
 
         return {"progress_id": progress_id}
 
     @router.get("/api/accounts/refresh/progress/{progress_id}")
     async def get_refresh_progress(progress_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         progress = account_service.get_refresh_progress(progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
@@ -278,7 +399,7 @@ def create_router() -> APIRouter:
     @router.post("/api/accounts/re-login")
     async def re_login_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
         """对选中账号执行密码重新登录流程（密码登录→验证码登录→刷新token）。"""
-        require_admin(authorization)
+        await require_admin_async(authorization)
         access_tokens = [str(token or "").strip() for token in body.access_tokens if str(token or "").strip()]
         if not access_tokens:
             raise HTTPException(status_code=400, detail={"error": "access_tokens is required"})
@@ -287,17 +408,17 @@ def create_router() -> APIRouter:
 
         async def _do_relogin():
             try:
-                await run_in_threadpool(account_service.re_login_accounts, access_tokens, progress_id)
+                await run_management_io(account_service.re_login_accounts, access_tokens, progress_id)
             except Exception as e:
-                account_service.finish_relogin_progress(progress_id, error=str(e))
+                account_service.finish_relogin_progress(progress_id, error=exception_log_message(e))
 
-        asyncio.create_task(_do_relogin())
+        _schedule_management_task(_do_relogin)
 
         return {"progress_id": progress_id}
 
     @router.get("/api/accounts/re-login/progress/{progress_id}")
     async def get_relogin_progress(progress_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         progress = account_service.get_relogin_progress(progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
@@ -305,41 +426,35 @@ def create_router() -> APIRouter:
 
     @router.post("/api/accounts/export")
     async def export_accounts(body: AccountExportRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         access_tokens = _unique_tokens(body.access_tokens)
-        items = account_service.build_export_items(access_tokens)
-        if not items:
+        export_file = await run_management_io(
+            _build_account_export_file,
+            access_tokens,
+            body.format,
+        )
+        if export_file is None:
             raise HTTPException(
                 status_code=400,
                 detail={"error": "没有可导出的完整账号，需要同时有 access_token、refresh_token 和 id_token"},
             )
-
-        timestamp = _download_timestamp()
-        if body.format == "zip":
-            content = _account_zip_bytes(items)
-            return Response(
-                content,
-                media_type="application/zip",
-                headers={"Content-Disposition": f'attachment; filename="codex-accounts-{timestamp}.zip"'},
-            )
-
-        payload: dict[str, str] | list[dict[str, str]] = items[0] if len(items) == 1 else items
+        content, media_type, filename = export_file
         return Response(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="codex-accounts-{timestamp}.json"'},
+            content,
+            media_type=media_type,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 
     @router.post("/api/accounts/update")
     async def update_account(body: AccountUpdateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         access_token = str(body.access_token or "").strip()
         if not access_token:
             raise HTTPException(status_code=400, detail={"error": "access_token is required"})
         updates = {key: value for key, value in {"type": body.type, "status": body.status, "quota": body.quota, "proxy": body.proxy}.items() if value is not None}
         if not updates:
             raise HTTPException(status_code=400, detail={"error": "还没有检测到改动，请修改后再保存"})
-        account = account_service.update_account(access_token, updates)
+        account = await run_management_io(account_service.update_account, access_token, updates)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
         return {"item": account, "items": account_service.list_accounts()}
@@ -350,11 +465,14 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         """登记一次 PKCE 会话，返回可让用户浏览器打开的 authorize URL。"""
-        require_admin(authorization)
+        await require_admin_async(authorization)
         try:
-            return await run_in_threadpool(oauth_login_service.start, body.email_hint)
+            return await run_management_io(oauth_login_service.start, body.email_hint)
         except OAuthLoginError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "OAuth 操作失败，请稍后重试")},
+            ) from exc
 
     @router.post("/api/accounts/oauth/finish")
     async def finish_oauth_login(
@@ -362,19 +480,22 @@ def create_router() -> APIRouter:
             authorization: str | None = Header(default=None),
     ):
         """收用户从浏览器抓回的 callback URL / code，换出 token 三件套并落盘。"""
-        require_admin(authorization)
-        # 入参日志：截断敏感字段，仅保留前几位，方便排错而不泄密
-        cb_preview = (body.callback or "")[:80]
-        sid_preview = (body.session_id or "")[:8]
+        await require_admin_async(authorization)
+        # callback 可能包含一次性 code/state，不把其内容写入日志。
         print(
-            f"[oauth-login] finish called: session_id={sid_preview}..., callback_preview={cb_preview!r}",
+            "[oauth-login] finish called: "
+            f"session_id_present={bool((body.session_id or '').strip())}, "
+            f"callback_present={bool((body.callback or '').strip())}",
             flush=True,
         )
         try:
-            tokens = await run_in_threadpool(oauth_login_service.finish, body.session_id, body.callback)
+            tokens = await run_management_io(oauth_login_service.finish, body.session_id, body.callback)
         except OAuthLoginError as exc:
-            print(f"[oauth-login] finish rejected: {exc}", flush=True)
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            print(f"[oauth-login] finish rejected: {exception_log_message(exc)}", flush=True)
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "OAuth 操作失败，请稍后重试")},
+            ) from exc
 
         payload = {
             "access_token": tokens["access_token"],
@@ -382,8 +503,8 @@ def create_router() -> APIRouter:
             "id_token": tokens["id_token"],
             "source_type": "oauth_login",
         }
-        add_result = await run_in_threadpool(account_service.add_account_items, [payload])
-        refresh_result = await run_in_threadpool(
+        add_result = await run_management_io(account_service.add_account_items, [payload])
+        refresh_result = await run_management_io(
             account_service.refresh_accounts, [tokens["access_token"]]
         )
         return {
@@ -395,77 +516,90 @@ def create_router() -> APIRouter:
 
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"pools": sanitize_cpa_pools(cpa_config.list_pools())}
+        await require_admin_async(authorization)
+        return {"pools": sanitize_cpa_pools(await run_management_io(cpa_config.list_pools))}
 
     @router.post("/api/cpa/pools")
     async def create_cpa_pool(body: CPAPoolCreateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         if not body.base_url.strip():
             raise HTTPException(status_code=400, detail={"error": "base_url is required"})
         if not body.secret_key.strip():
             raise HTTPException(status_code=400, detail={"error": "secret_key is required"})
-        pool = cpa_config.add_pool(name=body.name, base_url=body.base_url, secret_key=body.secret_key)
-        return {"pool": sanitize_cpa_pool(pool), "pools": sanitize_cpa_pools(cpa_config.list_pools())}
+        pool = await run_management_io(
+            cpa_config.add_pool,
+            name=body.name,
+            base_url=body.base_url,
+            secret_key=body.secret_key,
+        )
+        pools = await run_management_io(cpa_config.list_pools)
+        return {"pool": sanitize_cpa_pool(pool), "pools": sanitize_cpa_pools(pools)}
 
     @router.post("/api/cpa/pools/{pool_id}")
     async def update_cpa_pool(pool_id: str, body: CPAPoolUpdateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        pool = cpa_config.update_pool(pool_id, body.model_dump(exclude_none=True))
+        await require_admin_async(authorization)
+        pool = await run_management_io(cpa_config.update_pool, pool_id, body.model_dump(exclude_none=True))
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
-        return {"pool": sanitize_cpa_pool(pool), "pools": sanitize_cpa_pools(cpa_config.list_pools())}
+        pools = await run_management_io(cpa_config.list_pools)
+        return {"pool": sanitize_cpa_pool(pool), "pools": sanitize_cpa_pools(pools)}
 
     @router.delete("/api/cpa/pools/{pool_id}")
     async def delete_cpa_pool(pool_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        if not cpa_config.delete_pool(pool_id):
+        await require_admin_async(authorization)
+        if not await run_management_io(cpa_config.delete_pool, pool_id):
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
-        return {"pools": sanitize_cpa_pools(cpa_config.list_pools())}
+        return {"pools": sanitize_cpa_pools(await run_management_io(cpa_config.list_pools))}
 
     @router.get("/api/cpa/pools/{pool_id}/files")
     async def cpa_pool_files(pool_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        pool = cpa_config.get_pool(pool_id)
+        await require_admin_async(authorization)
+        pool = await run_management_io(cpa_config.get_pool, pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
-        return {"pool_id": pool_id, "files": await run_in_threadpool(list_remote_files, pool)}
+        return {"pool_id": pool_id, "files": await run_management_io(list_remote_files, pool)}
 
     @router.post("/api/cpa/pools/{pool_id}/import")
     async def cpa_pool_import(pool_id: str, body: CPAImportRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        pool = cpa_config.get_pool(pool_id)
+        await require_admin_async(authorization)
+        pool = await run_management_io(cpa_config.get_pool, pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
         try:
-            job = cpa_import_service.start_import(pool, body.names)
+            job = await run_management_io(cpa_import_service.start_import, pool, body.names)
+        except PublicSafeValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "CPA import request failed")},
+            ) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=400, detail={"error": "CPA import request failed"}) from exc
         return {"import_job": job}
 
     @router.get("/api/cpa/pools/{pool_id}/import")
     async def cpa_pool_import_progress(pool_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        pool = cpa_config.get_pool(pool_id)
+        await require_admin_async(authorization)
+        pool = await run_management_io(cpa_config.get_pool, pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
         return {"import_job": pool.get("import_job")}
 
     @router.get("/api/sub2api/servers")
     async def list_sub2api_servers(authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        return {"servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
+        await require_admin_async(authorization)
+        return {"servers": sanitize_sub2api_servers(await run_management_io(sub2api_config.list_servers))}
 
     @router.post("/api/sub2api/servers")
     async def create_sub2api_server(body: Sub2APIServerCreateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
+        await require_admin_async(authorization)
         if not body.base_url.strip():
             raise HTTPException(status_code=400, detail={"error": "base_url is required"})
         has_login = body.email.strip() and body.password.strip()
         has_api_key = bool(body.api_key.strip())
         if not has_login and not has_api_key:
             raise HTTPException(status_code=400, detail={"error": "email+password or api_key is required"})
-        server = sub2api_config.add_server(
+        server = await run_management_io(
+            sub2api_config.add_server,
             name=body.name,
             base_url=body.base_url,
             email=body.email,
@@ -473,63 +607,176 @@ def create_router() -> APIRouter:
             api_key=body.api_key,
             group_id=body.group_id,
         )
-        return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
+        servers = await run_management_io(sub2api_config.list_servers)
+        return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(servers)}
 
     @router.post("/api/sub2api/servers/{server_id}")
     async def update_sub2api_server(server_id: str, body: Sub2APIServerUpdateRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        server = sub2api_config.update_server(server_id, body.model_dump(exclude_none=True))
+        await require_admin_async(authorization)
+        server = await run_management_io(
+            sub2api_config.update_server,
+            server_id,
+            body.model_dump(exclude_none=True),
+        )
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
-        return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
+        servers = await run_management_io(sub2api_config.list_servers)
+        return {"server": sanitize_sub2api_server(server), "servers": sanitize_sub2api_servers(servers)}
 
     @router.delete("/api/sub2api/servers/{server_id}")
     async def delete_sub2api_server(server_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        if not sub2api_config.delete_server(server_id):
+        await require_admin_async(authorization)
+        if not await run_management_io(sub2api_config.delete_server, server_id):
             raise HTTPException(status_code=404, detail={"error": "server not found"})
-        return {"servers": sanitize_sub2api_servers(sub2api_config.list_servers())}
+        return {"servers": sanitize_sub2api_servers(await run_management_io(sub2api_config.list_servers))}
 
     @router.get("/api/sub2api/servers/{server_id}/groups")
     async def sub2api_server_groups(server_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        server = sub2api_config.get_server(server_id)
+        await require_admin_async(authorization)
+        server = await run_management_io(sub2api_config.get_server, server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         try:
-            groups = await run_in_threadpool(sub2api_list_remote_groups, server)
+            groups = await run_management_io(sub2api_list_remote_groups, server)
         except Exception as exc:
-            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=502, detail={"error": PUBLIC_SERVER_ERROR_MESSAGE}) from exc
         return {"server_id": server_id, "groups": groups}
 
     @router.get("/api/sub2api/servers/{server_id}/accounts")
     async def sub2api_server_accounts(server_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        server = sub2api_config.get_server(server_id)
+        await require_admin_async(authorization)
+        server = await run_management_io(sub2api_config.get_server, server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         try:
-            accounts = await run_in_threadpool(sub2api_list_remote_accounts, server)
+            accounts = await run_management_io(sub2api_list_remote_accounts, server)
         except Exception as exc:
-            raise HTTPException(status_code=502, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=502, detail={"error": PUBLIC_SERVER_ERROR_MESSAGE}) from exc
         return {"server_id": server_id, "accounts": accounts}
 
     @router.post("/api/sub2api/servers/{server_id}/import")
     async def sub2api_server_import(server_id: str, body: Sub2APIImportRequest, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        server = sub2api_config.get_server(server_id)
+        await require_admin_async(authorization)
+        server = await run_management_io(sub2api_config.get_server, server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         try:
-            job = sub2api_import_service.start_import(server, body.account_ids)
+            job = await run_management_io(sub2api_import_service.start_import, server, body.account_ids)
+        except PublicSafeValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "Sub2API import request failed")},
+            ) from exc
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+            raise HTTPException(status_code=400, detail={"error": "Sub2API import request failed"}) from exc
         return {"import_job": job}
 
     @router.get("/api/sub2api/servers/{server_id}/import")
     async def sub2api_server_import_progress(server_id: str, authorization: str | None = Header(default=None)):
-        require_admin(authorization)
-        server = sub2api_config.get_server(server_id)
+        await require_admin_async(authorization)
+        server = await run_management_io(sub2api_config.get_server, server_id)
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "server not found"})
+        return {"import_job": server.get("import_job")}
+
+    @router.get("/api/ccload/servers")
+    async def list_ccload_servers(authorization: str | None = Header(default=None)):
+        await require_admin_async(authorization)
+        return {"servers": sanitize_ccload_servers(await run_management_io(ccload_config.list_servers))}
+
+    @router.post("/api/ccload/servers")
+    async def create_ccload_server(
+        body: CCLoadServerCreateRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        await require_admin_async(authorization)
+        try:
+            server = await run_management_io(
+                ccload_config.add_server,
+                name=body.name,
+                base_url=body.base_url,
+                password=body.password,
+            )
+        except PublicSafeValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "ccLoad server request failed")},
+            ) from exc
+        return {
+            "server": sanitize_ccload_server(server),
+            "servers": sanitize_ccload_servers(await run_management_io(ccload_config.list_servers)),
+        }
+
+    @router.post("/api/ccload/servers/{server_id}")
+    async def update_ccload_server(
+        server_id: str,
+        body: CCLoadServerUpdateRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        await require_admin_async(authorization)
+        try:
+            server = await run_management_io(
+                ccload_config.update_server,
+                server_id,
+                body.model_dump(exclude_none=True),
+            )
+        except PublicSafeValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "ccLoad server request failed")},
+            ) from exc
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "server not found"})
+        return {
+            "server": sanitize_ccload_server(server),
+            "servers": sanitize_ccload_servers(await run_management_io(ccload_config.list_servers)),
+        }
+
+    @router.delete("/api/ccload/servers/{server_id}")
+    async def delete_ccload_server(server_id: str, authorization: str | None = Header(default=None)):
+        await require_admin_async(authorization)
+        if not await run_management_io(ccload_config.delete_server, server_id):
+            raise HTTPException(status_code=404, detail={"error": "server not found"})
+        return {"servers": sanitize_ccload_servers(await run_management_io(ccload_config.list_servers))}
+
+    @router.get("/api/ccload/servers/{server_id}/channels")
+    async def ccload_server_channels(server_id: str, authorization: str | None = Header(default=None)):
+        await require_admin_async(authorization)
+        server = await run_management_io(ccload_config.get_server, server_id)
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "server not found"})
+        try:
+            channels = await run_management_io(ccload_list_remote_channels, server)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail={"error": PUBLIC_SERVER_ERROR_MESSAGE}) from exc
+        return {"server_id": server_id, "channels": channels}
+
+    @router.post("/api/ccload/servers/{server_id}/import")
+    async def ccload_server_import(
+        server_id: str,
+        body: CCLoadImportRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        await require_admin_async(authorization)
+        server = await run_management_io(ccload_config.get_server, server_id)
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "server not found"})
+        try:
+            job = await run_management_io(ccload_import_service.start_import, server, body.channel_ids)
+        except PublicSafeValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": public_exception_message(exc, "ccLoad import request failed")},
+            ) from exc
+        return {"import_job": job}
+
+    @router.get("/api/ccload/servers/{server_id}/import")
+    async def ccload_server_import_progress(
+        server_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        await require_admin_async(authorization)
+        server = await run_management_io(ccload_config.get_server, server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         return {"import_job": server.get("import_job")}

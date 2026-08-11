@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
+from threading import RLock
 import time
+from urllib.parse import urlsplit
 
-from services.storage.base import StorageBackend
+from services.storage.base import StorageBackend, StorageConflictError, StorageDataError
+from services.secure_file import authorized_root, delete_checked_file, open_checked_file, resolve_under_root
+from services.protocol.error_response import PublicSafeValueError
+from services.url_utils import redact_url_credentials as _redact_url_credentials
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
@@ -20,6 +27,7 @@ DEFAULT_BACKUP_INCLUDE = {
     "config": True,
     "cpa": True,
     "sub2api": True,
+    "ccload": True,
     "logs": True,
     "image_tasks": True,
     "accounts_snapshot": True,
@@ -82,6 +90,91 @@ DEFAULT_THIRD_PARTY_APPS = {
     },
 }
 
+_PUBLIC_CONFIG_RAW_KEYS = frozenset({"proxy", "base_url", "image_timeout_retry_secs"})
+
+PUBLIC_SECRET_MASK = "********"
+BACKUP_STATE_ERROR_FALLBACK = "备份执行失败，请稍后重试"
+_BACKUP_STATE_FIXED_MESSAGES = {
+    "backup_failed": BACKUP_STATE_ERROR_FALLBACK,
+    "r2_config_incomplete": "R2 配置不完整",
+    "backup_encrypt_unavailable": "当前环境缺少 openssl，无法执行加密备份",
+    "backup_encrypt_failed": "加密备份失败：openssl 执行失败",
+    "backup_decrypt_unavailable": "当前环境缺少 openssl，无法解密备份内容",
+    "backup_decrypt_failed": "解密备份失败：openssl 执行失败",
+    "backup_key_required": "备份对象 key 不能为空",
+    "backup_download_passphrase_missing": "当前未配置加密口令，无法下载并解密已加密备份",
+    "backup_detail_passphrase_missing": "当前未配置加密口令，无法查看已加密备份",
+    "backup_busy": "当前已有备份任务正在执行",
+    "backup_encrypt_passphrase_missing": "已启用备份加密，但未设置加密口令",
+    "backup_archive_invalid": "解析备份压缩包失败，备份可能已损坏",
+}
+_BACKUP_STATE_STATUS_MESSAGES = {
+    "r2_connection_failed": "连接 R2 失败：HTTP {}",
+    "r2_upload_failed": "上传备份失败：HTTP {}",
+    "r2_delete_failed": "删除备份失败：HTTP {}",
+    "r2_read_failed": "读取备份失败：HTTP {}",
+    "r2_list_failed": "获取备份列表失败：HTTP {}",
+}
+
+
+def parse_public_url(value: object) -> str:
+    """Return a safe absolute HTTP(S) base URL, or empty on invalid input."""
+    text = str(value or "").strip().rstrip("/")
+    if not text or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in text):
+        return ""
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            return ""
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            return ""
+        if parsed.query or parsed.fragment:
+            return ""
+        _ = parsed.port
+        authority = parsed.netloc
+        if authority.endswith(":"):
+            return ""
+        if authority.startswith("["):
+            if authority.count("[") != 1 or authority.count("]") != 1:
+                return ""
+            closing = authority.find("]")
+            suffix = authority[closing + 1:]
+            if suffix and (not suffix.startswith(":") or suffix == ":"):
+                return ""
+        elif authority.count(":") > 1:
+            return ""
+        if not parsed.hostname:
+            return ""
+    except (TypeError, ValueError):
+        return ""
+    return text
+
+
+def _restore_redacted_url(value: object, existing: object) -> object:
+    candidate = str(value or "").strip()
+    previous = str(existing or "").strip()
+    redacted_previous = _redact_url_credentials(previous)
+    if previous and redacted_previous and candidate == redacted_previous:
+        return existing
+    return value
+
+
+def _public_secret(value: object) -> str:
+    return PUBLIC_SECRET_MASK if str(value or "").strip() else ""
+
+
+def _restore_masked_fields(
+    value: object,
+    existing: object,
+    fields: set[str],
+) -> dict[str, object]:
+    incoming = dict(value) if isinstance(value, dict) else {}
+    previous = existing if isinstance(existing, dict) else {}
+    for field in fields:
+        if str(incoming.get(field) or "").strip() == PUBLIC_SECRET_MASK and previous.get(field):
+            incoming[field] = previous[field]
+    return incoming
+
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
     if isinstance(value, str):
@@ -132,11 +225,29 @@ def _normalize_backup_settings(value: object) -> dict[str, object]:
 
 def _normalize_backup_state(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
+    raw_error = str(source.get("last_error") or "").strip()
+    error_code = str(source.get("last_error_code") or "").strip()
+    raw_status = source.get("last_error_status")
+    status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) and 400 <= raw_status <= 599 else None
+    invalid_status = raw_status is not None and status is None
+    last_error = None
+    if invalid_status:
+        last_error = BACKUP_STATE_ERROR_FALLBACK
+    elif error_code in _BACKUP_STATE_STATUS_MESSAGES:
+        last_error = (
+            _BACKUP_STATE_STATUS_MESSAGES[error_code].format(status)
+            if status is not None
+            else BACKUP_STATE_ERROR_FALLBACK
+        )
+    elif error_code in _BACKUP_STATE_FIXED_MESSAGES:
+        last_error = _BACKUP_STATE_FIXED_MESSAGES[error_code]
+    elif raw_error or error_code or raw_status is not None or source.get("_last_error_public") is True:
+        last_error = BACKUP_STATE_ERROR_FALLBACK
     return {
         "last_started_at": str(source.get("last_started_at") or "").strip() or None,
         "last_finished_at": str(source.get("last_finished_at") or "").strip() or None,
         "last_status": str(source.get("last_status") or "idle").strip() or "idle",
-        "last_error": str(source.get("last_error") or "").strip() or None,
+        "last_error": last_error,
         "last_object_key": str(source.get("last_object_key") or "").strip() or None,
     }
 
@@ -157,7 +268,7 @@ def _normalize_image_storage_settings(value: object) -> dict[str, object]:
         "webdav_username": str(source.get("webdav_username") or "").strip(),
         "webdav_password": str(source.get("webdav_password") or "").strip(),
         "webdav_root_path": root_path or str(DEFAULT_IMAGE_STORAGE["webdav_root_path"]),
-        "public_base_url": str(source.get("public_base_url") or "").strip().rstrip("/"),
+        "public_base_url": parse_public_url(source.get("public_base_url")),
     }
 
 
@@ -279,10 +390,15 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
 def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
     source = value if isinstance(value, dict) else {}
     canvas_source = source.get("infinite_canvas") if isinstance(source.get("infinite_canvas"), dict) else {}
+    raw_url = canvas_source.get("url")
+    url = parse_public_url(
+        raw_url if raw_url is not None else DEFAULT_THIRD_PARTY_APPS["infinite_canvas"]["url"]
+    )
+    enabled = _normalize_bool(canvas_source.get("enabled"), False) and bool(url)
     return {
         "infinite_canvas": {
-            "enabled": _normalize_bool(canvas_source.get("enabled"), False),
-            "url": str(canvas_source.get("url") or DEFAULT_THIRD_PARTY_APPS["infinite_canvas"]["url"]).strip(),
+            "enabled": enabled,
+            "url": url,
         },
     }
 
@@ -291,9 +407,9 @@ def _validate_image_storage_settings(settings: dict[str, object]) -> None:
     if not _normalize_bool(settings.get("enabled"), False):
         return
     if not str(settings.get("webdav_url") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
+        raise PublicSafeValueError("启用 WebDAV 图片存储后必须填写 WebDAV URL")
     if not str(settings.get("webdav_password") or "").strip():
-        raise ValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
+        raise PublicSafeValueError("启用 WebDAV 图片存储后必须填写 WebDAV 密码")
 
 
 @dataclass(frozen=True)
@@ -310,10 +426,17 @@ def _is_invalid_auth_key(value: object) -> bool:
     return _normalize_auth_key(value) == ""
 
 
-def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
+def _read_json_object(
+    path: Path,
+    *,
+    name: str,
+    fail_closed: bool = False,
+) -> dict[str, object]:
     if not path.exists():
         return {}
     if path.is_dir():
+        if fail_closed:
+            raise StorageDataError()
         print(
             f"Warning: {name} at '{path}' is a directory, ignoring it and falling back to other configuration sources.",
             file=sys.stderr,
@@ -321,9 +444,25 @@ def _read_json_object(path: Path, *, name: str) -> dict[str, object]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        if fail_closed:
+            raise StorageDataError() from exc
         return {}
-    return data if isinstance(data, dict) else {}
+    if isinstance(data, dict):
+        return data
+    if fail_closed:
+        raise StorageDataError()
+    return {}
+
+
+def _config_file_revision(path: Path) -> str | None:
+    try:
+        payload = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        raise StorageDataError() from exc
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _load_settings() -> LoadedSettings:
@@ -350,6 +489,8 @@ def _load_settings() -> LoadedSettings:
 class ConfigStore:
     def __init__(self, path: Path):
         self.path = path
+        self._lock = RLock()
+        self._snapshot_revision: str | None = None
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.data = self._load()
         self._storage_backend: StorageBackend | None = None
@@ -364,10 +505,30 @@ class ConfigStore:
             )
 
     def _load(self) -> dict[str, object]:
-        return _read_json_object(self.path, name="config.json")
+        data = _read_json_object(self.path, name="config.json", fail_closed=True)
+        self._snapshot_revision = _config_file_revision(self.path)
+        return data
 
-    def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    def _save(self, data: dict[str, object] | None = None) -> None:
+        _read_json_object(self.path, name="config.json", fail_closed=True)
+        current_revision = _config_file_revision(self.path)
+        if current_revision != self._snapshot_revision:
+            raise StorageConflictError()
+        payload = (
+            json.dumps(self.data if data is None else data, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tmp_path.write_bytes(payload)
+            tmp_path.replace(self.path)
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+        self._snapshot_revision = hashlib.sha256(payload).hexdigest()
 
     @property
     def auth_key(self) -> str:
@@ -467,6 +628,13 @@ class ConfigStore:
             return 2.0
 
     @property
+    def image_timeout_retry_secs(self) -> int:
+        try:
+            return max(1, int(self.data.get("image_timeout_retry_secs", 30)))
+        except (TypeError, ValueError):
+            return 30
+
+    @property
     def auto_remove_invalid_accounts(self) -> bool:
         value = self.data.get("auto_remove_invalid_accounts", False)
         if isinstance(value, str):
@@ -533,15 +701,31 @@ class ConfigStore:
     def cleanup_old_images(self) -> int:
         cutoff = time.time() - self.image_retention_days * 86400
         removed = 0
-        for path in self.images_dir.rglob("*"):
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        for path in sorted((p for p in self.images_dir.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+        try:
+            root = authorized_root(self.images_dir)
+        except OSError:
+            return 0
+        for candidate in root.rglob("*"):
             try:
-                path.rmdir()
+                rel = candidate.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            try:
+                path = resolve_under_root(root, rel)
+                opened = open_checked_file(path, root, root)
             except OSError:
-                pass
+                continue
+            try:
+                old = opened.stat_result.st_mtime < cutoff
+            finally:
+                opened.file.close()
+            if not old:
+                continue
+            try:
+                if delete_checked_file(path, root):
+                    removed += 1
+            except OSError:
+                continue
         return removed
 
     @property
@@ -561,13 +745,18 @@ class ConfigStore:
         return value or "0.0.0"
 
     def get(self) -> dict[str, object]:
-        data = dict(self.data)
+        data = {
+            key: copy.deepcopy(self.data[key])
+            for key in _PUBLIC_CONFIG_RAW_KEYS
+            if key in self.data
+        }
         data["refresh_account_interval_minute"] = self.refresh_account_interval_minute
         data["image_retention_days"] = self.image_retention_days
         data["image_poll_timeout_secs"] = self.image_poll_timeout_secs
         data["image_poll_interval_secs"] = self.image_poll_interval_secs
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
+        data["image_timeout_retry_secs"] = self.image_timeout_retry_secs
         data["image_parallel_generation"] = self.image_parallel_generation
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["image_remove_conversation_always"] = self.image_remove_conversation_always
@@ -576,14 +765,29 @@ class ConfigStore:
         data["auto_relogin_after_refresh"] = self.auto_relogin_after_refresh
         data["log_levels"] = self.log_levels
         data["sensitive_words"] = self.sensitive_words
-        data["ai_review"] = self.ai_review
+        ai_review = copy.deepcopy(self.ai_review)
+        if isinstance(ai_review, dict):
+            ai_review["api_key"] = _public_secret(ai_review.get("api_key"))
+            if "base_url" in ai_review:
+                ai_review["base_url"] = _redact_url_credentials(ai_review.get("base_url"))
+        data["ai_review"] = ai_review
         data["global_system_prompt"] = self.global_system_prompt
         data["default_upstream_model_name"] = self.default_upstream_model_name
         data["default_thinking_effort"] = self.default_thinking_effort
-        data["backup"] = self.get_backup_settings()
-        data["image_storage"] = self.get_image_storage_settings()
+        backup = self.get_backup_settings()
+        backup["secret_access_key"] = _public_secret(backup.get("secret_access_key"))
+        backup["passphrase"] = _public_secret(backup.get("passphrase"))
+        data["backup"] = backup
+        image_storage = self.get_image_storage_settings()
+        image_storage["webdav_password"] = _public_secret(image_storage.get("webdav_password"))
+        image_storage["webdav_url"] = _redact_url_credentials(image_storage.get("webdav_url"))
+        data["image_storage"] = image_storage
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
+        if "proxy" in data:
+            data["proxy"] = _redact_url_credentials(data.get("proxy"))
+        if "base_url" in data:
+            data["base_url"] = _redact_url_credentials(data.get("base_url"))
         data["third_party_apps"] = self.get_third_party_apps_settings()
         data.pop("auth-key", None)
         return data
@@ -596,6 +800,8 @@ class ConfigStore:
 
     def get_public_proxy_runtime_settings(self) -> dict[str, object]:
         runtime = copy.deepcopy(self.get_proxy_runtime_settings())
+        for field in ("proxy_url", "resource_proxy_url"):
+            runtime[field] = _redact_url_credentials(runtime.get(field))
         clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
         if isinstance(clearance, dict):
             cf_cookies = str(clearance.get("cf_cookies") or "").strip()
@@ -604,18 +810,47 @@ class ConfigStore:
             clearance["cf_clearance"] = ""
             clearance["has_cf_cookies"] = bool(cf_cookies)
             clearance["has_cf_clearance"] = bool(cf_clearance)
+            clearance["flaresolverr_url"] = _redact_url_credentials(clearance.get("flaresolverr_url"))
         return runtime
 
     def get_third_party_apps_settings(self) -> dict[str, object]:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
 
     def update(self, data: dict[str, object]) -> dict[str, object]:
-        next_data = dict(self.data)
+        with self._lock:
+            return self._update_locked(data)
+
+    def _update_locked(self, data: dict[str, object]) -> dict[str, object]:
+        next_data = copy.deepcopy(self.data)
         next_data.update(dict(data or {}))
+        next_data["proxy"] = _restore_redacted_url(next_data.get("proxy"), self.data.get("proxy"))
+        next_data["base_url"] = _restore_redacted_url(next_data.get("base_url"), self.data.get("base_url"))
+        if "ai_review" in next_data:
+            next_data["ai_review"] = _restore_masked_fields(
+                next_data.get("ai_review"),
+                self.data.get("ai_review"),
+                {"api_key"},
+            )
+            if isinstance(next_data["ai_review"], dict):
+                next_data["ai_review"]["base_url"] = _restore_redacted_url(
+                    next_data["ai_review"].get("base_url"),
+                    (self.data.get("ai_review") or {}).get("base_url") if isinstance(self.data.get("ai_review"), dict) else "",
+                )
         if "backup" in next_data:
-            next_data["backup"] = _normalize_backup_settings(next_data.get("backup"))
+            next_data["backup"] = _normalize_backup_settings(
+                _restore_masked_fields(next_data.get("backup"), self.data.get("backup"), {"secret_access_key", "passphrase"})
+            )
         if "image_storage" in next_data:
-            next_data["image_storage"] = _normalize_image_storage_settings(next_data.get("image_storage"))
+            image_storage = _restore_masked_fields(
+                next_data.get("image_storage"),
+                self.data.get("image_storage"),
+                {"webdav_password"},
+            )
+            image_storage["webdav_url"] = _restore_redacted_url(
+                image_storage.get("webdav_url"),
+                (self.data.get("image_storage") or {}).get("webdav_url") if isinstance(self.data.get("image_storage"), dict) else "",
+            )
+            next_data["image_storage"] = _normalize_image_storage_settings(image_storage)
             _validate_image_storage_settings(next_data["image_storage"])
         if "chat_completion_cache" in next_data:
             next_data["chat_completion_cache"] = _normalize_chat_completion_cache_settings(
@@ -626,15 +861,29 @@ class ConfigStore:
         if "proxy_runtime" in next_data:
             incoming_runtime = next_data.get("proxy_runtime")
             if isinstance(incoming_runtime, dict):
+                previous_runtime = self.get_proxy_runtime_settings()
+                incoming_runtime = dict(incoming_runtime)
+                for field in ("proxy_url", "resource_proxy_url"):
+                    incoming_runtime[field] = _restore_redacted_url(
+                        incoming_runtime.get(field),
+                        previous_runtime.get(field),
+                    )
                 previous_clearance = self.get_proxy_runtime_settings().get("clearance")
                 if isinstance(previous_clearance, dict):
-                    incoming_runtime = dict(incoming_runtime)
                     incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
+                    incoming_clearance = incoming_runtime.get("clearance")
+                    if isinstance(incoming_clearance, dict):
+                        incoming_clearance = dict(incoming_clearance)
+                        incoming_clearance["flaresolverr_url"] = _restore_redacted_url(
+                            incoming_clearance.get("flaresolverr_url"),
+                            previous_clearance.get("flaresolverr_url"),
+                        )
+                        incoming_runtime["clearance"] = incoming_clearance
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
         next_data.pop("backup_state", None)
+        self._save(next_data)
         self.data = next_data
-        self._save()
         return self.get()
 
     def get_backup_settings(self) -> dict[str, object]:
@@ -660,7 +909,43 @@ def load_backup_state() -> dict[str, object]:
 
 def save_backup_state(state: dict[str, object]) -> dict[str, object]:
     normalized = _normalize_backup_state(state)
-    BACKUP_STATE_FILE.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    persisted = {key: value for key, value in normalized.items() if key != "last_error"}
+    raw_code = str(state.get("last_error_code") or "").strip()
+    raw_error = str(state.get("last_error") or "").strip()
+    raw_status = state.get("last_error_status")
+    status = raw_status if isinstance(raw_status, int) and not isinstance(raw_status, bool) and 400 <= raw_status <= 599 else None
+    if raw_code or raw_error or raw_status is not None:
+        code = raw_code if raw_code in (_BACKUP_STATE_FIXED_MESSAGES | _BACKUP_STATE_STATUS_MESSAGES) else "backup_failed"
+        if (raw_status is not None and status is None) or (code in _BACKUP_STATE_STATUS_MESSAGES and status is None):
+            code = "backup_failed"
+            status = None
+        persisted["last_error_code"] = code
+        if status is not None and code in _BACKUP_STATE_STATUS_MESSAGES:
+            persisted["last_error_status"] = status
+    BACKUP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=BACKUP_STATE_FILE.parent,
+            prefix=f".{BACKUP_STATE_FILE.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            json.dump(persisted, temp_file, ensure_ascii=False, indent=2)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, BACKUP_STATE_FILE)
+    except Exception:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
     return normalized
 
 
