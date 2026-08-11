@@ -26,6 +26,27 @@ def _png_bytes(color: tuple[int, int, int]) -> bytes:
 
 
 class ImageFileBoundaryTests(unittest.TestCase):
+    def test_posix_atomic_write_calls_replace_when_supports_dir_fd_omits_it(self) -> None:
+        replace = mock.Mock()
+
+        with (
+            mock.patch.object(secure_file.os, "supports_dir_fd", set()),
+            mock.patch.object(secure_file.os, "O_NOFOLLOW", 0, create=True),
+            mock.patch.object(secure_file, "_open_posix_directory", return_value=41),
+            mock.patch.object(secure_file.os, "open", return_value=42),
+            mock.patch.object(secure_file.os, "write", side_effect=lambda _fd, payload: len(payload)),
+            mock.patch.object(secure_file.os, "fsync"),
+            mock.patch.object(secure_file.os, "close"),
+            mock.patch.object(secure_file.os, "replace", replace),
+            mock.patch.object(secure_file.os, "unlink", side_effect=FileNotFoundError),
+        ):
+            secure_file._atomic_write_posix(Path("/root/image_index.json"), Path("/root"), b"payload")
+
+        replace.assert_called_once()
+        self.assertEqual(replace.call_args.args[1], "image_index.json")
+        self.assertEqual(replace.call_args.kwargs["src_dir_fd"], 41)
+        self.assertEqual(replace.call_args.kwargs["dst_dir_fd"], 41)
+
     def _replace_directory_with_link(self, directory: Path, foreign_directory: Path) -> None:
         shutil.rmtree(directory)
         if os.name == "nt":

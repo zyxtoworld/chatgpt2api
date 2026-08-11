@@ -447,8 +447,6 @@ def ensure_directory(root: Path, directory: Path) -> None:
 
 
 def _atomic_write_posix(path: Path, root: Path, payload: bytes) -> None:
-    if os.replace not in os.supports_dir_fd:
-        raise OSError("safe relative replace is unavailable")
     parts = _relative_file_parts(path, root)
     parent_fd = _open_posix_directory(root, parts[:-1])
     temp_name = f".{parts[-1]}.{secrets.token_hex(12)}.tmp"
