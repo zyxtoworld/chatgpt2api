@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -515,15 +516,58 @@ class ConfigStore:
         current_revision = _config_file_revision(self.path)
         if current_revision != self._snapshot_revision:
             raise StorageConflictError()
+        original_stat = self.path.stat() if current_revision is not None else None
+        target_mode = stat.S_IMODE(original_stat.st_mode) if original_stat is not None else stat.S_IRUSR | stat.S_IWUSR
         payload = (
             json.dumps(self.data if data is None else data, ensure_ascii=False, indent=2) + "\n"
         ).encode("utf-8")
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp_fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=self.path.parent,
+        )
+        tmp_path = Path(temp_name)
         try:
-            tmp_path.write_bytes(payload)
+            view = memoryview(payload)
+            while view:
+                written = os.write(temp_fd, view)
+                if written <= 0:
+                    raise OSError("config write made no progress")
+                view = view[written:]
+
+            fchmod = getattr(os, "fchmod", None)
+            if fchmod is not None:
+                fchmod(temp_fd, target_mode)
+            else:
+                os.chmod(tmp_path, target_mode)
+
+            if original_stat is not None:
+                fchown = getattr(os, "fchown", None)
+            else:
+                fchown = None
+            if fchown is not None:
+                effective_uid = getattr(os, "geteuid", lambda: None)()
+                effective_gid = getattr(os, "getegid", lambda: None)()
+                if (effective_uid, effective_gid) != (original_stat.st_uid, original_stat.st_gid):
+                    fchown(temp_fd, original_stat.st_uid, original_stat.st_gid)
+            elif original_stat is not None:
+                chown = getattr(os, "chown", None)
+                if chown is not None:
+                    effective_uid = getattr(os, "geteuid", lambda: None)()
+                    effective_gid = getattr(os, "getegid", lambda: None)()
+                    if (effective_uid, effective_gid) != (original_stat.st_uid, original_stat.st_gid):
+                        chown(tmp_path, original_stat.st_uid, original_stat.st_gid)
+            os.fsync(temp_fd)
+            os.close(temp_fd)
+            temp_fd = -1
             tmp_path.replace(self.path)
         except Exception:
+            if temp_fd >= 0:
+                try:
+                    os.close(temp_fd)
+                except OSError:
+                    pass
             try:
                 tmp_path.unlink()
             except OSError:
