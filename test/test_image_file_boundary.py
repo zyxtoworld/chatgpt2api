@@ -47,6 +47,33 @@ class ImageFileBoundaryTests(unittest.TestCase):
         self.assertEqual(replace.call_args.kwargs["src_dir_fd"], 41)
         self.assertEqual(replace.call_args.kwargs["dst_dir_fd"], 41)
 
+    def test_posix_atomic_write_replace_failure_preserves_target_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "image_index.json"
+            original = b'{"items": {}}\n'
+            target.write_bytes(original)
+            replace = mock.Mock(side_effect=OSError("replace failed"))
+
+            with (
+                mock.patch.object(secure_file.os, "O_NOFOLLOW", 0, create=True),
+                mock.patch.object(secure_file, "_open_posix_directory", return_value=41),
+                mock.patch.object(secure_file.os, "open", return_value=42),
+                mock.patch.object(secure_file.os, "write", side_effect=lambda _fd, payload: len(payload)),
+                mock.patch.object(secure_file.os, "fsync"),
+                mock.patch.object(secure_file.os, "close"),
+                mock.patch.object(secure_file.os, "replace", replace),
+                mock.patch.object(secure_file.os, "unlink", side_effect=FileNotFoundError) as unlink,
+            ):
+                with self.assertRaises(OSError):
+                    secure_file._atomic_write_posix(target, root, b'{"items": {"new": true}}\n')
+
+            self.assertEqual(target.read_bytes(), original)
+            self.assertFalse(list(root.glob(f".{target.name}.*.tmp")))
+            replace.assert_called_once()
+            unlink.assert_called_once()
+            self.assertRegex(unlink.call_args.args[0], rf"\.{target.name}\.[0-9a-f]+\.tmp")
+
     def _replace_directory_with_link(self, directory: Path, foreign_directory: Path) -> None:
         shutil.rmtree(directory)
         if os.name == "nt":
