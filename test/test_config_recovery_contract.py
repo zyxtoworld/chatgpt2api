@@ -12,8 +12,9 @@ from pathlib import Path
 from unittest import mock
 
 import services.config as config_module
+import services.secure_file as secure_file
 from services.config import ConfigStore
-from services.storage.base import StorageDataError
+from services.storage.base import StorageConflictError, StorageDataError
 
 
 class ConfigRecoveryContractTests(unittest.TestCase):
@@ -105,7 +106,16 @@ class ConfigRecoveryContractTests(unittest.TestCase):
                 store = ConfigStore(path)
                 original = path.read_bytes()
 
-                with mock.patch.object(Path, "replace", side_effect=OSError("replace failed")):
+                failure_patch = (
+                    mock.patch.object(secure_file.os, "replace", side_effect=OSError("replace failed"))
+                    if os.name == "posix"
+                    else mock.patch.object(
+                        secure_file,
+                        "_atomic_write_windows",
+                        side_effect=OSError("replace failed"),
+                    )
+                )
+                with failure_patch:
                     with self.assertRaises(OSError):
                         store.update({"proxy": "http://proxy.example"})
 
@@ -113,87 +123,78 @@ class ConfigRecoveryContractTests(unittest.TestCase):
             self.assertFalse(list(path.parent.glob(f".{path.name}.*.tmp")))
             self.assertNotIn("proxy", store.data)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX directory fsync")
+    def test_config_save_fsyncs_parent_directory_after_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({"auth-key": "file-auth"}), encoding="utf-8")
+            events: list[tuple[str, str | None]] = []
+            original_fsync = os.fsync
+            original_replace = os.replace
+
+            def record_fsync(fd: int) -> None:
+                kind = "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+                events.append(("fsync", kind))
+                original_fsync(fd)
+
+            def record_replace(source: str, target: str, *args, **kwargs) -> None:
+                events.append(("replace", None))
+                return original_replace(source, target, *args, **kwargs)
+
+            with (
+                mock.patch.object(secure_file.os, "fsync", side_effect=record_fsync),
+                mock.patch.object(secure_file.os, "replace", side_effect=record_replace),
+                mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "env-auth"}, clear=False),
+            ):
+                ConfigStore(path).update({"proxy": "http://proxy.example"})
+
+            replace_index = events.index(("replace", None))
+            self.assertTrue(
+                any(index > replace_index and event == ("fsync", "directory") for index, event in enumerate(events))
+            )
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX directory fsync")
+    def test_config_parent_fsync_failure_is_reported_and_enters_conflict_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "config.json"
+            path.write_text(json.dumps({"auth-key": "file-auth"}), encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "env-auth"}, clear=False):
+                store = ConfigStore(path)
+                original_revision = store._snapshot_revision
+                original_fsync = os.fsync
+
+                def fail_directory_fsync(fd: int) -> None:
+                    if stat.S_ISDIR(os.fstat(fd).st_mode):
+                        raise OSError("parent directory fsync failed")
+                    original_fsync(fd)
+
+                with mock.patch.object(secure_file.os, "fsync", side_effect=fail_directory_fsync):
+                    with self.assertRaises(OSError):
+                        store.update({"proxy": "http://proxy.example"})
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["proxy"], "http://proxy.example")
+            self.assertNotIn("proxy", store.data)
+            self.assertEqual(store._snapshot_revision, original_revision)
+            with self.assertRaises(StorageConflictError):
+                store.update({"next": True})
+            self.assertFalse(list(path.parent.glob(f".{path.name}.*.tmp")))
+
     def test_config_save_preserves_file_mode_and_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"
             path.write_text(json.dumps({"auth-key": "file-auth"}), encoding="utf-8")
             path.chmod(0o600)
             before = path.stat()
-            created_modes: list[int] = []
-            events: list[str] = []
-            original_mkstemp = config_module.tempfile.mkstemp
-            original_write = config_module.os.write
+            with mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "env-auth"}, clear=False):
+                ConfigStore(path).update({"proxy": "http://proxy.example"})
 
-            def record_mkstemp(*args, **kwargs):
-                temp_fd, temp_name = original_mkstemp(*args, **kwargs)
-                events.append("create")
-                created_modes.append(stat.S_IMODE(os.fstat(temp_fd).st_mode))
-                return temp_fd, temp_name
-
-            def record_write(fd: int, payload: bytes) -> int:
-                events.append("write")
-                return original_write(fd, payload)
-
-            with (
-                mock.patch.object(config_module.tempfile, "mkstemp", side_effect=record_mkstemp),
-                mock.patch.object(config_module.os, "write", side_effect=record_write),
-            ):
-                with mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "env-auth"}, clear=False):
-                    ConfigStore(path).update({"proxy": "http://proxy.example"})
-
-            self.assertTrue(created_modes)
-            self.assertLess(events.index("create"), events.index("write"))
-            if os.name == "posix":
-                self.assertTrue(all(mode & 0o177 == 0 for mode in created_modes))
             after = path.stat()
             self.assertEqual(after.st_mode & 0o7777, before.st_mode & 0o7777)
             self.assertEqual(after.st_uid, before.st_uid)
             self.assertEqual(after.st_gid, before.st_gid)
 
-    def test_config_metadata_restore_uses_chown_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "config.json"
-            path.write_text(json.dumps({"auth-key": "file-auth"}), encoding="utf-8")
-            path.chmod(0o640)
-            before = path.stat()
-            events: list[str] = []
-            original_chmod = os.chmod
-            original_chown = getattr(os, "chown", None)
-            original_fsync = os.fsync
-            original_replace = Path.replace
-
-            def record_chmod(target: Path, mode: int) -> None:
-                events.append("chmod")
-                original_chmod(target, mode)
-
-            def record_chown(target: Path, uid: int, gid: int) -> None:
-                events.append("chown")
-                if original_chown is not None:
-                    original_chown(target, uid, gid)
-
-            def record_replace(source: Path, target: Path) -> Path:
-                events.append("replace")
-                return original_replace(source, target)
-
-            with (
-                mock.patch.object(config_module.os, "fchmod", None, create=True),
-                mock.patch.object(config_module.os, "fchown", None, create=True),
-                mock.patch.object(config_module.os, "chmod", side_effect=record_chmod),
-                mock.patch.object(config_module.os, "chown", side_effect=record_chown, create=True),
-                mock.patch.object(config_module.os, "geteuid", return_value=before.st_uid + 1, create=True),
-                mock.patch.object(config_module.os, "getegid", return_value=before.st_gid + 1, create=True),
-                mock.patch.object(config_module.os, "fsync", side_effect=lambda fd: (events.append("fsync"), original_fsync(fd))[1]),
-                mock.patch.object(Path, "replace", autospec=True, side_effect=record_replace),
-                mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "env-auth"}, clear=False),
-            ):
-                ConfigStore(path).update({"proxy": "http://proxy.example"})
-
-            self.assertLess(events.index("chmod"), events.index("chown"))
-            self.assertLess(events.index("chown"), events.index("fsync"))
-            self.assertLess(events.index("fsync"), events.index("replace"))
-            self.assertEqual(path.stat().st_mode & 0o7777, stat.S_IMODE(before.st_mode))
-            self.assertFalse(list(path.parent.glob(f".{path.name}.*.tmp")))
-
+    @unittest.skipUnless(os.name == "posix", "requires POSIX dir-fd replacement")
     def test_config_metadata_is_restored_before_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "config.json"
@@ -203,19 +204,18 @@ class ConfigRecoveryContractTests(unittest.TestCase):
             events: list[str] = []
             original_write = os.write
             original_fsync = os.fsync
-            original_replace = Path.replace
+            original_replace = os.replace
 
             def record_write(fd: int, payload: bytes) -> int:
                 events.append("write")
                 return original_write(fd, payload)
 
-            def record_replace(source: Path, target: Path) -> Path:
+            def record_replace(source: str, target: str, *args, **kwargs) -> None:
                 events.append("replace")
-                self.assertEqual(source.parent, path.parent)
-                self.assertEqual(source.name.startswith(f".{path.name}."), True)
-                self.assertEqual(source.suffix, ".tmp")
-                self.assertFalse(source == path)
-                return original_replace(source, target)
+                self.assertTrue(Path(source).name.startswith(f".{path.name}."))
+                self.assertEqual(Path(source).suffix, ".tmp")
+                self.assertEqual(target, path.name)
+                return original_replace(source, target, *args, **kwargs)
 
             with (
                 mock.patch.object(config_module.os, "write", side_effect=record_write),
@@ -224,7 +224,7 @@ class ConfigRecoveryContractTests(unittest.TestCase):
                 mock.patch.object(config_module.os, "geteuid", return_value=before.st_uid + 1, create=True),
                 mock.patch.object(config_module.os, "getegid", return_value=before.st_gid + 1, create=True),
                 mock.patch.object(config_module.os, "fsync", side_effect=lambda fd: (events.append("fsync"), original_fsync(fd))[1]),
-                mock.patch.object(Path, "replace", autospec=True, side_effect=record_replace),
+                mock.patch.object(secure_file.os, "replace", side_effect=record_replace),
                 mock.patch.dict(os.environ, {"CHATGPT2API_AUTH_KEY": "env-auth"}, clear=False),
             ):
                 ConfigStore(path).update({"proxy": "http://proxy.example"})
@@ -236,8 +236,9 @@ class ConfigRecoveryContractTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o7777, stat.S_IMODE(before.st_mode))
             self.assertFalse(list(path.parent.glob(f".{path.name}.*.tmp")))
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX metadata operations")
     def test_config_metadata_restore_failure_preserves_snapshot(self) -> None:
-        for failure in ("write", "fchmod", "fchown", "chown", "fsync"):
+        for failure in ("write", "fchmod", "fchown", "fsync"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp_dir:
                 path = Path(tmp_dir) / "config.json"
                 path.write_text(json.dumps({"auth-key": "file-auth"}), encoding="utf-8")
@@ -252,7 +253,7 @@ class ConfigRecoveryContractTests(unittest.TestCase):
                     replace_called = True
                     raise AssertionError("replace must not run after temp failure")
 
-                patchers = [mock.patch.object(Path, "replace", autospec=True, side_effect=record_replace)]
+                patchers = [mock.patch.object(secure_file.os, "replace", side_effect=record_replace)]
                 if failure == "write":
                     patchers.append(mock.patch.object(config_module.os, "write", side_effect=OSError("write failed")))
                 elif failure == "fchmod":
@@ -263,16 +264,6 @@ class ConfigRecoveryContractTests(unittest.TestCase):
                         [
                             mock.patch.object(config_module.os, "fchmod", wraps=getattr(os, "fchmod", os.chmod), create=True),
                             mock.patch.object(config_module.os, "fchown", side_effect=OSError("fchown failed"), create=True),
-                            mock.patch.object(config_module.os, "geteuid", return_value=before.st_uid + 1, create=True),
-                            mock.patch.object(config_module.os, "getegid", return_value=before.st_gid + 1, create=True),
-                        ]
-                    )
-                elif failure == "chown":
-                    before = path.stat()
-                    patchers.extend(
-                        [
-                            mock.patch.object(config_module.os, "fchown", None, create=True),
-                            mock.patch.object(config_module.os, "chown", side_effect=OSError("chown failed"), create=True),
                             mock.patch.object(config_module.os, "geteuid", return_value=before.st_uid + 1, create=True),
                             mock.patch.object(config_module.os, "getegid", return_value=before.st_gid + 1, create=True),
                         ]

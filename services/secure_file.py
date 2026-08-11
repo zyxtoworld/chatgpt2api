@@ -446,7 +446,31 @@ def ensure_directory(root: Path, directory: Path) -> None:
         _ensure_posix_directory(root, parts)
 
 
-def _atomic_write_posix(path: Path, root: Path, payload: bytes) -> None:
+def _apply_file_metadata(
+    temp_fd: int,
+    mode: int,
+    owner: tuple[int, int] | None,
+) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    if not callable(fchmod):
+        raise OSError("safe POSIX file mode restoration is unavailable")
+    fchmod(temp_fd, mode)
+
+    if owner is None:
+        return
+    fchown = getattr(os, "fchown", None)
+    if not callable(fchown):
+        raise OSError("safe POSIX file owner restoration is unavailable")
+    fchown(temp_fd, owner[0], owner[1])
+
+
+def _atomic_write_posix(
+    path: Path,
+    root: Path,
+    payload: bytes,
+    mode: int = 0o600,
+    owner: tuple[int, int] | None = None,
+) -> None:
     parts = _relative_file_parts(path, root)
     parent_fd = _open_posix_directory(root, parts[:-1])
     temp_name = f".{parts[-1]}.{secrets.token_hex(12)}.tmp"
@@ -464,6 +488,7 @@ def _atomic_write_posix(path: Path, root: Path, payload: bytes) -> None:
             if not written:
                 raise OSError("short secure file write")
             view = view[written:]
+        _apply_file_metadata(temp_fd, mode, owner)
         os.fsync(temp_fd)
         os.close(temp_fd)
         temp_fd = None
@@ -645,7 +670,14 @@ def _windows_final_path(kernel32, handle) -> str:
     return buffer.value[:length]
 
 
-def _atomic_write_windows(path: Path, root: Path, expected_dir: Path, payload: bytes) -> None:
+def _atomic_write_windows(
+    path: Path,
+    root: Path,
+    expected_dir: Path,
+    payload: bytes,
+    mode: int,
+    owner: tuple[int, int] | None,
+) -> None:
     import ctypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -762,6 +794,15 @@ def _atomic_write_windows(path: Path, root: Path, expected_dir: Path, payload: b
             if not write_file(temp_handle, buffer, len(chunk), ctypes.byref(written), None) or written.value != len(chunk):
                 raise OSError(ctypes.get_last_error(), "safe Windows file write failed")
             remaining = remaining[written.value:]
+        chmod = getattr(os, "chmod", None)
+        if not callable(chmod):
+            raise OSError("safe Windows file mode restoration is unavailable")
+        chmod(temp_path, mode)
+        if owner is not None:
+            chown = getattr(os, "chown", None)
+            if not callable(chown):
+                raise OSError("safe Windows file owner restoration is unavailable")
+            chown(temp_path, owner[0], owner[1])
         if not flush_file_buffers(temp_handle):
             raise OSError(ctypes.get_last_error(), "safe Windows file flush failed")
         close_handle(temp_handle)
@@ -782,7 +823,14 @@ def _atomic_write_windows(path: Path, root: Path, expected_dir: Path, payload: b
             close_handle(directory_handle)
 
 
-def atomic_write_bytes(path: Path, root: Path, payload: bytes) -> None:
+def atomic_write_bytes(
+    path: Path,
+    root: Path,
+    payload: bytes,
+    *,
+    mode: int = 0o600,
+    owner: tuple[int, int] | None = None,
+) -> None:
     path = _lexical_absolute(Path(path))
     root = authorized_root(root)
     expected_dir = path.parent
@@ -795,6 +843,6 @@ def atomic_write_bytes(path: Path, root: Path, payload: bytes) -> None:
     if has_link(root, path.relative_to(root).parts):
         raise OSError("linked file path is not writable")
     if os.name == "nt":
-        _atomic_write_windows(path, root, expected_dir, bytes(payload))
+        _atomic_write_windows(path, root, expected_dir, bytes(payload), mode, owner)
     else:
-        _atomic_write_posix(path, root, bytes(payload))
+        _atomic_write_posix(path, root, bytes(payload), mode, owner)

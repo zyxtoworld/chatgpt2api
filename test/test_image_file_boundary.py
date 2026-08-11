@@ -35,6 +35,7 @@ class ImageFileBoundaryTests(unittest.TestCase):
             mock.patch.object(secure_file, "_open_posix_directory", return_value=41),
             mock.patch.object(secure_file.os, "open", return_value=42),
             mock.patch.object(secure_file.os, "write", side_effect=lambda _fd, payload: len(payload)),
+            mock.patch.object(secure_file.os, "fchmod", return_value=None, create=True),
             mock.patch.object(secure_file.os, "fsync"),
             mock.patch.object(secure_file.os, "close"),
             mock.patch.object(secure_file.os, "replace", replace),
@@ -46,6 +47,40 @@ class ImageFileBoundaryTests(unittest.TestCase):
         self.assertEqual(replace.call_args.args[1], "image_index.json")
         self.assertEqual(replace.call_args.kwargs["src_dir_fd"], 41)
         self.assertEqual(replace.call_args.kwargs["dst_dir_fd"], 41)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX fd metadata APIs")
+    def test_atomic_write_fails_closed_without_fd_mode_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "image_index.json"
+            target.write_bytes(b"old")
+
+            with mock.patch.object(secure_file.os, "fchmod", None, create=True):
+                with self.assertRaises(OSError):
+                    secure_file.atomic_write_bytes(target, root, b"new")
+
+            self.assertEqual(target.read_bytes(), b"old")
+            self.assertFalse(list(root.glob(f".{target.name}.*.tmp")))
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX fd owner APIs")
+    def test_atomic_write_fails_closed_without_fd_owner_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "image_index.json"
+            target.write_bytes(b"old")
+            current = target.stat()
+
+            with mock.patch.object(secure_file.os, "fchown", None, create=True):
+                with self.assertRaises(OSError):
+                    secure_file.atomic_write_bytes(
+                        target,
+                        root,
+                        b"new",
+                        owner=(current.st_uid, current.st_gid),
+                    )
+
+            self.assertEqual(target.read_bytes(), b"old")
+            self.assertFalse(list(root.glob(f".{target.name}.*.tmp")))
 
     def test_posix_atomic_write_replace_failure_preserves_target_and_cleans_temp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -60,6 +95,7 @@ class ImageFileBoundaryTests(unittest.TestCase):
                 mock.patch.object(secure_file, "_open_posix_directory", return_value=41),
                 mock.patch.object(secure_file.os, "open", return_value=42),
                 mock.patch.object(secure_file.os, "write", side_effect=lambda _fd, payload: len(payload)),
+                mock.patch.object(secure_file.os, "fchmod", return_value=None, create=True),
                 mock.patch.object(secure_file.os, "fsync"),
                 mock.patch.object(secure_file.os, "close"),
                 mock.patch.object(secure_file.os, "replace", replace),
