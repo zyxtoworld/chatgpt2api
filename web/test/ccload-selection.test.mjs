@@ -7,6 +7,8 @@ import {
   getCCLoadPage,
   getValidCCLoadSelectedIds,
   getSelectableCCLoadChannelIds,
+  getUnloadedCCLoadChannelIds,
+  mergeCCLoadChannelModels,
   normalizeCCLoadChannels,
   toggleAllCCLoadChannels,
 } from "../src/lib/ccload-selection.js";
@@ -55,8 +57,33 @@ test("ccLoad channels preserve each authenticated channel catalog instead of one
       { id: "pro", name: "duplicate", enabled: true, plan_type: "Pro", models: ["wrong"] },
     ]),
     [
-      { id: "free", name: "Free", enabled: true, plan_type: "free", subscription_active_until: "", models: ["common", "free-only"] },
-      { id: "pro", name: "Pro", enabled: true, plan_type: "Pro", subscription_active_until: "", models: ["common", "pro-only", "pro-extra"] },
+      { id: "free", name: "Free", enabled: true, plan_type: "free", subscription_active_until: "", models: ["common", "free-only"], models_loaded: false },
+      { id: "pro", name: "Pro", enabled: true, plan_type: "Pro", subscription_active_until: "", models: ["common", "pro-only", "pro-extra"], models_loaded: false },
+    ],
+  );
+});
+
+test("ccLoad lazily requests only unloaded enabled channels on the visible page", () => {
+  assert.deepEqual(getUnloadedCCLoadChannelIds([
+    { id: "free", enabled: true, models_loaded: false },
+    { id: "pro", enabled: true, models_loaded: true },
+    { id: "disabled", enabled: false, models_loaded: false },
+    { id: "free", enabled: true, models_loaded: false },
+  ]), ["free"]);
+});
+
+test("ccLoad merges per-channel model results without replacing list metadata", () => {
+  assert.deepEqual(
+    mergeCCLoadChannelModels(
+      [
+        { id: "free", name: "Free", enabled: true, models: [], models_loaded: false },
+        { id: "pro", name: "Pro", enabled: true, models: [], models_loaded: false },
+      ],
+      [{ id: "pro", models: [" gpt-pro ", "gpt-pro", ""], models_loaded: true }],
+    ),
+    [
+      { id: "free", name: "Free", enabled: true, models: [], models_loaded: false },
+      { id: "pro", name: "Pro", enabled: true, models: ["gpt-pro"], models_loaded: true },
     ],
   );
 });

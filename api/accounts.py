@@ -32,6 +32,7 @@ from services.account_service import account_service
 from services.ccload_service import (
     ccload_config,
     ccload_import_service,
+    list_remote_channel_models as ccload_list_remote_channel_models,
     list_remote_channels as ccload_list_remote_channels,
 )
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
@@ -175,6 +176,10 @@ class CCLoadServerUpdateRequest(BaseModel):
 
 class CCLoadImportRequest(BaseModel):
     channel_ids: list[str] = Field(default_factory=list)
+
+
+class CCLoadChannelModelsRequest(BaseModel):
+    channel_ids: list[str] = Field(default_factory=list, max_length=50)
 
 
 class OAuthLoginStartRequest(BaseModel):
@@ -809,6 +814,26 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
         try:
             channels = await run_management_io(ccload_list_remote_channels, server)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail={"error": PUBLIC_SERVER_ERROR_MESSAGE}) from exc
+        return {"server_id": server_id, "channels": channels}
+
+    @router.post("/api/ccload/servers/{server_id}/channel-models")
+    async def ccload_server_channel_models(
+        server_id: str,
+        body: CCLoadChannelModelsRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        await require_admin_async(authorization)
+        server = await run_management_io(ccload_config.get_server, server_id)
+        if server is None:
+            raise HTTPException(status_code=404, detail={"error": "server not found"})
+        try:
+            channels = await run_management_io(
+                ccload_list_remote_channel_models,
+                server,
+                body.channel_ids,
+            )
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": PUBLIC_SERVER_ERROR_MESSAGE}) from exc
         return {"server_id": server_id, "channels": channels}

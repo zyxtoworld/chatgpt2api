@@ -146,7 +146,8 @@ class CCLoadServiceContractTests(unittest.TestCase):
                     "enabled": True,
                     "plan_type": "pro",
                     "subscription_active_until": "2027-01-02T03:04:05Z",
-                    "models": ["gpt-5.4", "gpt-5.4-pro"],
+                    "models": [],
+                    "models_loaded": False,
                 }
             ],
         )
@@ -158,14 +159,43 @@ class CCLoadServiceContractTests(unittest.TestCase):
         self.assertEqual([call[0:2] for call in session.calls], [
             ("POST", "https://ccload.example.test/login"),
             ("GET", "https://ccload.example.test/admin/channels"),
-            ("GET", "https://ccload.example.test/admin/channels/7/editor"),
             ("POST", "https://ccload.example.test/logout"),
         ])
         list_kwargs = session.calls[1][2]
         self.assertEqual(list_kwargs["headers"]["Authorization"], "Bearer temporary-session-token")
         self.assertEqual(list_kwargs["params"], {"auth_type": "codex_oauth", "limit": 200, "offset": 0})
+        self.assertEqual(_FakeChannelModelBackend.instances, [])
+
+    def test_loads_models_only_for_the_requested_channel_batch(self) -> None:
+        with (
+            mock.patch.object(ccload_module, "Session", _FakeCCLoadSession),
+            mock.patch.object(ccload_module, "OpenAIBackendAPI", _FakeChannelModelBackend),
+        ):
+            channels = ccload_module.list_remote_channel_models(self.server, ["7"])
+
+        self.assertEqual(channels, [{
+            "id": "7",
+            "models": ["gpt-5.4", "gpt-5.4-pro"],
+            "models_loaded": True,
+        }])
+        session = _FakeCCLoadSession.instances[0]
+        self.assertEqual([call[0:2] for call in session.calls], [
+            ("POST", "https://ccload.example.test/login"),
+            ("GET", "https://ccload.example.test/admin/channels/7/editor"),
+            ("POST", "https://ccload.example.test/logout"),
+        ])
         self.assertEqual([backend.access_token for backend in _FakeChannelModelBackend.instances], ["access-token-secret"])
         self.assertTrue(_FakeChannelModelBackend.instances[0].closed)
+
+    def test_model_batch_rejects_more_than_fifty_channels_before_remote_io(self) -> None:
+        with mock.patch.object(ccload_module, "Session", _FakeCCLoadSession):
+            with self.assertRaisesRegex(ccload_module.CCLoadError, "at most 50"):
+                ccload_module.list_remote_channel_models(
+                    self.server,
+                    [str(index) for index in range(1, 52)],
+                )
+
+        self.assertEqual(_FakeCCLoadSession.instances, [])
 
     def test_each_channel_uses_its_own_authenticated_model_catalog(self) -> None:
         class TwoChannelSession(_FakeCCLoadSession):
@@ -225,39 +255,30 @@ class CCLoadServiceContractTests(unittest.TestCase):
             mock.patch.object(ccload_module, "Session", TwoChannelSession),
             mock.patch.object(ccload_module, "OpenAIBackendAPI", PerChannelBackend),
         ):
-            channels = ccload_module.list_remote_channels(self.server)
+            channels = ccload_module.list_remote_channel_models(self.server, ["1", "2"])
 
-        self.assertEqual([channel["models"] for channel in channels], [
-            ["common", "free-model"],
-            ["common", "free-model", "pro-model"],
+        self.assertEqual(channels, [
+            {"id": "1", "models": ["common", "free-model"], "models_loaded": True},
+            {"id": "2", "models": ["common", "free-model", "pro-model"], "models_loaded": True},
         ])
         self.assertEqual([backend.access_token for backend in PerChannelBackend.instances], ["token-1", "token-2"])
         self.assertTrue(all(backend.closed for backend in PerChannelBackend.instances))
+        self.assertEqual(len(TwoChannelSession.instances), 1)
+        self.assertEqual(
+            [call[0:2] for call in TwoChannelSession.instances[0].calls],
+            [
+                ("POST", "https://ccload.example.test/login"),
+                ("GET", "https://ccload.example.test/admin/channels/1/editor"),
+                ("GET", "https://ccload.example.test/admin/channels/2/editor"),
+                ("POST", "https://ccload.example.test/logout"),
+            ],
+        )
 
     def test_enabled_channel_model_catalogs_are_loaded_concurrently(self) -> None:
-        class TwoChannelSession(_FakeCCLoadSession):
-            instances: list["TwoChannelSession"] = []
-
-            def get(self, url: str, **kwargs):
-                self.calls.append(("GET", url, kwargs))
-                if url.endswith("/admin/channels"):
-                    return _FakeResponse({
-                        "success": True,
-                        "data": [
-                            {"id": 1, "name": "Free", "auth_type": "codex_oauth", "enabled": True, "codex_plan_type": "free"},
-                            {"id": 2, "name": "Pro", "auth_type": "codex_oauth", "enabled": True, "codex_plan_type": "pro"},
-                        ],
-                        "count": 2,
-                    })
-                raise AssertionError(f"unexpected GET {url}")
-
         active = 0
         maximum_active = 0
         both_started = threading.Event()
         lock = threading.Lock()
-
-        def fetch_credential(_session, _base_url, _headers, channel_id: str, **_kwargs):
-            return {"access_token": f"token-{channel_id}"}
 
         def model_ids(access_token: str, **_kwargs):
             nonlocal active, maximum_active
@@ -271,12 +292,15 @@ class CCLoadServiceContractTests(unittest.TestCase):
                 active -= 1
             return [f"model-{access_token}"]
 
+        def fetch_credential(_session, _base_url, _headers, channel_id: str, **_kwargs):
+            return {"access_token": f"token-{channel_id}"}
+
         with (
-            mock.patch.object(ccload_module, "Session", TwoChannelSession),
+            mock.patch.object(ccload_module, "Session", _FakeCCLoadSession),
             mock.patch.object(ccload_module, "_fetch_remote_credential", side_effect=fetch_credential),
             mock.patch.object(ccload_module, "_channel_model_ids", side_effect=model_ids),
         ):
-            channels = ccload_module.list_remote_channels(self.server)
+            channels = ccload_module.list_remote_channel_models(self.server, ["1", "2"])
 
         self.assertEqual(maximum_active, 2)
         self.assertEqual([item["models"] for item in channels], [["model-token-1"], ["model-token-2"]])
@@ -284,9 +308,6 @@ class CCLoadServiceContractTests(unittest.TestCase):
     def test_channel_browse_deadline_fails_before_a_blocked_model_catalog_finishes(self) -> None:
         started = threading.Event()
         release = threading.Event()
-
-        def fetch_credential(_session, _base_url, _headers, _channel_id: str, **_kwargs):
-            return {"access_token": "token-7"}
 
         def blocked_model_ids(_access_token: str, **_kwargs):
             started.set()
@@ -296,13 +317,12 @@ class CCLoadServiceContractTests(unittest.TestCase):
         with (
             mock.patch.object(ccload_module, "Session", _FakeCCLoadSession),
             mock.patch.object(ccload_module, "CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS", 0.05),
-            mock.patch.object(ccload_module, "_fetch_remote_credential", side_effect=fetch_credential),
             mock.patch.object(ccload_module, "_channel_model_ids", side_effect=blocked_model_ids),
         ):
             before = time.monotonic()
             try:
                 with self.assertRaisesRegex(ccload_module.CCLoadError, "timed out"):
-                    ccload_module.list_remote_channels(self.server)
+                    ccload_module.list_remote_channel_models(self.server, ["7"])
             finally:
                 release.set()
 
@@ -327,27 +347,29 @@ class CCLoadServiceContractTests(unittest.TestCase):
                     "count": 3,
                 })
 
-        credential_calls: list[str] = []
+        model_calls: list[str] = []
 
         def fetch_credential(_session, _base_url, _headers, channel_id: str, **_kwargs):
-            credential_calls.append(channel_id)
             if channel_id == "2":
                 raise ccload_module.CCLoadError("fixture credential failure")
             return {"access_token": f"token-{channel_id}"}
 
+        def model_ids(access_token: str, **_kwargs):
+            model_calls.append(access_token)
+            return ["gpt-pro-model"]
+
         with (
             mock.patch.object(ccload_module, "Session", MixedChannelSession),
             mock.patch.object(ccload_module, "_fetch_remote_credential", side_effect=fetch_credential),
-            mock.patch.object(ccload_module, "_channel_model_ids", return_value=["gpt-pro-model"]) as model_ids,
+            mock.patch.object(ccload_module, "_channel_model_ids", side_effect=model_ids),
         ):
-            channels = ccload_module.list_remote_channels(self.server)
+            channels = ccload_module.list_remote_channel_models(self.server, ["2", "3"])
 
-        self.assertEqual(credential_calls, ["2", "3"])
-        self.assertEqual([channel["id"] for channel in channels], ["1", "2", "3"])
-        self.assertEqual([channel["models"] for channel in channels], [[], [], ["gpt-pro-model"]])
-        model_ids.assert_called_once()
-        self.assertEqual(model_ids.call_args.args, ("token-3",))
-        self.assertIsInstance(model_ids.call_args.kwargs.get("deadline"), float)
+        self.assertEqual(model_calls, ["token-3"])
+        self.assertEqual(channels, [
+            {"id": "2", "models": [], "models_loaded": True},
+            {"id": "3", "models": ["gpt-pro-model"], "models_loaded": True},
+        ])
 
     def test_fetches_selected_complete_codex_credential_and_never_lists_it(self) -> None:
         with mock.patch.object(ccload_module, "Session", _FakeCCLoadSession):

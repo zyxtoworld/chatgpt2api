@@ -27,6 +27,9 @@ test("ccLoad uses stable connection and channel wording without a pinned preview
 test("ccLoad uses each remote channel model catalog without a global model overwrite", () => {
   assert.match(componentSource, /normalizeCCLoadChannels\(data\.channels\)/);
   assert.match(componentSource, /await fetchCCLoadChannels\(server\.id\)/);
+  assert.match(componentSource, /fetchCCLoadChannelModels\(serverId, channelIds\)/);
+  assert.match(componentSource, /getUnloadedCCLoadChannelIds\(channelPageResult\.items\)\.slice\(0, 50\)/);
+  assert.match(componentSource, /mergeCCLoadChannelModels\(current, data\.channels\)/);
   assert.doesNotMatch(componentSource, /fetchModels/);
   assert.doesNotMatch(componentSource, /replaceCCLoadChannelModels/);
 });

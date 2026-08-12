@@ -33,7 +33,24 @@ export function normalizeCCLoadChannels(channels) {
       plan_type: String(channel?.plan_type || "").trim(),
       subscription_active_until: String(channel?.subscription_active_until || "").trim(),
       models: modelIds,
+      models_loaded: channel?.models_loaded === true,
     }];
+  });
+}
+
+export function getUnloadedCCLoadChannelIds(channels) {
+  return uniqueEnabledIds(
+    (Array.isArray(channels) ? channels : []).filter((channel) => channel?.models_loaded !== true),
+  );
+}
+
+export function mergeCCLoadChannelModels(channels, catalogs) {
+  const byId = new Map(normalizeCCLoadChannels(catalogs).map((channel) => [channel.id, channel]));
+  return (Array.isArray(channels) ? channels : []).map((channel) => {
+    const catalog = byId.get(String(channel?.id || "").trim());
+    return catalog
+      ? { ...channel, models: catalog.models, models_loaded: catalog.models_loaded }
+      : channel;
   });
 }
 

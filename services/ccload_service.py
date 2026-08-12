@@ -34,6 +34,7 @@ from utils.log import logger
 CCLOAD_CONFIG_FILE = DATA_DIR / "ccload_config.json"
 CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS = 90.0
 CCLOAD_MODEL_CATALOG_WORKERS = 8
+CCLOAD_MODEL_BATCH_LIMIT = 50
 
 
 class CCLoadError(RuntimeError):
@@ -347,7 +348,6 @@ def _admin_session(
 def list_remote_channels(server: dict) -> list[dict]:
     """List public metadata for ccLoad Codex OAuth channels."""
     channels: list[dict] = []
-    model_tokens: dict[int, str] = {}
     limit = 200
     offset = 0
     deadline = time.monotonic() + CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS
@@ -380,6 +380,7 @@ def list_remote_channels(server: dict) -> list[dict]:
                     "plan_type": _clean(item.get("codex_plan_type")),
                     "subscription_active_until": _clean(item.get("codex_subscription_active_until")),
                     "models": [],
+                    "models_loaded": not enabled,
                 })
 
             count = payload.get("count")
@@ -387,58 +388,73 @@ def list_remote_channels(server: dict) -> list[dict]:
             offset += len(data)
             if not data or offset >= total or len(data) < limit:
                 break
-        for index, channel in enumerate(channels):
-            if not channel["enabled"]:
-                continue
+    return channels
+
+
+def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dict]:
+    selected = list(dict.fromkeys(_clean(value) for value in channel_ids if _clean(value)))
+    if not selected or any(not value.isdecimal() or int(value) <= 0 for value in selected):
+        raise CCLoadError("ccLoad channel selection is invalid")
+    if len(selected) > CCLOAD_MODEL_BATCH_LIMIT:
+        raise CCLoadError("ccLoad model batch supports at most 50 channels")
+
+    deadline = time.monotonic() + CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS
+    catalogs = {channel_id: [] for channel_id in selected}
+    model_tokens: dict[str, str] = {}
+    with _admin_session(server, deadline=deadline) as (session, base_url, headers):
+        for channel_id in selected:
             try:
                 credential = _fetch_remote_credential(
                     session,
                     base_url,
                     headers,
-                    channel["id"],
+                    channel_id,
                     deadline=deadline,
                 )
-                model_tokens[index] = credential["access_token"]
+                model_tokens[channel_id] = credential["access_token"]
             except Exception as exc:
                 if time.monotonic() >= deadline:
-                    raise CCLoadError("ccLoad channel browse timed out") from exc
+                    raise CCLoadError("ccLoad channel model list timed out") from exc
                 logger.warning({
                     "event": "ccload_channel_model_catalog_failed",
-                    "channel_id": channel["id"],
+                    "channel_id": channel_id,
                     "error": exception_log_message(exc),
                 })
     if not model_tokens:
-        return channels
+        return [
+            {"id": channel_id, "models": [], "models_loaded": True}
+            for channel_id in selected
+        ]
 
     executor = ThreadPoolExecutor(
         max_workers=min(CCLOAD_MODEL_CATALOG_WORKERS, len(model_tokens)),
         thread_name_prefix="ccload-models",
     )
     futures = {
-        executor.submit(_channel_model_ids, access_token, deadline=deadline): index
-        for index, access_token in model_tokens.items()
+        executor.submit(_channel_model_ids, access_token, deadline=deadline): channel_id
+        for channel_id, access_token in model_tokens.items()
     }
     try:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise FuturesTimeoutError
-        for future in as_completed(futures, timeout=remaining):
-            index = futures[future]
+        for future in as_completed(futures, timeout=_remaining_timeout(deadline, CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS)):
+            channel_id = futures[future]
             try:
-                channels[index]["models"] = future.result()
+                catalogs[channel_id] = future.result()
             except Exception as exc:
                 if time.monotonic() >= deadline:
                     raise CCLoadError("ccLoad channel model list timed out") from exc
                 logger.warning({
                     "event": "ccload_channel_model_catalog_failed",
-                    "channel_id": channels[index]["id"],
+                    "channel_id": channel_id,
                     "error": exception_log_message(exc),
                 })
     except FuturesTimeoutError as exc:
         raise CCLoadError("ccLoad channel model list timed out") from exc
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
-    return channels
+    return [
+        {"id": channel_id, "models": catalogs[channel_id], "models_loaded": True}
+        for channel_id in selected
+    ]
 
 
 def _normalized_codex_credential(raw: object) -> dict | None:

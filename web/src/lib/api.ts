@@ -890,7 +890,10 @@ export type CCLoadChannel = {
   plan_type: string;
   subscription_active_until: string;
   models: string[];
+  models_loaded: boolean;
 };
+
+export type CCLoadChannelModels = Pick<CCLoadChannel, "id" | "models" | "models_loaded">;
 
 export async function fetchCCLoadServers() {
   return httpRequest<{ servers: CCLoadServer[] }>("/api/ccload/servers");
@@ -919,6 +922,13 @@ export async function deleteCCLoadServer(serverId: string) {
 
 export async function fetchCCLoadChannels(serverId: string) {
   return httpRequest<{ server_id: string; channels: CCLoadChannel[] }>(`/api/ccload/servers/${serverId}/channels`);
+}
+
+export async function fetchCCLoadChannelModels(serverId: string, channelIds: string[]) {
+  return httpRequest<{ server_id: string; channels: CCLoadChannelModels[] }>(
+    `/api/ccload/servers/${serverId}/channel-models`,
+    { method: "POST", body: { channel_ids: channelIds } },
+  );
 }
 
 export async function startCCLoadImport(serverId: string, channelIds: string[]) {

@@ -62,6 +62,7 @@ class CCLoadAPIContractTests(unittest.TestCase):
             ("POST", "/api/ccload/servers/server-1", {"name": "new"}),
             ("DELETE", "/api/ccload/servers/server-1", None),
             ("GET", "/api/ccload/servers/server-1/channels", None),
+            ("POST", "/api/ccload/servers/server-1/channel-models", {"channel_ids": ["7"]}),
             ("POST", "/api/ccload/servers/server-1/import", {"channel_ids": ["7"]}),
             ("GET", "/api/ccload/servers/server-1/import", None),
         )
@@ -95,6 +96,25 @@ class CCLoadAPIContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502, response.text)
         self.assertNotIn(opaque_secret, response.text)
         self.assertNotIn("user@example.test", response.text)
+
+    def test_channel_model_route_returns_only_requested_public_catalogs(self) -> None:
+        catalogs = [{"id": "7", "models": ["gpt-5.4-pro"], "models_loaded": True}]
+        with (
+            mock.patch.object(accounts_module, "ccload_config", self.config),
+            mock.patch.object(accounts_module, "ccload_list_remote_channel_models", return_value=catalogs) as load_models,
+        ):
+            response = self.client.post(
+                "/api/ccload/servers/server-1/channel-models",
+                headers=AUTH_HEADERS,
+                json={"channel_ids": ["7"]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"server_id": "server-1", "channels": catalogs})
+        load_models.assert_called_once_with(mock.ANY, ["7"])
+        serialized = json.dumps(response.json(), ensure_ascii=False)
+        self.assertNotIn("admin-password-secret", serialized)
+        self.assertNotIn("access_token", serialized)
 
     def test_import_route_returns_only_job_metadata(self) -> None:
         import_service = _FakeImportService()

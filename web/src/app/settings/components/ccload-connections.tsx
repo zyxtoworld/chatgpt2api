@@ -21,6 +21,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import {
   createCCLoadServer,
   deleteCCLoadServer,
+  fetchCCLoadChannelModels,
   fetchCCLoadChannels,
   fetchCCLoadServers,
   startCCLoadImport,
@@ -39,6 +40,8 @@ import {
   getCCLoadPage,
   getValidCCLoadSelectedIds,
   getSelectableCCLoadChannelIds,
+  getUnloadedCCLoadChannelIds,
+  mergeCCLoadChannelModels,
   normalizeCCLoadChannels,
   toggleAllCCLoadChannels,
 } from "@/lib/ccload-selection";
@@ -50,6 +53,7 @@ export function CCLoadConnections() {
   const deletingOwnerRef = useRef<{ epoch: number } | null>(null);
   const importingOwnerRef = useRef<{ epoch: number } | null>(null);
   const browsingOwnerRef = useRef<{ generation: number; mutationEpoch: number; allowed: boolean } | null>(null);
+  const modelOwnerRef = useRef<{ generation: number; mutationEpoch: number; allowed: boolean } | null>(null);
   const [servers, setServers] = useState<CCLoadServer[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -68,6 +72,7 @@ export function CCLoadConnections() {
   const [channelQuery, setChannelQuery] = useState("");
   const [channelPage, setChannelPage] = useState(1);
   const [channelPageSize, setChannelPageSize] = useState<PageSizeOption>("50");
+  const [loadingModelIds, setLoadingModelIds] = useState<string[]>([]);
   const [isStartingImport, setIsStartingImport] = useState(false);
 
   const commitServers = (next: CCLoadServer[] | ((current: CCLoadServer[]) => CCLoadServer[])) => {
@@ -115,6 +120,7 @@ export function CCLoadConnections() {
       deletingOwnerRef.current = null;
       importingOwnerRef.current = null;
       browsingOwnerRef.current = null;
+      modelOwnerRef.current = null;
       gate.cancel();
     };
   }, [loadServers]);
@@ -229,6 +235,9 @@ export function CCLoadConnections() {
 
   const browseChannels = async (server: CCLoadServer) => {
     const gate = requestGateRef.current;
+    gate.invalidateQueries("channel-models");
+    modelOwnerRef.current = null;
+    setLoadingModelIds([]);
     const queryOwner = gate.beginQuery("channels");
     if (!queryOwner.allowed) return;
     browsingOwnerRef.current = queryOwner;
@@ -301,6 +310,42 @@ export function CCLoadConnections() {
     () => getCCLoadPage(filteredChannels, channelPage, Number(channelPageSize)),
     [channelPage, channelPageSize, filteredChannels],
   );
+  const unloadedPageModelIds = getUnloadedCCLoadChannelIds(channelPageResult.items).slice(0, 50);
+  const unloadedPageModelKey = unloadedPageModelIds.join(",");
+
+  useEffect(() => {
+    if (!browserOpen || !browserServer || !unloadedPageModelKey) return;
+    const gate = requestGateRef.current;
+    const queryOwner = gate.beginQuery("channel-models");
+    if (!queryOwner.allowed) return;
+    const serverId = browserServer.id;
+    const channelIds = unloadedPageModelKey.split(",");
+    modelOwnerRef.current = queryOwner;
+    setLoadingModelIds(channelIds);
+    void fetchCCLoadChannelModels(serverId, channelIds)
+      .then((data) => {
+        if (!gate.acceptsQuery(queryOwner)) return;
+        setChannels((current) => mergeCCLoadChannelModels(current, data.channels));
+      })
+      .catch((error: unknown) => {
+        if (gate.acceptsQuery(queryOwner)) {
+          toast.error(error instanceof Error ? error.message : "读取渠道模型失败");
+        }
+      })
+      .finally(() => {
+        if (modelOwnerRef.current === queryOwner) {
+          modelOwnerRef.current = null;
+          setLoadingModelIds([]);
+        }
+      });
+  }, [browserOpen, browserServer, unloadedPageModelKey]);
+
+  const closeBrowser = () => {
+    requestGateRef.current.invalidateQueries("channel-models");
+    modelOwnerRef.current = null;
+    setLoadingModelIds([]);
+    setBrowserOpen(false);
+  };
   const selectableFilteredChannelIds = getSelectableCCLoadChannelIds(filteredChannels);
   const validSelectedIds = getValidCCLoadSelectedIds(selectedIds, channels);
   const allChannelsSelected = areAllCCLoadChannelsSelected(selectedIds, filteredChannels);
@@ -525,7 +570,7 @@ export function CCLoadConnections() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={browserOpen} onOpenChange={setBrowserOpen}>
+      <Dialog open={browserOpen} onOpenChange={(open) => (open ? setBrowserOpen(true) : closeBrowser())}>
         <DialogContent showCloseButton={false} className="max-h-[90vh] max-w-5xl rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>选择要导入的渠道</DialogTitle>
@@ -614,7 +659,9 @@ export function CCLoadConnections() {
                           {!channel.enabled ? <Badge variant="info" className="rounded-md">已禁用</Badge> : null}
                         </div>
                         <div className="mt-1 text-xs text-stone-400">
-                          模型：{channel.models.join(", ") || "暂无可用模型"}
+                          模型：{channel.models_loaded
+                            ? channel.models.join(", ") || "暂无可用模型"
+                            : loadingModelIds.includes(channel.id) ? "读取中…" : "等待读取"}
                           {channel.subscription_active_until ? ` · 到期 ${channel.subscription_active_until}` : ""}
                         </div>
                       </div>
@@ -654,7 +701,7 @@ export function CCLoadConnections() {
             <Button
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
-              onClick={() => setBrowserOpen(false)}
+              onClick={closeBrowser}
               disabled={hasMutation}
             >
               取消
