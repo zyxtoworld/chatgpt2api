@@ -7,6 +7,7 @@ import {
   getCCLoadPage,
   getValidCCLoadSelectedIds,
   getSelectableCCLoadChannelIds,
+  replaceCCLoadChannelModels,
   toggleAllCCLoadChannels,
 } from "../src/lib/ccload-selection.js";
 
@@ -44,6 +45,28 @@ test("ccLoad search matches channel fields", () => {
     [{ id: "alpha", name: "Team Alpha", plan_type: "pro", models: ["gpt-5"] }],
   );
   assert.equal(filterCCLoadChannels(channels, "  ").length, channels.length);
+});
+
+test("ccLoad channels use the chatgpt2api model list instead of remote channel models", () => {
+  assert.deepEqual(
+    replaceCCLoadChannelModels(
+      [
+        { id: "alpha", models: ["remote-only-model"] },
+        { id: "beta", models: [] },
+      ],
+      [
+        { id: " gpt-5 " },
+        { id: "gpt-image-2" },
+        { id: "gpt-5" },
+        { id: "" },
+        null,
+      ],
+    ),
+    [
+      { id: "alpha", models: ["gpt-5", "gpt-image-2"] },
+      { id: "beta", models: ["gpt-5", "gpt-image-2"] },
+    ],
+  );
 });
 
 test("ccLoad pagination clamps page boundaries and reports visible range", () => {

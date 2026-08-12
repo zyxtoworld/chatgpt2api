@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Eye, EyeOff, Import, LoaderCircle, Pencil, Plus, RefreshCcw, ServerCog, Trash2 } from "lucide-react";
+import { Eye, EyeOff, Import, KeyRound, Link2, LoaderCircle, Pencil, Plus, Save, Search, ServerCog, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -23,6 +23,7 @@ import {
   deleteCCLoadServer,
   fetchCCLoadChannels,
   fetchCCLoadServers,
+  fetchModels,
   startCCLoadImport,
   updateCCLoadServer,
   type CCLoadChannel,
@@ -39,6 +40,7 @@ import {
   getCCLoadPage,
   getValidCCLoadSelectedIds,
   getSelectableCCLoadChannelIds,
+  replaceCCLoadChannelModels,
   toggleAllCCLoadChannels,
 } from "@/lib/ccload-selection";
 
@@ -54,7 +56,7 @@ function normalizeChannels(items: CCLoadChannel[]) {
       enabled: Boolean(item.enabled),
       plan_type: String(item.plan_type || "").trim(),
       subscription_active_until: String(item.subscription_active_until || "").trim(),
-      models: Array.isArray(item.models) ? item.models.map(String) : [],
+      models: [],
     }];
   });
 }
@@ -250,11 +252,14 @@ export function CCLoadConnections() {
     browsingOwnerRef.current = queryOwner;
     setLoadingChannelsId(server.id);
     try {
-      const data = await fetchCCLoadChannels(server.id);
+      const [data, modelData] = await Promise.all([
+        fetchCCLoadChannels(server.id),
+        fetchModels(),
+      ]);
       if (!gate.acceptsQuery(queryOwner)) return;
       const currentServer = serversRef.current.find((item) => item.id === server.id);
       if (!currentServer) return;
-      const nextChannels = normalizeChannels(data.channels);
+      const nextChannels = replaceCCLoadChannelModels(normalizeChannels(data.channels), modelData.data);
       setBrowserServer(currentServer);
       setChannels(nextChannels);
       setSelectedIds([]);
@@ -262,10 +267,10 @@ export function CCLoadConnections() {
       setChannelPage(1);
       setChannelPageSize("50");
       setBrowserOpen(true);
-      toast.success(`读取到 ${nextChannels.length} 个 Codex OAuth 频道`);
+      toast.success(`读取到 ${nextChannels.length} 个 Codex OAuth 渠道`);
     } catch (error) {
       if (gate.acceptsQuery(queryOwner)) {
-        toast.error(error instanceof Error ? error.message : "读取 ccLoad 频道失败");
+        toast.error(error instanceof Error ? error.message : "读取 ccLoad 渠道失败");
       }
     } finally {
       if (browsingOwnerRef.current === queryOwner) {
@@ -278,7 +283,7 @@ export function CCLoadConnections() {
   const startImport = async () => {
     const importIds = getValidCCLoadSelectedIds(selectedIds, channels);
     if (!browserServer || importIds.length === 0) {
-      toast.error("请选择要导入的频道");
+      toast.error("请选择要导入的渠道");
       return;
     }
     const mutationOwner = beginMutation();
@@ -326,213 +331,362 @@ export function CCLoadConnections() {
 
   return (
     <>
-      <Card className="border-stone-200 bg-white/95 shadow-sm">
-        <CardContent className="space-y-5 p-5 sm:p-6">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
+        <CardContent className="space-y-6 p-6">
+          <div className="flex items-start justify-between">
             <div className="flex items-center gap-3">
-              <div className="rounded-xl bg-sky-50 p-2 text-sky-700"><ServerCog className="size-5" /></div>
+              <div className="flex size-10 items-center justify-center rounded-xl bg-stone-100">
+                <ServerCog className="size-5 text-stone-600" />
+              </div>
               <div>
-                <h2 className="text-lg font-semibold tracking-tight">ccLoad 预览版连接</h2>
-                <p className="text-sm text-stone-500">读取 Codex OAuth 频道并导入完整可刷新凭据。</p>
+                <h2 className="text-lg font-semibold tracking-tight">ccLoad 连接管理</h2>
+                <p className="text-sm text-stone-500">先配置连接，再读取 Codex OAuth 渠道并选择导入到本地号池。</p>
               </div>
             </div>
-            <Button onClick={() => openEditor(null)} disabled={hasMutation}><Plus className="mr-2 size-4" />添加连接</Button>
+            <div className="flex items-center gap-2">
+              {servers.length > 0 ? <Badge className="rounded-md px-2.5 py-1">{servers.length} 个连接</Badge> : null}
+              <Button
+                className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800"
+                onClick={() => openEditor(null)}
+                disabled={hasMutation}
+              >
+                <Plus className="size-4" />
+                添加连接
+              </Button>
+            </div>
           </div>
 
           {isLoading ? (
-            <div className="flex min-h-28 items-center justify-center"><LoaderCircle className="size-5 animate-spin" /></div>
+            <div className="flex items-center justify-center py-10">
+              <LoaderCircle className="size-5 animate-spin text-stone-400" />
+            </div>
           ) : servers.length === 0 ? (
-            <div className="rounded-xl border border-dashed border-stone-200 p-8 text-center text-sm text-stone-500">
-              暂无 ccLoad 连接。
+            <div className="flex flex-col items-center justify-center gap-3 rounded-xl bg-stone-50 px-6 py-10 text-center">
+              <ServerCog className="size-8 text-stone-300" />
+              <div className="space-y-1">
+                <p className="text-sm font-medium text-stone-600">暂无 ccLoad 连接</p>
+                <p className="text-sm text-stone-400">点击「添加连接」保存你的 ccLoad 管理信息。</p>
+              </div>
             </div>
           ) : (
             <div className="space-y-3">
               {servers.map((server) => {
                 const job = server.import_job;
                 const running = job?.status === "pending" || job?.status === "running";
+                const progress = job?.total ? Math.round((job.completed / job.total) * 100) : 0;
+                const isBusy = hasMutation || loadingChannelsId === server.id;
                 return (
-                  <div key={server.id} className="rounded-xl border border-stone-200 p-4">
-                    <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                      <div className="min-w-0 space-y-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="font-medium text-stone-800">{server.name || server.base_url}</p>
-                          <Badge variant="secondary">{server.has_password ? "已配置密码" : "缺少密码"}</Badge>
-                          {job && <Badge variant={job.status === "completed" ? "default" : "secondary"}>{job.status}</Badge>}
+                  <div key={server.id} className="flex flex-col gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <div className="truncate text-sm font-medium text-stone-800">{server.name || server.base_url}</div>
+                          <Badge className="rounded-md bg-stone-100 text-stone-600">
+                            {server.has_password ? "已配置密码" : "缺少密码"}
+                          </Badge>
                         </div>
-                        <p className="truncate text-sm text-stone-500">{server.base_url}</p>
-                        {job && (
-                          <p className="text-xs text-stone-500">
-                            {job.completed}/{job.total} · 新增 {job.added} · 跳过 {job.skipped} · 刷新 {job.refreshed} · 失败 {job.failed}
-                          </p>
-                        )}
+                        <div className="truncate text-xs text-stone-400">{server.base_url}</div>
                       </div>
-                      <div className="flex flex-wrap gap-2">
-                        <Button variant="outline" size="sm" disabled={hasMutation || running || loadingChannelsId === server.id} onClick={() => void browseChannels(server)}>
-                          {loadingChannelsId === server.id ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : <RefreshCcw className="mr-2 size-4" />}
-                          读取频道
-                        </Button>
-                        <Button variant="outline" size="sm" onClick={() => openEditor(server)} disabled={hasMutation}><Pencil className="mr-2 size-4" />编辑</Button>
-                        <Button variant="outline" size="sm" disabled={hasMutation} onClick={() => void removeServer(server)}>
-                          <Trash2 className="mr-2 size-4" />删除
-                        </Button>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          className="rounded-lg p-2 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
+                          onClick={() => openEditor(server)}
+                          disabled={hasMutation}
+                          title="编辑"
+                        >
+                          <Pencil className="size-4" />
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-lg p-2 text-stone-400 transition hover:bg-rose-50 hover:text-rose-500"
+                          disabled={hasMutation}
+                          onClick={() => void removeServer(server)}
+                          title="删除"
+                        >
+                          {deletingId === server.id ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
+                        </button>
                       </div>
                     </div>
+
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="outline"
+                        className="h-8 rounded-lg border-stone-200 bg-white px-3 text-xs text-stone-600"
+                        disabled={isBusy || running}
+                        onClick={() => void browseChannels(server)}
+                      >
+                        {loadingChannelsId === server.id ? <LoaderCircle className="size-3.5 animate-spin" /> : <Import className="size-3.5" />}
+                        读取渠道
+                      </Button>
+                    </div>
+
+                    {job ? (
+                      <div className="space-y-2 rounded-xl bg-stone-50 px-3 py-3">
+                        <div className="text-xs font-medium tracking-[0.16em] text-stone-400 uppercase">导入任务</div>
+                        <div className="rounded-lg border border-stone-200 bg-white px-3 py-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-sm font-medium text-stone-700">
+                                状态 {job.status}，已处理 {job.completed}/{job.total}
+                              </div>
+                              <div className="truncate text-xs text-stone-400">
+                                任务 {job.job_id.slice(0, 8)} · {job.created_at}
+                              </div>
+                            </div>
+                            <Badge
+                              variant={job.status === "completed" ? "success" : job.status === "failed" ? "danger" : "info"}
+                              className="rounded-md"
+                            >
+                              {progress}%
+                            </Badge>
+                          </div>
+                          <div className="mt-3 h-2 overflow-hidden rounded-full bg-stone-200">
+                            <div className="h-full rounded-full bg-stone-900 transition-all" style={{ width: `${progress}%` }} />
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-2 text-xs text-stone-500">
+                            <span>新增 {job.added}</span>
+                            <span>跳过 {job.skipped}</span>
+                            <span>刷新 {job.refreshed}</span>
+                            <span>失败 {job.failed}</span>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 );
               })}
             </div>
           )}
-          <div className="rounded-xl bg-stone-50 p-4 text-xs leading-6 text-stone-600">
-            ccLoad 管理员密码只保存在服务端；浏览器响应不包含密码、临时会话令牌或 OAuth 凭据。导入时会保留 access/refresh/id token，便于后续刷新。
+
+          <div className="rounded-xl bg-stone-50 px-4 py-3 text-sm leading-6 text-stone-500">
+            <p className="font-medium text-stone-600">使用说明</p>
+            <ul className="mt-1 list-inside list-disc space-y-0.5">
+              <li>页面进入后先读取系统里已配置的 ccLoad 连接。</li>
+              <li>点击某个连接的「读取渠道」后，会读取 Codex OAuth 渠道和 chatgpt2api 模型列表。</li>
+              <li>确认选择后，后端后台获取对应凭据并导入本地号池。</li>
+              <li>管理员密码和 OAuth 凭据不会返回浏览器。</li>
+            </ul>
           </div>
         </CardContent>
       </Card>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
+        <DialogContent showCloseButton={false} className="rounded-2xl p-6">
+          <DialogHeader className="gap-2">
             <DialogTitle>{editingServer ? "编辑 ccLoad 连接" : "添加 ccLoad 连接"}</DialogTitle>
-            <DialogDescription>适配 ccLoad v4.6.12-beta.1 的管理员登录与 Codex OAuth 频道接口。</DialogDescription>
+            <DialogDescription className="text-sm leading-6">
+              {editingServer ? "修改 ccLoad 管理员连接信息" : "添加一个新的 ccLoad 管理员连接"}
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-4">
-            <Input value={formName} onChange={(event) => setFormName(event.target.value)} placeholder="连接名称" />
-            <Input value={formBaseUrl} onChange={(event) => setFormBaseUrl(event.target.value)} placeholder="https://ccload.example.com" />
-            <div className="relative">
+            <div className="space-y-2">
+              <label className="text-sm font-medium text-stone-700">名称（可选）</label>
               <Input
-                type={showPassword ? "text" : "password"}
-                value={formPassword}
-                onChange={(event) => setFormPassword(event.target.value)}
-                placeholder={editingServer ? "留空则保留现有管理员密码" : "管理员密码"}
-                className="pr-10"
+                value={formName}
+                onChange={(event) => setFormName(event.target.value)}
+                placeholder="例如：主连接、备用连接"
+                className="h-11 rounded-xl border-stone-200 bg-white"
               />
-              <button type="button" aria-label={showPassword ? "隐藏密码" : "显示密码"} className="absolute right-3 top-1/2 -translate-y-1/2 text-stone-400" onClick={() => setShowPassword((value) => !value)}>
-                {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-              </button>
+            </div>
+            <div className="space-y-2">
+              <label className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
+                <Link2 className="size-3.5" />
+                ccLoad 地址
+              </label>
+              <Input
+                value={formBaseUrl}
+                onChange={(event) => setFormBaseUrl(event.target.value)}
+                placeholder="https://ccload.example.com"
+                className="h-11 rounded-xl border-stone-200 bg-white"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="flex items-center gap-1.5 text-sm font-medium text-stone-700">
+                <KeyRound className="size-3.5" />
+                管理员密码
+              </label>
+              <div className="relative">
+                <Input
+                  type={showPassword ? "text" : "password"}
+                  value={formPassword}
+                  onChange={(event) => setFormPassword(event.target.value)}
+                  placeholder={editingServer ? "留空则保留现有管理员密码" : "ccLoad 管理员密码"}
+                  className="h-11 rounded-xl border-stone-200 bg-white pr-10"
+                />
+                <button
+                  type="button"
+                  aria-label={showPassword ? "隐藏密码" : "显示密码"}
+                  className="absolute top-1/2 right-3 -translate-y-1/2 text-stone-400 transition hover:text-stone-600"
+                  onClick={() => setShowPassword((value) => !value)}
+                >
+                  {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                </button>
+              </div>
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={hasMutation}>取消</Button>
-            <Button disabled={hasMutation} onClick={() => void saveServer()}>
-              {isSaving && <LoaderCircle className="mr-2 size-4 animate-spin" />}保存
+          <DialogFooter className="pt-2">
+            <Button
+              variant="secondary"
+              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              onClick={() => setDialogOpen(false)}
+              disabled={hasMutation}
+            >
+              取消
+            </Button>
+            <Button
+              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              disabled={hasMutation}
+              onClick={() => void saveServer()}
+            >
+              {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
+              {editingServer ? "保存修改" : "添加"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
       <Dialog open={browserOpen} onOpenChange={setBrowserOpen}>
-        <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>选择 Codex OAuth 频道</DialogTitle>
-            <DialogDescription>{browserServer?.name || browserServer?.base_url}</DialogDescription>
+        <DialogContent showCloseButton={false} className="max-h-[90vh] max-w-5xl rounded-2xl p-6">
+          <DialogHeader className="gap-2">
+            <DialogTitle>选择要导入的渠道</DialogTitle>
+            <DialogDescription className="text-sm leading-6">
+              {browserServer ? `来自 ${browserServer.name || browserServer.base_url}` : "读取到的 Codex OAuth 渠道"}
+            </DialogDescription>
           </DialogHeader>
-          <div className="space-y-3">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div className="relative min-w-[260px]">
+              <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
               <Input
                 value={channelQuery}
                 onChange={(event) => {
                   setChannelQuery(event.target.value);
                   setChannelPage(1);
                 }}
-                placeholder="搜索频道名称、ID或模型"
-                className="h-10 min-w-[260px] rounded-xl border-stone-200 bg-white lg:max-w-sm"
+                placeholder="搜索渠道名称、ID或模型"
+                className="h-10 rounded-xl border-stone-200 bg-white pl-10"
                 disabled={hasMutation}
               />
-              <div className="flex items-center gap-2">
-                <Select
-                  value={channelPageSize}
-                  onValueChange={(value) => {
-                    setChannelPageSize(value as PageSizeOption);
-                    setChannelPage(1);
-                  }}
-                  disabled={hasMutation}
-                >
-                  <SelectTrigger className="h-10 w-[120px] rounded-xl border-stone-200 bg-white">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {PAGE_SIZE_OPTIONS.map((item) => (
-                      <SelectItem key={item} value={item}>{item} / 页</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-                <Button
-                  variant="outline"
-                  className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
-                  onClick={() => toggleAllChannels(!allChannelsSelected)}
-                  disabled={hasMutation || selectableFilteredChannelIds.length === 0}
-                >
-                  {allChannelsSelected ? "取消全选" : "全选筛选结果"}
-                </Button>
-              </div>
             </div>
-            <div className="flex items-center justify-between rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-500">
-              <label className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
+              <Select
+                value={channelPageSize}
+                onValueChange={(value) => {
+                  setChannelPageSize(value as PageSizeOption);
+                  setChannelPage(1);
+                }}
+                disabled={hasMutation}
+              >
+                <SelectTrigger className="h-10 w-[120px] rounded-xl border-stone-200 bg-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {PAGE_SIZE_OPTIONS.map((item) => (
+                    <SelectItem key={item} value={item}>{item} / 页</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button
+                variant="outline"
+                className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
+                onClick={() => toggleAllChannels(!allChannelsSelected)}
+                disabled={hasMutation || selectableFilteredChannelIds.length === 0}
+              >
+                {allChannelsSelected ? "取消全选" : "全选筛选结果"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-stone-200">
+            <div className="flex items-center justify-between border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
+              <div className="flex items-center gap-3">
                 <Checkbox
                   checked={allChannelsSelected}
                   disabled={selectableFilteredChannelIds.length === 0 || hasMutation}
                   onCheckedChange={(checked) => toggleAllChannels(Boolean(checked))}
                 />
                 <span>筛选结果 {filteredChannels.length} 个，可用 {selectableFilteredChannelIds.length} 个</span>
-              </label>
+              </div>
               <span>已选 {validSelectedIds.length} 个</span>
             </div>
-            {filteredChannels.length === 0 ? (
-              <p className="py-8 text-center text-sm text-stone-500">
-                {channels.length === 0 ? "没有可导入频道" : "没有匹配的频道"}
-              </p>
-            ) : (
-              channelPageResult.items.map((channel) => (
-                <label key={channel.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-stone-200 p-3">
-                  <Checkbox
-                    checked={selectedIds.includes(channel.id)}
-                    disabled={!channel.enabled || hasMutation}
-                    onCheckedChange={(checked) => setSelectedIds((current) => (
-                      checked ? [...new Set([...current, channel.id])] : current.filter((id) => id !== channel.id)
-                    ))}
-                  />
-                  <span className="min-w-0 flex-1">
-                    <span className="flex flex-wrap items-center gap-2 font-medium text-stone-800">
-                      {channel.name || `频道 ${channel.id}`}
-                      <Badge variant="secondary">{channel.plan_type || "unknown"}</Badge>
-                      {!channel.enabled && <Badge variant="secondary">已禁用</Badge>}
-                    </span>
-                    <span className="mt-1 block text-xs text-stone-500">
-                      {channel.models.join(", ") || "未声明模型"}{channel.subscription_active_until ? ` · 到期 ${channel.subscription_active_until}` : ""}
-                    </span>
-                  </span>
-                </label>
-              ))
-            )}
-            <div className="flex items-center justify-between text-sm text-stone-500">
-              <span>
-                第 {channelPageResult.start} - {channelPageResult.end} 条，共 {channelPageResult.total} 条
-              </span>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  className="h-9 rounded-xl border-stone-200 bg-white px-3"
-                  onClick={() => setChannelPage(Math.max(1, channelPageResult.page - 1))}
-                  disabled={hasMutation || channelPageResult.page <= 1}
-                >
-                  上一页
-                </Button>
-                <span>{channelPageResult.page}/{channelPageResult.pageCount}</span>
-                <Button
-                  variant="outline"
-                  className="h-9 rounded-xl border-stone-200 bg-white px-3"
-                  onClick={() => setChannelPage(Math.min(channelPageResult.pageCount, channelPageResult.page + 1))}
-                  disabled={hasMutation || channelPageResult.page >= channelPageResult.pageCount}
-                >
-                  下一页
-                </Button>
-              </div>
+            <div className="max-h-[420px] overflow-auto">
+              {channelPageResult.items.length === 0 ? (
+                <div className="flex items-center justify-center py-12 text-sm text-stone-400">
+                  {channels.length === 0 ? "没有可导入渠道" : "没有匹配的渠道"}
+                </div>
+              ) : (
+                <div className="divide-y divide-stone-100">
+                  {channelPageResult.items.map((channel) => (
+                    <label key={channel.id} className="flex cursor-pointer items-start gap-3 px-4 py-3 hover:bg-stone-50">
+                      <Checkbox
+                        checked={selectedIds.includes(channel.id)}
+                        disabled={!channel.enabled || hasMutation}
+                        onCheckedChange={(checked) => setSelectedIds((current) => (
+                          checked ? [...new Set([...current, channel.id])] : current.filter((id) => id !== channel.id)
+                        ))}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="truncate text-sm font-medium text-stone-700">
+                            {channel.name || `渠道 ${channel.id}`}
+                          </span>
+                          <Badge className="rounded-md bg-stone-100 text-stone-600">{channel.plan_type || "unknown"}</Badge>
+                          {!channel.enabled ? <Badge variant="info" className="rounded-md">已禁用</Badge> : null}
+                        </div>
+                        <div className="mt-1 text-xs text-stone-400">
+                          模型：{channel.models.join(", ") || "暂无可用模型"}
+                          {channel.subscription_active_until ? ` · 到期 ${channel.subscription_active_until}` : ""}
+                        </div>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setBrowserOpen(false)} disabled={hasMutation}>取消</Button>
-            <Button disabled={validSelectedIds.length === 0 || hasMutation} onClick={() => void startImport()}>
-              {isStartingImport ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : <Import className="mr-2 size-4" />}
-              导入 {validSelectedIds.length > 0 ? validSelectedIds.length : ""} 个频道
+
+          <div className="flex items-center justify-between text-sm text-stone-500">
+            <span>
+              第 {channelPageResult.start} - {channelPageResult.end} 条，共 {channelPageResult.total} 条
+            </span>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                className="h-9 rounded-xl border-stone-200 bg-white px-3"
+                onClick={() => setChannelPage(Math.max(1, channelPageResult.page - 1))}
+                disabled={hasMutation || channelPageResult.page <= 1}
+              >
+                上一页
+              </Button>
+              <span>{channelPageResult.page}/{channelPageResult.pageCount}</span>
+              <Button
+                variant="outline"
+                className="h-9 rounded-xl border-stone-200 bg-white px-3"
+                onClick={() => setChannelPage(Math.min(channelPageResult.pageCount, channelPageResult.page + 1))}
+                disabled={hasMutation || channelPageResult.page >= channelPageResult.pageCount}
+              >
+                下一页
+              </Button>
+            </div>
+          </div>
+
+          <DialogFooter className="pt-2">
+            <Button
+              variant="secondary"
+              className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
+              onClick={() => setBrowserOpen(false)}
+              disabled={hasMutation}
+            >
+              取消
+            </Button>
+            <Button
+              className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
+              disabled={validSelectedIds.length === 0 || hasMutation}
+              onClick={() => void startImport()}
+            >
+              {isStartingImport ? <LoaderCircle className="size-4 animate-spin" /> : <Import className="size-4" />}
+              导入选中渠道
             </Button>
           </DialogFooter>
         </DialogContent>

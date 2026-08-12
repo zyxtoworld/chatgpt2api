@@ -12,6 +12,23 @@ function uniqueEnabledIds(channels) {
   return ids;
 }
 
+export function replaceCCLoadChannelModels(channels, models) {
+  const modelIds = [];
+  const seen = new Set();
+  for (const model of Array.isArray(models) ? models : []) {
+    const id = typeof model?.id === "string" ? model.id.trim() : "";
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    modelIds.push(id);
+  }
+  return (Array.isArray(channels) ? channels : []).map((channel) => ({
+    ...channel,
+    models: modelIds.slice(),
+  }));
+}
+
 export function filterCCLoadChannels(channels, query) {
   const items = Array.isArray(channels) ? channels : [];
   const normalizedQuery = String(query || "").trim().toLowerCase();

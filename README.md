@@ -154,9 +154,9 @@ environment:
 - 支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理
 - 支持 WARP / FlareSolverr 稳定代理运行时
 - 支持搜索、筛选、批量刷新、导出、手动编辑和清理账号
-- 支持五种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、ccLoad 预览版 Codex OAuth 频道导入、`access_token` 导入
+- 支持五种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、ccLoad Codex OAuth 渠道导入、`access_token` 导入
 - 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
-- 支持连接 ccLoad `v4.6.12-beta.1` 预览版，读取 `codex_oauth` 频道并导入 access/refresh token 及其可选 id token；管理员密码、临时会话令牌和 OAuth 凭据不会返回浏览器
+- 支持连接 ccLoad，读取 `codex_oauth` 渠道并导入 access/refresh token 及其可选 id token；管理员密码、临时会话令牌和 OAuth 凭据不会返回浏览器
 
 ### 实验性 / 规划中
 
