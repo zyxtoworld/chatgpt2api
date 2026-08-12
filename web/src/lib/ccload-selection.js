@@ -39,15 +39,34 @@ export function normalizeCCLoadChannels(channels) {
 }
 
 export function getUnloadedCCLoadChannelIds(channels) {
-  return uniqueEnabledIds(
-    (Array.isArray(channels) ? channels : []).filter((channel) => channel?.models_loaded !== true),
-  );
+  const seenPlans = new Set();
+  const ids = [];
+  for (const channel of Array.isArray(channels) ? channels : []) {
+    const id = String(channel?.id || "").trim();
+    if (!id || channel?.enabled !== true || channel?.models_loaded === true) continue;
+    const planType = String(channel?.plan_type || "").trim().toLowerCase();
+    const catalogKey = planType ? `plan:${planType}` : `channel:${id}`;
+    if (seenPlans.has(catalogKey)) continue;
+    seenPlans.add(catalogKey);
+    ids.push(id);
+  }
+  return ids;
 }
 
 export function mergeCCLoadChannelModels(channels, catalogs) {
-  const byId = new Map(normalizeCCLoadChannels(catalogs).map((channel) => [channel.id, channel]));
+  const normalizedCatalogs = normalizeCCLoadChannels(catalogs);
+  const byId = new Map(normalizedCatalogs.map((channel) => [channel.id, channel]));
+  const byPlanType = new Map();
+  for (const catalog of normalizedCatalogs) {
+    const planType = catalog.plan_type.toLowerCase();
+    if (planType && !byPlanType.has(planType)) {
+      byPlanType.set(planType, catalog);
+    }
+  }
   return (Array.isArray(channels) ? channels : []).map((channel) => {
-    const catalog = byId.get(String(channel?.id || "").trim());
+    const id = String(channel?.id || "").trim();
+    const planType = String(channel?.plan_type || "").trim().toLowerCase();
+    const catalog = byId.get(id) || (planType ? byPlanType.get(planType) : undefined);
     return catalog
       ? { ...channel, models: catalog.models, models_loaded: catalog.models_loaded }
       : channel;

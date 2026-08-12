@@ -310,16 +310,16 @@ export function CCLoadConnections() {
     () => getCCLoadPage(filteredChannels, channelPage, Number(channelPageSize)),
     [channelPage, channelPageSize, filteredChannels],
   );
-  const unloadedPageModelIds = getUnloadedCCLoadChannelIds(channelPageResult.items).slice(0, 50);
-  const unloadedPageModelKey = unloadedPageModelIds.join(",");
+  const unloadedModelIds = getUnloadedCCLoadChannelIds(channels).slice(0, 50);
+  const unloadedModelKey = unloadedModelIds.join(",");
 
   useEffect(() => {
-    if (!browserOpen || !browserServer || !unloadedPageModelKey) return;
+    if (!browserOpen || !browserServer || !unloadedModelKey) return;
     const gate = requestGateRef.current;
     const queryOwner = gate.beginQuery("channel-models");
     if (!queryOwner.allowed) return;
     const serverId = browserServer.id;
-    const channelIds = unloadedPageModelKey.split(",");
+    const channelIds = unloadedModelKey.split(",");
     modelOwnerRef.current = queryOwner;
     setLoadingModelIds(channelIds);
     void fetchCCLoadChannelModels(serverId, channelIds)
@@ -338,7 +338,7 @@ export function CCLoadConnections() {
           setLoadingModelIds([]);
         }
       });
-  }, [browserOpen, browserServer, unloadedPageModelKey]);
+  }, [browserOpen, browserServer, unloadedModelKey]);
 
   const closeBrowser = () => {
     requestGateRef.current.invalidateQueries("channel-models");

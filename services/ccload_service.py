@@ -399,8 +399,9 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
         raise CCLoadError("ccLoad model batch supports at most 50 channels")
 
     deadline = time.monotonic() + CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS
-    catalogs = {channel_id: [] for channel_id in selected}
-    model_tokens: dict[str, str] = {}
+    catalogs: list[dict] = []
+    model_tokens: dict[int, str] = {}
+    seen_plan_types: set[str] = set()
     with _admin_session(server, deadline=deadline) as (session, base_url, headers):
         for channel_id in selected:
             try:
@@ -411,50 +412,61 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
                     channel_id,
                     deadline=deadline,
                 )
-                model_tokens[channel_id] = credential["access_token"]
+                plan_type = _clean(credential.get("plan_type"))
+                plan_key = plan_type.casefold() if plan_type else f"channel:{channel_id}"
+                if plan_key in seen_plan_types:
+                    continue
+                seen_plan_types.add(plan_key)
+                catalogs.append({
+                    "id": channel_id,
+                    "plan_type": plan_type,
+                    "models": [],
+                    "models_loaded": True,
+                })
+                model_tokens[len(catalogs) - 1] = credential["access_token"]
             except Exception as exc:
                 if time.monotonic() >= deadline:
                     raise CCLoadError("ccLoad channel model list timed out") from exc
+                catalogs.append({
+                    "id": channel_id,
+                    "plan_type": "",
+                    "models": [],
+                    "models_loaded": True,
+                })
                 logger.warning({
                     "event": "ccload_channel_model_catalog_failed",
                     "channel_id": channel_id,
                     "error": exception_log_message(exc),
                 })
     if not model_tokens:
-        return [
-            {"id": channel_id, "models": [], "models_loaded": True}
-            for channel_id in selected
-        ]
+        return catalogs
 
     executor = ThreadPoolExecutor(
         max_workers=min(CCLOAD_MODEL_CATALOG_WORKERS, len(model_tokens)),
         thread_name_prefix="ccload-models",
     )
     futures = {
-        executor.submit(_channel_model_ids, access_token, deadline=deadline): channel_id
-        for channel_id, access_token in model_tokens.items()
+        executor.submit(_channel_model_ids, access_token, deadline=deadline): catalog_index
+        for catalog_index, access_token in model_tokens.items()
     }
     try:
         for future in as_completed(futures, timeout=_remaining_timeout(deadline, CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS)):
-            channel_id = futures[future]
+            catalog_index = futures[future]
             try:
-                catalogs[channel_id] = future.result()
+                catalogs[catalog_index]["models"] = future.result()
             except Exception as exc:
                 if time.monotonic() >= deadline:
                     raise CCLoadError("ccLoad channel model list timed out") from exc
                 logger.warning({
                     "event": "ccload_channel_model_catalog_failed",
-                    "channel_id": channel_id,
+                    "channel_id": catalogs[catalog_index]["id"],
                     "error": exception_log_message(exc),
                 })
     except FuturesTimeoutError as exc:
         raise CCLoadError("ccLoad channel model list timed out") from exc
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
-    return [
-        {"id": channel_id, "models": catalogs[channel_id], "models_loaded": True}
-        for channel_id in selected
-    ]
+    return catalogs
 
 
 def _normalized_codex_credential(raw: object) -> dict | None:

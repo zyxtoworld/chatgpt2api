@@ -63,27 +63,63 @@ test("ccLoad channels preserve each authenticated channel catalog instead of one
   );
 });
 
-test("ccLoad lazily requests only unloaded enabled channels on the visible page", () => {
+test("ccLoad requests one unloaded representative for each account type in the full list", () => {
   assert.deepEqual(getUnloadedCCLoadChannelIds([
-    { id: "free", enabled: true, models_loaded: false },
-    { id: "pro", enabled: true, models_loaded: true },
-    { id: "disabled", enabled: false, models_loaded: false },
-    { id: "free", enabled: true, models_loaded: false },
-  ]), ["free"]);
+    { id: "free-a", enabled: true, plan_type: " free ", models_loaded: false },
+    { id: "free-b", enabled: true, plan_type: "FREE", models_loaded: false },
+    { id: "pro-a", enabled: true, plan_type: "pro", models_loaded: false },
+    { id: "pro-b", enabled: true, plan_type: "Pro", models_loaded: false },
+    { id: "team", enabled: true, plan_type: "team", models_loaded: false },
+    { id: "loaded", enabled: true, plan_type: "plus", models_loaded: true },
+    { id: "disabled", enabled: false, plan_type: "business", models_loaded: false },
+    { id: "unknown-a", enabled: true, plan_type: "", models_loaded: false },
+    { id: "unknown-b", enabled: true, models_loaded: false },
+  ]), ["free-a", "pro-a", "team", "unknown-a", "unknown-b"]);
 });
 
-test("ccLoad merges per-channel model results without replacing list metadata", () => {
+test("ccLoad reuses one account-type catalog across pagination", () => {
+  const allChannels = Array.from({ length: 100 }, (_, index) => ({
+    id: `free-${index + 1}`,
+    name: `Free ${index + 1}`,
+    enabled: true,
+    plan_type: "free",
+    models: [],
+    models_loaded: false,
+  }));
+
+  assert.deepEqual(getUnloadedCCLoadChannelIds(allChannels), ["free-1"]);
+  const merged = mergeCCLoadChannelModels(allChannels, [{
+    id: "free-1",
+    plan_type: "free",
+    models: ["gpt-free"],
+    models_loaded: true,
+  }]);
+  const secondPage = getCCLoadPage(merged, 2, 50).items;
+
+  assert.equal(secondPage.length, 50);
+  assert.equal(secondPage.every((channel) => channel.models_loaded === true), true);
+  assert.deepEqual(getUnloadedCCLoadChannelIds(secondPage), []);
+});
+
+test("ccLoad shares one model catalog with every channel of the same account type", () => {
   assert.deepEqual(
     mergeCCLoadChannelModels(
       [
-        { id: "free", name: "Free", enabled: true, models: [], models_loaded: false },
-        { id: "pro", name: "Pro", enabled: true, models: [], models_loaded: false },
+        { id: "free-a", name: "Free A", enabled: true, plan_type: "free", models: [], models_loaded: false },
+        { id: "free-b", name: "Free B", enabled: true, plan_type: "FREE", models: [], models_loaded: false },
+        { id: "pro", name: "Pro", enabled: true, plan_type: "pro", models: [], models_loaded: false },
+        { id: "unknown", name: "Unknown", enabled: true, plan_type: "", models: [], models_loaded: false },
       ],
-      [{ id: "pro", models: [" gpt-pro ", "gpt-pro", ""], models_loaded: true }],
+      [
+        { id: "free-a", plan_type: " Free ", models: [" gpt-free ", "gpt-free", ""], models_loaded: true },
+        { id: "unknown", plan_type: "", models: ["gpt-unknown"], models_loaded: true },
+      ],
     ),
     [
-      { id: "free", name: "Free", enabled: true, models: [], models_loaded: false },
-      { id: "pro", name: "Pro", enabled: true, models: ["gpt-pro"], models_loaded: true },
+      { id: "free-a", name: "Free A", enabled: true, plan_type: "free", models: ["gpt-free"], models_loaded: true },
+      { id: "free-b", name: "Free B", enabled: true, plan_type: "FREE", models: ["gpt-free"], models_loaded: true },
+      { id: "pro", name: "Pro", enabled: true, plan_type: "pro", models: [], models_loaded: false },
+      { id: "unknown", name: "Unknown", enabled: true, plan_type: "", models: ["gpt-unknown"], models_loaded: true },
     ],
   );
 });

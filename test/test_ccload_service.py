@@ -175,6 +175,7 @@ class CCLoadServiceContractTests(unittest.TestCase):
 
         self.assertEqual(channels, [{
             "id": "7",
+            "plan_type": "pro",
             "models": ["gpt-5.4", "gpt-5.4-pro"],
             "models_loaded": True,
         }])
@@ -197,7 +198,7 @@ class CCLoadServiceContractTests(unittest.TestCase):
 
         self.assertEqual(_FakeCCLoadSession.instances, [])
 
-    def test_each_channel_uses_its_own_authenticated_model_catalog(self) -> None:
+    def test_each_distinct_account_type_uses_its_own_authenticated_model_catalog(self) -> None:
         class TwoChannelSession(_FakeCCLoadSession):
             instances: list["TwoChannelSession"] = []
 
@@ -258,8 +259,8 @@ class CCLoadServiceContractTests(unittest.TestCase):
             channels = ccload_module.list_remote_channel_models(self.server, ["1", "2"])
 
         self.assertEqual(channels, [
-            {"id": "1", "models": ["common", "free-model"], "models_loaded": True},
-            {"id": "2", "models": ["common", "free-model", "pro-model"], "models_loaded": True},
+            {"id": "1", "plan_type": "free", "models": ["common", "free-model"], "models_loaded": True},
+            {"id": "2", "plan_type": "pro", "models": ["common", "free-model", "pro-model"], "models_loaded": True},
         ])
         self.assertEqual([backend.access_token for backend in PerChannelBackend.instances], ["token-1", "token-2"])
         self.assertTrue(all(backend.closed for backend in PerChannelBackend.instances))
@@ -273,6 +274,51 @@ class CCLoadServiceContractTests(unittest.TestCase):
                 ("POST", "https://ccload.example.test/logout"),
             ],
         )
+
+    def test_model_batch_fetches_one_catalog_per_account_type(self) -> None:
+        credentials = {
+            "1": {"access_token": "free-token-1", "plan_type": "free"},
+            "2": {"access_token": "free-token-2", "plan_type": " Free "},
+            "3": {"access_token": "pro-token-1", "plan_type": "pro"},
+            "4": {"access_token": "team-token-1", "plan_type": "team"},
+        }
+        model_calls: list[str] = []
+
+        def fetch_credential(_session, _base_url, _headers, channel_id: str, **_kwargs):
+            return credentials[channel_id]
+
+        def model_ids(access_token: str, **_kwargs):
+            model_calls.append(access_token)
+            return [f"model-{access_token}"]
+
+        with (
+            mock.patch.object(ccload_module, "Session", _FakeCCLoadSession),
+            mock.patch.object(ccload_module, "_fetch_remote_credential", side_effect=fetch_credential),
+            mock.patch.object(ccload_module, "_channel_model_ids", side_effect=model_ids),
+        ):
+            channels = ccload_module.list_remote_channel_models(self.server, ["1", "2", "3", "4"])
+
+        self.assertCountEqual(model_calls, ["free-token-1", "pro-token-1", "team-token-1"])
+        self.assertEqual(channels, [
+            {
+                "id": "1",
+                "plan_type": "free",
+                "models": ["model-free-token-1"],
+                "models_loaded": True,
+            },
+            {
+                "id": "3",
+                "plan_type": "pro",
+                "models": ["model-pro-token-1"],
+                "models_loaded": True,
+            },
+            {
+                "id": "4",
+                "plan_type": "team",
+                "models": ["model-team-token-1"],
+                "models_loaded": True,
+            },
+        ])
 
     def test_enabled_channel_model_catalogs_are_loaded_concurrently(self) -> None:
         active = 0
@@ -352,7 +398,7 @@ class CCLoadServiceContractTests(unittest.TestCase):
         def fetch_credential(_session, _base_url, _headers, channel_id: str, **_kwargs):
             if channel_id == "2":
                 raise ccload_module.CCLoadError("fixture credential failure")
-            return {"access_token": f"token-{channel_id}"}
+            return {"access_token": f"token-{channel_id}", "plan_type": "pro"}
 
         def model_ids(access_token: str, **_kwargs):
             model_calls.append(access_token)
@@ -367,8 +413,8 @@ class CCLoadServiceContractTests(unittest.TestCase):
 
         self.assertEqual(model_calls, ["token-3"])
         self.assertEqual(channels, [
-            {"id": "2", "models": [], "models_loaded": True},
-            {"id": "3", "models": ["gpt-pro-model"], "models_loaded": True},
+            {"id": "2", "plan_type": "", "models": [], "models_loaded": True},
+            {"id": "3", "plan_type": "pro", "models": ["gpt-pro-model"], "models_loaded": True},
         ])
 
     def test_fetches_selected_complete_codex_credential_and_never_lists_it(self) -> None:

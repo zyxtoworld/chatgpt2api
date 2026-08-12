@@ -98,7 +98,7 @@ class CCLoadAPIContractTests(unittest.TestCase):
         self.assertNotIn("user@example.test", response.text)
 
     def test_channel_model_route_returns_only_requested_public_catalogs(self) -> None:
-        catalogs = [{"id": "7", "models": ["gpt-5.4-pro"], "models_loaded": True}]
+        catalogs = [{"id": "7", "plan_type": "pro", "models": ["gpt-5.4-pro"], "models_loaded": True}]
         with (
             mock.patch.object(accounts_module, "ccload_config", self.config),
             mock.patch.object(accounts_module, "ccload_list_remote_channel_models", return_value=catalogs) as load_models,

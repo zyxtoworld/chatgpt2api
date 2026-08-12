@@ -893,7 +893,7 @@ export type CCLoadChannel = {
   models_loaded: boolean;
 };
 
-export type CCLoadChannelModels = Pick<CCLoadChannel, "id" | "models" | "models_loaded">;
+export type CCLoadChannelModels = Pick<CCLoadChannel, "id" | "plan_type" | "models" | "models_loaded">;
 
 export async function fetchCCLoadServers() {
   return httpRequest<{ servers: CCLoadServer[] }>("/api/ccload/servers");
