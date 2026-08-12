@@ -1023,7 +1023,7 @@ def stream_image_outputs(
         logger.info({
             "event": "image_detected_text_reply_with_ids",
             "conversation_id": conversation_id,
-            "message_preview": message[:200],
+            "message_len": len(message),
         })
 
     # 当检测到文本回复但 conversation_id 丢失时，尝试从最近对话列表中恢复
@@ -1040,7 +1040,7 @@ def stream_image_outputs(
                 logger.info({
                     "event": "image_conversation_id_recovered",
                     "conversation_id": conversation_id,
-                    "message_preview": message[:200],
+                    "message_len": len(message),
                 })
         except Exception as exc:
             logger.warning({
@@ -1155,7 +1155,7 @@ def stream_image_outputs(
                     logger.info({
                         "event": "image_text_reply_conversation_id_recovered",
                         "conversation_id": conversation_id,
-                        "message_preview": message[:200],
+                        "message_len": len(message),
                     })
             except Exception as exc:
                 logger.warning({
@@ -1166,7 +1166,7 @@ def stream_image_outputs(
             logger.info({
                 "event": "image_model_text_reply_retry_poll",
                 "conversation_id": conversation_id,
-                "message_preview": message[:200],
+                "message_len": len(message),
             })
             # 文本回复场景下，图片可能需要 4-5 分钟才能异步生成完成。
             # 使用 300s 超时并允许多次重试，避免因临时网络问题提前退出。
@@ -1244,7 +1244,7 @@ def stream_image_outputs(
             logger.warning({
                 "event": "image_model_text_reply_no_image",
                 "conversation_id": conversation_id,
-                "message_preview": message[:200],
+                "message_len": len(message),
             })
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return

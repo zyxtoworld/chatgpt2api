@@ -601,6 +601,51 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertNotIn(UPSTREAM_SECRET, logged)
         self.assertNotIn("error_msg", logged)
 
+    def test_image_text_reply_logs_only_structured_metadata(self) -> None:
+        secret = "opaque-image-text-secret owner@example.test"
+        message = f'{secret} {{"referenced_image_ids":["image-1"]}}'
+
+        class TextReplyBackend:
+            @staticmethod
+            def resolve_conversation_image_urls(*args, **kwargs):
+                return []
+
+            @staticmethod
+            def _poll_image_results(*args, **kwargs):
+                return [], []
+
+        request = conversation_module.ConversationRequest(
+            model="gpt-image-2",
+            prompt="draw an apple",
+        )
+        event = {
+            "type": "conversation.done",
+            "conversation_id": "conversation-1",
+            "file_ids": [],
+            "sediment_ids": [],
+            "text": message,
+            "turn_use_case": "image gen",
+        }
+
+        with (
+            mock.patch.object(conversation_module, "conversation_events", return_value=iter([event])),
+            mock.patch.object(conversation_module, "_get_detailed_error_from_tasks", return_value=""),
+            mock.patch.object(conversation_module.logger, "info") as info,
+            mock.patch.object(conversation_module.logger, "warning") as warning,
+        ):
+            outputs = list(conversation_module.stream_image_outputs(TextReplyBackend(), request))
+
+        self.assertEqual(outputs[-1].kind, "message")
+        self.assertEqual(outputs[-1].text, message)
+        logged = json.dumps(
+            [*info.call_args_list, *warning.call_args_list],
+            ensure_ascii=False,
+            default=str,
+        )
+        self.assertNotIn(secret, logged)
+        self.assertNotIn("message_preview", logged)
+        self.assertIn(f'"message_len": {len(message)}', logged)
+
     def test_refresh_token_failure_does_not_include_upstream_body(self) -> None:
         class FailedResponse:
             status_code = 401
