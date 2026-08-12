@@ -2951,9 +2951,14 @@ class OpenAIBackendAPI:
                 efforts.append(normalized)
         return efforts
 
-    def list_models(self) -> Dict[str, Any]:
+    def list_models(
+            self,
+            *,
+            timeout_secs: float = 30.0,
+            deadline: float | None = None,
+    ) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""
-        self._bootstrap()
+        self._bootstrap(timeout_secs=timeout_secs, deadline=deadline)
         # Model discovery must request the account's complete catalog. Tying this
         # query to the conversation privacy mode hides paid-plan models upstream.
         path = "/backend-api/models?history_and_training_disabled=false" if self.access_token else (
@@ -2964,7 +2969,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + path,
             headers=self._headers(route),
-            timeout=30,
+            timeout=self._search_remaining(deadline, timeout_secs),
         )
         ensure_ok(response, context)
         data = []

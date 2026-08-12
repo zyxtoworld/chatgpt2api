@@ -319,6 +319,9 @@ function LogsContent() {
         <DialogContent className="flex h-[min(88vh,860px)] w-[min(92vw,920px)] flex-col overflow-hidden rounded-2xl p-0">
           <DialogHeader className="shrink-0 border-b border-stone-100 px-6 py-5">
             <DialogTitle>日志详情</DialogTitle>
+            <DialogDescription className="sr-only">
+              查看本条调用日志的结构化字段、关联图片和完整详情。
+            </DialogDescription>
           </DialogHeader>
           <div className="flex-1 overflow-y-auto px-6 py-5">
             <div className="space-y-4">

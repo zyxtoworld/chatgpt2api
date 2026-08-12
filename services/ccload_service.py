@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,10 +32,21 @@ from utils.log import logger
 
 
 CCLOAD_CONFIG_FILE = DATA_DIR / "ccload_config.json"
+CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS = 90.0
+CCLOAD_MODEL_CATALOG_WORKERS = 8
 
 
 class CCLoadError(RuntimeError):
     pass
+
+
+def _remaining_timeout(deadline: float | None, maximum: float) -> float:
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise CCLoadError("ccLoad channel browse timed out")
+    return min(maximum, remaining)
 
 
 def _clean(value: object) -> str:
@@ -286,7 +299,11 @@ def _response_payload(response, operation: str) -> dict:
 
 
 @contextmanager
-def _admin_session(server: dict) -> Iterator[tuple[Session, str, dict[str, str]]]:
+def _admin_session(
+        server: dict,
+        *,
+        deadline: float | None = None,
+) -> Iterator[tuple[Session, str, dict[str, str]]]:
     base_url = _clean(server.get("base_url")).rstrip("/")
     password = _clean(server.get("password"))
     if not base_url or not password:
@@ -300,7 +317,7 @@ def _admin_session(server: dict) -> Iterator[tuple[Session, str, dict[str, str]]
                 f"{base_url}/login",
                 json={"mode": "admin", "password": password},
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
-                timeout=30,
+                timeout=_remaining_timeout(deadline, 30.0),
             )
         except Exception as exc:
             raise CCLoadError("ccLoad login failed") from exc
@@ -330,16 +347,18 @@ def _admin_session(server: dict) -> Iterator[tuple[Session, str, dict[str, str]]
 def list_remote_channels(server: dict) -> list[dict]:
     """List public metadata for ccLoad Codex OAuth channels."""
     channels: list[dict] = []
+    model_tokens: dict[int, str] = {}
     limit = 200
     offset = 0
-    with _admin_session(server) as (session, base_url, headers):
+    deadline = time.monotonic() + CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS
+    with _admin_session(server, deadline=deadline) as (session, base_url, headers):
         while True:
             try:
                 response = session.get(
                     f"{base_url}/admin/channels",
                     headers=headers,
                     params={"auth_type": "codex_oauth", "limit": limit, "offset": offset},
-                    timeout=30,
+                    timeout=_remaining_timeout(deadline, 30.0),
                 )
             except Exception as exc:
                 raise CCLoadError("ccLoad channel list failed") from exc
@@ -368,18 +387,57 @@ def list_remote_channels(server: dict) -> list[dict]:
             offset += len(data)
             if not data or offset >= total or len(data) < limit:
                 break
-        for channel in channels:
+        for index, channel in enumerate(channels):
             if not channel["enabled"]:
                 continue
             try:
-                credential = _fetch_remote_credential(session, base_url, headers, channel["id"])
-                channel["models"] = _channel_model_ids(credential["access_token"])
+                credential = _fetch_remote_credential(
+                    session,
+                    base_url,
+                    headers,
+                    channel["id"],
+                    deadline=deadline,
+                )
+                model_tokens[index] = credential["access_token"]
             except Exception as exc:
+                if time.monotonic() >= deadline:
+                    raise CCLoadError("ccLoad channel browse timed out") from exc
                 logger.warning({
                     "event": "ccload_channel_model_catalog_failed",
                     "channel_id": channel["id"],
                     "error": exception_log_message(exc),
                 })
+    if not model_tokens:
+        return channels
+
+    executor = ThreadPoolExecutor(
+        max_workers=min(CCLOAD_MODEL_CATALOG_WORKERS, len(model_tokens)),
+        thread_name_prefix="ccload-models",
+    )
+    futures = {
+        executor.submit(_channel_model_ids, access_token, deadline=deadline): index
+        for index, access_token in model_tokens.items()
+    }
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise FuturesTimeoutError
+        for future in as_completed(futures, timeout=remaining):
+            index = futures[future]
+            try:
+                channels[index]["models"] = future.result()
+            except Exception as exc:
+                if time.monotonic() >= deadline:
+                    raise CCLoadError("ccLoad channel model list timed out") from exc
+                logger.warning({
+                    "event": "ccload_channel_model_catalog_failed",
+                    "channel_id": channels[index]["id"],
+                    "error": exception_log_message(exc),
+                })
+    except FuturesTimeoutError as exc:
+        raise CCLoadError("ccLoad channel model list timed out") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     return channels
 
 
@@ -429,11 +487,13 @@ def _fetch_remote_credential(
         base_url: str,
         headers: dict[str, str],
         channel_id: str,
+        *,
+        deadline: float | None = None,
 ) -> dict:
     response = session.get(
         f"{base_url}/admin/channels/{channel_id}/editor",
         headers=headers,
-        timeout=30,
+        timeout=_remaining_timeout(deadline, 30.0),
     )
     payload = _response_payload(response, "credential fetch")
     data = payload.get("data")
@@ -450,10 +510,10 @@ def _fetch_remote_credential(
     return credential
 
 
-def _channel_model_ids(access_token: str) -> list[str]:
+def _channel_model_ids(access_token: str, *, deadline: float | None = None) -> list[str]:
     backend = OpenAIBackendAPI(access_token=access_token)
     try:
-        payload = backend.list_models()
+        payload = backend.list_models(timeout_secs=30.0, deadline=deadline)
     except Exception as exc:
         raise CCLoadError("ccLoad channel model list failed") from exc
     finally:

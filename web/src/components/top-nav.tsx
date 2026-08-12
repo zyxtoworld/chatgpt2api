@@ -8,7 +8,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { HeaderActions } from "@/components/header-actions";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Sheet, SheetClose, SheetContent, SheetFooter, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
+import { Sheet, SheetClose, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import webConfig from "@/constants/common-env";
 import { fetchThirdPartyApps, type ThirdPartyAppsSettings } from "@/lib/api";
 import { getValidatedAuthSession } from "@/lib/auth-session";
@@ -151,7 +151,9 @@ export function TopNav() {
               <SheetContent side="left">
                 <SheetHeader>
                   <SheetTitle>chatgpt2api</SheetTitle>
-                  <span className="text-xs text-stone-500 dark:text-stone-400">{roleLabel} · {displayName}</span>
+                  <SheetDescription className="text-xs text-stone-500 dark:text-stone-400">
+                    {roleLabel} · {displayName}
+                  </SheetDescription>
                 </SheetHeader>
                 <nav className="mt-8 flex flex-col gap-1">
                   {canvasHref ? (
