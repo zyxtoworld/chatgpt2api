@@ -34,6 +34,7 @@ import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
 import { createConversationQueueGate } from "@/lib/image-conversation-queue-gate";
 import { applyImageConversationUpdate, findImageTaskConversation } from "@/lib/image-conversation-update";
+import { createScrollCleanupSnapshot } from "@/lib/image-scroll-cleanup";
 import { useSettingsStore } from "@/app/settings/store";
 import {
   clearImageConversations,
@@ -592,13 +593,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   useEffect(() => {
+    const scrollPositions = scrollPositionsRef.current;
     return () => {
       if (scrollRafRef.current !== null) {
         window.cancelAnimationFrame(scrollRafRef.current);
       }
       if (scrollSaveTimerRef.current !== null) {
         clearTimeout(scrollSaveTimerRef.current);
-        saveScrollPositions(scrollPositionsRef.current);
+        saveScrollPositions(scrollPositions);
       }
     };
   }, []);
@@ -672,6 +674,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   useEffect(() => {
     let cancelled = false;
     loadCancelledRef.current = false;
+    const scrollPositions = scrollPositionsRef.current;
+    const scrollCleanup = createScrollCleanupSnapshot(resultsViewportRef.current, scrollPositions);
     queueMicrotask(() => {
       if (!cancelled) void loadHistory();
     });
@@ -680,11 +684,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       loadCancelledRef.current = true;
       historyRequestRef.current += 1;
       // 组件卸载时保存当前滚动位置到 sessionStorage
-      const element = resultsViewportRef.current;
-      const convId = lastConversationIdRef.current;
-      if (element && convId) {
-        scrollPositionsRef.current.set(convId, element.scrollTop);
-        saveScrollPositions(scrollPositionsRef.current);
+      if (scrollCleanup.persist(lastConversationIdRef.current)) {
+        saveScrollPositions(scrollPositions);
       }
     };
   }, [loadHistory]);
