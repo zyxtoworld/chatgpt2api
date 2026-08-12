@@ -24,6 +24,7 @@ from api.support import (
     sanitize_ccload_servers,
     sanitize_cpa_pool,
     sanitize_cpa_pools,
+    sanitize_import_job,
     sanitize_sub2api_server,
     sanitize_sub2api_servers,
 )
@@ -195,6 +196,63 @@ def _unique_tokens(tokens: list[str]) -> list[str]:
     return list(dict.fromkeys(str(token or "").strip() for token in tokens if str(token or "").strip()))
 
 
+_PUBLIC_ACCOUNT_FIELDS = (
+    "access_token",
+    "proxy",
+    "type",
+    "source_type",
+    "status",
+    "quota",
+    "email",
+    "user_id",
+    "limits_progress",
+    "default_model_slug",
+    "restore_at",
+    "success",
+    "fail",
+    "image_inflight",
+    "last_used_at",
+)
+
+
+def _public_account(item: object) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    projected = {key: item[key] for key in _PUBLIC_ACCOUNT_FIELDS if key in item}
+    limits_progress = projected.get("limits_progress")
+    if isinstance(limits_progress, list):
+        projected["limits_progress"] = [
+            {
+                key: entry[key]
+                for key in ("feature_name", "remaining", "reset_after")
+                if key in entry
+            }
+            for entry in limits_progress
+            if isinstance(entry, dict)
+        ]
+    return projected
+
+
+def _public_accounts(items: object) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    return [projected for item in items if (projected := _public_account(item)) is not None]
+
+
+def _public_account_result(result: object) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    projected = dict(result)
+    if "item" in projected:
+        projected["item"] = _public_account(projected["item"])
+    if "items" in projected:
+        projected["items"] = _public_accounts(projected["items"])
+    nested = projected.get("result")
+    if isinstance(nested, dict):
+        projected["result"] = _public_account_result(nested)
+    return projected
+
+
 def _download_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -337,7 +395,7 @@ def create_router() -> APIRouter:
     @router.get("/api/accounts")
     async def get_accounts(authorization: str | None = Header(default=None)):
         await require_admin_async(authorization)
-        return {"items": account_service.list_accounts()}
+        return {"items": _public_accounts(account_service.list_accounts())}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
@@ -352,12 +410,12 @@ def create_router() -> APIRouter:
             account_payloads,
             tokens,
         )
-        return {
+        return _public_account_result({
             **result,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", result.get("items", [])),
-        }
+        })
 
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
@@ -365,7 +423,7 @@ def create_router() -> APIRouter:
         tokens = [str(token or "").strip() for token in body.tokens if str(token or "").strip()]
         if not tokens:
             raise HTTPException(status_code=400, detail={"error": "tokens is required"})
-        return await run_management_io(account_service.delete_accounts, tokens)
+        return _public_account_result(await run_management_io(account_service.delete_accounts, tokens))
 
     @router.post("/api/accounts/refresh")
     async def refresh_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
@@ -394,7 +452,7 @@ def create_router() -> APIRouter:
         progress = account_service.get_refresh_progress(progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
-        return progress
+        return _public_account_result(progress)
 
     @router.post("/api/accounts/re-login")
     async def re_login_accounts(body: AccountRefreshRequest, authorization: str | None = Header(default=None)):
@@ -422,7 +480,7 @@ def create_router() -> APIRouter:
         progress = account_service.get_relogin_progress(progress_id)
         if progress is None:
             raise HTTPException(status_code=404, detail={"error": "progress not found"})
-        return progress
+        return _public_account_result(progress)
 
     @router.post("/api/accounts/export")
     async def export_accounts(body: AccountExportRequest, authorization: str | None = Header(default=None)):
@@ -457,7 +515,7 @@ def create_router() -> APIRouter:
         account = await run_management_io(account_service.update_account, access_token, updates)
         if account is None:
             raise HTTPException(status_code=404, detail={"error": "account not found"})
-        return {"item": account, "items": account_service.list_accounts()}
+        return _public_account_result({"item": account, "items": account_service.list_accounts()})
 
     @router.post("/api/accounts/oauth/start")
     async def start_oauth_login(
@@ -507,12 +565,12 @@ def create_router() -> APIRouter:
         refresh_result = await run_management_io(
             account_service.refresh_accounts, [tokens["access_token"]]
         )
-        return {
+        return _public_account_result({
             **add_result,
             "refreshed": refresh_result.get("refreshed", 0),
             "errors": refresh_result.get("errors", []),
             "items": refresh_result.get("items", add_result.get("items", [])),
-        }
+        })
 
     @router.get("/api/cpa/pools")
     async def list_cpa_pools(authorization: str | None = Header(default=None)):
@@ -557,7 +615,11 @@ def create_router() -> APIRouter:
         pool = await run_management_io(cpa_config.get_pool, pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
-        return {"pool_id": pool_id, "files": await run_management_io(list_remote_files, pool)}
+        try:
+            files = await run_management_io(list_remote_files, pool)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail={"error": PUBLIC_SERVER_ERROR_MESSAGE}) from exc
+        return {"pool_id": pool_id, "files": files}
 
     @router.post("/api/cpa/pools/{pool_id}/import")
     async def cpa_pool_import(pool_id: str, body: CPAImportRequest, authorization: str | None = Header(default=None)):
@@ -582,7 +644,7 @@ def create_router() -> APIRouter:
         pool = await run_management_io(cpa_config.get_pool, pool_id)
         if pool is None:
             raise HTTPException(status_code=404, detail={"error": "pool not found"})
-        return {"import_job": pool.get("import_job")}
+        return {"import_job": sanitize_import_job(pool.get("import_job"))}
 
     @router.get("/api/sub2api/servers")
     async def list_sub2api_servers(authorization: str | None = Header(default=None)):
@@ -677,7 +739,7 @@ def create_router() -> APIRouter:
         server = await run_management_io(sub2api_config.get_server, server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
-        return {"import_job": server.get("import_job")}
+        return {"import_job": sanitize_import_job(server.get("import_job"))}
 
     @router.get("/api/ccload/servers")
     async def list_ccload_servers(authorization: str | None = Header(default=None)):
@@ -779,6 +841,6 @@ def create_router() -> APIRouter:
         server = await run_management_io(ccload_config.get_server, server_id)
         if server is None:
             raise HTTPException(status_code=404, detail={"error": "server not found"})
-        return {"import_job": server.get("import_job")}
+        return {"import_job": sanitize_import_job(server.get("import_job"))}
 
     return router

@@ -1,23 +1,33 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Copy, Download } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import webConfig from "@/constants/common-env";
 import { fetchSettingsConfig } from "@/lib/api";
-import { getStoredAuthSession } from "@/store/auth";
+
+const API_KEY_PLACEHOLDER = "<YOUR_API_KEY>";
 
 export function SkillPanel() {
-  const [browserBaseUrl, setBrowserBaseUrl] = useState("");
+  const browserBaseUrl = useSyncExternalStore(
+    () => () => undefined,
+    () => window.location.origin,
+    () => "",
+  );
   const [configuredBaseUrl, setConfiguredBaseUrl] = useState("");
-  const [authKey, setAuthKey] = useState("");
 
   useEffect(() => {
-    setBrowserBaseUrl(window.location.origin);
-    void fetchSettingsConfig().then((data) => setConfiguredBaseUrl(String(data.config.base_url || "").replace(/\/$/, ""))).catch(() => undefined);
-    void getStoredAuthSession().then((session) => setAuthKey(session?.key || ""));
+    let cancelled = false;
+    void fetchSettingsConfig()
+      .then((data) => {
+        if (!cancelled) setConfiguredBaseUrl(String(data.config.base_url || "").replace(/\/$/, ""));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const apiBaseUrl = configuredBaseUrl || webConfig.apiUrl.replace(/\/$/, "") || browserBaseUrl;
@@ -36,8 +46,10 @@ POST ${apiBaseUrl}/v1/search
 
 Headers:
 
-Authorization: Bearer ${authKey}
+Authorization: Bearer ${API_KEY_PLACEHOLDER}
 Content-Type: application/json
+
+请将 ${API_KEY_PLACEHOLDER} 替换为你自己的 API key，不要把管理页面登录凭据写入 skill。
 
 Body:
 
@@ -49,7 +61,7 @@ Body:
 
 - 使用接口返回的 \`answer\` 作为主要回答。
 - 如果有 \`sources\`，在回答里附上来源链接。
-- 如果接口报错，简要说明错误并询问是否重试。`, [apiBaseUrl, authKey]);
+- 如果接口报错，简要说明错误并询问是否重试。`, [apiBaseUrl]);
 
   const skillEn = useMemo(() => `---
 name: chatgpt2api-search
@@ -72,8 +84,10 @@ POST ${apiBaseUrl}/v1/search
 
 Headers:
 
-Authorization: Bearer ${authKey}
+Authorization: Bearer ${API_KEY_PLACEHOLDER}
 Content-Type: application/json
+
+Replace ${API_KEY_PLACEHOLDER} with your own API key. Never put an admin page session credential in the skill.
 
 JSON body:
 
@@ -86,7 +100,7 @@ JSON body:
 - Use \`answer\` as the main response.
 - Include source URLs from \`sources\` when available.
 - If the endpoint returns an error, summarize the error and ask the user whether to retry.
-- Keep the final answer concise unless the user asks for detail.`, [apiBaseUrl, authKey]);
+- Keep the final answer concise unless the user asks for detail.`, [apiBaseUrl]);
 
   const zhPrompt = useMemo(() => `请帮我在本机安装一个用于联网搜索的 skill。
 
@@ -121,8 +135,12 @@ ${skillEn}
 \`\`\``, [skillEn]);
 
   const copyText = async (text: string) => {
-    await navigator.clipboard.writeText(text);
-    toast.success("已复制");
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success("已复制");
+    } catch {
+      toast.error("复制失败，请检查浏览器剪贴板权限");
+    }
   };
 
   const downloadSkill = (text: string) => {

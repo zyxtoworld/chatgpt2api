@@ -472,6 +472,34 @@ class CCLoadPersistenceAndImportContractTests(unittest.TestCase):
             self.assertNotEqual(store_file.read_bytes(), original)
             self.assertEqual(list(store_file.parent.glob(".ccload_config.json.*.tmp")), [])
 
+    def test_config_replace_failure_preserves_previous_snapshot(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store_file = Path(temp_dir) / "ccload_config.json"
+            config = ccload_module.CCLoadConfig(store_file)
+            config.add_server(
+                name="preview",
+                base_url="https://ccload.example.test",
+                password="admin-password-secret",
+            )
+            original = store_file.read_bytes()
+
+            with mock.patch.object(
+                ccload_module,
+                "atomic_write_bytes",
+                side_effect=OSError("replace failed"),
+                create=True,
+            ):
+                with self.assertRaises(OSError):
+                    config.add_server(
+                        name="second",
+                        base_url="https://second.example.test",
+                        password="admin-password-secret",
+                    )
+
+            self.assertEqual(store_file.read_bytes(), original)
+            self.assertEqual(len(config.list_servers()), 1)
+            self.assertEqual(list(store_file.parent.glob(".ccload_config.json.*.tmp")), [])
+
     def test_import_preserves_complete_credentials_without_persisting_secrets(self) -> None:
         credential = {
             "id_token": "id-token-secret",

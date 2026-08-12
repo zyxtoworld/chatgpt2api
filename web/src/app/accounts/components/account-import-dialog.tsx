@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import {
   ArrowLeft,
   Copy,
@@ -36,6 +36,7 @@ import {
   type AccountImportPayload,
   type OAuthLoginStartResponse,
 } from "@/lib/api";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { cn } from "@/lib/utils";
 
 type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json" | "oauth";
@@ -43,6 +44,15 @@ type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json"
 type AccountImportDialogProps = {
   disabled?: boolean;
   onImported: (items: Account[]) => void;
+  onMutationStart: () => { accepted: boolean; epoch: number } | null;
+  onMutationFinish: (owner: { accepted: boolean; epoch: number }) => void;
+};
+
+type ImportMutationOwner = { accepted: boolean; epoch: number };
+type OwnedImportAction = {
+  identity: string;
+  generation: number;
+  mutation: ImportMutationOwner;
 };
 
 type PendingAccountJsonImport = {
@@ -180,7 +190,12 @@ function MethodCard({
   );
 }
 
-export function AccountImportDialog({ disabled, onImported }: AccountImportDialogProps) {
+export function AccountImportDialog({
+  disabled,
+  onImported,
+  onMutationStart,
+  onMutationFinish,
+}: AccountImportDialogProps) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [method, setMethod] = useState<ImportMethod>("menu");
@@ -194,9 +209,69 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const [oauthSession, setOauthSession] = useState<OAuthLoginStartResponse | null>(null);
   const [oauthCallbackInput, setOauthCallbackInput] = useState("");
   const [oauthStarting, setOauthStarting] = useState(false);
+  const mountedRef = useRef(false);
+  const submitOwnerRef = useRef(createLatestActionOwner());
+  const oauthStartOwnerRef = useRef(createLatestActionOwner());
+  const fileReadOwnerRef = useRef(createLatestActionOwner());
+  const activeMutationRef = useRef<ImportMutationOwner | null>(null);
+  const onMutationStartRef = useRef(onMutationStart);
+  const onMutationFinishRef = useRef(onMutationFinish);
 
   const txtInputRef = useRef<HTMLInputElement | null>(null);
   const accountJsonInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    onMutationStartRef.current = onMutationStart;
+    onMutationFinishRef.current = onMutationFinish;
+  }, [onMutationFinish, onMutationStart]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const submitOwner = submitOwnerRef.current;
+    const oauthStartOwner = oauthStartOwnerRef.current;
+    const fileReadOwner = fileReadOwnerRef.current;
+    submitOwnerRef.current.activate();
+    oauthStartOwnerRef.current.activate();
+    fileReadOwnerRef.current.activate();
+    return () => {
+      mountedRef.current = false;
+      submitOwner.cancel();
+      oauthStartOwner.cancel();
+      fileReadOwner.cancel();
+      const activeMutation = activeMutationRef.current;
+      activeMutationRef.current = null;
+      if (activeMutation) {
+      onMutationFinishRef.current(activeMutation);
+      }
+    };
+  }, []);
+
+  const beginImportAction = (identity: string): OwnedImportAction | null => {
+    const mutation = onMutationStartRef.current();
+    if (mutation === null || !(mutation.accepted === true)) {
+      return null;
+    }
+    const action = submitOwnerRef.current.begin(identity) as { identity: string; generation: number };
+    activeMutationRef.current = mutation;
+    return { identity, generation: action.generation, mutation };
+  };
+
+  const acceptsImportAction = (owner: OwnedImportAction) => Boolean(
+    mountedRef.current
+      && activeMutationRef.current === owner.mutation
+      && submitOwnerRef.current.accepts(owner, owner.identity),
+  );
+
+  const finishImportAction = (owner: OwnedImportAction) => {
+    if (activeMutationRef.current !== owner.mutation) {
+      return;
+    }
+    activeMutationRef.current = null;
+    if (mountedRef.current) {
+      setIsSubmitting(false);
+    }
+    onMutationFinishRef.current(owner.mutation);
+  };
 
   const resetState = () => {
     setMethod("menu");
@@ -214,6 +289,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
   const handleOpenChange = (nextOpen: boolean) => {
     setOpen(nextOpen);
     if (!nextOpen) {
+      oauthStartOwnerRef.current.invalidate();
+      fileReadOwnerRef.current.invalidate();
       resetState();
     }
   };
@@ -226,9 +303,14 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       return;
     }
 
+    const action = beginImportAction("account-import");
+    if (!action) {
+      return;
+    }
     setIsSubmitting(true);
     try {
       const data = await createAccounts(normalizedTokens, accountPayloads);
+      if (!acceptsImportAction(action)) return;
       onImported(data.items);
       setOpen(false);
       resetState();
@@ -244,10 +326,12 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
         );
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "导入账户失败";
-      toast.error(message);
+      if (acceptsImportAction(action)) {
+        const message = error instanceof Error ? error.message : "导入账户失败";
+        toast.error(message);
+      }
     } finally {
-      setIsSubmitting(false);
+      finishImportAction(action);
     }
   };
 
@@ -257,9 +341,11 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
 
   // 起授权：拿 authorize URL，立刻在新窗口打开，方便用户登录
   const handleStartOAuth = async () => {
+    const action = oauthStartOwnerRef.current.begin("oauth-start");
     setOauthStarting(true);
     try {
       const data = await startOAuthLogin(oauthEmailHint.trim());
+      if (!mountedRef.current || !oauthStartOwnerRef.current.accepts(action, "oauth-start")) return;
       setOauthSession(data);
       setOauthCallbackInput("");
       if (typeof window !== "undefined") {
@@ -267,10 +353,14 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       }
       toast.success("已打开 OpenAI 授权页面，请在登录后复制 callback URL 回来");
     } catch (error) {
-      const message = error instanceof Error ? error.message : "OAuth 起始失败";
-      toast.error(message);
+      if (mountedRef.current && oauthStartOwnerRef.current.accepts(action, "oauth-start")) {
+        const message = error instanceof Error ? error.message : "OAuth 起始失败";
+        toast.error(message);
+      }
     } finally {
-      setOauthStarting(false);
+      if (mountedRef.current && oauthStartOwnerRef.current.accepts(action, "oauth-start")) {
+        setOauthStarting(false);
+      }
     }
   };
 
@@ -286,9 +376,14 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       return;
     }
 
+    const action = beginImportAction("oauth-finish");
+    if (!action) {
+      return;
+    }
     setIsSubmitting(true);
     try {
       const data = await finishOAuthLogin(oauthSession.session_id, trimmed);
+      if (!acceptsImportAction(action)) return;
       onImported(data.items);
       setOpen(false);
       resetState();
@@ -304,10 +399,12 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
         );
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "OAuth 换 token 失败";
-      toast.error(message);
+      if (acceptsImportAction(action)) {
+        const message = error instanceof Error ? error.message : "OAuth 换 token 失败";
+        toast.error(message);
+      }
     } finally {
-      setIsSubmitting(false);
+      finishImportAction(action);
     }
   };
 
@@ -336,8 +433,13 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       return;
     }
 
+    const fileReadOwner = fileReadOwnerRef.current;
+    const readAction = fileReadOwner.begin("txt");
     try {
       const content = await readFileAsText(file);
+      if (!mountedRef.current || !fileReadOwner.accepts(readAction, "txt")) {
+        return;
+      }
       const tokens = splitTokens(content);
 
       if (tokens.length === 0) {
@@ -351,6 +453,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       });
       toast.success(`已从 ${file.name} 读取 ${tokens.length} 个 Token`);
     } catch (error) {
+      if (!mountedRef.current || !fileReadOwner.accepts(readAction, "txt")) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "读取 TXT 文件失败";
       toast.error(message);
     }
@@ -408,6 +513,8 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       return;
     }
 
+    const fileReadOwner = fileReadOwnerRef.current;
+    const readAction = fileReadOwner.begin("account-json");
     try {
       const results = await Promise.all(
         files.map(async (file) => {
@@ -419,6 +526,10 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
           };
         }),
       );
+
+      if (!mountedRef.current || !fileReadOwner.accepts(readAction, "account-json")) {
+        return;
+      }
 
       const accounts = results.flatMap((item) => item.accounts);
       const tokens = accounts.map((item) => item.access_token);
@@ -438,6 +549,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
       });
       setConfirmOpen(true);
     } catch (error) {
+      if (!mountedRef.current || !fileReadOwner.accepts(readAction, "account-json")) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "读取账号 JSON 文件失败";
       toast.error(message);
     }
@@ -557,9 +671,9 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
             <div className="font-medium text-stone-800">操作步骤</div>
             <ol className="list-decimal pl-5 space-y-1">
               <li>（可选）填写你 ChatGPT 账号的邮箱，登录页会预填。</li>
-              <li>点击下方"打开授权页面"，在新标签里登录自己的 ChatGPT 账号。</li>
+              <li>点击下方&quot;打开授权页面&quot;，在新标签里登录自己的 ChatGPT 账号。</li>
               <li>登录完成后浏览器会跳到 <code className="rounded bg-stone-200 px-1">platform.openai.com/auth/callback?code=...</code>。立刻从地址栏复制整段 URL（或开 F12 在 Network 里抓到 callback 那一行，右键 Copy → Copy URL）。</li>
-              <li>把 callback URL 粘到下面输入框，点"完成导入"。</li>
+              <li>把 callback URL 粘到下面输入框，点&quot;完成导入&quot;。</li>
             </ol>
           </div>
           <div className="space-y-2">
@@ -634,7 +748,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
             <div className="font-medium">注意</div>
             <div>
               授权码（code）只能使用一次。如果浏览器的 callback 页加载完成、显示了 OpenAI 的错误页，那 code 大概率已经被消耗，
-              请点击"重新生成"再走一次。整个流程在 10 分钟内完成即可。
+              请点击&quot;重新生成&quot;再走一次。整个流程在 10 分钟内完成即可。
             </div>
           </div>
         </div>

@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect } from "react";
 import { LoaderCircle } from "lucide-react";
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { createSerialPoller } from "@/lib/serial-poll";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 import { BackupSettingsCard } from "./components/backup-settings-card";
@@ -33,45 +34,74 @@ const settingsTabs = [
 ];
 
 function SettingsDataController() {
-  const didLoadRef = useRef(false);
   const initialize = useSettingsStore((state) => state.initialize);
+  const cancelInitialization = useSettingsStore((state) => state.cancelInitialization);
+  const cancelConfigOperations = useSettingsStore((state) => state.cancelConfigOperations);
   const loadPools = useSettingsStore((state) => state.loadPools);
   const loadBackups = useSettingsStore((state) => state.loadBackups);
+  const invalidatePoolLoads = useSettingsStore((state) => state.invalidatePoolLoads);
+  const invalidateBackupLoads = useSettingsStore((state) => state.invalidateBackupLoads);
+  const cancelPoolOperations = useSettingsStore((state) => state.cancelPoolOperations);
+  const cancelBackupOperations = useSettingsStore((state) => state.cancelBackupOperations);
+  const cancelImageStorageOperations = useSettingsStore((state) => state.cancelImageStorageOperations);
   const pools = useSettingsStore((state) => state.pools);
   const backupState = useSettingsStore((state) => state.backupState);
+  const hasRunningPoolJobs = pools.some((pool) => {
+    const status = pool.import_job?.status;
+    return status === "pending" || status === "running";
+  });
 
   useEffect(() => {
-    if (didLoadRef.current) {
-      return;
-    }
-    didLoadRef.current = true;
     void initialize();
-  }, [initialize]);
+    return () => {
+      cancelInitialization();
+      cancelConfigOperations();
+      cancelPoolOperations();
+      cancelBackupOperations();
+      cancelImageStorageOperations();
+    };
+  }, [cancelBackupOperations, cancelConfigOperations, cancelImageStorageOperations, cancelInitialization, cancelPoolOperations, initialize]);
 
   useEffect(() => {
-    const hasRunningJobs = pools.some((pool) => {
-      const status = pool.import_job?.status;
-      return status === "pending" || status === "running";
-    });
-    if (!hasRunningJobs) {
+    if (!hasRunningPoolJobs) {
       return;
     }
 
-    const timer = window.setInterval(() => {
-      void loadPools(true);
-    }, 1500);
-    return () => window.clearInterval(timer);
-  }, [loadPools, pools]);
+    const poller = createSerialPoller({
+      intervalMs: 1500,
+      initialDelayMs: 1500,
+      poll: async () => {
+        await loadPools(true);
+      },
+      isDone: () => false,
+      onProgress: () => undefined,
+    });
+    void poller.start().catch(() => undefined);
+    return () => {
+      poller.stop();
+      invalidatePoolLoads();
+    };
+  }, [hasRunningPoolJobs, invalidatePoolLoads, loadPools]);
 
   useEffect(() => {
     if (!backupState?.running) {
       return;
     }
-    const timer = window.setInterval(() => {
-      void loadBackups(true);
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [backupState?.running, loadBackups]);
+    const poller = createSerialPoller({
+      intervalMs: 3000,
+      initialDelayMs: 3000,
+      poll: async () => {
+        await loadBackups(true);
+      },
+      isDone: () => false,
+      onProgress: () => undefined,
+    });
+    void poller.start().catch(() => undefined);
+    return () => {
+      poller.stop();
+      invalidateBackupLoads();
+    };
+  }, [backupState?.running, invalidateBackupLoads, loadBackups]);
 
   return null;
 }

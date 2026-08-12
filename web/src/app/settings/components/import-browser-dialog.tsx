@@ -27,6 +27,8 @@ export function ImportBrowserDialog() {
   const filePage = useSettingsStore((state) => state.filePage);
   const pageSize = useSettingsStore((state) => state.pageSize);
   const isStartingImport = useSettingsStore((state) => state.isStartingImport);
+  const isSavingPool = useSettingsStore((state) => state.isSavingPool);
+  const deletingId = useSettingsStore((state) => state.deletingId);
   const setBrowserOpen = useSettingsStore((state) => state.setBrowserOpen);
   const toggleFile = useSettingsStore((state) => state.toggleFile);
   const replaceSelectedNames = useSettingsStore((state) => state.replaceSelectedNames);
@@ -34,6 +36,7 @@ export function ImportBrowserDialog() {
   const setFilePage = useSettingsStore((state) => state.setFilePage);
   const setPageSize = useSettingsStore((state) => state.setPageSize);
   const startImport = useSettingsStore((state) => state.startImport);
+  const hasMutation = isStartingImport || isSavingPool || deletingId !== null;
 
   const filteredFiles = useMemo(() => {
     const query = fileQuery.trim().toLowerCase();
@@ -166,14 +169,14 @@ export function ImportBrowserDialog() {
             variant="secondary"
             className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
             onClick={() => setBrowserOpen(false)}
-            disabled={isStartingImport}
+              disabled={hasMutation}
           >
             取消
           </Button>
           <Button
             className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
             onClick={() => void startImport()}
-            disabled={isStartingImport || selectedNames.length === 0}
+            disabled={hasMutation || selectedNames.length === 0}
           >
             {isStartingImport ? <LoaderCircle className="size-4 animate-spin" /> : <Import className="size-4" />}
             导入选中账号

@@ -1,7 +1,7 @@
 "use client";
 
 import { AlertTriangle, Cookie, LoaderCircle, PlugZap, Save, ShieldCheck } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,7 @@ import {
   type ProxyRuntimeEgressMode,
   type ProxyTestResult,
 } from "@/lib/api";
+import { createProxyRuntimeRequestGate } from "@/lib/proxy-runtime-request-gate";
 
 import { useSettingsStore } from "../store";
 
@@ -27,6 +28,7 @@ export function ProxyRuntimeCard() {
   const [proxyResult, setProxyResult] = useState<ProxyTestResult | null>(null);
   const [clearanceResult, setClearanceResult] = useState<ClearanceTestResult | null>(null);
   const [targetUrl, setTargetUrl] = useState("https://chatgpt.com");
+  const requestGateRef = useRef(createProxyRuntimeRequestGate());
   const config = useSettingsStore((state) => state.config);
   const isLoadingConfig = useSettingsStore((state) => state.isLoadingConfig);
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
@@ -34,6 +36,12 @@ export function ProxyRuntimeCard() {
   const setProxyRuntimeField = useSettingsStore((state) => state.setProxyRuntimeField);
   const setProxyRuntimeClearanceField = useSettingsStore((state) => state.setProxyRuntimeClearanceField);
   const setProxyRuntimeStatusCodesText = useSettingsStore((state) => state.setProxyRuntimeStatusCodesText);
+
+  useEffect(() => {
+    const requestGate = requestGateRef.current;
+    requestGate.activate();
+    return () => requestGate.cancel();
+  }, []);
 
   if (isLoadingConfig || !config?.proxy_runtime) {
     return (
@@ -51,7 +59,33 @@ export function ProxyRuntimeCard() {
   const clearanceMode = clearance.mode;
   const hasStoredClearance = Boolean(clearance.has_cf_cookies || clearance.has_cf_clearance);
 
+  const invalidateRuntimeTests = () => {
+    requestGateRef.current.invalidateProxy();
+    requestGateRef.current.invalidateClearance();
+    setIsTestingProxy(false);
+    setIsTestingClearance(false);
+    setProxyResult(null);
+    setClearanceResult(null);
+  };
+
+  const updateRuntimeField = <K extends keyof typeof runtime>(key: K, value: (typeof runtime)[K]) => {
+    invalidateRuntimeTests();
+    setProxyRuntimeField(key, value);
+  };
+
+  const updateClearanceField = <K extends keyof typeof clearance>(key: K, value: (typeof clearance)[K]) => {
+    invalidateRuntimeTests();
+    setProxyRuntimeClearanceField(key, value);
+  };
+
+  const updateStatusCodes = (value: string) => {
+    invalidateRuntimeTests();
+    setProxyRuntimeStatusCodesText(value);
+  };
+
   const handleTestRuntimeProxy = async () => {
+    const requestGate = requestGateRef.current;
+    const request = requestGate.beginProxy();
     setIsTestingProxy(true);
     setProxyResult(null);
     try {
@@ -60,20 +94,29 @@ export function ProxyRuntimeCard() {
         return;
       }
       const data = await testProxy();
-      setProxyResult(data.result);
-      if (data.result.ok) {
-        toast.success(`清障代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
-      } else {
-        toast.error(`清障代理不可用：${data.result.error ?? "未知错误"}`);
+      if (requestGate.acceptsProxy(request)) {
+        setProxyResult(data.result);
+        if (data.result.ok) {
+          toast.success(`清障代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+        } else {
+          toast.error(`清障代理不可用：${data.result.error ?? "未知错误"}`);
+        }
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试清障代理失败");
+      if (requestGate.acceptsProxy(request)) {
+        toast.error(error instanceof Error ? error.message : "测试清障代理失败");
+      }
     } finally {
-      setIsTestingProxy(false);
+      if (requestGate.acceptsProxy(request)) {
+        setIsTestingProxy(false);
+      }
     }
   };
 
   const handleTestClearance = async () => {
+    const requestGate = requestGateRef.current;
+    const candidate = targetUrl.trim() || "https://chatgpt.com";
+    const request = requestGate.beginClearance(candidate);
     setIsTestingClearance(true);
     setClearanceResult(null);
     try {
@@ -81,17 +124,23 @@ export function ProxyRuntimeCard() {
       if (!saved) {
         return;
       }
-      const data = await testProxyClearance(targetUrl.trim() || "https://chatgpt.com");
-      setClearanceResult(data.result);
-      if (data.result.ok) {
-        toast.success(`Clearance 获取成功（${data.result.latency_ms} ms）`);
-      } else {
-        toast.error(`Clearance 获取失败：${data.result.error ?? data.result.status}`);
+      const data = await testProxyClearance(candidate);
+      if (requestGate.acceptsClearance(request, candidate)) {
+        setClearanceResult(data.result);
+        if (data.result.ok) {
+          toast.success(`Clearance 获取成功（${data.result.latency_ms} ms）`);
+        } else {
+          toast.error(`Clearance 获取失败：${data.result.error ?? data.result.status}`);
+        }
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试 Clearance 失败");
+      if (requestGate.acceptsClearance(request, candidate)) {
+        toast.error(error instanceof Error ? error.message : "测试 Clearance 失败");
+      }
     } finally {
-      setIsTestingClearance(false);
+      if (requestGate.acceptsClearance(request, candidate)) {
+        setIsTestingClearance(false);
+      }
     }
   };
 
@@ -126,7 +175,7 @@ export function ProxyRuntimeCard() {
           <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700 md:col-span-2">
             <Checkbox
               checked={runtimeEnabled}
-              onCheckedChange={(checked) => setProxyRuntimeField("enabled", Boolean(checked))}
+              onCheckedChange={(checked) => updateRuntimeField("enabled", Boolean(checked))}
             />
             启用 FlareSolverr 清障
           </label>
@@ -135,7 +184,7 @@ export function ProxyRuntimeCard() {
             <label className="text-sm text-stone-700">出站模式</label>
             <Select
               value={runtime.egress_mode}
-              onValueChange={(value) => setProxyRuntimeField("egress_mode", value as ProxyRuntimeEgressMode)}
+              onValueChange={(value) => updateRuntimeField("egress_mode", value as ProxyRuntimeEgressMode)}
               disabled={!runtimeEnabled}
             >
               <SelectTrigger className="h-10 rounded-xl border-stone-200 bg-white shadow-none">
@@ -153,7 +202,7 @@ export function ProxyRuntimeCard() {
             <label className="text-sm text-stone-700">清障代理 URL</label>
             <Input
               value={runtime.proxy_url}
-              onChange={(event) => setProxyRuntimeField("proxy_url", event.target.value)}
+              onChange={(event) => updateRuntimeField("proxy_url", event.target.value)}
               placeholder="http://privoxy:8118"
               className="h-10 rounded-xl border-stone-200 bg-white"
               disabled={!runtimeEnabled || runtime.egress_mode !== "single_proxy"}
@@ -167,7 +216,7 @@ export function ProxyRuntimeCard() {
             <label className="text-sm text-stone-700">资源代理 URL</label>
             <Input
               value={runtime.resource_proxy_url}
-              onChange={(event) => setProxyRuntimeField("resource_proxy_url", event.target.value)}
+              onChange={(event) => updateRuntimeField("resource_proxy_url", event.target.value)}
               placeholder="留空则复用清障代理"
               className="h-10 rounded-xl border-stone-200 bg-white"
               disabled={!runtimeEnabled || runtime.egress_mode !== "single_proxy"}
@@ -178,7 +227,7 @@ export function ProxyRuntimeCard() {
             <label className="text-sm text-stone-700">重置会话状态码</label>
             <Input
               value={runtime.reset_session_status_codes.join(",")}
-              onChange={(event) => setProxyRuntimeStatusCodesText(event.target.value)}
+              onChange={(event) => updateStatusCodes(event.target.value)}
               placeholder="403"
               className="h-10 rounded-xl border-stone-200 bg-white"
               disabled={!runtimeEnabled}
@@ -189,7 +238,7 @@ export function ProxyRuntimeCard() {
           <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
             <Checkbox
               checked={Boolean(runtime.skip_ssl_verify)}
-              onCheckedChange={(checked) => setProxyRuntimeField("skip_ssl_verify", Boolean(checked))}
+              onCheckedChange={(checked) => updateRuntimeField("skip_ssl_verify", Boolean(checked))}
               disabled={!runtimeEnabled}
             />
             跳过 SSL 校验
@@ -235,8 +284,8 @@ export function ProxyRuntimeCard() {
                 value={clearanceMode}
                 onValueChange={(value) => {
                   const mode = value as ProxyRuntimeClearanceMode;
-                  setProxyRuntimeClearanceField("mode", mode);
-                  setProxyRuntimeClearanceField("enabled", mode !== "none");
+                  updateClearanceField("mode", mode);
+                  updateClearanceField("enabled", mode !== "none");
                 }}
                 disabled={!runtimeEnabled}
               >
@@ -255,7 +304,7 @@ export function ProxyRuntimeCard() {
               <label className="text-sm text-stone-700">FlareSolverr URL</label>
               <Input
                 value={clearance.flaresolverr_url}
-                onChange={(event) => setProxyRuntimeClearanceField("flaresolverr_url", event.target.value)}
+                onChange={(event) => updateClearanceField("flaresolverr_url", event.target.value)}
                 placeholder="http://flaresolverr:8191"
                 className="h-10 rounded-xl border-stone-200 bg-white"
                 disabled={!runtimeEnabled || clearanceMode !== "flaresolverr"}
@@ -266,7 +315,7 @@ export function ProxyRuntimeCard() {
               <label className="text-sm text-stone-700">User-Agent</label>
               <Input
                 value={clearance.user_agent}
-                onChange={(event) => setProxyRuntimeClearanceField("user_agent", event.target.value)}
+                onChange={(event) => updateClearanceField("user_agent", event.target.value)}
                 className="h-10 rounded-xl border-stone-200 bg-white font-mono text-xs"
                 disabled={!runtimeEnabled || clearanceMode === "none"}
               />
@@ -276,7 +325,7 @@ export function ProxyRuntimeCard() {
               <label className="text-sm text-stone-700">超时秒数</label>
               <Input
                 value={String(clearance.timeout_sec)}
-                onChange={(event) => setProxyRuntimeClearanceField("timeout_sec", event.target.value)}
+                onChange={(event) => updateClearanceField("timeout_sec", event.target.value)}
                 placeholder="60"
                 className="h-10 rounded-xl border-stone-200 bg-white"
                 disabled={!runtimeEnabled || clearanceMode === "none"}
@@ -287,7 +336,7 @@ export function ProxyRuntimeCard() {
               <label className="text-sm text-stone-700">刷新间隔秒数</label>
               <Input
                 value={String(clearance.refresh_interval)}
-                onChange={(event) => setProxyRuntimeClearanceField("refresh_interval", event.target.value)}
+                onChange={(event) => updateClearanceField("refresh_interval", event.target.value)}
                 placeholder="3600"
                 className="h-10 rounded-xl border-stone-200 bg-white"
                 disabled={!runtimeEnabled || clearanceMode === "none"}
@@ -298,7 +347,7 @@ export function ProxyRuntimeCard() {
               <label className="text-sm text-stone-700">手动 Cookie</label>
               <Textarea
                 value={clearance.cf_cookies}
-                onChange={(event) => setProxyRuntimeClearanceField("cf_cookies", event.target.value)}
+                onChange={(event) => updateClearanceField("cf_cookies", event.target.value)}
                 placeholder="可选：foo=bar; cf_clearance=..."
                 className="min-h-24 rounded-xl border-stone-200 bg-white font-mono text-xs shadow-none"
                 disabled={!runtimeEnabled || clearanceMode !== "manual"}
@@ -312,7 +361,7 @@ export function ProxyRuntimeCard() {
               <label className="text-sm text-stone-700">单独 cf_clearance</label>
               <Input
                 value={clearance.cf_clearance}
-                onChange={(event) => setProxyRuntimeClearanceField("cf_clearance", event.target.value)}
+                onChange={(event) => updateClearanceField("cf_clearance", event.target.value)}
                 placeholder="可选：只填写 cf_clearance 值"
                 className="h-10 rounded-xl border-stone-200 bg-white font-mono text-xs"
                 disabled={!runtimeEnabled || clearanceMode !== "manual"}
@@ -322,7 +371,7 @@ export function ProxyRuntimeCard() {
             <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-stone-50 px-4 py-3 text-sm text-stone-700">
               <Checkbox
                 checked={Boolean(clearance.warm_up_on_start)}
-                onCheckedChange={(checked) => setProxyRuntimeClearanceField("warm_up_on_start", Boolean(checked))}
+                onCheckedChange={(checked) => updateClearanceField("warm_up_on_start", Boolean(checked))}
                 disabled={!runtimeEnabled || clearanceMode === "none"}
               />
               启动时预热 Clearance
@@ -332,7 +381,12 @@ export function ProxyRuntimeCard() {
               <label className="text-sm text-stone-700">测试目标 URL</label>
               <Input
                 value={targetUrl}
-                onChange={(event) => setTargetUrl(event.target.value)}
+                onChange={(event) => {
+                  requestGateRef.current.invalidateClearance();
+                  setIsTestingClearance(false);
+                  setClearanceResult(null);
+                  setTargetUrl(event.target.value);
+                }}
                 placeholder="https://chatgpt.com"
                 className="h-10 rounded-xl border-stone-200 bg-white"
                 disabled={!runtimeEnabled || clearanceMode === "none"}

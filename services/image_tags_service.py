@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import RLock
 
 from services.config import DATA_DIR
+from services.secure_file import atomic_write_bytes
 from services.storage.base import StorageConflictError, StorageDataError
 
 TAGS_FILE = DATA_DIR / "image_tags.json"
@@ -13,16 +14,7 @@ _TAGS_LOCK = RLock()
 
 def _atomic_write_locked(payload: bytes) -> None:
     TAGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = TAGS_FILE.with_suffix(TAGS_FILE.suffix + ".tmp")
-    try:
-        temp_path.write_bytes(payload)
-        temp_path.replace(TAGS_FILE)
-    except Exception:
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    atomic_write_bytes(TAGS_FILE, TAGS_FILE.parent, payload)
 
 
 def _read_locked() -> tuple[bytes, dict[str, list[str]]]:

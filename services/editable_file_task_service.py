@@ -22,6 +22,7 @@ from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
 from services.protocol.error_response import PublicSafeError, PublicSafeValueError, public_exception_message
 from services.secure_file import (
     OpenedFile as OpenedEditableFile,
+    atomic_write_bytes,
     authorized_root,
     has_link as _has_symlink,
     normalize_windows_handle_path as _normalize_windows_handle_path,
@@ -597,16 +598,8 @@ class EditableFileTaskService:
         if current_revision != self._snapshot_revision:
             raise StorageConflictError()
         next_snapshot = make_storage_snapshot(items)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            tmp_path.replace(self.path)
-        except Exception:
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
-            raise
+        payload = (json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        atomic_write_bytes(self.path, self.path.parent, payload)
         self._snapshot_revision = next_snapshot.revision
 
     def _recover_unfinished_locked(self) -> bool:

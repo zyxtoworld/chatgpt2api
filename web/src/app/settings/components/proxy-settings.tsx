@@ -19,9 +19,15 @@ import {
   type ProxySettings,
   type ProxyTestResult,
 } from "@/lib/api";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
 
 export function ProxySettingsCard() {
-  const didLoadRef = useRef(false);
+  const requestGateRef = useRef(createMutationRequestGate());
+  const loadOwnerRef = useRef<ReturnType<typeof createOwnedQueryLoader> | null>(null);
+  const saveOwnerRef = useRef<{ epoch: number } | null>(null);
+  const testOwnerRef = useRef(createLatestActionOwner());
   const [settings, setSettings] = useState<ProxySettings>({ enabled: false, url: "" });
   const [formUrl, setFormUrl] = useState("");
   const [formEnabled, setFormEnabled] = useState(false);
@@ -30,26 +36,36 @@ export function ProxySettingsCard() {
   const [isTesting, setIsTesting] = useState(false);
   const [testResult, setTestResult] = useState<ProxyTestResult | null>(null);
 
-  const load = async () => {
-    setIsLoading(true);
-    try {
-      const data = await fetchProxy();
-      setSettings(data.proxy);
-      setFormUrl(data.proxy.url);
-      setFormEnabled(data.proxy.enabled);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载代理配置失败");
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
   useEffect(() => {
-    if (didLoadRef.current) {
-      return;
-    }
-    didLoadRef.current = true;
-    void load();
+    const gate = requestGateRef.current;
+    const testOwner = testOwnerRef.current;
+    testOwner.activate();
+    const loader = createOwnedQueryLoader({
+      gate,
+      request: fetchProxy,
+      onStart: () => setIsLoading(true),
+      onCommit: (data: Awaited<ReturnType<typeof fetchProxy>>) => {
+        setSettings(data.proxy);
+        setFormUrl(data.proxy.url);
+        setFormEnabled(data.proxy.enabled);
+      },
+      onError: (error: unknown) => {
+        toast.error(error instanceof Error ? error.message : "加载代理配置失败");
+      },
+      onFinish: () => setIsLoading(false),
+    });
+    loadOwnerRef.current = loader;
+    const cancelInitialLoad = scheduleOwnedMicrotask(() => loader.run());
+    return () => {
+      cancelInitialLoad();
+      loader.cancel();
+      if (loadOwnerRef.current === loader) {
+        loadOwnerRef.current = null;
+      }
+      saveOwnerRef.current = null;
+      testOwner.cancel();
+      gate.cancel();
+    };
   }, []);
 
   const urlChanged = formUrl.trim() !== settings.url;
@@ -61,20 +77,38 @@ export function ProxySettingsCard() {
       toast.error("启用代理时必须填写代理地址");
       return;
     }
+    testOwnerRef.current.invalidate();
+    setIsTesting(false);
+    setTestResult(null);
+    const mutationOwner = requestGateRef.current.beginMutation();
+    if (!mutationOwner.accepted) {
+      toast.error("代理配置操作正在进行，请稍候");
+      return;
+    }
+    loadOwnerRef.current?.clearLoadingForMutation();
+    saveOwnerRef.current = mutationOwner;
     setIsSaving(true);
     try {
       const payload: { enabled?: boolean; url?: string } = {};
       if (enabledChanged) payload.enabled = formEnabled;
       if (urlChanged) payload.url = formUrl.trim();
       const data = await updateProxy(payload);
-      setSettings(data.proxy);
-      setFormUrl(data.proxy.url);
-      setFormEnabled(data.proxy.enabled);
-      toast.success("代理配置已保存");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        setSettings(data.proxy);
+        setFormUrl(data.proxy.url);
+        setFormEnabled(data.proxy.enabled);
+        toast.success("代理配置已保存");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "保存失败");
+      }
     } finally {
-      setIsSaving(false);
+      if (saveOwnerRef.current === mutationOwner) {
+        saveOwnerRef.current = null;
+        setIsSaving(false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
@@ -84,20 +118,27 @@ export function ProxySettingsCard() {
       toast.error("请先填写代理地址");
       return;
     }
+    const testOwner = testOwnerRef.current.begin(candidate);
     setIsTesting(true);
     setTestResult(null);
     try {
       const data = await testProxy(candidate);
-      setTestResult(data.result);
-      if (data.result.ok) {
-        toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
-      } else {
-        toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+      if (testOwnerRef.current.accepts(testOwner, candidate)) {
+        setTestResult(data.result);
+        if (data.result.ok) {
+          toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+        } else {
+          toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+        }
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试代理失败");
+      if (testOwnerRef.current.accepts(testOwner, candidate)) {
+        toast.error(error instanceof Error ? error.message : "测试代理失败");
+      }
     } finally {
-      setIsTesting(false);
+      if (testOwnerRef.current.accepts(testOwner, candidate)) {
+        setIsTesting(false);
+      }
     }
   };
 
@@ -146,7 +187,12 @@ export function ProxySettingsCard() {
               </label>
               <Input
                 value={formUrl}
-                onChange={(event) => setFormUrl(event.target.value)}
+                onChange={(event) => {
+                  testOwnerRef.current.invalidate();
+                  setTestResult(null);
+                  setIsTesting(false);
+                  setFormUrl(event.target.value);
+                }}
                 placeholder="http://user:pass@host:port 或 socks5://host:port"
                 className="h-11 rounded-xl border-stone-200 bg-white font-mono text-xs"
               />

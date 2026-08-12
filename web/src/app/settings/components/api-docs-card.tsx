@@ -1,11 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { ChevronDown, FileArchive, FileText, KeyRound, ListChecks, type LucideIcon } from "lucide-react";
 
 import { Card, CardContent } from "@/components/ui/card";
 import webConfig from "@/constants/common-env";
-import { getStoredAuthSession } from "@/store/auth";
+
+const API_KEY_PLACEHOLDER = "<YOUR_API_KEY>";
 
 type ParamRow = [string, string, string];
 
@@ -274,20 +274,9 @@ function ParamTable({ rows }: { rows: ParamRow[] }) {
 }
 
 export function ApiDocsCard() {
-  const [authKey, setAuthKey] = useState("");
   const serviceBaseUrl = webConfig.apiUrl.replace(/\/$/, "") || (typeof window !== "undefined" ? window.location.origin : "");
   const openAIBaseUrl = `${serviceBaseUrl}/v1`;
-  const displayKey = authKey || "<当前密钥>";
-
-  useEffect(() => {
-    let active = true;
-    void getStoredAuthSession().then((session) => {
-      if (active) setAuthKey(session?.key || "");
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
+  const displayKey = API_KEY_PLACEHOLDER;
 
   return (
     <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">

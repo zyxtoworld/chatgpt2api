@@ -37,7 +37,7 @@ export function ThirdPartyAppsCard() {
               <ExternalLink className="size-5 text-stone-500" />
               无限画布入口
             </div>
-            <p className="mt-1 text-xs leading-6 text-stone-500">开启后会在顶部导航显示入口，跳转时自动附带本项目地址和当前密钥。</p>
+            <p className="mt-1 text-xs leading-6 text-stone-500">开启后会在顶部导航显示入口，跳转时只附带本项目地址；请在三方应用内手工输入独立 API key。</p>
           </div>
           <span className={`rounded-full px-3 py-1 text-xs ${canvas.enabled ? "bg-emerald-50 text-emerald-700" : "bg-stone-100 text-stone-500"}`}>
             {canvas.enabled ? "已启用" : "未启用"}
@@ -61,7 +61,7 @@ export function ThirdPartyAppsCard() {
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs leading-5 text-stone-500">
-              顶部入口跳转时会追加 apiKey 和 baseUrl 参数；关闭后顶部导航不显示无限画布。
+              顶部入口跳转时只会追加 baseUrl 参数；请在三方应用内输入独立 API key。关闭后顶部导航不显示无限画布。
             </p>
             <p className="text-xs leading-5 text-amber-700">
               该入口仅供个人测试使用；长期使用建议自行本机部署无限画布。

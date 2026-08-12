@@ -81,6 +81,12 @@ class ImageStreamHardTimeoutError(RuntimeError):
     pass
 
 
+class SearchTimeoutError(RuntimeError):
+    """Search exceeded its single end-to-end wall-clock budget."""
+
+    pass
+
+
 @dataclass
 class ChatRequirements:
     """保存一次对话请求所需的 sentinel token。"""
@@ -103,7 +109,10 @@ CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 CODEX_RESPONSE_MAX_EVENT_BYTES = 64 * 1024 * 1024
 SEARCH_MODEL = "gpt-5-5"
-SEARCH_TIMEOUT_SECS = 300.0
+# Keep the complete search workflow below the reverse-proxy read timeout. The
+# value is a wall-clock budget shared by prepare, bootstrap, streaming, and
+# polling; it is not a per-request timeout.
+SEARCH_TIMEOUT_SECS = 90.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
@@ -1867,12 +1876,63 @@ class OpenAIBackendAPI:
                poll_interval_secs: float = SEARCH_POLL_INTERVAL_SECS) -> Dict[str, Any]:
         if not self.access_token:
             raise RuntimeError("access_token is required for search")
-        conduit_token = self._prepare_search_conversation(prompt, model)
-        self._bootstrap()
-        conversation_id = self._run_search_conversation(prompt, conduit_token, model)
-        return self._wait_search_result(conversation_id, timeout_secs, poll_interval_secs)
+        try:
+            requested_timeout = float(timeout_secs)
+        except (TypeError, ValueError):
+            raise SearchTimeoutError from None
+        if not math.isfinite(requested_timeout) or requested_timeout <= 0:
+            raise SearchTimeoutError from None
+        budget = min(requested_timeout, SEARCH_TIMEOUT_SECS)
+        deadline = time.monotonic() + budget
 
-    def _prepare_search_conversation(self, prompt: str, model: str) -> str:
+        conduit_token = self._prepare_search_conversation(
+            prompt,
+            model,
+            timeout_secs=self._search_remaining(deadline, budget),
+            deadline=deadline,
+        )
+        self._bootstrap(
+            timeout_secs=self._search_remaining(deadline, budget),
+            deadline=deadline,
+        )
+        conversation_id = self._run_search_conversation(
+            prompt,
+            conduit_token,
+            model,
+            timeout_secs=self._search_remaining(deadline, budget),
+            deadline=deadline,
+        )
+        return self._wait_search_result(
+            conversation_id,
+            timeout_secs=self._search_remaining(deadline, budget),
+            poll_interval_secs=poll_interval_secs,
+            deadline=deadline,
+        )
+
+    @staticmethod
+    def _search_remaining(deadline: float | None, requested_timeout: float) -> float:
+        """Return a positive request timeout that cannot exceed the deadline."""
+        try:
+            requested = float(requested_timeout)
+        except (TypeError, ValueError):
+            requested = 0.0
+        if not math.isfinite(requested) or requested <= 0:
+            requested = 0.1
+        if deadline is None:
+            return requested
+        remaining = float(deadline) - time.monotonic()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise SearchTimeoutError from None
+        return min(requested, remaining)
+
+    def _prepare_search_conversation(
+            self,
+            prompt: str,
+            model: str,
+            *,
+            timeout_secs: float = 60.0,
+            deadline: float | None = None,
+    ) -> str:
         path = "/backend-api/f/conversation/prepare"
         response = self.session.post(
             self.base_url + path,
@@ -1892,7 +1952,7 @@ class OpenAIBackendAPI:
                 "supported_encodings": ["v1"],
                 "client_contextual_info": {"app_name": "chatgpt.com"},
             },
-            timeout=60,
+            timeout=self._search_remaining(deadline, timeout_secs),
         )
         ensure_ok(response, path)
         token = str(response.json().get("conduit_token") or "")
@@ -1900,8 +1960,19 @@ class OpenAIBackendAPI:
             raise RuntimeError("missing conduit_token")
         return token
 
-    def _run_search_conversation(self, prompt: str, conduit_token: str, model: str) -> str:
-        requirements = self._get_chat_requirements()
+    def _run_search_conversation(
+            self,
+            prompt: str,
+            conduit_token: str,
+            model: str,
+            *,
+            timeout_secs: float = 300.0,
+            deadline: float | None = None,
+    ) -> str:
+        requirements = self._get_chat_requirements(
+            timeout_secs=self._search_remaining(deadline, timeout_secs),
+            deadline=deadline,
+        )
         path = "/backend-api/f/conversation"
         response = self.session.post(
             self.base_url + path,
@@ -1937,13 +2008,14 @@ class OpenAIBackendAPI:
                 "paragen_cot_summary_display_override": "allow",
                 "force_parallel_switch": "auto",
             },
-            timeout=300,
+            timeout=self._search_remaining(deadline, timeout_secs),
             stream=True,
         )
         ensure_ok(response, path)
         conversation_id = ""
         try:
-            for payload in iter_sse_payloads(response):
+            payloads = self._iter_search_sse_until(response, deadline)
+            for payload in payloads:
                 conversation_id = conversation_id or self._find_search_value(payload, "conversation_id")
                 if payload == "[DONE]":
                     break
@@ -1953,14 +2025,64 @@ class OpenAIBackendAPI:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
 
-    def _wait_search_result(self, conversation_id: str, timeout_secs: float, poll_interval_secs: float) -> Dict[str, Any]:
-        deadline = time.time() + timeout_secs
+    def _iter_search_sse_until(self, response: Any, deadline: float | None) -> Iterator[str]:
+        """Consume search SSE with the same absolute deadline as the request."""
+        if deadline is None:
+            yield from iter_sse_payloads(response)
+            return
+
+        remaining = self._search_remaining(deadline, SEARCH_TIMEOUT_SECS)
+        timeout_event = threading.Event()
+
+        def expire() -> None:
+            timeout_event.set()
+            try:
+                response.close()
+            except Exception:
+                pass
+
+        watchdog = threading.Timer(remaining, expire)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            for payload in iter_sse_payloads(response):
+                if timeout_event.is_set() or time.monotonic() >= deadline:
+                    raise SearchTimeoutError from None
+                yield payload
+            if timeout_event.is_set() or time.monotonic() >= deadline:
+                raise SearchTimeoutError from None
+        except SearchTimeoutError:
+            raise
+        except Exception as exc:
+            if timeout_event.is_set() or time.monotonic() >= deadline:
+                raise SearchTimeoutError from exc
+            raise
+        finally:
+            watchdog.cancel()
+
+    def _wait_search_result(
+            self,
+            conversation_id: str,
+            timeout_secs: float,
+            poll_interval_secs: float,
+            *,
+            deadline: float | None = None,
+    ) -> Dict[str, Any]:
+        if deadline is None:
+            deadline = time.monotonic() + self._search_remaining(None, timeout_secs)
         last_result: Dict[str, Any] | None = None
         last_answer = ""
         stable_hits = 0
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
-                last_result = self._extract_search_result(conversation_id, self._get_search_conversation(conversation_id))
+                last_result = self._extract_search_result(
+                    conversation_id,
+                    self._get_search_conversation(
+                        conversation_id,
+                        timeout_secs=self._search_remaining(deadline, 60.0),
+                        deadline=deadline,
+                    ),
+                )
             except UpstreamHTTPError as exc:
                 if exc.status_code not in {404, 409, 423, 429, 500, 502, 503, 504}:
                     raise
@@ -1972,17 +2094,32 @@ class OpenAIBackendAPI:
                 last_answer = answer
                 if stable_hits >= 2:
                     return last_result
-            time.sleep(poll_interval_secs)
-        if last_result:
-            return last_result
-        raise RuntimeError(f"timed out waiting for search result: {conversation_id}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                interval = max(0.0, float(poll_interval_secs))
+            except (TypeError, ValueError):
+                interval = 0.0
+            time.sleep(min(interval, remaining))
+        raise SearchTimeoutError from None
 
-    def _get_search_conversation(self, conversation_id: str) -> Dict[str, Any]:
+    def _get_search_conversation(
+            self,
+            conversation_id: str,
+            *,
+            timeout_secs: float = 60.0,
+            deadline: float | None = None,
+    ) -> Dict[str, Any]:
         path = f"/backend-api/conversation/{conversation_id}"
         headers = self._headers(path, {"Accept": "*/*"})
         headers["Referer"] = f"{self.base_url}/c/{conversation_id}"
         headers["X-OpenAI-Target-Route"] = "/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=headers, timeout=60)
+        response = self.session.get(
+            self.base_url + path,
+            headers=headers,
+            timeout=self._search_remaining(deadline, timeout_secs),
+        )
         ensure_ok(response, path)
         return response.json()
 
@@ -2686,19 +2823,24 @@ class OpenAIBackendAPI:
             except Exception:
                 pass
 
-    def _bootstrap(self) -> None:
+    def _bootstrap(self, *, timeout_secs: float = 30.0, deadline: float | None = None) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
-            timeout=30,
+            timeout=self._search_remaining(deadline, timeout_secs),
         )
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
 
-    def _get_chat_requirements(self) -> ChatRequirements:
+    def _get_chat_requirements(
+            self,
+            *,
+            timeout_secs: float = 30.0,
+            deadline: float | None = None,
+    ) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
         p_token = build_legacy_requirements_token(self.user_agent, self.pow_script_sources, self.pow_data_build)
@@ -2708,7 +2850,7 @@ class OpenAIBackendAPI:
             self.base_url + prepare_path,
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
-            timeout=30,
+            timeout=self._search_remaining(deadline, timeout_secs),
         )
         ensure_ok(response, "chat_requirements_prepare")
         prepare_data = response.json()
@@ -2741,7 +2883,7 @@ class OpenAIBackendAPI:
                 "proof_token": proof_token,
                 "turnstile_token": turnstile_token,
             },
-            timeout=30,
+            timeout=self._search_remaining(deadline, timeout_secs),
         )
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()

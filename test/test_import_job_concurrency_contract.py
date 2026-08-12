@@ -162,7 +162,19 @@ class ImportJobConcurrencyContractTests(unittest.TestCase):
             pool = config.add_pool("CPA", "https://cpa.example.test", "management-secret")
             config.set_import_job(
                 pool["id"],
-                {"job_id": "batched", "status": "pending", "total": 33},
+                {
+                    "job_id": "batched",
+                    "status": "pending",
+                    "created_at": "2026-08-11T00:00:00+00:00",
+                    "updated_at": "2026-08-11T00:00:01+00:00",
+                    "total": 33,
+                    "completed": 0,
+                    "added": 0,
+                    "skipped": 0,
+                    "refreshed": 0,
+                    "failed": 0,
+                    "errors": [],
+                },
             )
             service = cpa_module.CPAImportService(config)
             with (
@@ -173,13 +185,33 @@ class ImportJobConcurrencyContractTests(unittest.TestCase):
                     side_effect=AssertionError("CPA import must not create a per-job executor"),
                 ),
                 mock.patch.object(cpa_module, "as_completed", side_effect=recording_as_completed),
-                mock.patch.object(cpa_module.account_service, "add_accounts", return_value={"added": 33}),
-                mock.patch.object(cpa_module.account_service, "refresh_accounts", return_value={"refreshed": 33}),
+                mock.patch.object(
+                    cpa_module.account_service,
+                    "add_accounts",
+                    return_value={"added": 33, "skipped": 0},
+                ),
+                mock.patch.object(
+                    cpa_module.account_service,
+                    "refresh_accounts",
+                    return_value={"refreshed": 33},
+                ),
             ):
                 service._run_import(pool["id"], pool, [f"file-{index}" for index in range(33)])
                 config.set_import_job(
                     pool["id"],
-                    {"job_id": "batched-second", "status": "pending", "total": 33},
+                    {
+                        "job_id": "batched-second",
+                        "status": "pending",
+                        "created_at": "2026-08-11T00:00:00+00:00",
+                        "updated_at": "2026-08-11T00:00:01+00:00",
+                        "total": 33,
+                        "completed": 0,
+                        "added": 0,
+                        "skipped": 0,
+                        "refreshed": 0,
+                        "failed": 0,
+                        "errors": [],
+                    },
                 )
                 service._run_import(pool["id"], pool, [f"second-{index}" for index in range(33)])
 

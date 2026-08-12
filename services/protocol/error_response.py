@@ -4,6 +4,8 @@ from typing import Any
 
 from fastapi.responses import JSONResponse
 
+from services.storage.base import StorageDataError
+
 
 PUBLIC_SERVER_ERROR_MESSAGE = "The upstream request failed. Please try again later."
 
@@ -16,6 +18,55 @@ _SAFE_IMPORT_JOB_ERROR_MESSAGES = frozenset(
     }
 )
 _IMPORT_JOB_ERROR_FALLBACK = "import failed"
+IMPORT_JOB_ERROR_MAX_ITEMS = 100
+_IMPORT_JOB_ERROR_FIELDS = frozenset({"name", "error"})
+
+
+def _safe_import_job_error_message(value: object) -> str:
+    message = value.strip() if isinstance(value, str) else ""
+    if message in _SAFE_IMPORT_JOB_ERROR_MESSAGES or message == _IMPORT_JOB_ERROR_FALLBACK:
+        return message
+    prefix, separator, suffix = message.partition(" ")
+    if prefix == "HTTP" and separator and suffix.isdecimal():
+        status = int(suffix)
+        if 100 <= status <= 599:
+            return f"HTTP {status}"
+    return _IMPORT_JOB_ERROR_FALLBACK
+
+
+def _is_canonical_import_job_error_message(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value == value.strip() and _safe_import_job_error_message(value) == value
+
+
+def canonicalize_import_job_errors(raw: object) -> list[dict[str, str]]:
+    """Convert import failures into the bounded format stored on disk."""
+    if not isinstance(raw, list):
+        raise StorageDataError()
+    return [
+        {
+            "name": f"item-{index + 1}",
+            "error": _safe_import_job_error_message(item.get("error") if isinstance(item, dict) else ""),
+        }
+        for index, item in enumerate(raw[:IMPORT_JOB_ERROR_MAX_ITEMS])
+    ]
+
+
+def validate_import_job_errors(raw: object) -> list[dict[str, str]]:
+    """Accept only the exact canonical import-error snapshot format."""
+    if not isinstance(raw, list) or len(raw) > IMPORT_JOB_ERROR_MAX_ITEMS:
+        raise StorageDataError()
+    validated: list[dict[str, str]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict) or set(item) != _IMPORT_JOB_ERROR_FIELDS:
+            raise StorageDataError()
+        name = item.get("name")
+        error = item.get("error")
+        if name != f"item-{index + 1}" or not _is_canonical_import_job_error_message(error):
+            raise StorageDataError()
+        validated.append({"name": name, "error": error})
+    return validated
 
 
 def sanitize_import_job_errors(raw: object) -> list[dict[str, str]]:
@@ -24,21 +75,10 @@ def sanitize_import_job_errors(raw: object) -> list[dict[str, str]]:
         return []
 
     safe_errors: list[dict[str, str]] = []
-    for index, item in enumerate(raw[:100]):
+    for index, item in enumerate(raw[:IMPORT_JOB_ERROR_MAX_ITEMS]):
         if not isinstance(item, dict):
             continue
-        value = item.get("error")
-        message = value if isinstance(value, str) else ""
-        if message in _SAFE_IMPORT_JOB_ERROR_MESSAGES:
-            safe_message = message
-        else:
-            prefix, separator, suffix = message.partition(" ")
-            if prefix == "HTTP" and separator and suffix.isdecimal():
-                status = int(suffix)
-                safe_message = f"HTTP {status}" if 100 <= status <= 599 else _IMPORT_JOB_ERROR_FALLBACK
-            else:
-                safe_message = _IMPORT_JOB_ERROR_FALLBACK
-        safe_errors.append({"name": f"item-{index + 1}", "error": safe_message})
+        safe_errors.append({"name": f"item-{index + 1}", "error": _safe_import_job_error_message(item.get("error"))})
     return safe_errors
 
 

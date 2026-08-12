@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Eye, EyeOff, Import, LoaderCircle, Pencil, Plus, RefreshCcw, ServerCog, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -17,6 +17,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   createCCLoadServer,
   deleteCCLoadServer,
@@ -27,6 +28,19 @@ import {
   type CCLoadChannel,
   type CCLoadServer,
 } from "@/lib/api";
+import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
+import { createSerialPoller } from "@/lib/serial-poll";
+import { commitSynchronousSnapshot } from "@/lib/synchronous-snapshot";
+import { PAGE_SIZE_OPTIONS, type PageSizeOption } from "../store";
+import {
+  areAllCCLoadChannelsSelected,
+  filterCCLoadChannels,
+  getCCLoadPage,
+  getValidCCLoadSelectedIds,
+  getSelectableCCLoadChannelIds,
+  toggleAllCCLoadChannels,
+} from "@/lib/ccload-selection";
 
 function normalizeChannels(items: CCLoadChannel[]) {
   const seen = new Set<string>();
@@ -46,7 +60,12 @@ function normalizeChannels(items: CCLoadChannel[]) {
 }
 
 export function CCLoadConnections() {
-  const didLoadRef = useRef(false);
+  const requestGateRef = useRef(createMutationRequestGate());
+  const serversRef = useRef<CCLoadServer[]>([]);
+  const savingOwnerRef = useRef<{ epoch: number } | null>(null);
+  const deletingOwnerRef = useRef<{ epoch: number } | null>(null);
+  const importingOwnerRef = useRef<{ epoch: number } | null>(null);
+  const browsingOwnerRef = useRef<{ generation: number; mutationEpoch: number; allowed: boolean } | null>(null);
   const [servers, setServers] = useState<CCLoadServer[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -62,32 +81,94 @@ export function CCLoadConnections() {
   const [browserServer, setBrowserServer] = useState<CCLoadServer | null>(null);
   const [channels, setChannels] = useState<CCLoadChannel[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [channelQuery, setChannelQuery] = useState("");
+  const [channelPage, setChannelPage] = useState(1);
+  const [channelPageSize, setChannelPageSize] = useState<PageSizeOption>("50");
   const [isStartingImport, setIsStartingImport] = useState(false);
 
-  const loadServers = useCallback(async (silent = false) => {
-    if (!silent) setIsLoading(true);
+  const commitServers = (next: CCLoadServer[] | ((current: CCLoadServer[]) => CCLoadServer[])) => {
+    const resolved = commitSynchronousSnapshot(serversRef, next);
+    setServers(resolved);
+  };
+
+  const listQueryRef = useRef<ReturnType<typeof createOwnedQueryLoader> | null>(null);
+
+  const requestServers = async () => {
+    const gate = requestGateRef.current;
+    const queryOwner = gate.beginQuery("list");
+    if (!queryOwner.allowed) return null;
     try {
       const data = await fetchCCLoadServers();
-      setServers(data.servers);
+      return { queryOwner, data };
     } catch (error) {
-      if (!silent) toast.error(error instanceof Error ? error.message : "加载 ccLoad 连接失败");
-    } finally {
-      if (!silent) setIsLoading(false);
+      if (!gate.acceptsQuery(queryOwner)) return null;
+      throw error;
     }
-  }, []);
+  };
+
+  const loadServers = useCallback(() => listQueryRef.current?.run(), []);
 
   useEffect(() => {
-    if (didLoadRef.current) return;
-    didLoadRef.current = true;
-    void loadServers();
+    const gate = requestGateRef.current;
+    const loader = createOwnedQueryLoader({
+      gate,
+      domain: "list",
+      request: fetchCCLoadServers,
+      onStart: () => setIsLoading(true),
+      onCommit: (data: Awaited<ReturnType<typeof fetchCCLoadServers>>) => commitServers(data.servers),
+      onError: (error: unknown) => toast.error(error instanceof Error ? error.message : "加载 ccLoad 连接失败"),
+      onFinish: () => setIsLoading(false),
+    });
+    listQueryRef.current = loader;
+    const cancelInitialLoad = scheduleOwnedMicrotask(() => loadServers());
+    return () => {
+      cancelInitialLoad();
+      loader.cancel();
+      if (listQueryRef.current === loader) {
+        listQueryRef.current = null;
+      }
+      savingOwnerRef.current = null;
+      deletingOwnerRef.current = null;
+      importingOwnerRef.current = null;
+      browsingOwnerRef.current = null;
+      gate.cancel();
+    };
   }, [loadServers]);
 
+  const beginMutation = () => {
+    const owner = requestGateRef.current.beginMutation();
+    if (!owner.accepted) {
+      toast.error("已有 ccLoad 操作正在进行，请稍候");
+      return null;
+    }
+    listQueryRef.current?.clearLoadingForMutation();
+    return owner;
+  };
+
+  const running = servers.some(({ import_job: job }) => job?.status === "pending" || job?.status === "running");
+
   useEffect(() => {
-    const running = servers.some(({ import_job: job }) => job?.status === "pending" || job?.status === "running");
     if (!running) return;
-    const timer = window.setInterval(() => void loadServers(true), 1500);
-    return () => window.clearInterval(timer);
-  }, [loadServers, servers]);
+    let cancelled = false;
+    const gate = requestGateRef.current;
+    const poller = createSerialPoller({
+      intervalMs: 1500,
+      initialDelayMs: 1500,
+      poll: requestServers,
+      isDone: () => false,
+      onProgress: (result: Awaited<ReturnType<typeof requestServers>>) => {
+        if (result && !cancelled && gate.acceptsQuery(result.queryOwner)) {
+          commitServers(result.data.servers);
+        }
+      },
+    });
+    void poller.start().catch(() => undefined);
+    return () => {
+      cancelled = true;
+      gate.invalidateQueries("list");
+      poller.stop();
+    };
+  }, [running]);
 
   const openEditor = (server: CCLoadServer | null) => {
     setEditingServer(server);
@@ -105,6 +186,9 @@ export function CCLoadConnections() {
       toast.error("请填写 ccLoad 地址和管理员密码");
       return;
     }
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) return;
+    savingOwnerRef.current = mutationOwner;
     setIsSaving(true);
     try {
       const data = editingServer
@@ -114,65 +198,130 @@ export function CCLoadConnections() {
           ...(password ? { password } : {}),
         })
         : await createCCLoadServer({ name: formName.trim(), base_url: baseUrl, password });
-      setServers(data.servers);
-      setDialogOpen(false);
-      toast.success(editingServer ? "ccLoad 连接已更新" : "ccLoad 连接已添加");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        commitServers(data.servers);
+        setDialogOpen(false);
+        toast.success(editingServer ? "ccLoad 连接已更新" : "ccLoad 连接已添加");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存 ccLoad 连接失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "保存 ccLoad 连接失败");
+      }
     } finally {
-      setIsSaving(false);
+      const isOwner = savingOwnerRef.current === mutationOwner;
+      if (isOwner) {
+        savingOwnerRef.current = null;
+        setIsSaving(false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
   const removeServer = async (server: CCLoadServer) => {
     if (!window.confirm(`删除 ccLoad 连接「${server.name || server.base_url}」？`)) return;
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) return;
+    deletingOwnerRef.current = mutationOwner;
     setDeletingId(server.id);
     try {
       const data = await deleteCCLoadServer(server.id);
-      setServers(data.servers);
-      toast.success("ccLoad 连接已删除");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        commitServers(data.servers);
+        toast.success("ccLoad 连接已删除");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除 ccLoad 连接失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除 ccLoad 连接失败");
+      }
     } finally {
-      setDeletingId(null);
+      const isOwner = deletingOwnerRef.current === mutationOwner;
+      if (isOwner) {
+        deletingOwnerRef.current = null;
+        setDeletingId(null);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
   const browseChannels = async (server: CCLoadServer) => {
+    const gate = requestGateRef.current;
+    const queryOwner = gate.beginQuery("channels");
+    if (!queryOwner.allowed) return;
+    browsingOwnerRef.current = queryOwner;
     setLoadingChannelsId(server.id);
     try {
       const data = await fetchCCLoadChannels(server.id);
+      if (!gate.acceptsQuery(queryOwner)) return;
+      const currentServer = serversRef.current.find((item) => item.id === server.id);
+      if (!currentServer) return;
       const nextChannels = normalizeChannels(data.channels);
-      setBrowserServer(server);
+      setBrowserServer(currentServer);
       setChannels(nextChannels);
       setSelectedIds([]);
+      setChannelQuery("");
+      setChannelPage(1);
+      setChannelPageSize("50");
       setBrowserOpen(true);
       toast.success(`读取到 ${nextChannels.length} 个 Codex OAuth 频道`);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "读取 ccLoad 频道失败");
+      if (gate.acceptsQuery(queryOwner)) {
+        toast.error(error instanceof Error ? error.message : "读取 ccLoad 频道失败");
+      }
     } finally {
-      setLoadingChannelsId(null);
+      if (browsingOwnerRef.current === queryOwner) {
+        browsingOwnerRef.current = null;
+        setLoadingChannelsId(null);
+      }
     }
   };
 
   const startImport = async () => {
-    if (!browserServer || selectedIds.length === 0) {
+    const importIds = getValidCCLoadSelectedIds(selectedIds, channels);
+    if (!browserServer || importIds.length === 0) {
       toast.error("请选择要导入的频道");
       return;
     }
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) return;
+    importingOwnerRef.current = mutationOwner;
     setIsStartingImport(true);
     try {
-      const result = await startCCLoadImport(browserServer.id, selectedIds);
-      setServers((current) => current.map((server) => (
-        server.id === browserServer.id ? { ...server, import_job: result.import_job } : server
-      )));
-      setBrowserOpen(false);
-      toast.success("ccLoad 导入任务已启动");
+      const result = await startCCLoadImport(browserServer.id, importIds);
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        commitServers((current) => current.map((server) => (
+          server.id === browserServer.id ? { ...server, import_job: result.import_job } : server
+        )));
+        setBrowserOpen(false);
+        toast.success("ccLoad 导入任务已启动");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "启动 ccLoad 导入失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "启动 ccLoad 导入失败");
+      }
     } finally {
-      setIsStartingImport(false);
+      const isOwner = importingOwnerRef.current === mutationOwner;
+      if (isOwner) {
+        importingOwnerRef.current = null;
+        setIsStartingImport(false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
+  };
+
+  const hasMutation = isSaving || deletingId !== null || isStartingImport;
+  const filteredChannels = useMemo(
+    () => filterCCLoadChannels(channels, channelQuery),
+    [channelQuery, channels],
+  );
+  const channelPageResult = useMemo(
+    () => getCCLoadPage(filteredChannels, channelPage, Number(channelPageSize)),
+    [channelPage, channelPageSize, filteredChannels],
+  );
+  const selectableFilteredChannelIds = getSelectableCCLoadChannelIds(filteredChannels);
+  const validSelectedIds = getValidCCLoadSelectedIds(selectedIds, channels);
+  const allChannelsSelected = areAllCCLoadChannelsSelected(selectedIds, filteredChannels);
+  const toggleAllChannels = (checked: boolean) => {
+    setSelectedIds((current) => toggleAllCCLoadChannels(current, filteredChannels, checked));
   };
 
   return (
@@ -187,7 +336,7 @@ export function CCLoadConnections() {
                 <p className="text-sm text-stone-500">读取 Codex OAuth 频道并导入完整可刷新凭据。</p>
               </div>
             </div>
-            <Button onClick={() => openEditor(null)}><Plus className="mr-2 size-4" />添加连接</Button>
+            <Button onClick={() => openEditor(null)} disabled={hasMutation}><Plus className="mr-2 size-4" />添加连接</Button>
           </div>
 
           {isLoading ? (
@@ -218,12 +367,12 @@ export function CCLoadConnections() {
                         )}
                       </div>
                       <div className="flex flex-wrap gap-2">
-                        <Button variant="outline" size="sm" disabled={running || loadingChannelsId === server.id} onClick={() => void browseChannels(server)}>
+                        <Button variant="outline" size="sm" disabled={hasMutation || running || loadingChannelsId === server.id} onClick={() => void browseChannels(server)}>
                           {loadingChannelsId === server.id ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : <RefreshCcw className="mr-2 size-4" />}
                           读取频道
                         </Button>
-                        <Button variant="outline" size="sm" onClick={() => openEditor(server)}><Pencil className="mr-2 size-4" />编辑</Button>
-                        <Button variant="outline" size="sm" disabled={deletingId === server.id} onClick={() => void removeServer(server)}>
+                        <Button variant="outline" size="sm" onClick={() => openEditor(server)} disabled={hasMutation}><Pencil className="mr-2 size-4" />编辑</Button>
+                        <Button variant="outline" size="sm" disabled={hasMutation} onClick={() => void removeServer(server)}>
                           <Trash2 className="mr-2 size-4" />删除
                         </Button>
                       </div>
@@ -262,8 +411,8 @@ export function CCLoadConnections() {
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDialogOpen(false)}>取消</Button>
-            <Button disabled={isSaving} onClick={() => void saveServer()}>
+            <Button variant="outline" onClick={() => setDialogOpen(false)} disabled={hasMutation}>取消</Button>
+            <Button disabled={hasMutation} onClick={() => void saveServer()}>
               {isSaving && <LoaderCircle className="mr-2 size-4 animate-spin" />}保存
             </Button>
           </DialogFooter>
@@ -276,34 +425,114 @@ export function CCLoadConnections() {
             <DialogTitle>选择 Codex OAuth 频道</DialogTitle>
             <DialogDescription>{browserServer?.name || browserServer?.base_url}</DialogDescription>
           </DialogHeader>
-          <div className="space-y-2">
-            {channels.length === 0 ? <p className="py-8 text-center text-sm text-stone-500">没有可导入频道</p> : channels.map((channel) => (
-              <label key={channel.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-stone-200 p-3">
+          <div className="space-y-3">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+              <Input
+                value={channelQuery}
+                onChange={(event) => {
+                  setChannelQuery(event.target.value);
+                  setChannelPage(1);
+                }}
+                placeholder="搜索频道名称、ID或模型"
+                className="h-10 min-w-[260px] rounded-xl border-stone-200 bg-white lg:max-w-sm"
+                disabled={hasMutation}
+              />
+              <div className="flex items-center gap-2">
+                <Select
+                  value={channelPageSize}
+                  onValueChange={(value) => {
+                    setChannelPageSize(value as PageSizeOption);
+                    setChannelPage(1);
+                  }}
+                  disabled={hasMutation}
+                >
+                  <SelectTrigger className="h-10 w-[120px] rounded-xl border-stone-200 bg-white">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PAGE_SIZE_OPTIONS.map((item) => (
+                      <SelectItem key={item} value={item}>{item} / 页</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Button
+                  variant="outline"
+                  className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
+                  onClick={() => toggleAllChannels(!allChannelsSelected)}
+                  disabled={hasMutation || selectableFilteredChannelIds.length === 0}
+                >
+                  {allChannelsSelected ? "取消全选" : "全选筛选结果"}
+                </Button>
+              </div>
+            </div>
+            <div className="flex items-center justify-between rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-500">
+              <label className="flex items-center gap-3">
                 <Checkbox
-                  checked={selectedIds.includes(channel.id)}
-                  disabled={!channel.enabled}
-                  onCheckedChange={(checked) => setSelectedIds((current) => (
-                    checked ? [...new Set([...current, channel.id])] : current.filter((id) => id !== channel.id)
-                  ))}
+                  checked={allChannelsSelected}
+                  disabled={selectableFilteredChannelIds.length === 0 || hasMutation}
+                  onCheckedChange={(checked) => toggleAllChannels(Boolean(checked))}
                 />
-                <span className="min-w-0 flex-1">
-                  <span className="flex flex-wrap items-center gap-2 font-medium text-stone-800">
-                    {channel.name || `频道 ${channel.id}`}
-                    <Badge variant="secondary">{channel.plan_type || "unknown"}</Badge>
-                    {!channel.enabled && <Badge variant="secondary">已禁用</Badge>}
-                  </span>
-                  <span className="mt-1 block text-xs text-stone-500">
-                    {channel.models.join(", ") || "未声明模型"}{channel.subscription_active_until ? ` · 到期 ${channel.subscription_active_until}` : ""}
-                  </span>
-                </span>
+                <span>筛选结果 {filteredChannels.length} 个，可用 {selectableFilteredChannelIds.length} 个</span>
               </label>
-            ))}
+              <span>已选 {validSelectedIds.length} 个</span>
+            </div>
+            {filteredChannels.length === 0 ? (
+              <p className="py-8 text-center text-sm text-stone-500">
+                {channels.length === 0 ? "没有可导入频道" : "没有匹配的频道"}
+              </p>
+            ) : (
+              channelPageResult.items.map((channel) => (
+                <label key={channel.id} className="flex cursor-pointer items-start gap-3 rounded-xl border border-stone-200 p-3">
+                  <Checkbox
+                    checked={selectedIds.includes(channel.id)}
+                    disabled={!channel.enabled || hasMutation}
+                    onCheckedChange={(checked) => setSelectedIds((current) => (
+                      checked ? [...new Set([...current, channel.id])] : current.filter((id) => id !== channel.id)
+                    ))}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="flex flex-wrap items-center gap-2 font-medium text-stone-800">
+                      {channel.name || `频道 ${channel.id}`}
+                      <Badge variant="secondary">{channel.plan_type || "unknown"}</Badge>
+                      {!channel.enabled && <Badge variant="secondary">已禁用</Badge>}
+                    </span>
+                    <span className="mt-1 block text-xs text-stone-500">
+                      {channel.models.join(", ") || "未声明模型"}{channel.subscription_active_until ? ` · 到期 ${channel.subscription_active_until}` : ""}
+                    </span>
+                  </span>
+                </label>
+              ))
+            )}
+            <div className="flex items-center justify-between text-sm text-stone-500">
+              <span>
+                第 {channelPageResult.start} - {channelPageResult.end} 条，共 {channelPageResult.total} 条
+              </span>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  className="h-9 rounded-xl border-stone-200 bg-white px-3"
+                  onClick={() => setChannelPage(Math.max(1, channelPageResult.page - 1))}
+                  disabled={hasMutation || channelPageResult.page <= 1}
+                >
+                  上一页
+                </Button>
+                <span>{channelPageResult.page}/{channelPageResult.pageCount}</span>
+                <Button
+                  variant="outline"
+                  className="h-9 rounded-xl border-stone-200 bg-white px-3"
+                  onClick={() => setChannelPage(Math.min(channelPageResult.pageCount, channelPageResult.page + 1))}
+                  disabled={hasMutation || channelPageResult.page >= channelPageResult.pageCount}
+                >
+                  下一页
+                </Button>
+              </div>
+            </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setBrowserOpen(false)}>取消</Button>
-            <Button disabled={selectedIds.length === 0 || isStartingImport} onClick={() => void startImport()}>
+            <Button variant="outline" onClick={() => setBrowserOpen(false)} disabled={hasMutation}>取消</Button>
+            <Button disabled={validSelectedIds.length === 0 || hasMutation} onClick={() => void startImport()}>
               {isStartingImport ? <LoaderCircle className="mr-2 size-4 animate-spin" /> : <Import className="mr-2 size-4" />}
-              导入 {selectedIds.length > 0 ? selectedIds.length : ""} 个频道
+              导入 {validSelectedIds.length > 0 ? validSelectedIds.length : ""} 个频道
             </Button>
           </DialogFooter>
         </DialogContent>

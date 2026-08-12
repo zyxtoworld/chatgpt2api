@@ -1,10 +1,17 @@
 "use client";
 
 import { login } from "@/lib/api";
-import { clearStoredAuthSession, getStoredAuthSession, setStoredAuthSession, type StoredAuthSession } from "@/store/auth";
+import {
+  beginStoredAuthValidation,
+  clearStoredAuthSessionIfCurrent,
+  getStoredAuthSession,
+  setStoredAuthSessionIfCurrent,
+  type StoredAuthSession,
+} from "@/store/auth";
 
 export async function getValidatedAuthSession(): Promise<StoredAuthSession | null> {
-  const storedSession = await getStoredAuthSession();
+  const validationLease = beginStoredAuthValidation();
+  const storedSession = await getStoredAuthSession(validationLease);
   if (!storedSession) {
     return null;
   }
@@ -17,10 +24,10 @@ export async function getValidatedAuthSession(): Promise<StoredAuthSession | nul
       subjectId: data.subject_id,
       name: data.name,
     };
-    await setStoredAuthSession(nextSession);
-    return nextSession;
+    const committed = await setStoredAuthSessionIfCurrent(nextSession, validationLease);
+    return committed ? nextSession : null;
   } catch {
-    await clearStoredAuthSession();
+    await clearStoredAuthSessionIfCurrent(validationLease);
     return null;
   }
 }

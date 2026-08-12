@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ExternalLink, Globe2, LoaderCircle, Search } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { httpRequest } from "@/lib/request";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { cn } from "@/lib/utils";
 
 import type { SearchResult } from "./types";
@@ -64,7 +65,14 @@ export function SearchPanel() {
   const [error, setError] = useState("");
   const [elapsedMs, setElapsedMs] = useState(0);
   const [startedAt, setStartedAt] = useState(0);
+  const searchOwnerRef = useRef(createLatestActionOwner());
   const searched = loading || !!result || !!error;
+
+  useEffect(() => {
+    const searchOwner = searchOwnerRef.current;
+    searchOwner.activate();
+    return () => searchOwner.cancel();
+  }, []);
 
   useEffect(() => {
     if (!loading || !startedAt) return;
@@ -75,6 +83,8 @@ export function SearchPanel() {
   const runSearch = async () => {
     const value = prompt.trim();
     if (!value || loading) return;
+    const searchOwner = searchOwnerRef.current;
+    const requestOwner = searchOwner.begin();
     const start = Date.now();
     setStartedAt(start);
     setElapsedMs(0);
@@ -82,12 +92,19 @@ export function SearchPanel() {
     setError("");
     setResult(null);
     try {
-      setResult(await httpRequest<SearchResult>("/v1/search", { method: "POST", body: { prompt: value } }));
+      const data = await httpRequest<SearchResult>("/v1/search", { method: "POST", body: { prompt: value } });
+      if (searchOwner.accepts(requestOwner)) {
+        setResult(data);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (searchOwner.accepts(requestOwner)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setElapsedMs(Date.now() - start);
-      setLoading(false);
+      if (searchOwner.accepts(requestOwner)) {
+        setElapsedMs(Date.now() - start);
+        setLoading(false);
+      }
     }
   };
 

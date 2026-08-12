@@ -31,10 +31,88 @@ import {
   type SettingsConfig,
   type ThirdPartyAppsSettings,
 } from "@/lib/api";
+import { createMutationRequestGate } from "@/lib/mutation-request-gate";
 
 export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
+
+const backupRequestGate = createMutationRequestGate();
+const backupWriteGate = createMutationRequestGate();
+const poolRequestGate = createMutationRequestGate();
+const configRequestGate = createMutationRequestGate();
+const configWriteGate = createMutationRequestGate();
+const imageStorageOperationGate = createMutationRequestGate();
+let backupLoadingOwner: unknown = null;
+let poolLoadingOwner: unknown = null;
+let backupRunOwner: unknown = null;
+let backupDeleteOwner: unknown = null;
+let backupTestOwner: unknown = null;
+let backupWriteSettled: Promise<void> | null = null;
+let backupOperationsGeneration = 0;
+let configLoadingOwner: unknown = null;
+let configWriteOwner: unknown = null;
+let configWriteSettled: Promise<void> | null = null;
+let settingsInitializationGeneration = 0;
+let imageStoragePresentationGeneration = 0;
+let poolSaveOwner: unknown = null;
+let poolDeleteOwner: unknown = null;
+let poolImportOwner: unknown = null;
+let poolFilesOwner: unknown = null;
+
+function beginBackupMutation() {
+  const writeOwner = backupWriteGate.beginMutation();
+  if (!writeOwner.accepted) {
+    return null;
+  }
+  const queryOwner = backupRequestGate.beginMutation();
+  if (!queryOwner.accepted) {
+    backupWriteGate.finishMutation(writeOwner);
+    return null;
+  }
+  let resolveSettled!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    resolveSettled = resolve;
+  });
+  backupWriteSettled = settled;
+  return { writeOwner, queryOwner, settled, resolveSettled };
+}
+
+function acceptsBackupMutation(owner: ReturnType<typeof beginBackupMutation>) {
+  return Boolean(
+    owner
+      && backupWriteGate.acceptsMutation(owner.writeOwner)
+      && backupRequestGate.acceptsMutation(owner.queryOwner),
+  );
+}
+
+function finishBackupMutation(owner: NonNullable<ReturnType<typeof beginBackupMutation>>) {
+  const queryFinished = backupRequestGate.finishMutation(owner.queryOwner);
+  const writeFinished = backupWriteGate.finishMutation(owner.writeOwner);
+  if (backupWriteSettled === owner.settled) {
+    backupWriteSettled = null;
+  }
+  owner.resolveSettled();
+  return { queryFinished, writeFinished };
+}
+
+function beginImageStorageOperation() {
+  const owner = imageStorageOperationGate.beginMutation();
+  if (!owner.accepted) {
+    return null;
+  }
+  return {
+    owner,
+    presentationGeneration: imageStoragePresentationGeneration,
+  };
+}
+
+function acceptsImageStoragePresentation(operation: ReturnType<typeof beginImageStorageOperation>) {
+  return Boolean(
+    operation
+      && operation.presentationGeneration === imageStoragePresentationGeneration,
+  );
+}
 
 const DEFAULT_PROXY_RUNTIME: ProxyRuntimeSettings = {
   enabled: false,
@@ -287,9 +365,13 @@ type SettingsStore = {
   isStartingImport: boolean;
 
   initialize: () => Promise<void>;
+  cancelInitialization: () => void;
   loadConfig: () => Promise<void>;
+  cancelConfigOperations: () => void;
   saveConfig: () => Promise<boolean>;
   loadBackups: (silent?: boolean) => Promise<void>;
+  invalidateBackupLoads: () => void;
+  cancelBackupOperations: () => void;
   runBackup: () => Promise<void>;
   removeBackup: (key: string) => Promise<void>;
   testBackup: () => Promise<void>;
@@ -321,10 +403,13 @@ type SettingsStore = {
   setInfiniteCanvasField: <K extends keyof ThirdPartyAppsSettings["infinite_canvas"]>(key: K, value: ThirdPartyAppsSettings["infinite_canvas"][K]) => void;
   testImageStorage: () => Promise<void>;
   syncImagesToWebDAV: () => Promise<void>;
+  cancelImageStorageOperations: () => void;
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
 
   loadPools: (silent?: boolean) => Promise<void>;
+  invalidatePoolLoads: () => void;
+  cancelPoolOperations: () => void;
   openAddDialog: () => void;
   openEditDialog: (pool: CPAPool) => void;
   setDialogOpen: (open: boolean) => void;
@@ -381,7 +466,21 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   isStartingImport: false,
 
   initialize: async () => {
+    const initializationGeneration = ++settingsInitializationGeneration;
+    if (configWriteGate.isMutationActive()) {
+      const activeWrite = configWriteSettled;
+      if (!activeWrite) {
+        return;
+      }
+      await activeWrite;
+      if (initializationGeneration !== settingsInitializationGeneration) {
+        return;
+      }
+    }
     await Promise.allSettled([get().loadConfig(), get().loadPools()]);
+    if (initializationGeneration !== settingsInitializationGeneration) {
+      return;
+    }
     const backup = get().config?.backup;
     const isConfigured = Boolean(
       String(backup?.account_id || "").trim()
@@ -391,24 +490,51 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     );
     if (isConfigured) {
       await get().loadBackups();
-    } else {
+    } else if (initializationGeneration === settingsInitializationGeneration) {
       set({ backups: [], isLoadingBackups: false });
     }
   },
 
+  cancelInitialization: () => {
+    settingsInitializationGeneration += 1;
+  },
+
   loadConfig: async () => {
+    const queryOwner = configRequestGate.beginQuery();
+    if (!configRequestGate.acceptsQuery(queryOwner)) {
+      return;
+    }
+    configLoadingOwner = queryOwner;
     set({ isLoadingConfig: true });
     try {
       const data = await fetchSettingsConfig();
       const normalized = normalizeConfig(data.config);
-      set({
-        config: normalized,
-      });
+      if (configRequestGate.acceptsQuery(queryOwner)) {
+        set({
+          config: normalized,
+        });
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载系统配置失败");
+      if (configRequestGate.acceptsQuery(queryOwner)) {
+        toast.error(error instanceof Error ? error.message : "加载系统配置失败");
+      }
     } finally {
-      set({ isLoadingConfig: false });
+      if (configLoadingOwner === queryOwner && configRequestGate.acceptsQuery(queryOwner)) {
+        configLoadingOwner = null;
+        set({ isLoadingConfig: false });
+      }
     }
+  },
+
+  cancelConfigOperations: () => {
+    configLoadingOwner = null;
+    configRequestGate.cancel();
+    set({ isLoadingConfig: false });
+  },
+
+  cancelImageStorageOperations: () => {
+    imageStoragePresentationGeneration += 1;
+    set({ isTestingImageStorage: false, isSyncingImageStorage: false });
   },
 
   saveConfig: async () => {
@@ -417,7 +543,24 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       return false;
     }
 
-    set({ isSavingConfig: true });
+    const writeOwner = configWriteGate.beginMutation();
+    if (!writeOwner.accepted) {
+      return false;
+    }
+    const queryFence = configRequestGate.beginMutation();
+    if (!queryFence.accepted) {
+      configWriteGate.finishMutation(writeOwner);
+      return false;
+    }
+
+    let resolveWriteSettled!: () => void;
+    const writeSettled = new Promise<void>((resolve) => {
+      resolveWriteSettled = resolve;
+    });
+    configWriteSettled = writeSettled;
+    configWriteOwner = writeOwner;
+    configLoadingOwner = null;
+    set({ isLoadingConfig: false, isSavingConfig: true });
     try {
       const data = await updateSettingsConfig({
         ...config,
@@ -496,17 +639,33 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           passphrase: String(config.backup?.passphrase || "").trim(),
         },
       });
+      if (!configWriteGate.acceptsMutation(writeOwner)) {
+        return false;
+      }
       set({
         config: normalizeConfig(data.config),
       });
-      window.dispatchEvent(new Event("third-party-apps-updated"));
-      toast.success("配置已保存");
+      if (configRequestGate.acceptsMutation(queryFence)) {
+        window.dispatchEvent(new Event("third-party-apps-updated"));
+        toast.success("配置已保存");
+      }
       return true;
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存系统配置失败");
+      if (configWriteGate.acceptsMutation(writeOwner) && configRequestGate.acceptsMutation(queryFence)) {
+        toast.error(error instanceof Error ? error.message : "保存系统配置失败");
+      }
       return false;
     } finally {
-      set({ isSavingConfig: false });
+      configRequestGate.finishMutation(queryFence);
+      configWriteGate.finishMutation(writeOwner);
+      if (configWriteOwner === writeOwner) {
+        configWriteOwner = null;
+        set({ isSavingConfig: false });
+      }
+      if (configWriteSettled === writeSettled) {
+        configWriteSettled = null;
+      }
+      resolveWriteSettled();
     }
   },
 
@@ -739,6 +898,11 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   testImageStorage: async () => {
+    const operation = beginImageStorageOperation();
+    if (!operation) {
+      toast.error("已有 WebDAV 操作正在进行");
+      return;
+    }
     set({ isTestingImageStorage: true });
     try {
       const saved = await get().saveConfig();
@@ -746,19 +910,32 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         return;
       }
       const data = await testImageStorageConnection();
+      if (!acceptsImageStoragePresentation(operation)) {
+        return;
+      }
       if (data.result.ok) {
         toast.success(`WebDAV 连接可用：HTTP ${data.result.status}`);
       } else {
         toast.error(`WebDAV 连接失败：${data.result.error ?? `HTTP ${data.result.status}`}`);
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试 WebDAV 失败");
+      if (acceptsImageStoragePresentation(operation)) {
+        toast.error(error instanceof Error ? error.message : "测试 WebDAV 失败");
+      }
     } finally {
-      set({ isTestingImageStorage: false });
+      imageStorageOperationGate.finishMutation(operation.owner);
+      if (acceptsImageStoragePresentation(operation)) {
+        set({ isTestingImageStorage: false });
+      }
     }
   },
 
   syncImagesToWebDAV: async () => {
+    const operation = beginImageStorageOperation();
+    if (!operation) {
+      toast.error("已有 WebDAV 操作正在进行");
+      return;
+    }
     set({ isSyncingImageStorage: true });
     try {
       const saved = await get().saveConfig();
@@ -766,11 +943,18 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         return;
       }
       const data = await syncImageStorage();
-      toast.success(`同步完成：上传 ${data.result.uploaded}，跳过 ${data.result.skipped}，失败 ${data.result.failed}`);
+      if (acceptsImageStoragePresentation(operation)) {
+        toast.success(`同步完成：上传 ${data.result.uploaded}，跳过 ${data.result.skipped}，失败 ${data.result.failed}`);
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "同步图片失败");
+      if (acceptsImageStoragePresentation(operation)) {
+        toast.error(error instanceof Error ? error.message : "同步图片失败");
+      }
     } finally {
-      set({ isSyncingImageStorage: false });
+      imageStorageOperationGate.finishMutation(operation.owner);
+      if (acceptsImageStoragePresentation(operation)) {
+        set({ isSyncingImageStorage: false });
+      }
     }
   },
 
@@ -812,57 +996,137 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   loadBackups: async (silent = false) => {
+    const invocationGeneration = backupOperationsGeneration;
+    if (backupWriteGate.isMutationActive()) {
+      const settled = backupWriteSettled;
+      if (!settled) {
+        return;
+      }
+      await settled;
+      if (invocationGeneration !== backupOperationsGeneration) {
+        return;
+      }
+    }
+    const queryOwner = backupRequestGate.beginQuery();
+    if (!queryOwner.allowed) {
+      return;
+    }
     if (!silent) {
+      backupLoadingOwner = queryOwner;
       set({ isLoadingBackups: true });
     }
     try {
       const data = await fetchBackups();
+      if (!backupRequestGate.acceptsQuery(queryOwner)) {
+        return;
+      }
       set({
         backups: data.items,
         backupState: data.state,
       });
     } catch (error) {
-      if (!silent) {
+      if (!silent && backupRequestGate.acceptsQuery(queryOwner)) {
         toast.error(error instanceof Error ? error.message : "加载备份列表失败");
       }
     } finally {
-      if (!silent) {
+      if (!silent && backupLoadingOwner === queryOwner) {
+        backupLoadingOwner = null;
         set({ isLoadingBackups: false });
       }
     }
   },
 
+  invalidateBackupLoads: () => {
+    backupRequestGate.invalidateQueries();
+  },
+
+  cancelBackupOperations: () => {
+    backupOperationsGeneration += 1;
+    backupRequestGate.cancel();
+    backupLoadingOwner = null;
+    backupRunOwner = null;
+    backupDeleteOwner = null;
+    backupTestOwner = null;
+    set({ isLoadingBackups: false, isRunningBackup: false, deletingBackupKey: null, isTestingBackup: false });
+  },
+
   runBackup: async () => {
-    set({ isRunningBackup: true });
+    const mutationOwner = beginBackupMutation();
+    if (!mutationOwner) {
+      toast.error("已有备份操作正在进行，请稍候");
+      return;
+    }
+    backupLoadingOwner = null;
+    backupRunOwner = mutationOwner;
+    set({ isLoadingBackups: false, isRunningBackup: true });
+    let shouldReload = false;
     try {
       const saved = await get().saveConfig();
       if (!saved) {
         return;
       }
       const data = await runBackupNow();
-      toast.success(`备份已完成：${data.result.key}`);
-      await get().loadBackups(true);
+      if (acceptsBackupMutation(mutationOwner)) {
+        toast.success(`备份已完成：${data.result.key}`);
+        shouldReload = true;
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "执行备份失败");
+      if (acceptsBackupMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "执行备份失败");
+      }
     } finally {
-      set({ isRunningBackup: false });
+      const isOwner = backupRunOwner === mutationOwner;
+      if (isOwner) {
+        backupRunOwner = null;
+        set({ isRunningBackup: false });
+      }
+      const finished = finishBackupMutation(mutationOwner);
+      if (finished.queryFinished && finished.writeFinished && shouldReload) {
+        await get().loadBackups(true);
+      }
     }
   },
 
   removeBackup: async (key) => {
-    set({ deletingBackupKey: key });
+    const mutationOwner = beginBackupMutation();
+    if (!mutationOwner) {
+      toast.error("已有备份操作正在进行，请稍候");
+      return;
+    }
+    backupLoadingOwner = null;
+    backupDeleteOwner = mutationOwner;
+    set({ isLoadingBackups: false, deletingBackupKey: key });
+    let shouldReload = false;
     try {
       await deleteBackup(key);
-      toast.success("备份已删除");
-      await get().loadBackups(true);
+      if (acceptsBackupMutation(mutationOwner)) {
+        toast.success("备份已删除");
+        shouldReload = true;
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除备份失败");
+      if (acceptsBackupMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除备份失败");
+      }
     } finally {
-      set({ deletingBackupKey: null });
+      const isOwner = backupDeleteOwner === mutationOwner;
+      if (isOwner) {
+        backupDeleteOwner = null;
+        set({ deletingBackupKey: null });
+      }
+      const finished = finishBackupMutation(mutationOwner);
+      if (finished.queryFinished && finished.writeFinished && shouldReload) {
+        await get().loadBackups(true);
+      }
     }
   },
 
   testBackup: async () => {
+    const mutationOwner = beginBackupMutation();
+    if (!mutationOwner) {
+      toast.error("已有备份操作正在进行，请稍候");
+      return;
+    }
+    backupTestOwner = mutationOwner;
     set({ isTestingBackup: true });
     try {
       const saved = await get().saveConfig();
@@ -870,30 +1134,61 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         return;
       }
       const data = await testBackupConnection();
-      toast.success(`R2 连接正常（HTTP ${data.result.status}）`);
+      if (acceptsBackupMutation(mutationOwner)) {
+        toast.success(`R2 连接正常（HTTP ${data.result.status}）`);
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试备份连接失败");
+      if (acceptsBackupMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "测试备份连接失败");
+      }
     } finally {
-      set({ isTestingBackup: false });
+      if (backupTestOwner === mutationOwner) {
+        backupTestOwner = null;
+        set({ isTestingBackup: false });
+      }
+      finishBackupMutation(mutationOwner);
     }
   },
 
   loadPools: async (silent = false) => {
+    const queryOwner = poolRequestGate.beginQuery("list");
+    if (!queryOwner.allowed) {
+      return;
+    }
     if (!silent) {
+      poolLoadingOwner = queryOwner;
       set({ isLoadingPools: true });
     }
     try {
       const data = await fetchCPAPools();
+      if (!poolRequestGate.acceptsQuery(queryOwner)) {
+        return;
+      }
       set({ pools: data.pools });
     } catch (error) {
-      if (!silent) {
+      if (!silent && poolRequestGate.acceptsQuery(queryOwner)) {
         toast.error(error instanceof Error ? error.message : "加载 CPA 连接失败");
       }
     } finally {
-      if (!silent) {
+      if (!silent && poolLoadingOwner === queryOwner) {
+        poolLoadingOwner = null;
         set({ isLoadingPools: false });
       }
     }
+  },
+
+  invalidatePoolLoads: () => {
+    poolRequestGate.invalidateQueries("list");
+  },
+
+  cancelPoolOperations: () => {
+    poolRequestGate.cancel();
+    poolLoadingOwner = null;
+    poolSaveOwner = null;
+    poolDeleteOwner = null;
+    poolImportOwner = null;
+    poolFilesOwner = null;
+    set({ isLoadingPools: false, isSavingPool: false, deletingId: null, isStartingImport: false });
   },
 
   openAddDialog: () => {
@@ -949,7 +1244,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       return;
     }
 
-    set({ isSavingPool: true });
+    const mutationOwner = poolRequestGate.beginMutation();
+    if (!mutationOwner.accepted) {
+      toast.error("已有 CPA 操作正在进行，请稍候");
+      return;
+    }
+    poolLoadingOwner = null;
+    poolSaveOwner = mutationOwner;
+    set({ isLoadingPools: false, isSavingPool: true });
     try {
       if (editingPool) {
         const data = await updateCPAPool(editingPool.id, {
@@ -957,44 +1259,81 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
           base_url: formBaseUrl.trim(),
           secret_key: formSecretKey.trim() || undefined,
         });
-        set({ pools: data.pools, dialogOpen: false });
-        toast.success("连接已更新");
+        if (poolRequestGate.acceptsMutation(mutationOwner)) {
+          set({ pools: data.pools, dialogOpen: false });
+          toast.success("连接已更新");
+        }
       } else {
         const data = await createCPAPool({
           name: formName.trim(),
           base_url: formBaseUrl.trim(),
           secret_key: formSecretKey.trim(),
         });
-        set({ pools: data.pools, dialogOpen: false });
-        toast.success("连接已添加");
+        if (poolRequestGate.acceptsMutation(mutationOwner)) {
+          set({ pools: data.pools, dialogOpen: false });
+          toast.success("连接已添加");
+        }
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存失败");
+      if (poolRequestGate.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "保存失败");
+      }
     } finally {
-      set({ isSavingPool: false });
+      if (poolSaveOwner === mutationOwner) {
+        poolSaveOwner = null;
+        set({ isSavingPool: false });
+      }
+      poolRequestGate.finishMutation(mutationOwner);
     }
   },
 
   deletePool: async (pool) => {
-    set({ deletingId: pool.id });
+    const mutationOwner = poolRequestGate.beginMutation();
+    if (!mutationOwner.accepted) {
+      toast.error("已有 CPA 操作正在进行，请稍候");
+      return;
+    }
+    poolLoadingOwner = null;
+    poolDeleteOwner = mutationOwner;
+    set({ isLoadingPools: false, deletingId: pool.id });
     try {
       const data = await deleteCPAPool(pool.id);
-      set({ pools: data.pools });
-      toast.success("连接已删除");
+      if (poolRequestGate.acceptsMutation(mutationOwner)) {
+        set({ pools: data.pools });
+        toast.success("连接已删除");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除失败");
+      if (poolRequestGate.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除失败");
+      }
     } finally {
-      set({ deletingId: null });
+      if (poolDeleteOwner === mutationOwner) {
+        poolDeleteOwner = null;
+        set({ deletingId: null });
+      }
+      poolRequestGate.finishMutation(mutationOwner);
     }
   },
 
   browseFiles: async (pool) => {
+    const queryOwner = poolRequestGate.beginQuery("files");
+    if (!queryOwner.allowed) {
+      return;
+    }
+    poolFilesOwner = queryOwner;
     set({ loadingFilesId: pool.id });
     try {
       const data = await fetchCPAPoolFiles(pool.id);
+      if (!poolRequestGate.acceptsQuery(queryOwner)) {
+        return;
+      }
+      const currentPool = get().pools.find((item) => item.id === pool.id);
+      if (!currentPool) {
+        return;
+      }
       const files = normalizeFiles(data.files);
       set({
-        browserPool: pool,
+        browserPool: currentPool,
         remoteFiles: files,
         selectedNames: [],
         fileQuery: "",
@@ -1003,9 +1342,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       });
       toast.success(`读取成功，共 ${files.length} 个远程账号`);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "读取远程账号失败");
+      if (poolRequestGate.acceptsQuery(queryOwner)) {
+        toast.error(error instanceof Error ? error.message : "读取远程账号失败");
+      }
     } finally {
-      set({ loadingFilesId: null });
+      if (poolFilesOwner === queryOwner) {
+        poolFilesOwner = null;
+        set({ loadingFilesId: null });
+      }
     }
   },
 
@@ -1052,20 +1396,35 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       return;
     }
 
-    set({ isStartingImport: true });
+    const mutationOwner = poolRequestGate.beginMutation();
+    if (!mutationOwner.accepted) {
+      toast.error("已有 CPA 操作正在进行，请稍候");
+      return;
+    }
+    poolLoadingOwner = null;
+    poolImportOwner = mutationOwner;
+    set({ isLoadingPools: false, isStartingImport: true });
     try {
       const result = await startCPAImport(browserPool.id, selectedNames);
-      set({
-        pools: pools.map((pool) =>
-          pool.id === browserPool.id ? { ...pool, import_job: result.import_job } : pool,
-        ),
-        browserOpen: false,
-      });
-      toast.success("导入任务已启动");
+      if (poolRequestGate.acceptsMutation(mutationOwner)) {
+        set({
+          pools: pools.map((pool) =>
+            pool.id === browserPool.id ? { ...pool, import_job: result.import_job } : pool,
+          ),
+          browserOpen: false,
+        });
+        toast.success("导入任务已启动");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "启动导入失败");
+      if (poolRequestGate.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "启动导入失败");
+      }
     } finally {
-      set({ isStartingImport: false });
+      if (poolImportOwner === mutationOwner) {
+        poolImportOwner = null;
+        set({ isStartingImport: false });
+      }
+      poolRequestGate.finishMutation(mutationOwner);
     }
   },
 }));

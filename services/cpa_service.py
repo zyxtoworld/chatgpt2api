@@ -15,10 +15,12 @@ from services.account_service import account_service
 from services.config import DATA_DIR
 from services.protocol.error_response import (
     PublicSafeValueError,
+    canonicalize_import_job_errors,
     exception_log_message,
-    sanitize_import_job_errors,
+    validate_import_job_errors,
 )
 from services.proxy_service import proxy_settings
+from services.secure_file import atomic_write_bytes
 from services.storage.base import StorageConflictError, StorageDataError, make_storage_snapshot
 from services.task_executor import reserve_background_task
 
@@ -39,33 +41,78 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_nonnegative_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("invalid non-negative integer")
+    return value
+
+
 def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
-    if not isinstance(raw, dict):
+    if raw is None:
         return None
-    status = str(raw.get("status") or "failed").strip() or "failed"
+    if not isinstance(raw, dict):
+        raise StorageDataError()
+
+    raw_status = raw.get("status")
+    if not isinstance(raw_status, str) or not raw_status.strip():
+        raise StorageDataError()
+    status = raw_status.strip()
+    if status not in {"pending", "running", "completed", "failed"}:
+        raise StorageDataError()
     if fail_unfinished and status in {"pending", "running"}:
         status = "failed"
+
+    counters: dict[str, int] = {}
+    for name in ("total", "completed", "added", "skipped", "refreshed", "failed"):
+        value = raw.get(name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise StorageDataError()
+        counters[name] = value
+
+    text_fields: dict[str, str] = {}
+    for name in ("job_id", "created_at", "updated_at"):
+        value = raw.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise StorageDataError()
+        text_fields[name] = value.strip()
+
+    if "errors" not in raw:
+        raise StorageDataError()
+    raw_errors = validate_import_job_errors(raw["errors"])
+    if counters["completed"] > counters["total"] or counters["failed"] > counters["completed"]:
+        raise StorageDataError()
     return {
-        "job_id": str(raw.get("job_id") or uuid.uuid4().hex).strip(),
+        "job_id": text_fields["job_id"],
         "status": status,
-        "created_at": str(raw.get("created_at") or _now_iso()).strip() or _now_iso(),
-        "updated_at": str(raw.get("updated_at") or raw.get("created_at") or _now_iso()).strip() or _now_iso(),
-        "total": int(raw.get("total") or 0),
-        "completed": int(raw.get("completed") or 0),
-        "added": int(raw.get("added") or 0),
-        "skipped": int(raw.get("skipped") or 0),
-        "refreshed": int(raw.get("refreshed") or 0),
-        "failed": int(raw.get("failed") or 0),
-        "errors": sanitize_import_job_errors(raw.get("errors")),
+        "created_at": text_fields["created_at"],
+        "updated_at": text_fields["updated_at"],
+        **counters,
+        "errors": raw_errors,
     }
 
 
 def _normalize_pool(raw: dict, *, fail_unfinished: bool = True) -> dict:
+    if not isinstance(raw, dict):
+        raise StorageDataError()
+
+    values: dict[str, str] = {}
+    for name in ("id", "name", "base_url", "secret_key"):
+        if name not in raw:
+            values[name] = ""
+            continue
+        value = raw[name]
+        if not isinstance(value, str):
+            raise StorageDataError()
+        values[name] = value.strip()
+
+    if not values["id"]:
+        raise StorageDataError()
+
     return {
-        "id": str(raw.get("id") or _new_id()).strip(),
-        "name": str(raw.get("name") or "").strip(),
-        "base_url": str(raw.get("base_url") or "").strip(),
-        "secret_key": str(raw.get("secret_key") or "").strip(),
+        "id": values["id"],
+        "name": values["name"],
+        "base_url": values["base_url"],
+        "secret_key": values["secret_key"],
         "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=fail_unfinished),
     }
 
@@ -81,17 +128,36 @@ class CPAConfig:
     def __init__(self, store_file: Path):
         self._store_file = store_file
         self._lock = Lock()
-        self._pools: list[dict] = self._load()
+        self._pools, migrated = self._load(fail_unfinished=False)
         self._snapshot_revision = make_storage_snapshot(self._pools).revision
+        recovered_pools: list[dict] = []
+        recovered = migrated
+        for pool in self._pools:
+            next_pool = dict(pool)
+            import_job = pool.get("import_job")
+            if isinstance(import_job, dict) and import_job.get("status") in {"pending", "running"}:
+                next_pool["import_job"] = _normalize_import_job(import_job, fail_unfinished=True)
+                recovered = True
+            recovered_pools.append(next_pool)
+        if recovered:
+            self._commit_locked(recovered_pools)
 
-    def _load(self, *, fail_unfinished: bool = True) -> list[dict]:
+    def _load(self, *, fail_unfinished: bool = True) -> tuple[list[dict], bool]:
         if not self._store_file.exists():
-            return []
+            return [], False
         try:
             raw = json.loads(self._store_file.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and "base_url" in raw:
-                pool = _normalize_pool(raw, fail_unfinished=fail_unfinished)
-                return [pool] if pool["base_url"] else []
+                legacy = dict(raw)
+                legacy_id = legacy.get("id")
+                if legacy_id is None or (isinstance(legacy_id, str) and not legacy_id.strip()):
+                    legacy["id"] = "legacy-cpa"
+                elif not isinstance(legacy_id, str):
+                    raise StorageDataError()
+                pool = _normalize_pool(legacy, fail_unfinished=fail_unfinished)
+                if not pool["base_url"]:
+                    raise StorageDataError()
+                return [pool], True
             if not isinstance(raw, list):
                 raise StorageDataError()
             pools: list[dict] = []
@@ -104,14 +170,14 @@ class CPAConfig:
                     raise StorageDataError()
                 seen_ids.add(pool["id"])
                 pools.append(pool)
-            return pools
+            return pools, False
         except StorageDataError:
             raise
         except Exception as exc:
             raise StorageDataError() from exc
 
     def _reload_locked(self) -> None:
-        pools = self._load(fail_unfinished=False)
+        pools, _ = self._load(fail_unfinished=False)
         self._pools = pools
         self._snapshot_revision = make_storage_snapshot(pools).revision
 
@@ -126,20 +192,12 @@ class CPAConfig:
 
     def _save(self) -> None:
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        current_revision = make_storage_snapshot(self._load(fail_unfinished=False)).revision
+        current_pools, _ = self._load(fail_unfinished=False)
+        current_revision = make_storage_snapshot(current_pools).revision
         if current_revision != self._snapshot_revision:
             raise StorageConflictError()
         payload = (json.dumps(self._pools, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        temp_path = self._store_file.with_suffix(self._store_file.suffix + ".tmp")
-        try:
-            temp_path.write_bytes(payload)
-            temp_path.replace(self._store_file)
-        except Exception:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        atomic_write_bytes(self._store_file, self._store_file.parent, payload)
         self._snapshot_revision = make_storage_snapshot(self._pools).revision
 
     def list_pools(self) -> list[dict]:
@@ -323,7 +381,13 @@ class CPAImportService:
         except Exception:
             self._config.set_import_job(
                 pool_id,
-                {**job, "status": "failed", "failed": len(names), "errors": []},
+                {
+                    **job,
+                    "status": "failed",
+                    "completed": len(names),
+                    "failed": len(names),
+                    "errors": [],
+                },
             )
             raise
         return dict(saved_pool.get("import_job") or job)
@@ -345,12 +409,14 @@ class CPAImportService:
             return
         errors = list(current.get("errors") or [])
         errors.append({"name": file_name, "error": message})
-        self._update_job(pool_id, errors=errors, failed=len(errors))
+        self._update_job(pool_id, errors=canonicalize_import_job_errors(errors))
 
     def _run_import(self, pool_id: str, pool: dict, names: list[str]) -> None:
         self._update_job(pool_id, status="running")
 
         tokens: list[str] = []
+        current = self._config.get_import_job(pool_id) or {}
+        failed_count = int(current.get("failed") or 0)
         for offset in range(0, len(names), CPA_FETCH_WORKERS):
             batch = names[offset:offset + CPA_FETCH_WORKERS]
             future_map = {
@@ -368,10 +434,14 @@ class CPAImportService:
                     tokens.append(token)
                 else:
                     self._append_error(pool_id, file_name, error or "unknown error")
+                    failed_count += 1
 
                 current = self._config.get_import_job(pool_id) or {}
-                failed = len(current.get("errors") or [])
-                self._update_job(pool_id, completed=int(current.get("completed") or 0) + 1, failed=failed)
+                self._update_job(
+                    pool_id,
+                    completed=int(current.get("completed") or 0) + 1,
+                    failed=failed_count,
+                )
 
         if not tokens:
             current = self._config.get_import_job(pool_id) or {}
@@ -379,21 +449,60 @@ class CPAImportService:
                 pool_id,
                 status="failed",
                 completed=int(current.get("total") or 0),
-                failed=len(current.get("errors") or []),
+                failed=failed_count,
             )
             return
 
-        add_result = account_service.add_accounts(tokens, source_type="codex")
-        refresh_result = account_service.refresh_accounts(tokens)
+        current = self._config.get_import_job(pool_id) or {}
+        total = int(current.get("total") or len(names))
+        try:
+            add_result = account_service.add_accounts(tokens, source_type="codex")
+            if not isinstance(add_result, dict) or not add_result:
+                raise ValueError("invalid account import result")
+            added = _parse_nonnegative_int(add_result["added"])
+            skipped = _parse_nonnegative_int(add_result["skipped"])
+        except Exception:
+            self._update_job(
+                pool_id,
+                status="failed",
+                completed=total,
+                added=0,
+                skipped=0,
+                refreshed=0,
+                failed=total,
+                errors=canonicalize_import_job_errors(
+                    [*(current.get("errors") or []), {"name": "CPA", "error": "import failed"}],
+                ),
+            )
+            return
+        try:
+            refresh_result = account_service.refresh_accounts(tokens)
+            if not isinstance(refresh_result, dict) or not refresh_result:
+                raise ValueError("invalid account refresh result")
+            refreshed = _parse_nonnegative_int(refresh_result["refreshed"])
+        except Exception:
+            self._update_job(
+                pool_id,
+                status="failed",
+                completed=total,
+                added=added,
+                skipped=skipped,
+                refreshed=0,
+                failed=failed_count,
+                errors=canonicalize_import_job_errors(
+                    [*(current.get("errors") or []), {"name": "CPA", "error": "import failed"}],
+                ),
+            )
+            return
         current = self._config.get_import_job(pool_id) or {}
         self._update_job(
             pool_id,
             status="completed",
-            completed=len(names),
-            added=int(add_result.get("added") or 0),
-            skipped=int(add_result.get("skipped") or 0),
-            refreshed=int(refresh_result.get("refreshed") or 0),
-            failed=len(current.get("errors") or []),
+            completed=total,
+            added=added,
+            skipped=skipped,
+            refreshed=refreshed,
+            failed=failed_count,
         )
 
 

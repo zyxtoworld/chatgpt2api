@@ -383,6 +383,28 @@ def test_auth_service_rejects_wrong_identity_field_types_and_formats(tmp_path, f
     assert auth_keys_path.read_text(encoding="utf-8") == before
 
 
+def test_auth_service_rejects_persisted_key_without_stable_id(tmp_path) -> None:
+    accounts_path = tmp_path / "accounts.json"
+    auth_keys_path = tmp_path / "auth_keys.json"
+    raw_key = "auth-missing-id-key"
+    payload = {
+        "items": [{
+            "role": "user",
+            "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
+            "name": "missing-id",
+            "enabled": True,
+        }],
+    }
+    auth_keys_path.write_text(json.dumps(payload), encoding="utf-8")
+    accounts_path.write_text("[]", encoding="utf-8")
+    before = auth_keys_path.read_text(encoding="utf-8")
+
+    with pytest.raises(StorageDataError):
+        AuthService(JSONStorageBackend(accounts_path, auth_keys_path))
+
+    assert auth_keys_path.read_text(encoding="utf-8") == before
+
+
 @pytest.mark.parametrize("operation", ("disable", "delete"))
 def test_stale_auth_service_rejects_key_revoked_by_other_service(tmp_path, operation: str) -> None:
     accounts_path = tmp_path / "accounts.json"

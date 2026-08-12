@@ -15,9 +15,11 @@ from services.account_service import account_service
 from services.config import DATA_DIR
 from services.protocol.error_response import (
     PublicSafeValueError,
+    canonicalize_import_job_errors,
     exception_log_message,
-    sanitize_import_job_errors,
+    validate_import_job_errors,
 )
+from services.secure_file import atomic_write_bytes
 from services.storage.base import StorageConflictError, StorageDataError, make_storage_snapshot
 from services.task_executor import reserve_background_task
 
@@ -41,36 +43,81 @@ def _clean(value: object) -> str:
     return str(value or "").strip()
 
 
+def _parse_nonnegative_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("invalid non-negative integer")
+    return value
+
+
 def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
-    if not isinstance(raw, dict):
+    if raw is None:
         return None
-    status = _clean(raw.get("status")) or "failed"
+    if not isinstance(raw, dict):
+        raise StorageDataError()
+
+    raw_status = raw.get("status")
+    if not isinstance(raw_status, str) or not raw_status.strip():
+        raise StorageDataError()
+    status = raw_status.strip()
+    if status not in {"pending", "running", "completed", "failed"}:
+        raise StorageDataError()
     if fail_unfinished and status in {"pending", "running"}:
         status = "failed"
+
+    counters: dict[str, int] = {}
+    for name in ("total", "completed", "added", "skipped", "refreshed", "failed"):
+        value = raw.get(name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise StorageDataError()
+        counters[name] = value
+
+    text_fields: dict[str, str] = {}
+    for name in ("job_id", "created_at", "updated_at"):
+        value = raw.get(name)
+        if not isinstance(value, str) or not value.strip():
+            raise StorageDataError()
+        text_fields[name] = value.strip()
+
+    if "errors" not in raw:
+        raise StorageDataError()
+    raw_errors = validate_import_job_errors(raw["errors"])
+    if counters["completed"] > counters["total"] or counters["failed"] > counters["completed"]:
+        raise StorageDataError()
     return {
-        "job_id": _clean(raw.get("job_id")) or uuid.uuid4().hex,
+        "job_id": text_fields["job_id"],
         "status": status,
-        "created_at": _clean(raw.get("created_at")) or _now_iso(),
-        "updated_at": _clean(raw.get("updated_at")) or _clean(raw.get("created_at")) or _now_iso(),
-        "total": int(raw.get("total") or 0),
-        "completed": int(raw.get("completed") or 0),
-        "added": int(raw.get("added") or 0),
-        "skipped": int(raw.get("skipped") or 0),
-        "refreshed": int(raw.get("refreshed") or 0),
-        "failed": int(raw.get("failed") or 0),
-        "errors": sanitize_import_job_errors(raw.get("errors")),
+        "created_at": text_fields["created_at"],
+        "updated_at": text_fields["updated_at"],
+        **counters,
+        "errors": raw_errors,
     }
 
 
 def _normalize_server(raw: dict, *, fail_unfinished: bool = True) -> dict:
+    if not isinstance(raw, dict):
+        raise StorageDataError()
+
+    values: dict[str, str] = {}
+    for name in ("id", "name", "base_url", "email", "password", "api_key", "group_id"):
+        if name not in raw:
+            values[name] = ""
+            continue
+        value = raw[name]
+        if not isinstance(value, str):
+            raise StorageDataError()
+        values[name] = value.strip()
+
+    if not values["id"]:
+        raise StorageDataError()
+
     return {
-        "id": _clean(raw.get("id")) or _new_id(),
-        "name": _clean(raw.get("name")),
-        "base_url": _clean(raw.get("base_url")),
-        "email": _clean(raw.get("email")),
-        "password": _clean(raw.get("password")),
-        "api_key": _clean(raw.get("api_key")),
-        "group_id": _clean(raw.get("group_id")),
+        "id": values["id"],
+        "name": values["name"],
+        "base_url": values["base_url"],
+        "email": values["email"],
+        "password": values["password"],
+        "api_key": values["api_key"],
+        "group_id": values["group_id"],
         "import_job": _normalize_import_job(raw.get("import_job"), fail_unfinished=fail_unfinished),
     }
 
@@ -79,8 +126,19 @@ class Sub2APIConfig:
     def __init__(self, store_file: Path):
         self._store_file = store_file
         self._lock = Lock()
-        self._servers: list[dict] = self._load()
+        self._servers: list[dict] = self._load(fail_unfinished=False)
         self._snapshot_revision = make_storage_snapshot(self._servers).revision
+        recovered_servers: list[dict] = []
+        recovered = False
+        for server in self._servers:
+            next_server = dict(server)
+            import_job = server.get("import_job")
+            if isinstance(import_job, dict) and import_job.get("status") in {"pending", "running"}:
+                next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=True)
+                recovered = True
+            recovered_servers.append(next_server)
+        if recovered:
+            self._commit_locked(recovered_servers)
 
     def _load(self, *, fail_unfinished: bool = True) -> list[dict]:
         if not self._store_file.exists():
@@ -125,16 +183,7 @@ class Sub2APIConfig:
         if current_revision != self._snapshot_revision:
             raise StorageConflictError()
         payload = (json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        temp_path = self._store_file.with_suffix(self._store_file.suffix + ".tmp")
-        try:
-            temp_path.write_bytes(payload)
-            temp_path.replace(self._store_file)
-        except Exception:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        atomic_write_bytes(self._store_file, self._store_file.parent, payload)
         self._snapshot_revision = make_storage_snapshot(self._servers).revision
 
     def list_servers(self) -> list[dict]:
@@ -537,7 +586,13 @@ class Sub2APIImportService:
         except Exception:
             self._config.set_import_job(
                 server_id,
-                {**job, "status": "failed", "failed": len(ids), "errors": []},
+                {
+                    **job,
+                    "status": "failed",
+                    "completed": len(ids),
+                    "failed": len(ids),
+                    "errors": [],
+                },
             )
             raise
         return dict(saved.get("import_job") or job)
@@ -555,10 +610,12 @@ class Sub2APIImportService:
             return
         errors = list(current.get("errors") or [])
         errors.append({"name": account_id, "error": message})
-        self._update_job(server_id, errors=errors, failed=len(errors))
+        self._update_job(server_id, errors=canonicalize_import_job_errors(errors))
 
     def _run_import(self, server_id: str, server: dict, account_ids: list[str]) -> None:
         self._update_job(server_id, status="running")
+        current = self._config.get_import_job(server_id) or {}
+        failed_count = int(current.get("failed") or 0)
 
         try:
             tokens, errors = _fetch_access_tokens_for_accounts(server, account_ids)
@@ -566,16 +623,20 @@ class Sub2APIImportService:
             message = exception_log_message(exc)
             for account_id in account_ids:
                 self._append_error(server_id, account_id, message)
+                failed_count += 1
             tokens = []
         else:
             for error in errors:
                 self._append_error(server_id, _clean(error.get("name")), _clean(error.get("error")) or "unknown error")
+                failed_count += 1
 
         current = self._config.get_import_job(server_id) or {}
+        total = int(current.get("total") or len(account_ids))
+        failed_count = min(total, failed_count)
         self._update_job(
             server_id,
             completed=len(account_ids),
-            failed=len(current.get("errors") or []),
+            failed=failed_count,
         )
 
         if not tokens:
@@ -583,22 +644,59 @@ class Sub2APIImportService:
             self._update_job(
                 server_id,
                 status="failed",
-                completed=int(current.get("total") or 0),
-                failed=len(current.get("errors") or []),
+                completed=total,
+                failed=failed_count,
             )
             return
 
-        add_result = account_service.add_accounts(tokens, source_type="codex")
-        refresh_result = account_service.refresh_accounts(tokens)
+        try:
+            add_result = account_service.add_accounts(tokens, source_type="codex")
+            if not isinstance(add_result, dict) or not add_result:
+                raise ValueError("invalid account import result")
+            added = _parse_nonnegative_int(add_result["added"])
+            skipped = _parse_nonnegative_int(add_result["skipped"])
+        except Exception:
+            self._update_job(
+                server_id,
+                status="failed",
+                completed=total,
+                added=0,
+                skipped=0,
+                refreshed=0,
+                failed=total,
+                errors=canonicalize_import_job_errors(
+                    [*(current.get("errors") or []), {"name": "Sub2API", "error": "import failed"}],
+                ),
+            )
+            return
+        try:
+            refresh_result = account_service.refresh_accounts(tokens)
+            if not isinstance(refresh_result, dict) or not refresh_result:
+                raise ValueError("invalid account refresh result")
+            refreshed = _parse_nonnegative_int(refresh_result["refreshed"])
+        except Exception:
+            self._update_job(
+                server_id,
+                status="failed",
+                completed=total,
+                added=added,
+                skipped=skipped,
+                refreshed=0,
+                failed=failed_count,
+                errors=canonicalize_import_job_errors(
+                    [*(current.get("errors") or []), {"name": "Sub2API", "error": "import failed"}],
+                ),
+            )
+            return
         current = self._config.get_import_job(server_id) or {}
         self._update_job(
             server_id,
             status="completed",
-            completed=len(account_ids),
-            added=int(add_result.get("added") or 0),
-            skipped=int(add_result.get("skipped") or 0),
-            refreshed=int(refresh_result.get("refreshed") or 0),
-            failed=len(current.get("errors") or []),
+            completed=total,
+            added=added,
+            skipped=skipped,
+            refreshed=refreshed,
+            failed=failed_count,
         )
 
 

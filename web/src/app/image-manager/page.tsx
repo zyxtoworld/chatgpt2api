@@ -14,6 +14,11 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
+import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { finishMutationAndRefresh } from "@/lib/mutation-refresh-controller";
+import { createRequestGate } from "@/lib/query-request-gate";
+import { createReplaceableTimeout } from "@/lib/replaceable-timeout";
+import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
@@ -26,6 +31,8 @@ function formatSize(size: number) {
 function imageKey(item: ManagedImage) {
   return item.rel || item.url;
 }
+
+const imageQueryKey = (startDate: string, endDate: string) => JSON.stringify([startDate, endDate]);
 
 function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -70,28 +77,75 @@ function ImageManagerContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [allTags, setAllTags] = useState<string[]>([]);
   const [storage, setStorage] = useState<ImageStorageStats | null>(null);
-  const [storageLoading, setStorageLoading] = useState(false);
+  const [storageLoading, setStorageLoading] = useState(true);
   const [compressResult, setCompressResult] = useState<string>("");
   const [targetFreeMb, setTargetFreeMb] = useState(500);
+  const imageQueryRef = useRef({ startDate: "", endDate: "" });
+  const imageRequestGateRef = useRef(createRequestGate(imageQueryKey("", "")));
+  const storageRequestRef = useRef(0);
 
-  const loadStorage = useCallback(async () => {
-    try {
-      setStorageLoading(true);
-      const data = await fetchImageStorage();
-      setStorage(data);
-    } catch { /* ignore */ }
-    finally { setStorageLoading(false); }
+  const updateImageQuery = useCallback((nextStartDate: string, nextEndDate: string) => {
+    imageQueryRef.current = { startDate: nextStartDate, endDate: nextEndDate };
+    imageRequestGateRef.current.setQuery(imageQueryKey(nextStartDate, nextEndDate));
+    setStartDate(nextStartDate);
+    setEndDate(nextEndDate);
   }, []);
 
-  useEffect(() => { void loadStorage(); }, [loadStorage]);
+  const loadStorage = useCallback(async () => {
+    const queryOwner = imageMutationGateRef.current.beginQuery("storage");
+    if (!queryOwner.allowed) return;
+    const requestId = ++storageRequestRef.current;
+    try {
+      const data = await fetchImageStorage();
+      if (!imageMutationGateRef.current.acceptsQuery(queryOwner) || requestId !== storageRequestRef.current) return;
+      setStorage(data);
+    } catch { /* ignore */ }
+    finally {
+      if (imageMutationGateRef.current.acceptsQuery(queryOwner) && requestId === storageRequestRef.current) setStorageLoading(false);
+    }
+  }, []);
+
+  const refreshStorage = useCallback(() => {
+    if (imageMutationGateRef.current.isMutationActive()) return Promise.resolve();
+    setStorageLoading(true);
+    return loadStorage();
+  }, [loadStorage]);
+
+  useEffect(() => {
+    let active = true;
+    queueMicrotask(() => {
+      if (active) void loadStorage();
+    });
+    return () => {
+      active = false;
+    };
+  }, [loadStorage]);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [tagEditTarget, setTagEditTarget] = useState<ManagedImage | null>(null);
   const [tagInput, setTagInput] = useState("");
   const [dialogVisible, setDialogVisible] = useState(false);
-  const deleteTargetRef = useRef<ManagedImage | null>(null);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [deleteMode, setDeleteMode] = useState<"selected" | "filtered" | "byDate" | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [isMutating, setIsMutating] = useState(false);
+  const imageMutationGateRef = useRef(createMutationRequestGate());
+  const downloadOwnerRef = useRef(createLifecycleActionOwner());
+  const deleteDialogCleanupTimerRef = useRef(createReplaceableTimeout());
+  const tagPressTimerRef = useRef(createReplaceableTimeout());
+
+  useEffect(() => {
+    const mutationGate = imageMutationGateRef.current;
+    const downloadOwner = downloadOwnerRef.current;
+    const cleanupTimer = deleteDialogCleanupTimerRef.current;
+    const tagPressTimer = tagPressTimerRef.current;
+    downloadOwner.activate();
+    return () => {
+      mutationGate.cancel();
+      downloadOwner.cancel();
+      cleanupTimer.cancel();
+      tagPressTimer.cancel();
+    };
+  }, []);
 
   const filteredItems = selectedTags.length > 0
     ? items.filter((item) => selectedTags.every((t) => (item.tags ?? []).includes(t)))
@@ -112,59 +166,112 @@ function ImageManagerContent() {
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(imageKey(item)));
   const allSelected = filteredItems.length > 0 && filteredItems.every((item) => selectedSet.has(imageKey(item)));
 
-  const loadImages = async () => {
+  const loadImages = useCallback(async () => {
+    const query = imageQueryRef.current;
+    const queryOwner = imageMutationGateRef.current.beginQuery("list");
+    if (!queryOwner.allowed) return;
+    const request = imageRequestGateRef.current.begin(imageQueryKey(query.startDate, query.endDate));
+    if (request.sequence === null) return;
     setIsLoading(true);
+    const accepts = () => imageMutationGateRef.current.acceptsQuery(queryOwner) && imageRequestGateRef.current.isCurrent(request);
     try {
       const [data, tagsData] = await Promise.all([
-        fetchManagedImages({ start_date: startDate, end_date: endDate }),
+        fetchManagedImages({ start_date: query.startDate, end_date: query.endDate }),
         fetchImageTags(),
       ]);
+      if (!accepts()) return;
       setItems(data.items);
       setAllTags(tagsData.tags);
       setSelectedPaths((current) => current.filter((path) => data.items.some((item) => imageKey(item) === path)));
       setPage(1);
     } catch (error) {
+      if (!accepts()) return;
       toast.error(error instanceof Error ? error.message : "加载图片失败");
     } finally {
-      setIsLoading(false);
+      if (accepts()) setIsLoading(false);
     }
-  };
+  }, []);
+
+  const beginImageMutation = useCallback(() => {
+    const owner = imageMutationGateRef.current.beginMutation();
+    if (!owner.accepted) {
+      toast.error("已有图片操作正在进行");
+      return null;
+    }
+    setIsMutating(true);
+    return owner;
+  }, []);
+
+  const finishImageMutation = useCallback((
+    owner: { accepted?: boolean; epoch?: number },
+  ) => {
+    return finishMutationAndRefresh({
+      gate: imageMutationGateRef.current,
+      owner,
+      onBusyChange: setIsMutating,
+      reloadList: loadImages,
+      refreshSecondary: refreshStorage,
+    });
+  }, [loadImages, refreshStorage]);
 
   const closeDialog = useCallback(() => {
     setDialogVisible(false);
-    setTimeout(() => setDeleteTarget(null), 200);
+    deleteDialogCleanupTimerRef.current.schedule(() => {
+      setDeleteTarget(null);
+    }, 200);
   }, []);
 
   const openDeleteDialog = useCallback((item: ManagedImage) => {
-    deleteTargetRef.current = item;
+    deleteDialogCleanupTimerRef.current.cancel();
     setDeleteTarget(item);
     setDialogVisible(true);
   }, []);
 
   const handleDelete = async () => {
-    if (!deleteTarget) return;
+    const target = deleteTarget;
+    if (!target) return;
+    const mutationOwner = beginImageMutation();
+    if (!mutationOwner) return;
+    const queryAtStart = imageQueryKey(imageQueryRef.current.startDate, imageQueryRef.current.endDate);
     setIsDeleting(true);
     try {
-      await deleteManagedImages({ paths: [deleteTarget.rel] });
-      setItems((prev) => prev.filter((item) => item.rel !== deleteTarget.rel));
-      setSelectedPaths((prev) => prev.filter((p) => p !== imageKey(deleteTarget)));
+      await deleteManagedImages({ paths: [target.rel] });
+      if (!imageMutationGateRef.current.acceptsMutation(mutationOwner)) return;
+      if (queryAtStart === imageQueryKey(imageQueryRef.current.startDate, imageQueryRef.current.endDate)) {
+        setItems((prev) => prev.filter((item) => item.rel !== target.rel));
+        setSelectedPaths((prev) => prev.filter((p) => p !== imageKey(target)));
+      } else {
+        // The authoritative reload below reads the current query after any filter change.
+      }
       toast.success("图片已删除");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除失败");
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除失败");
+      }
     } finally {
-      setIsDeleting(false);
-      closeDialog();
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner) && finishImageMutation(mutationOwner)) {
+        setIsDeleting(false);
+        closeDialog();
+      }
     }
   };
 
   const handleSetTags = async (item: ManagedImage, tags: string[]) => {
+    const mutationOwner = beginImageMutation();
+    if (!mutationOwner) return;
     try {
       const result = await setImageTags(item.rel, tags);
+      if (!imageMutationGateRef.current.acceptsMutation(mutationOwner)) return;
       setItems((prev) => prev.map((i) => i.rel === item.rel ? { ...i, tags: result.tags } : i));
       const tagsData = await fetchImageTags();
+      if (!imageMutationGateRef.current.acceptsMutation(mutationOwner)) return;
       setAllTags(tagsData.tags);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "设置标签失败");
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "设置标签失败");
+      }
+    } finally {
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) finishImageMutation(mutationOwner);
     }
   };
 
@@ -190,12 +297,14 @@ function ImageManagerContent() {
   };
 
   const [pressingTag, setPressingTag] = useState<string | null>(null);
-  const pressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [tagDeleteTarget, setTagDeleteTarget] = useState<string | null>(null);
 
   const handleDeleteTag = async (tag: string) => {
+    const mutationOwner = beginImageMutation();
+    if (!mutationOwner) return;
     try {
       const result = await deleteImageTag(tag);
+      if (!imageMutationGateRef.current.acceptsMutation(mutationOwner)) return;
       setAllTags((prev) => prev.filter((t) => t !== tag));
       setSelectedTags((prev) => prev.filter((t) => t !== tag));
       setItems((prev) => prev.map((item) => ({
@@ -203,30 +312,31 @@ function ImageManagerContent() {
         tags: (item.tags ?? []).filter((t) => t !== tag),
       })));
       toast.success(`标签"${tag}"已删除，影响 ${result.removed_from} 张图片`);
+      setTagDeleteTarget(null);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除标签失败");
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除标签失败");
+      }
+    } finally {
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) finishImageMutation(mutationOwner);
     }
   };
 
   const startTagPress = useCallback((tag: string) => {
     setPressingTag(tag);
-    pressTimerRef.current = setTimeout(() => {
+    tagPressTimerRef.current.schedule(() => {
       setPressingTag(null);
       setTagDeleteTarget(tag);
     }, LONG_PRESS_MS);
-  }, []);
+  }, [setTagDeleteTarget]);
 
   const stopTagPress = useCallback(() => {
     setPressingTag(null);
-    if (pressTimerRef.current) {
-      clearTimeout(pressTimerRef.current);
-      pressTimerRef.current = null;
-    }
+    tagPressTimerRef.current.cancel();
   }, []);
 
   const clearFilters = () => {
-    setStartDate("");
-    setEndDate("");
+    updateImageQuery("", "");
     setSelectedTags([]);
   };
 
@@ -236,41 +346,121 @@ function ImageManagerContent() {
 
   const confirmDelete = async () => {
     if (!deleteMode || selectedCount === 0) return;
+    const mode = deleteMode;
+    const paths = [...selectedPaths];
+    const queryAtStart = imageQueryKey(imageQueryRef.current.startDate, imageQueryRef.current.endDate);
+    const mutationOwner = beginImageMutation();
+    if (!mutationOwner) return;
     setIsDeleting(true);
     try {
-      const data = await deleteManagedImages(deleteMode === "filtered" ? { start_date: startDate, end_date: endDate, all_matching: true } : { paths: selectedPaths });
+      const data = await deleteManagedImages(mode === "filtered" ? { start_date: startDate, end_date: endDate, all_matching: true } : { paths });
+      if (!imageMutationGateRef.current.acceptsMutation(mutationOwner)) return;
       toast.success(`已删除 ${data.removed} 张图片`);
-      setDeleteMode(null);
-      setSelectedPaths([]);
-      await loadImages();
+      if (queryAtStart === imageQueryKey(imageQueryRef.current.startDate, imageQueryRef.current.endDate)) {
+        setDeleteMode(null);
+        setSelectedPaths([]);
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除图片失败");
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除图片失败");
+      }
     } finally {
-      setIsDeleting(false);
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner) && finishImageMutation(mutationOwner)) {
+        setIsDeleting(false);
+      }
+    }
+  };
+
+  const handleCompress = async () => {
+    const mutationOwner = beginImageMutation();
+    if (!mutationOwner) return;
+    try {
+      const result = await compressAllImages();
+      if (!imageMutationGateRef.current.acceptsMutation(mutationOwner)) return;
+      setCompressResult(`已压缩${result.saved_mb}MB`);
+    } catch {
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) setCompressResult("压缩失败");
+    } finally {
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) finishImageMutation(mutationOwner);
+    }
+  };
+
+  const handleDeleteToTarget = async () => {
+    const mutationOwner = beginImageMutation();
+    if (!mutationOwner) return;
+    try {
+      const result = await deleteToTarget(targetFreeMb);
+      if (!imageMutationGateRef.current.acceptsMutation(mutationOwner)) return;
+      toast.success(`已删除 ${result.removed} 张图片，释放 ${result.freed_mb ?? 0}MB`);
+    } catch {
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) toast.error("清理失败");
+    } finally {
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) finishImageMutation(mutationOwner);
+    }
+  };
+
+  const handleDeleteByDate = async () => {
+    if (!deleteStartDate) return;
+    const cutoff = deleteStartDate;
+    const mutationOwner = beginImageMutation();
+    if (!mutationOwner) return;
+    setIsDeleting(true);
+    try {
+      const result = await deleteManagedImages({ end_date: cutoff, all_matching: true });
+      if (!imageMutationGateRef.current.acceptsMutation(mutationOwner)) return;
+      toast.success(`已删除 ${result.removed} 张图片`);
+      setDeleteMode(null);
+    } catch {
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner)) toast.error("删除失败");
+    } finally {
+      if (imageMutationGateRef.current.acceptsMutation(mutationOwner) && finishImageMutation(mutationOwner)) {
+        setIsDeleting(false);
+      }
     }
   };
 
   const handleBatchDownload = async () => {
     const paths = deleteMode === "filtered" ? items.map((item) => item.rel) : selectedPaths;
     if (paths.length === 0) return;
+    const downloadOwner = downloadOwnerRef.current;
+    const downloadAction = downloadOwner.begin();
+    const isDownloadActive = () => downloadOwner.accepts(downloadAction);
     setIsDownloading(true);
     try {
-      await downloadImages(paths);
-      toast.success(`已下载 ${paths.length} 张图片`);
+      const started = await downloadImages(paths, isDownloadActive);
+      if (isDownloadActive() && started) {
+        toast.success(`已下载 ${paths.length} 张图片`);
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "下载失败");
+      if (isDownloadActive()) {
+        toast.error(error instanceof Error ? error.message : "下载失败");
+      }
     } finally {
-      setIsDownloading(false);
+      if (isDownloadActive()) {
+        setIsDownloading(false);
+      }
     }
   };
 
   const handleSingleDownload = async (item: ManagedImage) => {
-    await downloadSingleImage(item.rel);
+    const downloadOwner = downloadOwnerRef.current;
+    const downloadAction = downloadOwner.begin();
+    const isDownloadActive = () => downloadOwner.accepts(downloadAction);
+    try {
+      const started = await downloadSingleImage(item.rel, isDownloadActive);
+      if (isDownloadActive() && started) {
+        toast.success("图片下载已开始");
+      }
+    } catch {
+      if (isDownloadActive()) {
+        toast.error("下载图片失败");
+      }
+    }
   };
 
   useEffect(() => {
     void loadImages();
-  }, [startDate, endDate]);
+  }, [endDate, loadImages, startDate]);
 
   return (
     <section className="space-y-5">
@@ -280,15 +470,15 @@ function ImageManagerContent() {
           <h1 className="text-2xl font-semibold tracking-tight">图片管理</h1>
         </div>
         <div className="flex flex-wrap gap-2">
-          <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
+          <DateRangeFilter startDate={startDate} endDate={endDate} onChange={updateImageQuery} />
           <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
             清除筛选条件
           </Button>
-          <Button onClick={() => void loadImages()} disabled={isLoading} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
+          <Button onClick={() => void loadImages()} disabled={isLoading || isMutating} className="h-10 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800">
             {isLoading ? <LoaderCircle className="size-4 animate-spin" /> : <Search className="size-4" />}
             查询
           </Button>
-          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || items.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
+          <Button variant="outline" onClick={() => setDeleteMode("filtered")} disabled={isDeleting || isMutating || items.length === 0 || (!startDate && !endDate)} className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50">
             <Trash2 className="size-4" />
             删除匹配日期
           </Button>
@@ -365,28 +555,18 @@ function ImageManagerContent() {
             </div>
             <div className="rounded-xl border border-stone-200 bg-white/80 p-3 col-span-2 flex items-center gap-2 flex-wrap">
               <span className="text-xs text-stone-500 w-full">快捷操作</span>
-              <Button size="sm" variant="outline" className="h-7 text-xs" disabled={storageLoading} onClick={() => { void loadStorage(); }}>
+              <Button size="sm" variant="outline" className="h-7 text-xs" disabled={storageLoading || isMutating} onClick={() => { void refreshStorage(); }}>
                 <RefreshCw className={`size-3 mr-1 ${storageLoading ? "animate-spin" : ""}`} />刷新
               </Button>
-              <Button size="sm" variant="outline" className="h-7 text-xs"
-                onClick={async () => {
-                  try { const r = await compressAllImages(); setCompressResult(`已压缩${r.saved_mb}MB`); void loadStorage(); }
-                  catch { setCompressResult("压缩失败"); }
-                }}>
+              <Button size="sm" variant="outline" className="h-7 text-xs" disabled={isMutating} onClick={() => void handleCompress()}>
                 🗜️ 压缩优化
               </Button>
-              <Button size="sm" variant="outline" className="h-7 text-xs border-rose-200 text-rose-600"
+              <Button size="sm" variant="outline" className="h-7 text-xs border-rose-200 text-rose-600" disabled={isMutating}
                 onClick={() => setDeleteMode("byDate")}>
                 🗑️ 按日期删除
               </Button>
-              <form onSubmit={async (e) => { e.preventDefault();
-                try {
-                  const r = await deleteToTarget(targetFreeMb);
-                  toast.success(`已删除 ${r.removed} 张图片，释放 ${r.freed_mb ?? 0}MB`);
-                  void loadStorage();
-                } catch { toast.error("清理失败"); }
-              }} className="flex items-center gap-1">
-                <Button size="sm" variant="outline" className="h-7 text-xs border-amber-200 text-amber-700" type="submit">
+              <form onSubmit={(event) => { event.preventDefault(); void handleDeleteToTarget(); }} className="flex items-center gap-1">
+                <Button size="sm" variant="outline" className="h-7 text-xs border-amber-200 text-amber-700" type="submit" disabled={isMutating}>
                   🧹 清理至
                 </Button>
                 <Input className="h-7 w-14 text-xs text-center px-1" type="number" min={50} value={targetFreeMb}
@@ -417,19 +597,7 @@ function ImageManagerContent() {
           </div>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setDeleteMode(null)}>取消</Button>
-            <Button variant="destructive" disabled={!deleteStartDate || isDeleting}
-              onClick={async () => {
-                if (!deleteStartDate) return;
-                try {
-                  setIsDeleting(true);
-                  const r = await deleteManagedImages({ end_date: deleteStartDate, all_matching: true });
-                  toast.success(`已删除 ${r.removed} 张图片`);
-                  setDeleteMode(null);
-                  void loadStorage();
-                  void loadImages();
-                } catch { toast.error("删除失败"); }
-                finally { setIsDeleting(false); }
-              }}>
+            <Button variant="destructive" disabled={!deleteStartDate || isDeleting || isMutating} onClick={() => void handleDeleteByDate()}>
               {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : null}
               确认删除
             </Button>
@@ -455,7 +623,7 @@ function ImageManagerContent() {
               {selectedPaths.length > 0 ? <span>已选 {selectedPaths.length} 张</span> : null}
             </div>
             <div className="flex items-center gap-2">
-              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadImages()} disabled={isLoading}>
+              <Button variant="ghost" className="h-8 rounded-lg px-3 text-stone-500" onClick={() => void loadImages()} disabled={isLoading || isMutating}>
                 <RefreshCw className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
                 刷新
               </Button>
@@ -466,7 +634,7 @@ function ImageManagerContent() {
                 {isDownloading ? <LoaderCircle className="size-4 animate-spin" /> : <Download className="size-4" />}
                 下载所选
               </Button>
-              <Button variant="outline" className="h-8 rounded-lg border-rose-200 bg-white px-3 text-rose-600 hover:bg-rose-50" onClick={() => setDeleteMode("selected")} disabled={selectedPaths.length === 0 || isDeleting}>
+              <Button variant="outline" className="h-8 rounded-lg border-rose-200 bg-white px-3 text-rose-600 hover:bg-rose-50" onClick={() => setDeleteMode("selected")} disabled={selectedPaths.length === 0 || isDeleting || isMutating}>
                 <Trash2 className="size-4" />
                 删除所选
               </Button>
@@ -504,6 +672,7 @@ function ImageManagerContent() {
                     type="button"
                     className="absolute top-2 right-2 z-10 inline-flex size-7 items-center justify-center rounded-full bg-black/50 text-white opacity-100 transition hover:bg-red-600 sm:opacity-0 sm:group-hover:opacity-100"
                     title="删除图片"
+                    disabled={isMutating}
                     onClick={(e) => {
                       e.stopPropagation();
                       openDeleteDialog(item);
@@ -553,6 +722,7 @@ function ImageManagerContent() {
                         <button
                           type="button"
                           className="inline-flex size-3.5 items-center justify-center rounded-full hover:bg-stone-300"
+                          disabled={isMutating}
                           onClick={() => handleRemoveTag(item, tag)}
                         >
                           <X className="size-2.5" />
@@ -565,6 +735,7 @@ function ImageManagerContent() {
                           type="button"
                           className="inline-flex size-5 items-center justify-center rounded-full border border-dashed border-stone-300 text-stone-400 hover:border-stone-500 hover:text-stone-600"
                           title="添加标签"
+                          disabled={isMutating}
                         >
                           <Plus className="size-3" />
                         </button>
@@ -576,6 +747,7 @@ function ImageManagerContent() {
                             <Input
                               value={tagInput}
                               onChange={(e) => setTagInput(e.target.value)}
+                              disabled={isMutating}
                               placeholder="输入标签名"
                               className="h-8 text-xs"
                               onKeyDown={(e) => {
@@ -590,6 +762,7 @@ function ImageManagerContent() {
                               variant="outline"
                               className="size-8 shrink-0"
                               onClick={() => handleAddTag(item)}
+                              disabled={isMutating}
                             >
                               <Plus className="size-3.5" />
                             </Button>
@@ -600,6 +773,7 @@ function ImageManagerContent() {
                                 <button
                                   key={tag}
                                   type="button"
+                                  disabled={isMutating}
                                   onClick={() => {
                                     void handleSetTags(item, [...(item.tags ?? []), tag]);
                                     setTagEditTarget(null);
@@ -657,10 +831,10 @@ function ImageManagerContent() {
             </div>
           ) : null}
           <DialogFooter>
-            <Button variant="outline" onClick={closeDialog} className="rounded-xl">
+                <Button variant="outline" onClick={closeDialog} disabled={isDeleting || isMutating} className="rounded-xl">
               取消
             </Button>
-            <Button variant="destructive" onClick={() => void handleDelete()} disabled={isDeleting} className="rounded-xl">
+                <Button variant="destructive" onClick={() => void handleDelete()} disabled={isDeleting || isMutating} className="rounded-xl">
               {isDeleting ? <LoaderCircle className="mr-1 size-4 animate-spin" /> : <Trash2 className="mr-1 size-4" />}
               删除
             </Button>
@@ -684,10 +858,10 @@ function ImageManagerContent() {
             确认删除 {selectedCount} 张图片吗？删除后无法恢复。
           </p>
           <DialogFooter>
-            <Button variant="outline" className="rounded-xl" onClick={() => setDeleteMode(null)} disabled={isDeleting}>
+                <Button variant="outline" className="rounded-xl" onClick={() => setDeleteMode(null)} disabled={isDeleting || isMutating}>
               取消
             </Button>
-            <Button className="rounded-xl bg-rose-600 text-white hover:bg-rose-700" onClick={() => void confirmDelete()} disabled={isDeleting || selectedCount === 0}>
+                <Button className="rounded-xl bg-rose-600 text-white hover:bg-rose-700" onClick={() => void confirmDelete()} disabled={isDeleting || isMutating || selectedCount === 0}>
               {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : null}
               确认删除
             </Button>
@@ -700,7 +874,7 @@ function ImageManagerContent() {
             <DialogTitle>删除标签</DialogTitle>
           </DialogHeader>
           <p className="text-sm text-stone-600">
-            确定要删除标签 <span className="font-semibold">"{tagDeleteTarget}"</span> 吗？将从所有图片中移除该标签。
+            确定要删除标签 <span className="font-semibold">&quot;{tagDeleteTarget}&quot;</span> 吗？将从所有图片中移除该标签。
           </p>
           <DialogFooter>
             <Button variant="outline" className="rounded-xl" onClick={() => setTagDeleteTarget(null)}>
@@ -709,9 +883,9 @@ function ImageManagerContent() {
             <Button
               variant="destructive"
               className="rounded-xl"
+              disabled={isMutating}
               onClick={() => {
                 if (tagDeleteTarget) void handleDeleteTag(tagDeleteTarget);
-                setTagDeleteTarget(null);
               }}
             >
               确认删除

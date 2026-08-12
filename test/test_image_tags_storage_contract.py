@@ -35,9 +35,21 @@ def test_tag_snapshot_replace_failure_keeps_previous_file(tmp_path, monkeypatch)
     path.write_text(original, encoding="utf-8")
     monkeypatch.setattr(tags_module, "TAGS_FILE", path)
 
-    with mock.patch.object(Path, "replace", side_effect=OSError("replace failed")):
+    with mock.patch.object(tags_module, "atomic_write_bytes", side_effect=OSError("replace failed")):
         with pytest.raises(OSError):
             tags_module.set_tags("images/a.png", ["favorite"])
 
     assert path.read_text(encoding="utf-8") == original
     assert not path.with_suffix(path.suffix + ".tmp").exists()
+
+
+def test_tag_save_does_not_clobber_preexisting_temp_file(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "image_tags.json"
+    stale_temp = path.with_suffix(path.suffix + ".tmp")
+    stale_temp.write_text("preexisting temp data", encoding="utf-8")
+    path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(tags_module, "TAGS_FILE", path)
+
+    tags_module.set_tags("images/a.png", ["favorite"])
+
+    assert stale_temp.read_text(encoding="utf-8") == "preexisting temp data"

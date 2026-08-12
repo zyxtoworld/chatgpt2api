@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Menu } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -12,8 +12,12 @@ import { Sheet, SheetClose, SheetContent, SheetFooter, SheetHeader, SheetTitle, 
 import webConfig from "@/constants/common-env";
 import { fetchThirdPartyApps, type ThirdPartyAppsSettings } from "@/lib/api";
 import { getValidatedAuthSession } from "@/lib/auth-session";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { runLogoutAfterClear } from "@/lib/logout-action";
+import { buildThirdPartyHref, formatThirdPartyDisplayHref } from "@/lib/third-party-url";
 import { cn } from "@/lib/utils";
 import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth";
+import { toast } from "sonner";
 
 const adminNavItems = [
   { href: "/image", label: "生图" },
@@ -26,31 +30,26 @@ const adminNavItems = [
 
 const userNavItems = [{ href: "/image", label: "画图" }];
 
-function buildThirdPartyHref(appUrl: string, baseUrl: string, apiKey: string) {
-  const url = appUrl.trim();
-  try {
-    const target = new URL(url);
-    target.searchParams.set("apiKey", apiKey);
-    target.searchParams.set("baseUrl", baseUrl);
-    return target.toString();
-  } catch {
-    return `${url}${url.includes("?") ? "&" : "?"}apiKey=${encodeURIComponent(apiKey)}&baseUrl=${encodeURIComponent(baseUrl)}`;
-  }
-}
-
 export function TopNav() {
   const pathname = usePathname();
   const router = useRouter();
   const [session, setSession] = useState<StoredAuthSession | null | undefined>(undefined);
-  const [thirdPartyApps, setThirdPartyApps] = useState<ThirdPartyAppsSettings | null>(null);
+  const [thirdPartyState, setThirdPartyState] = useState<{
+    owner: StoredAuthSession;
+    apps: ThirdPartyAppsSettings;
+  } | null>(null);
   const [isCanvasDialogOpen, setIsCanvasDialogOpen] = useState(false);
+  const authSessionOwnerRef = useRef(createLatestActionOwner());
+  const thirdPartyOwnerRef = useRef(createLatestActionOwner());
 
   useEffect(() => {
-    let active = true;
+    const authSessionOwner = authSessionOwnerRef.current;
+    authSessionOwner.activate();
+    const requestOwner = authSessionOwner.begin(pathname);
 
     const load = async () => {
       if (pathname === "/login") {
-        if (!active) {
+        if (!authSessionOwner.accepts(requestOwner, pathname)) {
           return;
         }
         setSession(null);
@@ -58,7 +57,7 @@ export function TopNav() {
       }
 
       const storedSession = await getValidatedAuthSession();
-      if (!active) {
+      if (!authSessionOwner.accepts(requestOwner, pathname)) {
         return;
       }
       setSession(storedSession);
@@ -66,25 +65,27 @@ export function TopNav() {
 
     void load();
     return () => {
-      active = false;
+      authSessionOwner.invalidate();
     };
   }, [pathname]);
 
   useEffect(() => {
     if (!session) {
-      setThirdPartyApps(null);
       return;
     }
-    let active = true;
+    const owner = session;
+    const thirdPartyOwner = thirdPartyOwnerRef.current;
+    thirdPartyOwner.activate();
     const load = async () => {
+      const requestOwner = thirdPartyOwner.begin(owner);
       try {
         const data = await fetchThirdPartyApps();
-        if (active) {
-          setThirdPartyApps(data.third_party_apps);
+        if (thirdPartyOwner.accepts(requestOwner, owner)) {
+          setThirdPartyState({ owner, apps: data.third_party_apps });
         }
       } catch {
-        if (active) {
-          setThirdPartyApps(null);
+        if (thirdPartyOwner.accepts(requestOwner, owner)) {
+          setThirdPartyState((current) => current?.owner === owner ? null : current);
         }
       }
     };
@@ -93,14 +94,21 @@ export function TopNav() {
     void load();
     window.addEventListener("third-party-apps-updated", reload);
     return () => {
-      active = false;
+      thirdPartyOwner.cancel();
       window.removeEventListener("third-party-apps-updated", reload);
     };
   }, [session]);
 
   const handleLogout = async () => {
-    await clearStoredAuthSession();
-    router.replace("/login");
+    authSessionOwnerRef.current.invalidate();
+    await runLogoutAfterClear({
+      clearSession: clearStoredAuthSession,
+      onSuccess: () => {
+        setThirdPartyState(null);
+        router.replace("/login");
+      },
+      onFailure: () => toast.error("退出登录失败，请重试"),
+    });
   };
 
   if (pathname === "/login" || session === undefined || !session) {
@@ -111,9 +119,10 @@ export function TopNav() {
   const roleLabel = session.role === "admin" ? "管理员" : "普通用户";
   const displayName = session.name.trim() || roleLabel;
   const baseUrl = webConfig.apiUrl.replace(/\/$/, "") || window.location.origin;
+  const thirdPartyApps = thirdPartyState?.owner === session ? thirdPartyState.apps : null;
   const canvas = thirdPartyApps?.infinite_canvas;
-  const canvasHref = canvas?.enabled && canvas.url.trim() ? buildThirdPartyHref(canvas.url, baseUrl, session.key) : "";
-  const canvasDisplayHref = canvasHref ? decodeURIComponent(canvasHref) : "";
+  const canvasHref = canvas?.enabled && canvas.url.trim() ? buildThirdPartyHref(canvas.url, baseUrl) : "";
+  const canvasDisplayHref = canvasHref ? formatThirdPartyDisplayHref(canvasHref) : "";
 
   const handleCanvasOpen = () => {
     if (!canvasHref) {
@@ -237,7 +246,7 @@ export function TopNav() {
           <DialogHeader className="gap-2">
             <DialogTitle>跳转到三方应用</DialogTitle>
             <DialogDescription className="text-sm leading-6">
-              该入口仅供个人测试使用，建议自行本机部署后再长期使用。跳转地址会默认带上本项目地址和当前密钥，用于自动填充连接信息；如果不放心，可以取消后手动前往应用并自行输入。
+              该入口仅供个人测试使用，建议自行本机部署后再长期使用。跳转地址只会带上本项目地址；请在三方应用内手工输入独立 API key。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">

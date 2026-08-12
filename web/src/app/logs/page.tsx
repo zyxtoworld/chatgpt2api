@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeft, ChevronRight, ImageIcon, LoaderCircle, RefreshCw, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -15,6 +15,9 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { deleteSystemLogs, fetchSystemLogs, type SystemLog } from "@/lib/api";
+import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { finishMutationAndRefresh } from "@/lib/mutation-refresh-controller";
+import { createRequestGate } from "@/lib/query-request-gate";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LogType = {
@@ -26,6 +29,8 @@ const typeLabels: Record<string, string> = {
   [LogType.Call]: "调用日志",
   [LogType.Account]: "账号管理日志",
 };
+
+const logQueryKey = (type: string, startDate: string, endDate: string) => JSON.stringify([type, startDate, endDate]);
 
 function getDetailText(item: SystemLog, key: string) {
   const value = item.detail?.[key];
@@ -63,6 +68,22 @@ function LogsContent() {
   const [isDeleting, setIsDeleting] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [deletingItems, setDeletingItems] = useState<SystemLog[]>([]);
+  const logQueryRef = useRef<{ type: string; startDate: string; endDate: string }>({ type: LogType.Call, startDate: "", endDate: "" });
+  const logRequestGateRef = useRef(createRequestGate(logQueryKey(LogType.Call, "", "")));
+  const logMutationGateRef = useRef(createMutationRequestGate());
+
+  useEffect(() => {
+    const mutationGate = logMutationGateRef.current;
+    return () => mutationGate.cancel();
+  }, []);
+
+  const updateLogQuery = useCallback((next: { type: string; startDate: string; endDate: string }) => {
+    logQueryRef.current = next;
+    logRequestGateRef.current.setQuery(logQueryKey(next.type, next.startDate, next.endDate));
+    setType(next.type);
+    setStartDate(next.startDate);
+    setEndDate(next.endDate);
+  }, []);
   const detailUrls = getUrls(detailLog);
   const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
   const isCallLog = type === LogType.Call;
@@ -74,23 +95,30 @@ function LogsContent() {
   const currentPageSelected = currentRows.length > 0 && currentRows.every((item) => selectedSet.has(item.id));
   const allSelected = items.length > 0 && items.every((item) => selectedSet.has(item.id));
 
-  const loadLogs = async () => {
+  const loadLogs = useCallback(async () => {
+    const query = logQueryRef.current;
+    const queryOwner = logMutationGateRef.current.beginQuery("list");
+    if (!queryOwner.allowed) return;
+    const request = logRequestGateRef.current.begin(logQueryKey(query.type, query.startDate, query.endDate));
+    if (request.sequence === null) return;
     setIsLoading(true);
+    const accepts = () => logMutationGateRef.current.acceptsQuery(queryOwner) && logRequestGateRef.current.isCurrent(request);
     try {
-      const data = await fetchSystemLogs({ type, start_date: startDate, end_date: endDate });
+      const data = await fetchSystemLogs({ type: query.type, start_date: query.startDate, end_date: query.endDate });
+      if (!accepts()) return;
       setItems(data.items);
       setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
       setPage(1);
     } catch (error) {
+      if (!accepts()) return;
       toast.error(error instanceof Error ? error.message : "加载日志失败");
     } finally {
-      setIsLoading(false);
+      if (accepts()) setIsLoading(false);
     }
-  };
+  }, []);
 
   const clearFilters = () => {
-    setStartDate("");
-    setEndDate("");
+    updateLogQuery({ type, startDate: "", endDate: "" });
   };
 
   const openDetail = (item: SystemLog) => {
@@ -111,9 +139,12 @@ function LogsContent() {
   const confirmDelete = async () => {
     const ids = deletingItems.map((item) => item.id);
     if (ids.length === 0) return;
+    const mutationOwner = logMutationGateRef.current.beginMutation();
+    if (!mutationOwner.accepted) return;
     setIsDeleting(true);
     try {
       const data = await deleteSystemLogs(ids);
+      if (!logMutationGateRef.current.acceptsMutation(mutationOwner)) return;
       toast.success(`已删除 ${data.removed} 条日志`);
       setDeletingItems([]);
       setSelectedIds((current) => current.filter((id) => !ids.includes(id)));
@@ -121,17 +152,25 @@ function LogsContent() {
         setDetailOpen(false);
         setDetailLog(null);
       }
-      await loadLogs();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除日志失败");
+      if (logMutationGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除日志失败");
+      }
     } finally {
-      setIsDeleting(false);
+      if (logMutationGateRef.current.acceptsMutation(mutationOwner)) {
+        finishMutationAndRefresh({
+          gate: logMutationGateRef.current,
+          owner: mutationOwner,
+          onBusyChange: setIsDeleting,
+          reloadList: loadLogs,
+        });
+      }
     }
   };
 
   useEffect(() => {
     void loadLogs();
-  }, [type, startDate, endDate]);
+  }, [endDate, loadLogs, startDate, type]);
 
   return (
     <section className="space-y-5">
@@ -141,14 +180,14 @@ function LogsContent() {
           <h1 className="text-2xl font-semibold tracking-tight">日志管理</h1>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Select value={type} onValueChange={setType}>
+          <Select value={type} onValueChange={(nextType) => updateLogQuery({ type: nextType, startDate, endDate })}>
             <SelectTrigger className="h-10 w-[150px] rounded-xl border-stone-200 bg-white"><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value={LogType.Call}>调用日志</SelectItem>
               <SelectItem value={LogType.Account}>账号管理日志</SelectItem>
             </SelectContent>
           </Select>
-          <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => { setStartDate(start); setEndDate(end); }} />
+          <DateRangeFilter startDate={startDate} endDate={endDate} onChange={(start, end) => updateLogQuery({ type, startDate: start, endDate: end })} />
           <Button variant="outline" onClick={clearFilters} className="h-10 rounded-xl border-stone-200 bg-white px-4 text-stone-700">
             清除筛选条件
           </Button>

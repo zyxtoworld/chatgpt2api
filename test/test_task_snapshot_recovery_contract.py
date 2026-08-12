@@ -49,7 +49,7 @@ class TaskSnapshotRecoveryContractTests(unittest.TestCase):
             original = path.read_bytes()
 
             with (
-                mock.patch.object(Path, "replace", side_effect=OSError("replace failed")),
+                mock.patch.object(editable_module, "atomic_write_bytes", side_effect=OSError("replace failed")),
                 mock.patch.object(editable_module.threading, "Thread") as thread,
             ):
                 with self.assertRaises(OSError):
@@ -59,6 +59,20 @@ class TaskSnapshotRecoveryContractTests(unittest.TestCase):
             self.assertFalse(path.with_suffix(path.suffix + ".tmp").exists())
             self.assertNotIn("owner-1:replace-task", service._tasks)
             thread.assert_not_called()
+
+    def test_editable_save_does_not_clobber_preexisting_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "editable_file_tasks.json"
+            stale_temp = path.with_suffix(path.suffix + ".tmp")
+            stale_temp.write_text("preexisting temp data", encoding="utf-8")
+            path.write_text('{"tasks": []}\n', encoding="utf-8")
+            service = EditableFileTaskService(path)
+
+            with mock.patch.object(editable_module, "reserve_background_task") as reserve:
+                service.submit_ppt(OWNER, client_task_id="collision-task", prompt="make a deck")
+            reserve.return_value.submit.assert_called_once()
+
+            self.assertEqual(stale_temp.read_text(encoding="utf-8"), "preexisting temp data")
 
     def test_image_constructor_rejects_corrupt_existing_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -108,7 +122,7 @@ class TaskSnapshotRecoveryContractTests(unittest.TestCase):
             original = path.read_bytes()
 
             with (
-                mock.patch.object(Path, "replace", side_effect=OSError("replace failed")),
+                mock.patch.object(image_module, "atomic_write_bytes", side_effect=OSError("replace failed")),
                 mock.patch.object(image_module.threading, "Thread") as thread,
             ):
                 with self.assertRaises(OSError):
@@ -124,6 +138,31 @@ class TaskSnapshotRecoveryContractTests(unittest.TestCase):
             self.assertFalse(path.with_suffix(path.suffix + ".tmp").exists())
             self.assertNotIn("owner-1:replace-task", service._tasks)
             thread.assert_not_called()
+
+    def test_image_save_does_not_clobber_preexisting_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            stale_temp = path.with_suffix(path.suffix + ".tmp")
+            stale_temp.write_text("preexisting temp data", encoding="utf-8")
+            path.write_text('{"tasks": []}\n', encoding="utf-8")
+            service = ImageTaskService(
+                path,
+                generation_handler=lambda _payload: {"data": [{"url": "http://example.test/image.png"}]},
+                edit_handler=lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]},
+                retention_days_getter=lambda: 30,
+            )
+
+            with mock.patch.object(image_module, "reserve_background_task") as reserve:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="collision-task",
+                    prompt="make an image",
+                    model="gpt-image-2",
+                    size=None,
+                )
+            reserve.return_value.submit.assert_called_once()
+
+            self.assertEqual(stale_temp.read_text(encoding="utf-8"), "preexisting temp data")
 
 
 if __name__ == "__main__":

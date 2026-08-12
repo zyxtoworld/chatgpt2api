@@ -1,7 +1,7 @@
 "use client";
 
 import { CloudUpload, Download, Eye, LoaderCircle, Play, RefreshCcw, Shield, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Badge } from "@/components/ui/badge";
@@ -12,6 +12,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Input } from "@/components/ui/input";
 import webConfig from "@/constants/common-env";
 import { fetchBackupDetail, getBackupDownloadUrl, type BackupDetail, type BackupInclude } from "@/lib/api";
+import { filenameFromContentDisposition } from "@/lib/content-disposition";
+import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { getStoredAuthKey } from "@/store/auth";
 import { useSettingsStore } from "../store";
 
@@ -46,23 +49,6 @@ function formatBytes(value: number) {
   return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`;
 }
 
-function getFilenameFromContentDisposition(value: string | null) {
-  const header = String(value || "").trim();
-  if (!header) {
-    return "";
-  }
-  const utf8Match = header.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
-  if (utf8Match?.[1]) {
-    try {
-      return decodeURIComponent(utf8Match[1]);
-    } catch {
-      return utf8Match[1];
-    }
-  }
-  const plainMatch = header.match(/filename\s*=\s*"?([^";]+)"?/i);
-  return plainMatch?.[1] || "";
-}
-
 const includeLabels: Array<{ key: keyof BackupInclude; label: string }> = [
   { key: "config", label: "系统配置" },
   { key: "cpa", label: "CPA 配置" },
@@ -76,6 +62,8 @@ const includeLabels: Array<{ key: keyof BackupInclude; label: string }> = [
 ];
 
 export function BackupSettingsCard() {
+  const backupDetailOwnerRef = useRef(createLatestActionOwner());
+  const backupDownloadOwnerRef = useRef(createLifecycleActionOwner());
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detail, setDetail] = useState<BackupDetail | null>(null);
@@ -95,6 +83,19 @@ export function BackupSettingsCard() {
   const testBackup = useSettingsStore((state) => state.testBackup);
   const setBackupField = useSettingsStore((state) => state.setBackupField);
   const setBackupInclude = useSettingsStore((state) => state.setBackupInclude);
+  const backupMutationBusy = isTestingBackup || isRunningBackup || deletingBackupKey !== null;
+
+  useEffect(() => {
+    const backupDetailOwner = backupDetailOwnerRef.current;
+    backupDetailOwner.activate();
+    return () => backupDetailOwner.cancel();
+  }, []);
+
+  useEffect(() => {
+    const backupDownloadOwner = backupDownloadOwnerRef.current;
+    backupDownloadOwner.activate();
+    return () => backupDownloadOwner.cancel();
+  }, []);
 
   if (isLoadingConfig) {
     return (
@@ -112,22 +113,35 @@ export function BackupSettingsCard() {
   }
 
   const handleOpenDetail = async (key: string) => {
+    const backupDetailOwner = backupDetailOwnerRef.current;
+    const requestOwner = backupDetailOwner.begin(key);
     setDetailLoading(true);
     setDetailOpen(true);
     try {
       const data = await fetchBackupDetail(key);
-      setDetail(data.item);
+      if (backupDetailOwner.accepts(requestOwner)) {
+        setDetail(data.item);
+      }
     } catch (error) {
-      setDetail(null);
-      toast.error(error instanceof Error ? error.message : "读取备份详情失败");
+      if (backupDetailOwner.accepts(requestOwner)) {
+        setDetail(null);
+        toast.error(error instanceof Error ? error.message : "读取备份详情失败");
+      }
     } finally {
-      setDetailLoading(false);
+      if (backupDetailOwner.accepts(requestOwner)) {
+        setDetailLoading(false);
+      }
     }
   };
 
   const handleDownload = async (key: string, name: string) => {
+    const backupDownloadOwner = backupDownloadOwnerRef.current;
+    const downloadOwner = backupDownloadOwner.begin();
     try {
       const authKey = await getStoredAuthKey();
+      if (!backupDownloadOwner.accepts(downloadOwner)) {
+        return;
+      }
       if (!authKey) {
         toast.error("当前登录态已失效，请重新登录后再下载");
         return;
@@ -137,29 +151,48 @@ export function BackupSettingsCard() {
           Authorization: `Bearer ${authKey}`,
         },
       });
+      if (!backupDownloadOwner.accepts(downloadOwner)) {
+        return;
+      }
       if (!response.ok) {
         let message = "下载备份失败";
         try {
           const data = await response.json() as { detail?: { error?: string }; error?: string; message?: string };
+          if (!backupDownloadOwner.accepts(downloadOwner)) {
+            return;
+          }
           message = data.detail?.error || data.error || data.message || message;
         } catch {
+          if (!backupDownloadOwner.accepts(downloadOwner)) {
+            return;
+          }
           message = response.status === 401 ? "登录已失效，请重新登录后再试" : message;
         }
         throw new Error(message);
       }
-      const downloadName = getFilenameFromContentDisposition(response.headers.get("Content-Disposition")) || name || "backup.bin";
+      const downloadName = filenameFromContentDisposition(response.headers.get("Content-Disposition")) || name || "backup.bin";
       const blob = await response.blob();
+      if (!backupDownloadOwner.accepts(downloadOwner)) {
+        return;
+      }
       const url = window.URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = downloadName;
-      document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-      window.URL.revokeObjectURL(url);
-      toast.success("备份下载已开始");
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = downloadName;
+        document.body.append(anchor);
+        anchor.click();
+        anchor.remove();
+      } finally {
+        window.URL.revokeObjectURL(url);
+      }
+      if (backupDownloadOwner.accepts(downloadOwner)) {
+        toast.success("备份下载已开始");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "下载备份失败");
+      if (backupDownloadOwner.accepts(downloadOwner)) {
+        toast.error(error instanceof Error ? error.message : "下载备份失败");
+      }
     }
   };
 
@@ -285,19 +318,19 @@ export function BackupSettingsCard() {
           </div>
 
           <div className="flex flex-wrap justify-end gap-2">
-          <Button type="button" variant="outline" className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700" onClick={() => void testBackup()} disabled={isTestingBackup}>
+          <Button type="button" variant="outline" className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700" onClick={() => void testBackup()} disabled={backupMutationBusy}>
             {isTestingBackup ? <LoaderCircle className="size-4 animate-spin" /> : <Shield className="size-4" />}
             测试连接
           </Button>
-          <Button type="button" variant="outline" className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700" onClick={() => void loadBackups()} disabled={isLoadingBackups}>
+          <Button type="button" variant="outline" className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700" onClick={() => void loadBackups()} disabled={isLoadingBackups || backupMutationBusy}>
             {isLoadingBackups ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCcw className="size-4" />}
             刷新列表
           </Button>
-          <Button type="button" variant="outline" className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700" onClick={() => void runBackup()} disabled={isRunningBackup || Boolean(backupState?.running)}>
+          <Button type="button" variant="outline" className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700" onClick={() => void runBackup()} disabled={backupMutationBusy || Boolean(backupState?.running)}>
             {isRunningBackup || backupState?.running ? <LoaderCircle className="size-4 animate-spin" /> : <Play className="size-4" />}
             立即备份
           </Button>
-          <Button className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800" onClick={() => void saveConfig()} disabled={isSavingConfig}>
+          <Button className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800" onClick={() => void saveConfig()} disabled={isSavingConfig || backupMutationBusy}>
             {isSavingConfig ? <LoaderCircle className="size-4 animate-spin" /> : <CloudUpload className="size-4" />}
             保存配置
           </Button>
@@ -356,7 +389,7 @@ export function BackupSettingsCard() {
                         variant="outline"
                         className="h-9 rounded-xl border-rose-200 bg-white px-4 text-rose-700"
                         onClick={() => void removeBackup(item.key)}
-                        disabled={isDeleting}
+                        disabled={backupMutationBusy}
                       >
                         {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                         删除

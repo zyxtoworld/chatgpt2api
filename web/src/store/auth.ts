@@ -1,6 +1,8 @@
 "use client";
 
 import localforage from "localforage";
+import { createAuthStorageCoordinator } from "@/lib/auth-storage-coordinator";
+import { normalizeStoredAuthSession } from "@/lib/auth-storage-record";
 
 export type AuthRole = "admin" | "user";
 
@@ -18,6 +20,24 @@ const authStorage = localforage.createInstance({
   name: "chatgpt2api",
   storeName: "auth",
 });
+
+const authStorageCoordinator = createAuthStorageCoordinator({
+  keyName: AUTH_KEY_STORAGE_KEY,
+  sessionName: AUTH_SESSION_STORAGE_KEY,
+  getItem: (key: string) => authStorage.getItem(key),
+  setItem: (key: string, value: unknown) => authStorage.setItem(key, value),
+  removeItem: (key: string) => authStorage.removeItem(key),
+});
+
+export type AuthStorageValidationLease = { epoch: number };
+
+export function beginStoredAuthValidation(): AuthStorageValidationLease {
+  return authStorageCoordinator.beginValidation();
+}
+
+export function beginStoredAuthMutation(): AuthStorageValidationLease {
+  return authStorageCoordinator.beginMutation();
+}
 
 function normalizeSession(value: unknown, fallbackKey = ""): StoredAuthSession | null {
   if (!value || typeof value !== "object") {
@@ -43,70 +63,66 @@ export function getDefaultRouteForRole(role: AuthRole) {
   return role === "admin" ? "/accounts" : "/image";
 }
 
-export async function getStoredAuthKey() {
-  if (typeof window === "undefined") {
-    return "";
-  }
-  const value = await authStorage.getItem<string>(AUTH_KEY_STORAGE_KEY);
-  return String(value || "").trim();
-}
-
-export async function getStoredAuthSession() {
+async function readStoredAuthSnapshot(validationLease?: AuthStorageValidationLease) {
   if (typeof window === "undefined") {
     return null;
   }
 
-  const [storedKey, storedSession] = await Promise.all([
-    authStorage.getItem<string>(AUTH_KEY_STORAGE_KEY),
-    authStorage.getItem<StoredAuthSession>(AUTH_SESSION_STORAGE_KEY),
-  ]);
+  const readLease = validationLease || beginStoredAuthValidation();
+  const snapshot = await authStorageCoordinator.readPairIfCurrent(readLease);
+  if (!snapshot) {
+    return null;
+  }
 
-  const normalizedSession = normalizeSession(storedSession, String(storedKey || ""));
+  const normalizedSession = normalizeStoredAuthSession(snapshot.key, snapshot.session);
   if (normalizedSession) {
-    if (normalizedSession.key !== String(storedKey || "").trim()) {
-      await authStorage.setItem(AUTH_KEY_STORAGE_KEY, normalizedSession.key);
-    }
-    return normalizedSession;
+    return { lease: readLease, session: normalizedSession };
   }
 
-  if (String(storedKey || "").trim()) {
-    await clearStoredAuthSession();
+  if (snapshot.key || snapshot.session) {
+    await clearStoredAuthSessionIfCurrent(readLease);
   }
-  return null;
+  return { lease: readLease, session: null };
+}
+
+export async function getStoredAuthKey() {
+  const snapshot = await readStoredAuthSnapshot();
+  return snapshot?.session?.key || "";
+}
+
+export async function getStoredAuthSession(validationLease?: AuthStorageValidationLease) {
+  const snapshot = await readStoredAuthSnapshot(validationLease);
+  return snapshot?.session || null;
 }
 
 export async function setStoredAuthSession(session: StoredAuthSession) {
-  const normalizedSession = normalizeSession(session);
-  if (!normalizedSession) {
-    await clearStoredAuthSession();
-    return;
-  }
-
-  await Promise.all([
-    authStorage.setItem(AUTH_KEY_STORAGE_KEY, normalizedSession.key),
-    authStorage.setItem(AUTH_SESSION_STORAGE_KEY, normalizedSession),
-  ]);
+  const mutationLease = beginStoredAuthMutation();
+  await setStoredAuthSessionIfCurrent(session, mutationLease);
 }
 
-export async function setStoredAuthKey(authKey: string) {
-  const normalizedAuthKey = String(authKey || "").trim();
-  if (!normalizedAuthKey) {
-    await clearStoredAuthSession();
-    return;
+export async function setStoredAuthSessionIfCurrent(
+  session: StoredAuthSession,
+  validationLease: AuthStorageValidationLease,
+) {
+  const normalizedSession = normalizeSession(session);
+  if (!normalizedSession) {
+    await clearStoredAuthSessionIfCurrent(validationLease);
+    return false;
   }
-  await authStorage.setItem(AUTH_KEY_STORAGE_KEY, normalizedAuthKey);
+
+  return authStorageCoordinator.setSessionIfCurrent(normalizedSession, validationLease);
 }
 
 export async function clearStoredAuthSession() {
   if (typeof window === "undefined") {
     return;
   }
-  await Promise.all([
-    authStorage.removeItem(AUTH_KEY_STORAGE_KEY),
-    authStorage.removeItem(AUTH_SESSION_STORAGE_KEY),
-  ]);
+  await authStorageCoordinator.clearSession();
 }
 
-export async function clearStoredAuthKey() {
-  await clearStoredAuthSession();
+export async function clearStoredAuthSessionIfCurrent(validationLease: AuthStorageValidationLease) {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return authStorageCoordinator.clearSessionIfCurrent(validationLease);
 }

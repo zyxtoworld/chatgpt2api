@@ -17,6 +17,7 @@ from services.openai_backend_api import ImagePollTimeoutError
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.protocol.error_response import PublicSafeError, public_exception_message
 from services.protocol.image_options import normalize_image_quality, normalize_image_size
+from services.secure_file import atomic_write_bytes
 from services.storage.base import StorageConflictError, StorageDataError, make_storage_snapshot
 from services.task_executor import reserve_background_task
 
@@ -580,16 +581,8 @@ class ImageTaskService:
             if current_revision != self._snapshot_revision:
                 raise StorageConflictError()
             next_snapshot = make_storage_snapshot(items)
-            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-            try:
-                tmp_path.write_text(json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                tmp_path.replace(self.path)
-            except Exception:
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-                raise
+            payload = (json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            atomic_write_bytes(self.path, self.path.parent, payload)
             self._snapshot_revision = next_snapshot.revision
 
     def _recover_unfinished_locked(self) -> bool:

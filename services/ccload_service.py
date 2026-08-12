@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
-import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -18,7 +16,12 @@ from curl_cffi.requests import Session
 
 from services.account_service import account_service
 from services.config import DATA_DIR, parse_public_url
-from services.protocol.error_response import PublicSafeValueError, sanitize_import_job_errors
+from services.protocol.error_response import (
+    PublicSafeValueError,
+    canonicalize_import_job_errors,
+    validate_import_job_errors,
+)
+from services.secure_file import atomic_write_bytes
 from services.storage.base import StorageConflictError, StorageDataError
 from services.task_executor import reserve_background_task
 
@@ -72,13 +75,18 @@ def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
     updated_at = raw.get("updated_at")
     if not all(isinstance(value, str) and value.strip() for value in (job_id, created_at, updated_at)):
         raise StorageDataError()
+    if "errors" not in raw:
+        raise StorageDataError()
+    errors = validate_import_job_errors(raw["errors"])
+    if counters["completed"] > counters["total"] or counters["failed"] > counters["completed"]:
+        raise StorageDataError()
     return {
         "job_id": job_id.strip(),
         "status": status,
         "created_at": created_at.strip(),
         "updated_at": updated_at.strip(),
         **counters,
-        "errors": sanitize_import_job_errors(raw.get("errors")),
+        "errors": errors,
     }
 
 
@@ -159,25 +167,7 @@ class CCLoadConfig:
             raise StorageConflictError()
         payload = (json.dumps(servers, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        file_descriptor, temp_name = tempfile.mkstemp(
-            prefix=f".{self._store_file.name}.",
-            suffix=".tmp",
-            dir=self._store_file.parent,
-        )
-        temp_path = Path(temp_name)
-        try:
-            with os.fdopen(file_descriptor, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, self._store_file)
-        except Exception:
-            try:
-                os.close(file_descriptor)
-            except OSError:
-                pass
-            temp_path.unlink(missing_ok=True)
-            raise
+        atomic_write_bytes(self._store_file, self._store_file.parent, payload)
         self._servers = servers
         self._snapshot_revision = hashlib.sha256(payload).hexdigest()
 
@@ -499,7 +489,13 @@ class CCLoadImportService:
         except Exception:
             self._config.set_import_job(
                 server_id,
-                {**job, "status": "failed", "failed": len(selected), "errors": []},
+                {
+                    **job,
+                    "status": "failed",
+                    "completed": len(selected),
+                    "failed": len(selected),
+                    "errors": [],
+                },
             )
             raise
         return dict(saved.get("import_job") or job)
@@ -518,28 +514,66 @@ class CCLoadImportService:
             credentials = []
             errors = [{"name": channel_id, "error": "credential unavailable"} for channel_id in channel_ids]
 
-        safe_errors = sanitize_import_job_errors(errors)
+        failure_count = min(len(channel_ids), len(errors))
+        safe_errors = canonicalize_import_job_errors(errors)
         if not credentials:
+            safe_errors = safe_errors or canonicalize_import_job_errors(
+                [{"name": "ccLoad", "error": "credential unavailable"}],
+            )
             self._update_job(
                 server_id,
                 status="failed",
                 completed=len(channel_ids),
-                failed=max(len(safe_errors), len(channel_ids)),
-                errors=safe_errors or [{"name": "ccLoad", "error": "credential unavailable"}],
+                failed=len(channel_ids),
+                errors=safe_errors,
             )
             return
 
         try:
             add_result = account_service.add_account_items(credentials)
-            access_tokens = [credential["access_token"] for credential in credentials]
+        except Exception:
+            self._update_job(
+                server_id,
+                status="failed",
+                completed=len(channel_ids),
+                added=0,
+                skipped=0,
+                refreshed=0,
+                failed=len(channel_ids),
+                errors=canonicalize_import_job_errors(
+                    [*safe_errors, {"name": "ccLoad", "error": "account import failed"}],
+                ),
+            )
+            return
+        if not isinstance(add_result, dict) or not add_result:
+            self._update_job(
+                server_id,
+                status="failed",
+                completed=len(channel_ids),
+                added=0,
+                skipped=0,
+                refreshed=0,
+                failed=len(channel_ids),
+                errors=canonicalize_import_job_errors(
+                    [*safe_errors, {"name": "ccLoad", "error": "account import failed"}],
+                ),
+            )
+            return
+        access_tokens = [credential["access_token"] for credential in credentials]
+        try:
             refresh_result = account_service.refresh_accounts(access_tokens)
         except Exception:
             self._update_job(
                 server_id,
                 status="failed",
                 completed=len(channel_ids),
-                failed=max(1, len(safe_errors)),
-                errors=[*safe_errors, {"name": "ccLoad", "error": "account import failed"}],
+                added=int(add_result.get("added") or 0),
+                skipped=int(add_result.get("skipped") or 0),
+                refreshed=0,
+                failed=failure_count,
+                errors=canonicalize_import_job_errors(
+                    [*safe_errors, {"name": "ccLoad", "error": "account import failed"}],
+                ),
             )
             return
 
@@ -550,7 +584,7 @@ class CCLoadImportService:
             added=int(add_result.get("added") or 0),
             skipped=int(add_result.get("skipped") or 0),
             refreshed=int(refresh_result.get("refreshed") or 0),
-            failed=len(safe_errors),
+            failed=failure_count,
             errors=safe_errors,
         )
 

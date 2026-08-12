@@ -23,12 +23,15 @@ export function CPAPoolDialog() {
   const formSecretKey = useSettingsStore((state) => state.formSecretKey);
   const showSecret = useSettingsStore((state) => state.showSecret);
   const isSavingPool = useSettingsStore((state) => state.isSavingPool);
+  const deletingId = useSettingsStore((state) => state.deletingId);
+  const isStartingImport = useSettingsStore((state) => state.isStartingImport);
   const setDialogOpen = useSettingsStore((state) => state.setDialogOpen);
   const setFormName = useSettingsStore((state) => state.setFormName);
   const setFormBaseUrl = useSettingsStore((state) => state.setFormBaseUrl);
   const setFormSecretKey = useSettingsStore((state) => state.setFormSecretKey);
   const setShowSecret = useSettingsStore((state) => state.setShowSecret);
   const savePool = useSettingsStore((state) => state.savePool);
+  const hasMutation = isSavingPool || deletingId !== null || isStartingImport;
 
   return (
     <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -89,14 +92,14 @@ export function CPAPoolDialog() {
             variant="secondary"
             className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
             onClick={() => setDialogOpen(false)}
-            disabled={isSavingPool}
+            disabled={hasMutation}
           >
             取消
           </Button>
           <Button
             className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
             onClick={() => void savePool()}
-            disabled={isSavingPool}
+            disabled={hasMutation}
           >
             {isSavingPool ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
             {editingPool ? "保存修改" : "添加"}

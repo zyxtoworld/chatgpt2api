@@ -8,52 +8,68 @@ from fastapi.testclient import TestClient
 
 import api.accounts as accounts_module
 from api.accounts import create_router
-from services.cpa_service import CPAConfig
-from services.sub2api_service import Sub2APIConfig
 
 
 SECRET = "import-job-opaque-secret owner@example.com"
+
+
+class _RawProgressConfig:
+    def __init__(self, record: dict) -> None:
+        self.record = record
+
+    def get_pool(self, pool_id: str):
+        return self.record if self.record.get("id") == pool_id else None
+
+    def get_server(self, server_id: str):
+        return self.record if self.record.get("id") == server_id else None
 
 
 def test_persisted_import_errors_are_not_reflected_by_management_api(tmp_path) -> None:
     app = FastAPI()
     app.include_router(create_router())
 
-    cpa_path = tmp_path / "cpa_config.json"
-    cpa_path.write_text(
-        json.dumps(
-            [{
-                "id": "pool-1",
-                "base_url": "https://cpa.example.test",
-                "import_job": {
-                    "job_id": "job-cpa",
-                    "status": "failed",
-                    "errors": [{"name": "owner@example.com", "error": SECRET}],
-                },
-            }],
-        ),
-        encoding="utf-8",
-    )
-    sub2api_path = tmp_path / "sub2api_config.json"
-    sub2api_path.write_text(
-        json.dumps(
-            [{
-                "id": "server-1",
-                "base_url": "https://sub2api.example.test",
-                "import_job": {
-                    "job_id": "job-sub2api",
-                    "status": "failed",
-                    "errors": [{"name": "owner@example.com", "error": SECRET}],
-                },
-            }],
-        ),
-        encoding="utf-8",
-    )
+    cpa_record = {
+        "id": "pool-1",
+        "base_url": "https://cpa.example.test",
+        "secret_key": "cpa-secret",
+        "import_job": {
+            "job_id": "job-cpa",
+            "status": "failed",
+            "created_at": "2026-08-11T00:00:00+00:00",
+            "updated_at": "2026-08-11T00:00:01+00:00",
+            "total": 1,
+            "completed": 1,
+            "added": 0,
+            "skipped": 0,
+            "refreshed": 0,
+            "failed": 1,
+            "errors": [{"name": "owner@example.com", "error": SECRET}],
+        },
+    }
+    sub2api_record = {
+        "id": "server-1",
+        "base_url": "https://sub2api.example.test",
+        "password": "password-secret",
+        "api_key": "api-key-secret",
+        "import_job": {
+            "job_id": "job-sub2api",
+            "status": "failed",
+            "created_at": "2026-08-11T00:00:00+00:00",
+            "updated_at": "2026-08-11T00:00:01+00:00",
+            "total": 1,
+            "completed": 1,
+            "added": 0,
+            "skipped": 0,
+            "refreshed": 0,
+            "failed": 1,
+            "errors": [{"name": "owner@example.com", "error": SECRET}],
+        },
+    }
 
     with (
         mock.patch.object(accounts_module, "require_admin_async", return_value={"role": "admin"}),
-        mock.patch.object(accounts_module, "cpa_config", CPAConfig(cpa_path)),
-        mock.patch.object(accounts_module, "sub2api_config", Sub2APIConfig(sub2api_path)),
+        mock.patch.object(accounts_module, "cpa_config", _RawProgressConfig(cpa_record)),
+        mock.patch.object(accounts_module, "sub2api_config", _RawProgressConfig(sub2api_record)),
     ):
         client = TestClient(app)
         responses = [

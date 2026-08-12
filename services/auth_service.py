@@ -79,13 +79,10 @@ class AuthService:
         if not key_hash:
             return None
 
-        if "id" in raw:
-            raw_id = raw.get("id")
-            if not isinstance(raw_id, str) or not raw_id.strip():
-                return None
-            item_id = raw_id.strip()
-        else:
-            item_id = uuid.uuid4().hex[:12]
+        raw_id = raw.get("id")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            return None
+        item_id = raw_id.strip()
 
         name = self._clean(raw.get("name")) or self._default_name(role)
 

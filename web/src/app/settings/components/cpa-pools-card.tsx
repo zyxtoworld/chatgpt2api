@@ -11,12 +11,15 @@ import { useSettingsStore } from "../store";
 export function CPAPoolsCard() {
   const pools = useSettingsStore((state) => state.pools);
   const isLoadingPools = useSettingsStore((state) => state.isLoadingPools);
+  const isSavingPool = useSettingsStore((state) => state.isSavingPool);
   const deletingId = useSettingsStore((state) => state.deletingId);
+  const isStartingImport = useSettingsStore((state) => state.isStartingImport);
   const loadingFilesId = useSettingsStore((state) => state.loadingFilesId);
   const openAddDialog = useSettingsStore((state) => state.openAddDialog);
   const openEditDialog = useSettingsStore((state) => state.openEditDialog);
   const deletePool = useSettingsStore((state) => state.deletePool);
   const browseFiles = useSettingsStore((state) => state.browseFiles);
+  const hasMutation = isSavingPool || deletingId !== null || isStartingImport;
 
   return (
     <Card className="rounded-2xl border-white/80 bg-white/90 shadow-sm">
@@ -33,7 +36,7 @@ export function CPAPoolsCard() {
           </div>
           <div className="flex items-center gap-2">
             {pools.length > 0 ? <Badge className="rounded-md px-2.5 py-1">{pools.length} 个连接</Badge> : null}
-            <Button className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800" onClick={openAddDialog}>
+            <Button className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800" onClick={openAddDialog} disabled={hasMutation}>
               <Plus className="size-4" />
               添加连接
             </Button>
@@ -55,7 +58,7 @@ export function CPAPoolsCard() {
         ) : (
           <div className="space-y-3">
             {pools.map((pool) => {
-              const isBusy = deletingId === pool.id || loadingFilesId === pool.id;
+              const isBusy = hasMutation || loadingFilesId === pool.id;
               const importJob = pool.import_job ?? null;
               const progress = importJob?.total
                 ? Math.round((importJob.completed / importJob.total) * 100)

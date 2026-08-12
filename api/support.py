@@ -13,7 +13,11 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config, parse_public_url
-from services.protocol.error_response import PUBLIC_SERVER_ERROR_MESSAGE, exception_log_message
+from services.protocol.error_response import (
+    PUBLIC_SERVER_ERROR_MESSAGE,
+    exception_log_message,
+    sanitize_import_job_errors,
+)
 from services.secure_file import OpenedFile, authorized_root, open_checked_file, resolve_under_root
 from services.url_utils import redact_url_credentials
 
@@ -134,12 +138,22 @@ def raise_image_quota_error(exc: Exception) -> None:
     raise HTTPException(status_code=502, detail={"error": PUBLIC_SERVER_ERROR_MESSAGE}) from exc
 
 
+def sanitize_import_job(value: object) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    sanitized = dict(value)
+    sanitized["errors"] = sanitize_import_job_errors(value.get("errors"))
+    return sanitized
+
+
 def sanitize_cpa_pool(pool: dict | None) -> dict | None:
     if not isinstance(pool, dict):
         return None
     sanitized = {key: value for key, value in pool.items() if key != "secret_key"}
     if "base_url" in sanitized:
         sanitized["base_url"] = redact_url_credentials(sanitized.get("base_url"))
+    if "import_job" in sanitized:
+        sanitized["import_job"] = sanitize_import_job(sanitized.get("import_job"))
     return sanitized
 
 
@@ -154,6 +168,8 @@ def sanitize_sub2api_server(server: dict | None) -> dict | None:
     if "base_url" in sanitized:
         sanitized["base_url"] = redact_url_credentials(sanitized.get("base_url"))
     sanitized["has_api_key"] = bool(str(server.get("api_key") or "").strip())
+    if "import_job" in sanitized:
+        sanitized["import_job"] = sanitize_import_job(sanitized.get("import_job"))
     return sanitized
 
 
@@ -168,6 +184,8 @@ def sanitize_ccload_server(server: dict | None) -> dict | None:
     if "base_url" in sanitized:
         sanitized["base_url"] = redact_url_credentials(sanitized.get("base_url"))
     sanitized["has_password"] = bool(str(server.get("password") or "").strip())
+    if "import_job" in sanitized:
+        sanitized["import_job"] = sanitize_import_job(sanitized.get("import_job"))
     return sanitized
 
 

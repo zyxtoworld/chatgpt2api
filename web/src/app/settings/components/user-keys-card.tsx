@@ -17,6 +17,8 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { createUserKey, deleteUserKey, fetchUserKeys, updateUserKey, type UserKey } from "@/lib/api";
+import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
 
 function formatDateTime(value?: string | null) {
   if (!value) {
@@ -36,7 +38,9 @@ function formatDateTime(value?: string | null) {
 }
 
 export function UserKeysCard() {
-  const didLoadRef = useRef(false);
+  const requestGateRef = useRef(createMutationRequestGate());
+  const loadingOwnerRef = useRef<unknown>(null);
+  const mutationOwnerRef = useRef<unknown>(null);
   const [items, setItems] = useState<UserKey[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
@@ -50,38 +54,78 @@ export function UserKeysCard() {
   const [editKey, setEditKey] = useState("");
 
   const load = async () => {
+    const gate = requestGateRef.current;
+    const queryOwner = gate.beginQuery();
+    if (!queryOwner.allowed) {
+      return;
+    }
+    loadingOwnerRef.current = queryOwner;
     setIsLoading(true);
     try {
       const data = await fetchUserKeys();
-      setItems(data.items);
+      if (gate.acceptsQuery(queryOwner)) {
+        setItems(data.items);
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载用户密钥失败");
+      if (gate.acceptsQuery(queryOwner)) {
+        toast.error(error instanceof Error ? error.message : "加载用户密钥失败");
+      }
     } finally {
-      setIsLoading(false);
+      if (loadingOwnerRef.current === queryOwner) {
+        loadingOwnerRef.current = null;
+        setIsLoading(false);
+      }
     }
   };
 
   useEffect(() => {
-    if (didLoadRef.current) {
-      return;
-    }
-    didLoadRef.current = true;
-    void load();
+    const gate = requestGateRef.current;
+    const cancelInitialLoad = scheduleOwnedMicrotask(() => load());
+    return () => {
+      cancelInitialLoad();
+      loadingOwnerRef.current = null;
+      mutationOwnerRef.current = null;
+      gate.cancel();
+    };
   }, []);
 
+  const beginMutation = () => {
+    const owner = requestGateRef.current.beginMutation();
+    if (!owner.accepted) {
+      toast.error("已有用户密钥操作正在进行，请稍候");
+      return null;
+    }
+    loadingOwnerRef.current = null;
+    mutationOwnerRef.current = owner;
+    setIsLoading(false);
+    return owner;
+  };
+
   const handleCreate = async () => {
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) {
+      return;
+    }
     setIsCreating(true);
     try {
       const data = await createUserKey(name.trim());
-      setItems(data.items);
-      setRevealedKey(data.key);
-      setName("");
-      setIsDialogOpen(false);
-      toast.success("用户密钥已创建");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        setItems(data.items);
+        setRevealedKey(data.key);
+        setName("");
+        setIsDialogOpen(false);
+        toast.success("用户密钥已创建");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "创建用户密钥失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "创建用户密钥失败");
+      }
     } finally {
-      setIsCreating(false);
+      if (mutationOwnerRef.current === mutationOwner) {
+        mutationOwnerRef.current = null;
+        setIsCreating(false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
@@ -98,15 +142,27 @@ export function UserKeysCard() {
   };
 
   const handleToggle = async (item: UserKey) => {
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) {
+      return;
+    }
     setItemPending(item.id, true);
     try {
       const data = await updateUserKey(item.id, { enabled: !item.enabled });
-      setItems(data.items);
-      toast.success(item.enabled ? "用户密钥已禁用" : "用户密钥已启用");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        setItems(data.items);
+        toast.success(item.enabled ? "用户密钥已禁用" : "用户密钥已启用");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "更新用户密钥失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "更新用户密钥失败");
+      }
     } finally {
-      setItemPending(item.id, false);
+      if (mutationOwnerRef.current === mutationOwner) {
+        mutationOwnerRef.current = null;
+        setItemPending(item.id, false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
@@ -115,16 +171,28 @@ export function UserKeysCard() {
       return;
     }
     const item = deletingItem;
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) {
+      return;
+    }
     setItemPending(item.id, true);
     try {
       const data = await deleteUserKey(item.id);
-      setItems(data.items);
-      setDeletingItem(null);
-      toast.success("用户密钥已删除");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        setItems(data.items);
+        setDeletingItem(null);
+        toast.success("用户密钥已删除");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除用户密钥失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除用户密钥失败");
+      }
     } finally {
-      setItemPending(item.id, false);
+      if (mutationOwnerRef.current === mutationOwner) {
+        mutationOwnerRef.current = null;
+        setItemPending(item.id, false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
@@ -145,20 +213,32 @@ export function UserKeysCard() {
       setEditingItem(null);
       return;
     }
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) {
+      return;
+    }
     setItemPending(item.id, true);
     try {
       const data = await updateUserKey(item.id, {
         ...(trimmedName !== item.name ? { name: trimmedName } : {}),
         ...(trimmedKey ? { key: trimmedKey } : {}),
       });
-      setItems(data.items);
-      setEditingItem(null);
-      setEditKey("");
-      toast.success(trimmedKey ? "用户密钥已更新" : "用户名称已更新");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        setItems(data.items);
+        setEditingItem(null);
+        setEditKey("");
+        toast.success(trimmedKey ? "用户密钥已更新" : "用户名称已更新");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "更新用户密钥失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "更新用户密钥失败");
+      }
     } finally {
-      setItemPending(item.id, false);
+      if (mutationOwnerRef.current === mutationOwner) {
+        mutationOwnerRef.current = null;
+        setItemPending(item.id, false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
@@ -170,6 +250,8 @@ export function UserKeysCard() {
       toast.error("复制失败，请手动复制");
     }
   };
+
+  const hasMutation = isCreating || pendingIds.size > 0;
 
   return (
     <>
@@ -185,7 +267,7 @@ export function UserKeysCard() {
                 <p className="text-sm text-stone-500">为普通用户创建专用密钥；普通用户只能进入画图页，不能查看设置和号池。</p>
               </div>
             </div>
-            <Button className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800" onClick={() => setIsDialogOpen(true)}>
+            <Button className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800" onClick={() => setIsDialogOpen(true)} disabled={hasMutation}>
               <Plus className="size-4" />
               创建用户密钥
             </Button>
@@ -242,7 +324,7 @@ export function UserKeysCard() {
                         variant="outline"
                         className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
                         onClick={() => openEditDialog(item)}
-                        disabled={isPending}
+                        disabled={hasMutation}
                       >
                         {isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Pencil className="size-4" />}
                         编辑
@@ -252,7 +334,7 @@ export function UserKeysCard() {
                         variant="outline"
                         className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
                         onClick={() => void handleToggle(item)}
-                        disabled={isPending}
+                        disabled={hasMutation}
                       >
                         {isPending ? (
                           <LoaderCircle className="size-4 animate-spin" />
@@ -268,7 +350,7 @@ export function UserKeysCard() {
                         variant="outline"
                         className="h-9 rounded-xl border-rose-200 bg-white px-4 text-rose-600 hover:bg-rose-50 hover:text-rose-700"
                         onClick={() => setDeletingItem(item)}
-                        disabled={isPending}
+                        disabled={hasMutation}
                       >
                         {isPending ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                         删除
@@ -305,7 +387,7 @@ export function UserKeysCard() {
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
               onClick={() => setIsDialogOpen(false)}
-              disabled={isCreating}
+              disabled={hasMutation}
             >
               取消
             </Button>
@@ -313,7 +395,7 @@ export function UserKeysCard() {
               type="button"
               className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
               onClick={() => void handleCreate()}
-              disabled={isCreating}
+              disabled={hasMutation}
             >
               {isCreating ? <LoaderCircle className="size-4 animate-spin" /> : <Plus className="size-4" />}
               创建
@@ -336,7 +418,7 @@ export function UserKeysCard() {
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
               onClick={() => setDeletingItem(null)}
-              disabled={deletingItem ? pendingIds.has(deletingItem.id) : false}
+              disabled={hasMutation}
             >
               取消
             </Button>
@@ -344,7 +426,7 @@ export function UserKeysCard() {
               type="button"
               className="h-10 rounded-xl bg-rose-600 px-5 text-white hover:bg-rose-700"
               onClick={() => void handleDelete()}
-              disabled={deletingItem ? pendingIds.has(deletingItem.id) : false}
+              disabled={hasMutation}
             >
               {deletingItem && pendingIds.has(deletingItem.id) ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
               删除
@@ -401,7 +483,7 @@ export function UserKeysCard() {
                 setEditingItem(null);
                 setEditKey("");
               }}
-              disabled={editingItem ? pendingIds.has(editingItem.id) : false}
+              disabled={hasMutation}
             >
               取消
             </Button>
@@ -409,7 +491,7 @@ export function UserKeysCard() {
               type="button"
               className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
               onClick={() => void handleEdit()}
-              disabled={editingItem ? pendingIds.has(editingItem.id) : false}
+              disabled={hasMutation}
             >
               {editingItem && pendingIds.has(editingItem.id) ? <LoaderCircle className="size-4 animate-spin" /> : <Pencil className="size-4" />}
               保存

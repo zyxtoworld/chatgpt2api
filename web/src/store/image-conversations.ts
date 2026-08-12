@@ -3,6 +3,7 @@
 import localforage from "localforage";
 
 import type { ImageModel } from "@/lib/api";
+import { createImageConversationWriteCoordinator } from "@/lib/image-conversation-write-coordinator";
 
 export type ImageConversationMode = "generate" | "edit";
 
@@ -68,26 +69,39 @@ const imageConversationStorage = localforage.createInstance({
 });
 
 const IMAGE_CONVERSATIONS_KEY = "items";
-let imageConversationWriteQueue: Promise<void> = Promise.resolve();
+const imageConversationWriteCoordinator = createImageConversationWriteCoordinator();
+
+function finiteNonNegative(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
 
 function normalizeStoredImage(image: StoredImage): StoredImage {
-  const normalized = {
-    ...image,
+  const b64Json = typeof image.b64_json === "string" && image.b64_json ? image.b64_json : undefined;
+  const url = typeof image.url === "string" && image.url ? image.url : undefined;
+  const normalized: StoredImage = {
+    id: typeof image.id === "string" ? image.id : "",
     taskId: typeof image.taskId === "string" && image.taskId ? image.taskId : undefined,
+    status:
+      image.status === "loading" || image.status === "error" || image.status === "success"
+        ? image.status
+        : undefined,
     taskStatus: image.taskStatus === "queued" || image.taskStatus === "running" ? image.taskStatus : undefined,
-    url: typeof image.url === "string" && image.url ? image.url : undefined,
+    progress: typeof image.progress === "string" ? image.progress : undefined,
+    b64_json: b64Json,
+    url,
     revised_prompt: typeof image.revised_prompt === "string" ? image.revised_prompt : undefined,
-    startTime: typeof image.startTime === "number" ? image.startTime : undefined,
-    elapsedSecs: typeof image.elapsedSecs === "number" ? image.elapsedSecs : undefined,
-    elapsedUpdatedAt: typeof image.elapsedUpdatedAt === "number" ? image.elapsedUpdatedAt : undefined,
-    durationMs: typeof image.durationMs === "number" ? image.durationMs : undefined,
+    error: typeof image.error === "string" ? image.error : undefined,
+    startTime: finiteNonNegative(image.startTime),
+    elapsedSecs: finiteNonNegative(image.elapsedSecs),
+    elapsedUpdatedAt: finiteNonNegative(image.elapsedUpdatedAt),
+    durationMs: finiteNonNegative(image.durationMs),
   };
   if (image.status === "loading" || image.status === "error" || image.status === "success") {
     return normalized;
   }
   return {
     ...normalized,
-    status: image.b64_json || image.url ? "success" : "loading",
+    status: b64Json || url ? "success" : "loading",
   };
 }
 
@@ -217,12 +231,7 @@ function pickLatestConversation(current: ImageConversation, next: ImageConversat
 }
 
 function queueImageConversationWrite<T>(operation: () => Promise<T>): Promise<T> {
-  const result = imageConversationWriteQueue.then(operation);
-  imageConversationWriteQueue = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  return result;
+  return imageConversationWriteCoordinator.enqueue(operation) as Promise<T>;
 }
 
 async function readStoredImageConversations(): Promise<ImageConversation[]> {

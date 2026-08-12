@@ -596,8 +596,10 @@ export async function deleteManagedImages(body: { paths?: string[]; start_date?:
   return httpRequest<{ removed: number }>("/api/images/delete", { method: "POST", body });
 }
 
-export async function downloadImages(paths: string[]) {
+export async function downloadImages(paths: string[], isActive?: () => boolean): Promise<boolean> {
+  if (isActive && !isActive()) return false;
   const response = await request.post("/api/images/download", { paths }, { responseType: "blob" });
+  if (isActive && !isActive()) return false;
   const blob = response.data as Blob;
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -607,10 +609,13 @@ export async function downloadImages(paths: string[]) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+  return true;
 }
 
-export async function downloadSingleImage(path: string) {
+export async function downloadSingleImage(path: string, isActive?: () => boolean): Promise<boolean> {
+  if (isActive && !isActive()) return false;
   const response = await request.get(`/api/images/download/${path}`, { responseType: "blob" });
+  if (isActive && !isActive()) return false;
   const blob = response.data as Blob;
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -620,6 +625,7 @@ export async function downloadSingleImage(path: string) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+  return true;
 }
 
 export async function fetchImageTags() {
