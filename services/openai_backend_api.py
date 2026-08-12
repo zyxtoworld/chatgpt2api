@@ -2954,8 +2954,9 @@ class OpenAIBackendAPI:
     def list_models(self) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""
         self._bootstrap()
-        history_disabled = str(CHAT_HISTORY_AND_TRAINING_DISABLED).lower()
-        path = f"/backend-api/models?history_and_training_disabled={history_disabled}" if self.access_token else (
+        # Model discovery must request the account's complete catalog. Tying this
+        # query to the conversation privacy mode hides paid-plan models upstream.
+        path = "/backend-api/models?history_and_training_disabled=false" if self.access_token else (
             "/backend-anon/models?iim=false&is_gizmo=false"
         )
         route = "/backend-api/models" if self.access_token else "/backend-anon/models"

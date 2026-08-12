@@ -47,14 +47,23 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         )
         self.assertNotIn("opaque_upstream_field", result["data"][0])
 
-    def test_model_catalog_uses_the_same_history_mode_as_conversation_requests(self) -> None:
-        response = mock.Mock(status_code=200)
-        response.json.return_value = {"models": []}
+    def test_model_catalog_requests_full_account_catalog_without_changing_conversation_history_mode(self) -> None:
+        limited_response = mock.Mock(status_code=200)
+        limited_response.json.return_value = {"models": [{"slug": "gpt-basic"}]}
+        full_response = mock.Mock(status_code=200)
+        full_response.json.return_value = {
+            "models": [
+                {"slug": "gpt-basic"},
+                {"slug": "gpt-pro-extra"},
+            ],
+        }
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "account-token"
         backend.base_url = "https://chatgpt.com"
         backend.session = mock.Mock()
-        backend.session.get.return_value = response
+        backend.session.get.side_effect = lambda url, **_kwargs: (
+            full_response if url.endswith("history_and_training_disabled=false") else limited_response
+        )
         backend._bootstrap = mock.Mock()
         backend._headers = mock.Mock(return_value={})
 
@@ -67,12 +76,16 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
                 "gpt-capable",
                 "Asia/Shanghai",
             )
-        backend.list_models()
+        result = backend.list_models()
 
         self.assertIs(payload["history_and_training_disabled"], True)
         self.assertEqual(
+            [item["id"] for item in result["data"]],
+            ["gpt-basic", "gpt-pro-extra"],
+        )
+        self.assertEqual(
             backend.session.get.call_args.args[0],
-            "https://chatgpt.com/backend-api/models?history_and_training_disabled=true",
+            "https://chatgpt.com/backend-api/models?history_and_training_disabled=false",
         )
 
     def test_invalid_or_unsupported_effort_uses_selected_models_strongest_level(self) -> None:
