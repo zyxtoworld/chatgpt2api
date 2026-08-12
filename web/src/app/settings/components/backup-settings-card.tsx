@@ -15,6 +15,7 @@ import { fetchBackupDetail, getBackupDownloadUrl, type BackupDetail, type Backup
 import { filenameFromContentDisposition } from "@/lib/content-disposition";
 import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { requestErrorMessage } from "@/lib/request-error-message";
 import { getStoredAuthKey } from "@/store/auth";
 import { useSettingsStore } from "../store";
 
@@ -165,11 +166,11 @@ export function BackupSettingsCard() {
       if (!response.ok) {
         let message = "下载备份失败";
         try {
-          const data = await response.json() as { detail?: { error?: string }; error?: string; message?: string };
+          const data = await response.json() as unknown;
           if (!backupDownloadOwner.accepts(downloadOwner)) {
             return;
           }
-          message = data.detail?.error || data.error || data.message || message;
+          message = requestErrorMessage({ status: response.status, payload: data });
         } catch {
           if (!backupDownloadOwner.accepts(downloadOwner)) {
             return;

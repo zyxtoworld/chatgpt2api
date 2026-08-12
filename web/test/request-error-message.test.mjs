@@ -9,6 +9,10 @@ import {
 } from "../src/lib/request-error-message.js";
 
 const requestSource = readFileSync(new URL("../src/lib/request.ts", import.meta.url), "utf8");
+const backupSettingsSource = readFileSync(
+  new URL("../src/app/settings/components/backup-settings-card.tsx", import.meta.url),
+  "utf8",
+);
 
 test("proxy-generated 5xx text never reaches the page", () => {
   const proxyText = "The origin web server did not return a complete response within the 120-second Proxy Read Timeout window.";
@@ -36,4 +40,20 @@ test("the Axios interceptor delegates public projection to the shared helper", (
   assert.ok(helperImport, "missing request error helper import");
   assert.match(helperImport[1], /\brequestErrorMessage\b/);
   assert.match(requestSource, /requestErrorMessage\(\{status, payload, fallback: error\.message\}\)/);
+});
+
+test("backup download errors use the same public projection contract", () => {
+  const helperImport = backupSettingsSource.match(
+    /import\s*\{([\s\S]*?)\}\s*from "@\/lib\/request-error-message"/,
+  );
+  assert.ok(helperImport, "backup download bypasses the shared request error projection");
+  assert.match(helperImport[1], /\brequestErrorMessage\b/);
+  assert.match(
+    backupSettingsSource,
+    /requestErrorMessage\(\{\s*status:\s*response\.status,\s*payload:\s*data\s*\}\)/,
+  );
+  assert.doesNotMatch(
+    backupSettingsSource,
+    /message\s*=\s*data\.detail\?\.error\s*\|\|\s*data\.error\s*\|\|\s*data\.message/,
+  );
 });
