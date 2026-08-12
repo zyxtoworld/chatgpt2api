@@ -16,7 +16,7 @@ const serviceSource = readFileSync(
 
 test("ccLoad uses stable connection and channel wording without a pinned preview version", () => {
   assert.match(componentSource, />ccLoad 连接管理</);
-  assert.match(componentSource, /管理 ccLoad 连接，读取可导入渠道并导入到本地号池。/);
+  assert.match(componentSource, /配置 ccLoad 服务连接，读取渠道并使用 chatgpt2api 模型列表导入本地号池。/);
   assert.match(componentSource, /读取渠道/);
   assert.doesNotMatch(componentSource, /预览版|preview|指定版本|固定版本|v\d+(?:\.\d+)+|频道/i);
   assert.doesNotMatch(readmeSource, /ccLoad[^\n]*(?:预览版|v4\.6\.12)/);
