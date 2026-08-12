@@ -39,6 +39,11 @@ class ModelListTests(unittest.TestCase):
         self.assertIn("team-codex-gpt-image-2", ids)
         self.assertNotIn("plus-codex-gpt-image-2", ids)
         self.assertNotIn("pro-codex-gpt-image-2", ids)
+        by_id = {item["id"]: item for item in result["data"]}
+        self.assertEqual(by_id["gpt-image-2"]["supported_account_types"], ["free", "team"])
+        self.assertEqual(by_id["codex-gpt-image-2"]["supported_account_types"], ["team"])
+        self.assertEqual(by_id["team-codex-gpt-image-2"]["supported_account_types"], ["team"])
+        self.assertFalse(by_id["gpt-image-2"]["allow_anonymous"])
 
     def test_list_models_does_not_return_codex_models_for_web_plus_accounts(self):
         with (

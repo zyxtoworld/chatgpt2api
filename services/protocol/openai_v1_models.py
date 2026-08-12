@@ -20,6 +20,11 @@ def list_models() -> dict[str, Any]:
         for account in accounts
         if isinstance(account, dict)
     ]
+    web_image_types = {
+        normalized.lower()
+        for account in web_image_accounts
+        if (normalized := account_service._normalize_account_type(account.get("type")))
+    }
     codex_types = {
         normalized
         for account in accounts
@@ -41,6 +46,14 @@ def list_models() -> dict[str, Any]:
 
     for model in sorted(dynamic_models):
         if model not in seen:
+            supported_account_types = web_image_types
+            if model == CODEX_IMAGE_MODEL:
+                supported_account_types = {
+                    account_type.lower()
+                    for account_type in codex_types & {"Plus", "Team", "Pro"}
+                }
+            elif model.startswith(("plus-", "team-", "pro-")):
+                supported_account_types = {model.split("-", 1)[0]}
             data.append({
                 "id": model,
                 "object": "model",
@@ -49,5 +62,7 @@ def list_models() -> dict[str, Any]:
                 "permission": [],
                 "root": model,
                 "parent": None,
+                "allow_anonymous": False,
+                "supported_account_types": sorted(supported_account_types),
             })
     return result

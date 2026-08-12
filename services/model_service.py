@@ -235,9 +235,19 @@ class ModelCatalogService:
             for account_type in sorted(self._models_by_account_type):
                 for model_id, item in self._models_by_account_type[account_type].items():
                     union.setdefault(model_id, dict(item))
+            data = []
+            for model_id in sorted(union):
+                item = dict(union[model_id])
+                item["allow_anonymous"] = model_id in self._anonymous_models
+                item["supported_account_types"] = sorted({
+                    account_type.lower()
+                    for account_type, models in self._models_by_account_type.items()
+                    if model_id in models
+                })
+                data.append(item)
         return {
             "object": "list",
-            "data": [union[model_id] for model_id in sorted(union)],
+            "data": data,
         }
 
     def route_for_model(self, model: str) -> ModelRoute:

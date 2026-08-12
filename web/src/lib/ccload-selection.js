@@ -13,7 +13,7 @@ function uniqueEnabledIds(channels) {
 }
 
 export function replaceCCLoadChannelModels(channels, models) {
-  const modelIds = [];
+  const catalog = [];
   const seen = new Set();
   for (const model of Array.isArray(models) ? models : []) {
     const id = typeof model?.id === "string" ? model.id.trim() : "";
@@ -21,12 +21,25 @@ export function replaceCCLoadChannelModels(channels, models) {
       continue;
     }
     seen.add(id);
-    modelIds.push(id);
+    catalog.push({
+      id,
+      allowAnonymous: model?.allow_anonymous === true,
+      accountTypes: new Set(
+        (Array.isArray(model?.supported_account_types) ? model.supported_account_types : [])
+          .map((value) => String(value || "").trim().toLowerCase())
+          .filter(Boolean),
+      ),
+    });
   }
-  return (Array.isArray(channels) ? channels : []).map((channel) => ({
-    ...channel,
-    models: modelIds.slice(),
-  }));
+  return (Array.isArray(channels) ? channels : []).map((channel) => {
+    const planType = String(channel?.plan_type || "").trim().toLowerCase();
+    return {
+      ...channel,
+      models: catalog
+        .filter((model) => model.allowAnonymous || (planType && model.accountTypes.has(planType)))
+        .map((model) => model.id),
+    };
+  });
 }
 
 export function filterCCLoadChannels(channels, query) {

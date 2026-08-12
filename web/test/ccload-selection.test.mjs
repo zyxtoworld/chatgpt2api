@@ -47,24 +47,29 @@ test("ccLoad search matches channel fields", () => {
   assert.equal(filterCCLoadChannels(channels, "  ").length, channels.length);
 });
 
-test("ccLoad channels use the chatgpt2api model list instead of remote channel models", () => {
+test("ccLoad channels use chatgpt2api capabilities for their own plan instead of one shared union", () => {
   assert.deepEqual(
     replaceCCLoadChannelModels(
       [
-        { id: "alpha", models: ["remote-only-model"] },
-        { id: "beta", models: [] },
+        { id: "free", plan_type: "free", models: ["remote-only-model"] },
+        { id: "pro", plan_type: "Pro", models: [] },
+        { id: "unknown", plan_type: "", models: [] },
       ],
       [
-        { id: " gpt-5 " },
-        { id: "gpt-image-2" },
-        { id: "gpt-5" },
+        { id: " common ", allow_anonymous: true, supported_account_types: [] },
+        { id: "free-only", allow_anonymous: false, supported_account_types: ["free"] },
+        { id: "pro-only", allow_anonymous: false, supported_account_types: ["pro"] },
+        { id: "pro-extra", allow_anonymous: false, supported_account_types: ["PRO"] },
+        { id: "shared", allow_anonymous: false, supported_account_types: ["free", "Pro"] },
+        { id: "common", allow_anonymous: true, supported_account_types: [] },
         { id: "" },
         null,
       ],
     ),
     [
-      { id: "alpha", models: ["gpt-5", "gpt-image-2"] },
-      { id: "beta", models: ["gpt-5", "gpt-image-2"] },
+      { id: "free", plan_type: "free", models: ["common", "free-only", "shared"] },
+      { id: "pro", plan_type: "Pro", models: ["common", "pro-only", "pro-extra", "shared"] },
+      { id: "unknown", plan_type: "", models: ["common"] },
     ],
   );
 });

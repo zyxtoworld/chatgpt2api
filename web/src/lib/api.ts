@@ -56,6 +56,8 @@ export type Model = {
   permission: unknown[];
   root: string;
   parent: string | null;
+  allow_anonymous: boolean;
+  supported_account_types: string[];
 };
 
 type AccountListResponse = {

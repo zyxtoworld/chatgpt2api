@@ -90,6 +90,18 @@ class ModelCatalogServiceTests(unittest.TestCase):
             [item["id"] for item in result["data"]],
             ["anon", "free-only", "plus-only", "pro-only", "shared"],
         )
+        capabilities = {
+            item["id"]: (
+                item["allow_anonymous"],
+                item["supported_account_types"],
+            )
+            for item in result["data"]
+        }
+        self.assertEqual(capabilities["anon"], (True, []))
+        self.assertEqual(capabilities["free-only"], (False, ["free"]))
+        self.assertEqual(capabilities["plus-only"], (False, ["plus"]))
+        self.assertEqual(capabilities["pro-only"], (False, ["pro"]))
+        self.assertEqual(capabilities["shared"], (True, ["free", "plus"]))
         self.assertCountEqual(self.calls, ["", "free-bad", "free-good", "plus", "pro"])
         self.assertCountEqual(self.closed, self.calls)
         self.assertNotIn("team-disabled", self.calls)
