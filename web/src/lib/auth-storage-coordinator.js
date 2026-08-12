@@ -37,7 +37,15 @@ export function createAuthStorageCoordinator({ keyName, sessionName, getItem, se
 
       try {
         await setItem(keyName, session.key);
+        if (!isCurrent(lease)) {
+          await removeBoth();
+          return false;
+        }
         await setItem(sessionName, session);
+        if (!isCurrent(lease)) {
+          await removeBoth();
+          return false;
+        }
       } catch (error) {
         await removeBoth();
         throw error;

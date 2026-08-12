@@ -246,6 +246,84 @@ test("a validation cleanup cannot delete a newer explicit login", async () => {
   assert.deepEqual(memory.events, ["set:key", "set:session"]);
 });
 
+test("an auth mutation invalidated during its first write cannot finish a stale session", async () => {
+  const memory = createMemoryStorage();
+  let releaseKeyWrite;
+  let markKeyWriteStarted;
+  const keyWriteStarted = new Promise((resolve) => {
+    markKeyWriteStarted = resolve;
+  });
+  const keyWriteBlocked = new Promise((resolve) => {
+    releaseKeyWrite = resolve;
+  });
+  const coordinator = createAuthStorageCoordinator({
+    keyName: "key",
+    sessionName: "session",
+    getItem: memory.storage.getItem,
+    setItem: async (key, value) => {
+      if (key === "key") {
+        markKeyWriteStarted();
+        await keyWriteBlocked;
+      }
+      return memory.storage.setItem(key, value);
+    },
+    removeItem: memory.storage.removeItem,
+  });
+  const staleLease = coordinator.beginMutation();
+  const staleWrite = coordinator.setSessionIfCurrent(
+    { key: "stale-key", role: "admin" },
+    staleLease,
+  );
+
+  await keyWriteStarted;
+  const currentLease = coordinator.beginMutation();
+  releaseKeyWrite();
+
+  assert.equal(await staleWrite, false);
+  assert.equal(memory.values.has("key"), false);
+  assert.equal(memory.values.has("session"), false);
+  assert.equal(coordinator.isCurrent(currentLease), true);
+});
+
+test("an auth mutation invalidated during its session write removes the stale pair", async () => {
+  const memory = createMemoryStorage();
+  let releaseSessionWrite;
+  let markSessionWriteStarted;
+  const sessionWriteStarted = new Promise((resolve) => {
+    markSessionWriteStarted = resolve;
+  });
+  const sessionWriteBlocked = new Promise((resolve) => {
+    releaseSessionWrite = resolve;
+  });
+  const coordinator = createAuthStorageCoordinator({
+    keyName: "key",
+    sessionName: "session",
+    getItem: memory.storage.getItem,
+    setItem: async (key, value) => {
+      if (key === "session") {
+        markSessionWriteStarted();
+        await sessionWriteBlocked;
+      }
+      return memory.storage.setItem(key, value);
+    },
+    removeItem: memory.storage.removeItem,
+  });
+  const staleLease = coordinator.beginMutation();
+  const staleWrite = coordinator.setSessionIfCurrent(
+    { key: "stale-key", role: "admin" },
+    staleLease,
+  );
+
+  await sessionWriteStarted;
+  const currentLease = coordinator.beginMutation();
+  releaseSessionWrite();
+
+  assert.equal(await staleWrite, false);
+  assert.equal(memory.values.has("key"), false);
+  assert.equal(memory.values.has("session"), false);
+  assert.equal(coordinator.isCurrent(currentLease), true);
+});
+
 test("persisted auth requires an exact key/session pair", () => {
   const session = { key: "session-key", role: "admin", subjectId: "1", name: "A" };
   assert.deepEqual(normalizeStoredAuthSession("session-key", session), session);
