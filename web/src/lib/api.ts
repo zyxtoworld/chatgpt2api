@@ -1,4 +1,5 @@
 import { httpRequest, request } from "@/lib/request";
+import { encodeApiPath } from "@/lib/api-path";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
@@ -616,7 +617,7 @@ export async function downloadImages(paths: string[], isActive?: () => boolean):
 
 export async function downloadSingleImage(path: string, isActive?: () => boolean): Promise<boolean> {
   if (isActive && !isActive()) return false;
-  const response = await request.get(`/api/images/download/${path}`, { responseType: "blob" });
+  const response = await request.get(`/api/images/download/${encodeApiPath(path)}`, { responseType: "blob" });
   if (isActive && !isActive()) return false;
   const blob = response.data as Blob;
   const url = URL.createObjectURL(blob);

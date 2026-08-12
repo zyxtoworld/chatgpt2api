@@ -223,6 +223,38 @@ test("clear attempts both removals even when the first removal fails", async () 
   assert.equal(memory.values.has("key"), false);
 });
 
+test("a failed clear keeps the old persisted pair unusable until a fresh session commits", async () => {
+  const memory = createMemoryStorage();
+  let removalFails = true;
+  const coordinator = createAuthStorageCoordinator({
+    keyName: "key",
+    sessionName: "session",
+    getItem: memory.storage.getItem,
+    setItem: memory.storage.setItem,
+    removeItem: async (key) => {
+      memory.events.push(`remove:${key}`);
+      if (removalFails) throw new Error("remove unavailable");
+      memory.values.delete(key);
+    },
+  });
+
+  await assert.rejects(coordinator.clearSession(), /remove unavailable/);
+  assert.equal(memory.values.has("key"), true);
+  assert.equal(memory.values.has("session"), true);
+  assert.equal(await coordinator.readPairIfCurrent(coordinator.beginValidation()), null);
+
+  removalFails = false;
+  const login = coordinator.beginMutation();
+  assert.equal(
+    await coordinator.setSessionIfCurrent({ key: "fresh-key", role: "user" }, login),
+    true,
+  );
+  assert.deepEqual(await coordinator.readPairIfCurrent(coordinator.beginValidation()), {
+    key: "fresh-key",
+    session: { key: "fresh-key", role: "user" },
+  });
+});
+
 test("a validation cleanup cannot delete a newer explicit login", async () => {
   const memory = createMemoryStorage();
   const coordinator = createAuthStorageCoordinator({

@@ -4,7 +4,9 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { Moon, Sun } from "lucide-react"
 import { flushSync } from "react-dom"
 
+import { toggleDocumentTheme } from "@/lib/theme-toggle-state"
 import { cn } from "@/lib/utils"
+import { observeViewTransition } from "@/lib/view-transition-lifecycle"
 
 export type TransitionVariant =
   | "circle"
@@ -177,11 +179,8 @@ export const AnimatedThemeToggler = ({
     )
 
     const applyTheme = () => {
-      const newTheme = !isDark
+      const newTheme = toggleDocumentTheme(document.documentElement, localStorage)
       setIsDark(newTheme)
-      document.documentElement.classList.toggle("dark")
-      document.documentElement.style.colorScheme = newTheme ? "dark" : "light"
-      localStorage.setItem("chatgpt2api-theme", newTheme ? "dark" : "light")
     }
 
     if (typeof document.startViewTransition !== "function") {
@@ -216,15 +215,8 @@ export const AnimatedThemeToggler = ({
     const transition = document.startViewTransition(() => {
       flushSync(applyTheme)
     })
-    if (typeof transition?.finished?.finally === "function") {
-      transition.finished.finally(cleanup)
-    } else {
-      cleanup()
-    }
-
-    const ready = transition?.ready
-    if (ready && typeof ready.then === "function") {
-      ready.then(() => {
+    observeViewTransition(transition, {
+      onReady: () => {
         document.documentElement.animate(
           {
             clipPath,
@@ -237,9 +229,10 @@ export const AnimatedThemeToggler = ({
             pseudoElement: "::view-transition-new(root)",
           }
         )
-      })
-    }
-  }, [shape, fromCenter, duration, isDark])
+      },
+      onSettled: cleanup,
+    })
+  }, [shape, fromCenter, duration])
 
   return (
     <button

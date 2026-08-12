@@ -7,7 +7,7 @@ import {
   getCCLoadPage,
   getValidCCLoadSelectedIds,
   getSelectableCCLoadChannelIds,
-  replaceCCLoadChannelModels,
+  normalizeCCLoadChannels,
   toggleAllCCLoadChannels,
 } from "../src/lib/ccload-selection.js";
 
@@ -47,29 +47,16 @@ test("ccLoad search matches channel fields", () => {
   assert.equal(filterCCLoadChannels(channels, "  ").length, channels.length);
 });
 
-test("ccLoad channels use chatgpt2api capabilities for their own plan instead of one shared union", () => {
+test("ccLoad channels preserve each authenticated channel catalog instead of one shared union", () => {
   assert.deepEqual(
-    replaceCCLoadChannelModels(
-      [
-        { id: "free", plan_type: "free", models: ["remote-only-model"] },
-        { id: "pro", plan_type: "Pro", models: [] },
-        { id: "unknown", plan_type: "", models: [] },
-      ],
-      [
-        { id: " common ", allow_anonymous: true, supported_account_types: [] },
-        { id: "free-only", allow_anonymous: false, supported_account_types: ["free"] },
-        { id: "pro-only", allow_anonymous: false, supported_account_types: ["pro"] },
-        { id: "pro-extra", allow_anonymous: false, supported_account_types: ["PRO"] },
-        { id: "shared", allow_anonymous: false, supported_account_types: ["free", "Pro"] },
-        { id: "common", allow_anonymous: true, supported_account_types: [] },
-        { id: "" },
-        null,
-      ],
-    ),
+    normalizeCCLoadChannels([
+      { id: "free", name: " Free ", enabled: true, plan_type: "free", models: [" common ", "free-only", "common", ""] },
+      { id: "pro", name: "Pro", enabled: true, plan_type: "Pro", models: ["common", "pro-only", "pro-extra"] },
+      { id: "pro", name: "duplicate", enabled: true, plan_type: "Pro", models: ["wrong"] },
+    ]),
     [
-      { id: "free", plan_type: "free", models: ["common", "free-only", "shared"] },
-      { id: "pro", plan_type: "Pro", models: ["common", "pro-only", "pro-extra", "shared"] },
-      { id: "unknown", plan_type: "", models: ["common"] },
+      { id: "free", name: "Free", enabled: true, plan_type: "free", subscription_active_until: "", models: ["common", "free-only"] },
+      { id: "pro", name: "Pro", enabled: true, plan_type: "Pro", subscription_active_until: "", models: ["common", "pro-only", "pro-extra"] },
     ],
   );
 });

@@ -18,7 +18,7 @@ import {
   type ProxyRuntimeEgressMode,
   type ProxyTestResult,
 } from "@/lib/api";
-import { createProxyRuntimeRequestGate } from "@/lib/proxy-runtime-request-gate";
+import { createProxyRuntimeRequestGate, runCurrentProxyFollowup } from "@/lib/proxy-runtime-request-gate";
 
 import { useSettingsStore } from "../store";
 
@@ -89,11 +89,15 @@ export function ProxyRuntimeCard() {
     setIsTestingProxy(true);
     setProxyResult(null);
     try {
-      const saved = await saveConfig();
-      if (!saved) {
+      const outcome = await runCurrentProxyFollowup(
+        saveConfig,
+        () => requestGate.acceptsProxy(request),
+        testProxy,
+      );
+      if (!outcome.started) {
         return;
       }
-      const data = await testProxy();
+      const data = outcome.value;
       if (requestGate.acceptsProxy(request)) {
         setProxyResult(data.result);
         if (data.result.ok) {
@@ -120,11 +124,15 @@ export function ProxyRuntimeCard() {
     setIsTestingClearance(true);
     setClearanceResult(null);
     try {
-      const saved = await saveConfig();
-      if (!saved) {
+      const outcome = await runCurrentProxyFollowup(
+        saveConfig,
+        () => requestGate.acceptsClearance(request, candidate),
+        () => testProxyClearance(candidate),
+      );
+      if (!outcome.started) {
         return;
       }
-      const data = await testProxyClearance(candidate);
+      const data = outcome.value;
       if (requestGate.acceptsClearance(request, candidate)) {
         setClearanceResult(data.result);
         if (data.result.ok) {

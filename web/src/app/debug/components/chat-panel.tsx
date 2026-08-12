@@ -72,6 +72,7 @@ function messageImages(message: ChatMessage): string[] {
 
 export function ChatPanel() {
   const chatRequestGateRef = useRef(createChatPanelRequestGate());
+  const pendingImageReadsRef = useRef(0);
   const [model, setModel] = useState("auto");
   const [reasoningEffort, setReasoningEffort] = useState("");
   const [input, setInput] = useState("你好，先记住我的项目叫 chatgpt2api。");
@@ -79,6 +80,7 @@ export function ChatPanel() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [raw, setRaw] = useState<ChatCompletionResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [pendingImageReads, setPendingImageReads] = useState(0);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -93,6 +95,8 @@ export function ChatPanel() {
     if (!files?.length) return;
     const requestGate = chatRequestGateRef.current;
     const readOwner = requestGate.beginImageRead();
+    pendingImageReadsRef.current += 1;
+    setPendingImageReads(pendingImageReadsRef.current);
     setError("");
     try {
       const images = await Promise.all(Array.from(files).map(readImage));
@@ -103,10 +107,19 @@ export function ChatPanel() {
       if (requestGate.acceptsImageRead(readOwner)) {
         setError(err instanceof Error ? err.message : String(err));
       }
+    } finally {
+      if (requestGate.acceptsImageRead(readOwner)) {
+        pendingImageReadsRef.current = Math.max(0, pendingImageReadsRef.current - 1);
+        setPendingImageReads(pendingImageReadsRef.current);
+      }
     }
   };
 
   const sendChat = async () => {
+    if (pendingImageReads > 0) {
+      setError("请等待图片读取完成");
+      return;
+    }
     const text = input.trim();
     if (!text && !selectedImages.length) return;
     const requestGate = chatRequestGateRef.current;
@@ -146,7 +159,10 @@ export function ChatPanel() {
   };
 
   const clearChat = () => {
-    chatRequestGateRef.current.clear();
+    const requestGate = chatRequestGateRef.current;
+    requestGate.clear();
+    pendingImageReadsRef.current = 0;
+    setPendingImageReads(0);
     setMessages([]);
     setSelectedImages([]);
     setRaw(null);
@@ -211,7 +227,7 @@ export function ChatPanel() {
             ) : null}
           </div>
           <div className="flex gap-2">
-            <Button size="sm" onClick={() => void sendChat()} disabled={loading || (!input.trim() && !selectedImages.length)}>
+            <Button size="sm" onClick={() => void sendChat()} disabled={loading || pendingImageReads > 0 || (!input.trim() && !selectedImages.length)}>
               {loading ? <LoaderCircle className="animate-spin" /> : <Send />}
               发送
             </Button>

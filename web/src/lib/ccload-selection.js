@@ -12,33 +12,28 @@ function uniqueEnabledIds(channels) {
   return ids;
 }
 
-export function replaceCCLoadChannelModels(channels, models) {
-  const catalog = [];
+export function normalizeCCLoadChannels(channels) {
   const seen = new Set();
-  for (const model of Array.isArray(models) ? models : []) {
-    const id = typeof model?.id === "string" ? model.id.trim() : "";
-    if (!id || seen.has(id)) {
-      continue;
-    }
+  return (Array.isArray(channels) ? channels : []).flatMap((channel) => {
+    const id = String(channel?.id || "").trim();
+    if (!id || seen.has(id)) return [];
     seen.add(id);
-    catalog.push({
+    const modelIds = [];
+    const seenModels = new Set();
+    for (const value of Array.isArray(channel?.models) ? channel.models : []) {
+      const modelId = typeof value === "string" ? value.trim() : "";
+      if (!modelId || seenModels.has(modelId)) continue;
+      seenModels.add(modelId);
+      modelIds.push(modelId);
+    }
+    return [{
       id,
-      allowAnonymous: model?.allow_anonymous === true,
-      accountTypes: new Set(
-        (Array.isArray(model?.supported_account_types) ? model.supported_account_types : [])
-          .map((value) => String(value || "").trim().toLowerCase())
-          .filter(Boolean),
-      ),
-    });
-  }
-  return (Array.isArray(channels) ? channels : []).map((channel) => {
-    const planType = String(channel?.plan_type || "").trim().toLowerCase();
-    return {
-      ...channel,
-      models: catalog
-        .filter((model) => model.allowAnonymous || (planType && model.accountTypes.has(planType)))
-        .map((model) => model.id),
-    };
+      name: String(channel?.name || "").trim(),
+      enabled: channel?.enabled === true,
+      plan_type: String(channel?.plan_type || "").trim(),
+      subscription_active_until: String(channel?.subscription_active_until || "").trim(),
+      models: modelIds,
+    }];
   });
 }
 

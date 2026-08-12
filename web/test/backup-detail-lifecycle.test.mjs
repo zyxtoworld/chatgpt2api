@@ -55,6 +55,24 @@ test("an unmounted backup detail response publishes no detail, error, or finally
   assert.deepEqual(events, []);
 });
 
+test("closing backup details invalidates the pending read before late callbacks", () => {
+  assert.doesNotMatch(source, /onOpenChange=\{setDetailOpen\}/);
+  assert.match(source, /const handleDetailOpenChange = \(open: boolean\) => \{/);
+  assert.match(source, /backupDetailOwnerRef\.current\.invalidate\(\);/);
+  assert.match(source, /onOpenChange=\{handleDetailOpenChange\}/);
+
+  const owner = createLatestActionOwner();
+  const requestOwner = owner.begin("A");
+  const events = [];
+
+  owner.invalidate();
+  if (owner.accepts(requestOwner)) events.push("detail");
+  if (owner.accepts(requestOwner)) events.push("error");
+  if (owner.accepts(requestOwner)) events.push("finally");
+
+  assert.deepEqual(events, []);
+});
+
 test("backup downloads share a lifecycle owner and reject late completion after unmount", () => {
   assert.match(source, /createLifecycleActionOwner/);
   assert.match(source, /backupDownloadOwnerRef/);

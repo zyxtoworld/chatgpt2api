@@ -31,6 +31,14 @@ export default function LoginPage() {
     return () => loginGate.cancel();
   }, []);
 
+  const handleAuthKeyChange = (value: string) => {
+    if (isSubmitting) {
+      loginGateRef.current.invalidate();
+      setIsSubmitting(false);
+    }
+    setAuthKey(value);
+  };
+
   const handleLogin = async () => {
     const normalizedAuthKey = authKey.trim();
     if (!normalizedAuthKey) {
@@ -39,6 +47,7 @@ export default function LoginPage() {
     }
 
     const loginOwner = loginGateRef.current.begin(normalizedAuthKey);
+    if (!loginOwner) return;
     setIsSubmitting(true);
     try {
       const data = await login(normalizedAuthKey);
@@ -95,7 +104,7 @@ export default function LoginPage() {
               id="auth-key"
               type="password"
               value={authKey}
-              onChange={(event) => setAuthKey(event.target.value)}
+              onChange={(event) => handleAuthKeyChange(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
                   void handleLogin();

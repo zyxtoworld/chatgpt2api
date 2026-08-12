@@ -867,7 +867,7 @@ export function Sub2APIConnections() {
           </DialogHeader>
 
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-            <div className="relative min-w-[260px]">
+            <div className="relative w-full min-w-0 sm:min-w-[260px]">
               <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
               <Input
                 value={accountQuery}
@@ -879,7 +879,7 @@ export function Sub2APIConnections() {
                 className="h-10 rounded-xl border-stone-200 bg-white pl-10"
               />
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Select
                 value={pageSize}
                 onValueChange={(value) => {
@@ -909,7 +909,7 @@ export function Sub2APIConnections() {
           </div>
 
           <div className="rounded-xl border border-stone-200">
-            <div className="flex items-center justify-between border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
               <div className="flex items-center gap-3">
                 <Checkbox
                   checked={allFilteredSelected}
@@ -962,7 +962,7 @@ export function Sub2APIConnections() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between text-sm text-stone-500">
+          <div className="flex flex-col gap-3 text-sm text-stone-500 sm:flex-row sm:items-center sm:justify-between">
             <span>
               第 {filteredAccounts.length === 0 ? 0 : (safeAccountPage - 1) * currentPageSize + 1} -{" "}
               {Math.min(safeAccountPage * currentPageSize, filteredAccounts.length)} 条，共 {filteredAccounts.length} 条

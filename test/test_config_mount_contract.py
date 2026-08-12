@@ -79,6 +79,17 @@ def test_container_runtime_uses_the_frozen_environment_without_syncing_dependenc
     assert 'CMD ["uv", "run", "--no-sync", "uvicorn"' in dockerfile
 
 
+def test_container_frontend_build_uses_the_bun_lock() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "FROM --platform=$BUILDPLATFORM oven/bun:1-alpine AS web-build" in dockerfile
+    assert "COPY web/package.json web/bun.lock ./" in dockerfile
+    assert "RUN bun install --frozen-lockfile" in dockerfile
+    assert 'RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" bun run build' in dockerfile
+    assert "npm install" not in dockerfile
+    assert "npm run build" not in dockerfile
+
+
 def test_settings_endpoint_persists_global_proxy_through_real_config_store(tmp_path: Path) -> None:
     config_path = tmp_path / "config_mount" / "config.json"
     config_path.parent.mkdir()

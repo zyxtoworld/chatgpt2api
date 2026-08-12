@@ -35,6 +35,9 @@ import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
 import { createConversationQueueGate } from "@/lib/image-conversation-queue-gate";
 import { applyImageConversationUpdate, findImageTaskConversation } from "@/lib/image-conversation-update";
 import { createScrollCleanupSnapshot } from "@/lib/image-scroll-cleanup";
+import { settleImageTaskSubmissions } from "@/lib/image-task-submission";
+import { readOptionalStorageItem, removeOptionalStorageItem, writeOptionalStorageItem } from "@/lib/optional-storage";
+import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
 import { useSettingsStore } from "@/app/settings/store";
 import {
   clearImageConversations,
@@ -319,7 +322,13 @@ function finalizeIdleQueuedTurn(turn: ImageTurn): ImageTurn {
   };
 }
 
-async function syncConversationImageTasks(items: ImageConversation[]) {
+async function syncConversationImageTasks(
+  items: ImageConversation[],
+  isCurrent: () => boolean = () => true,
+) {
+  if (!isCurrent()) {
+    return items;
+  }
   const taskIds = Array.from(
     new Set(
       items.flatMap((conversation) =>
@@ -343,6 +352,9 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
   try {
     taskList = await fetchImageTasks(taskIds);
   } catch {
+    return items;
+  }
+  if (!isCurrent()) {
     return items;
   }
   const taskMap = new Map(taskList.items.map((task) => [task.id, task]));
@@ -388,13 +400,13 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
     };
   });
 
-  if (changed) {
+  if (changed && isCurrent()) {
     await saveImageConversations(normalized);
   }
   return normalized;
 }
 
-async function recoverConversationHistory(items: ImageConversation[]) {
+async function recoverConversationHistory(items: ImageConversation[], isCurrent: () => boolean) {
   let changed = false;
   const normalized = items.map((conversation) => {
     const turns = conversation.turns.map((turn) => {
@@ -438,24 +450,25 @@ async function recoverConversationHistory(items: ImageConversation[]) {
     };
   });
 
-  if (changed) {
+  if (changed && isCurrent()) {
     await saveImageConversations(normalized);
   }
 
-  return syncConversationImageTasks(normalized);
+  if (!isCurrent()) {
+    return normalized;
+  }
+  return syncConversationImageTasks(normalized, isCurrent);
 }
 
 
 function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
-  const didLoadQuotaRef = useRef(false);
   const quotaOwnerRef = useRef(createLatestActionOwner());
   const continueEditOwnerRef = useRef(createLatestActionOwner());
+  const historyLoadOwnerRef = useRef(createLatestActionOwner());
   const referenceImageReadOwnerRef = useRef(createLifecycleActionOwner());
   const historyMutationOwnerRef = useRef(createLifecycleActionOwner());
   const conversationQueueGateRef = useRef(createConversationQueueGate());
   const conversationsRef = useRef<ImageConversation[]>([]);
-  const loadCancelledRef = useRef(false);
-  const historyRequestRef = useRef(0);
   const resultsViewportRef = useRef<HTMLDivElement>(null);
   const lastConversationIdRef = useRef<string | null>(null);
   const shouldStickToBottomRef = useRef(true);
@@ -606,17 +619,18 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   const loadHistory = useCallback(async () => {
-    const requestId = ++historyRequestRef.current;
-    const isCurrentRequest = () => !loadCancelledRef.current && requestId === historyRequestRef.current;
+    const historyLoadOwner = historyLoadOwnerRef.current;
+    const requestOwner = historyLoadOwner.begin();
+    const isCurrentRequest = () => historyLoadOwner.accepts(requestOwner);
     try {
       const storedRatio =
-        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_RATIO_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_RATIO_STORAGE_KEY) : null;
       const storedTier =
-        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_TIER_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_TIER_STORAGE_KEY) : null;
       const storedQuality =
-        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_QUALITY_STORAGE_KEY) : null;
       const storedCount =
-        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_COUNT_STORAGE_KEY) : null;
       setImageRatio(storedRatio || "1:1");
       setImageTier(storedTier || "1k");
       setImageWidth("1024");
@@ -625,7 +639,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       setImageCount(storedCount ? clampImageCount(storedCount) : "1");
 
       const items = await listImageConversations();
-      const normalizedItems = await recoverConversationHistory(items);
+      if (!isCurrentRequest()) {
+        return;
+      }
+      const normalizedItems = await recoverConversationHistory(items, isCurrentRequest);
       if (!isCurrentRequest()) {
         return;
       }
@@ -633,7 +650,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       conversationsRef.current = normalizedItems;
       setConversations(normalizedItems);
       const storedConversationId =
-        typeof window !== "undefined" ? window.localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, ACTIVE_CONVERSATION_STORAGE_KEY) : null;
       const nextSelectedConversationId =
         (storedConversationId && normalizedItems.some((conversation) => conversation.id === storedConversationId)
           ? storedConversationId
@@ -673,7 +690,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     let cancelled = false;
-    loadCancelledRef.current = false;
+    const historyLoadOwner = historyLoadOwnerRef.current;
+    historyLoadOwner.activate();
     const scrollPositions = scrollPositionsRef.current;
     const scrollCleanup = createScrollCleanupSnapshot(resultsViewportRef.current, scrollPositions);
     queueMicrotask(() => {
@@ -681,8 +699,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     });
     return () => {
       cancelled = true;
-      loadCancelledRef.current = true;
-      historyRequestRef.current += 1;
+      historyLoadOwner.cancel();
       // 组件卸载时保存当前滚动位置到 sessionStorage
       if (scrollCleanup.persist(lastConversationIdRef.current)) {
         saveScrollPositions(scrollPositions);
@@ -701,7 +718,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           return;
         }
         setImageModels(available);
-        const storedModel = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY) : null;
+        const storedModel = typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_MODEL_STORAGE_KEY) : null;
         setImageModel((current) => {
           if (available.includes(current)) {
             return current;
@@ -776,18 +793,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, [selectedConversationId]);
 
   useEffect(() => {
-    if (didLoadQuotaRef.current) {
-      return;
-    }
-    didLoadQuotaRef.current = true;
-
     const handleFocus = () => {
       void loadQuota();
     };
 
-    void loadQuota();
+    const cancelInitialQuotaLoad = scheduleOwnedMicrotask(() => loadQuota());
     window.addEventListener("focus", handleFocus);
     return () => {
+      cancelInitialQuotaLoad();
       window.removeEventListener("focus", handleFocus);
     };
   }, [isAdmin, loadQuota]);
@@ -890,9 +903,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
 
     if (selectedConversationId) {
-      window.localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, selectedConversationId);
+      writeOptionalStorageItem(window.localStorage, ACTIVE_CONVERSATION_STORAGE_KEY, selectedConversationId);
     } else {
-      window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+      removeOptionalStorageItem(window.localStorage, ACTIVE_CONVERSATION_STORAGE_KEY);
     }
   }, [selectedConversationId]);
 
@@ -901,15 +914,15 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
-    window.localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio);
-    window.localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier);
-    window.localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality);
-    window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel);
+    writeOptionalStorageItem(window.localStorage, IMAGE_RATIO_STORAGE_KEY, imageRatio);
+    writeOptionalStorageItem(window.localStorage, IMAGE_TIER_STORAGE_KEY, imageTier);
+    writeOptionalStorageItem(window.localStorage, IMAGE_QUALITY_STORAGE_KEY, imageQuality);
+    writeOptionalStorageItem(window.localStorage, IMAGE_MODEL_STORAGE_KEY, imageModel);
   }, [imageRatio, imageTier, imageQuality, imageModel]);
 
   useEffect(() => {
     if (typeof window !== "undefined" && parsedCount > 0) {
-      window.localStorage.setItem(IMAGE_COUNT_STORAGE_KEY, String(parsedCount));
+      writeOptionalStorageItem(window.localStorage, IMAGE_COUNT_STORAGE_KEY, String(parsedCount));
     }
   }, [parsedCount]);
 
@@ -926,7 +939,18 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     };
   }, [conversations, selectedConversationId]);
 
-  const persistConversation = async (conversation: ImageConversation) => {
+  const invalidateHistoryLoad = useCallback(() => {
+    historyLoadOwnerRef.current.invalidate();
+    setIsLoadingHistory(false);
+  }, []);
+
+  const beginHistoryMutation = useCallback(() => {
+    invalidateHistoryLoad();
+    return historyMutationOwnerRef.current.begin();
+  }, [invalidateHistoryLoad]);
+
+  const persistConversation = useCallback(async (conversation: ImageConversation) => {
+    invalidateHistoryLoad();
     const nextConversations = sortImageConversations([
       conversation,
       ...conversationsRef.current.filter((item) => item.id !== conversation.id),
@@ -934,7 +958,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     conversationsRef.current = nextConversations;
     setConversations(nextConversations);
     await saveImageConversation(conversation);
-  };
+  }, [invalidateHistoryLoad]);
 
   const updateConversation = useCallback(
     async (
@@ -942,6 +966,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       updater: (current: ImageConversation | null) => ImageConversation | null,
       options: { persist?: boolean } = {},
     ) => {
+      invalidateHistoryLoad();
       const result = applyImageConversationUpdate(conversationsRef.current, conversationId, updater);
       if (!result.changed) {
         return;
@@ -959,7 +984,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         await saveImageConversation(nextConversation);
       }
     },
-    [],
+    [invalidateHistoryLoad],
   );
 
   const clearComposerInputs = useCallback(() => {
@@ -988,7 +1013,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleDeleteConversation = async (id: string) => {
     const historyMutationOwner = historyMutationOwnerRef.current;
-    const mutationOwner = historyMutationOwner.begin();
+    const mutationOwner = beginHistoryMutation();
     conversationQueueGateRef.current.invalidate(id);
     const nextConversations = conversationsRef.current.filter((item) => item.id !== id);
     conversationsRef.current = nextConversations;
@@ -1020,7 +1045,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleDeleteTurnPart = async (conversationId: string, turnId: string, part: "prompt" | "results") => {
     const historyMutationOwner = historyMutationOwnerRef.current;
-    const mutationOwner = historyMutationOwner.begin();
+    const mutationOwner = beginHistoryMutation();
     conversationQueueGateRef.current.invalidate(conversationId);
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation) {
@@ -1081,7 +1106,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleClearHistory = async () => {
     const historyMutationOwner = historyMutationOwnerRef.current;
-    const mutationOwner = historyMutationOwner.begin();
+    const mutationOwner = beginHistoryMutation();
     conversationQueueGateRef.current.invalidateAll();
     try {
       await clearImageConversations();
@@ -1115,7 +1140,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleRenameConversation = async (id: string, title: string) => {
     const historyMutationOwner = historyMutationOwnerRef.current;
-    const mutationOwner = historyMutationOwner.begin();
+    const mutationOwner = beginHistoryMutation();
     await updateConversation(
       id,
       (current) => current ? { ...current, title, updatedAt: new Date().toISOString() } : null,
@@ -1365,6 +1390,34 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         return acceptsQueue();
       };
 
+      const applySubmissionFailures = async (
+        failures: Array<{ imageId: string; message: string }>,
+      ) => {
+        if (failures.length === 0 || !acceptsQueue()) {
+          return acceptsQueue();
+        }
+        const failureMessages = new Map(failures.map((failure) => [failure.imageId, failure.message]));
+        await updateConversation(conversationId, (current) => {
+          if (!acceptsQueue() || !current) {
+            return null;
+          }
+          const turns = current.turns.map((turn) => {
+            if (turn.id !== activeTurn.id) {
+              return turn;
+            }
+            const images = turn.images.map((image) => {
+              const message = failureMessages.get(image.id);
+              return message && image.status === "loading"
+                ? { ...image, status: "error" as const, error: message }
+                : image;
+            });
+            return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
+          });
+          return { ...current, updatedAt: new Date().toISOString(), turns };
+        });
+        return acceptsQueue();
+      };
+
       try {
         const referenceFiles = activeTurn.referenceImages.map((image, index) =>
           dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
@@ -1377,16 +1430,27 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         if (!acceptsQueue()) {
           return;
         }
-        const submitted = await Promise.all(
-          pendingImages.map((image) => {
+        const submission = await settleImageTaskSubmissions(
+          pendingImages,
+          (image: StoredImage) => {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
               ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
               : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
-          }),
+          },
         );
-        if (!acceptsQueue() || !(await applyTasks(submitted))) {
+        if (!acceptsQueue() || (submission.tasks.length > 0 && !(await applyTasks(submission.tasks)))) {
           return;
+        }
+        if (!(await applySubmissionFailures(submission.failures))) {
+          return;
+        }
+        if (submission.failures.length > 0) {
+          toast.error(
+            submission.failures.length === pendingImages.length
+              ? submission.failures[0].message
+              : `${submission.failures.length} 张图片任务提交失败，其余任务继续生成`,
+          );
         }
 
         let consecutiveErrors = 0;
@@ -1448,18 +1512,21 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               if (!acceptsQueue()) {
                 return;
               }
-              const resubmitted = await Promise.all(
-                missingImages.map((image) =>
+              const resubmission = await settleImageTaskSubmissions(
+                missingImages,
+                (image: StoredImage) =>
                   activeTurn.mode === "edit"
                     ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
                     : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality),
-                ),
               );
               if (!acceptsQueue()) {
                 return;
               }
-              if (resubmitted.length > 0 && !(await applyTasks(resubmitted))) {
+              if (resubmission.tasks.length > 0 && !(await applyTasks(resubmission.tasks))) {
                 return;
+              }
+              if (resubmission.failures.length > 0) {
+                throw new Error(resubmission.failures[0].message);
               }
             }
           } catch (pollError) {
@@ -1535,7 +1602,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       }
 
       const historyMutationOwner = historyMutationOwnerRef.current;
-      const mutationOwner = historyMutationOwner.begin();
+      const mutationOwner = beginHistoryMutation();
 
       const now = new Date().toISOString();
       const nextTurnId = createId();
@@ -1569,7 +1636,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       void runConversationQueue(conversationId);
       toast.success("已加入重新生成队列");
     },
-    [runConversationQueue],
+    [beginHistoryMutation, persistConversation, runConversationQueue],
   );
 
   const handleRetryImage = useCallback(
@@ -1580,7 +1647,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       }
 
       const historyMutationOwner = historyMutationOwnerRef.current;
-      const mutationOwner = historyMutationOwner.begin();
+      const mutationOwner = beginHistoryMutation();
 
       const now = new Date().toISOString();
       const retryImageId = `${turnId}-${createId()}`;
@@ -1620,7 +1687,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       }
       void runConversationQueue(conversationId);
     },
-    [runConversationQueue],
+    [beginHistoryMutation, persistConversation, runConversationQueue],
   );
 
   const handleTimeoutRetryContinue = useCallback(async (taskId: string) => {
@@ -1628,7 +1695,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     if (!targetConversation) return;
     const conversationId = targetConversation.id;
     const historyMutationOwner = historyMutationOwnerRef.current;
-    const mutationOwner = historyMutationOwner.begin();
+    const mutationOwner = beginHistoryMutation();
     try {
       await resumeImagePoll(taskId, imageTimeoutRetrySecs);
       if (!historyMutationOwner.accepts(mutationOwner)) {
@@ -1668,7 +1735,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       const msg = err instanceof Error ? err.message : "续轮询失败";
       toast.error(msg);
     }
-  }, [updateConversation, imageTimeoutRetrySecs]);
+  }, [beginHistoryMutation, updateConversation, imageTimeoutRetrySecs]);
 
   const handleDismissErrors = useCallback(
     async (conversationId: string, turnId: string) => {
@@ -1719,7 +1786,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
 
     const historyMutationOwner = historyMutationOwnerRef.current;
-    const mutationOwner = historyMutationOwner.begin();
+    const mutationOwner = beginHistoryMutation();
 
     const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
 

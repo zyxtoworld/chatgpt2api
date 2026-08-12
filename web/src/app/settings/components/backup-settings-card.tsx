@@ -134,6 +134,14 @@ export function BackupSettingsCard() {
     }
   };
 
+  const handleDetailOpenChange = (open: boolean) => {
+    if (!open) {
+      backupDetailOwnerRef.current.invalidate();
+      setDetailLoading(false);
+    }
+    setDetailOpen(open);
+  };
+
   const handleDownload = async (key: string, name: string) => {
     const backupDownloadOwner = backupDownloadOwnerRef.current;
     const downloadOwner = backupDownloadOwner.begin();
@@ -404,7 +412,7 @@ export function BackupSettingsCard() {
         </CardContent>
       </Card>
 
-      <Dialog open={detailOpen} onOpenChange={setDetailOpen}>
+      <Dialog open={detailOpen} onOpenChange={handleDetailOpenChange}>
         <DialogContent className="flex max-h-[85vh] max-w-3xl flex-col overflow-hidden rounded-2xl border-white/80 bg-white">
           <DialogHeader className="shrink-0 border-b border-stone-200 pb-3">
             <DialogTitle>备份详情</DialogTitle>

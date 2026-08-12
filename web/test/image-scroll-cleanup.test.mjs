@@ -30,7 +30,7 @@ test("scroll cleanup safely ignores a missing mounted viewport or conversation",
 });
 
 test("image page cleanup persists through the setup-time viewport snapshot", () => {
-  const effectIndex = pageSource.indexOf("loadCancelledRef.current = false;");
+  const effectIndex = pageSource.indexOf("historyLoadOwner.activate();");
   const positionsIndex = pageSource.indexOf("const scrollPositions = scrollPositionsRef.current", effectIndex);
   const snapshotIndex = pageSource.indexOf(
     "createScrollCleanupSnapshot(resultsViewportRef.current, scrollPositions)",

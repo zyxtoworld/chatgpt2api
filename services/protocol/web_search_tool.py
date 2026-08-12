@@ -5,6 +5,7 @@ from typing import Any
 
 from services.account_service import account_service
 from services.openai_backend_api import OpenAIBackendAPI
+from services.url_utils import normalize_public_http_url
 
 WEB_SEARCH_TOOL_TYPES = {
     "web_search",
@@ -119,7 +120,7 @@ def normalized_sources(result: dict[str, Any]) -> list[dict[str, str]]:
     for item in sources:
         if not isinstance(item, dict):
             continue
-        url = str(item.get("url") or "").strip()
+        url = normalize_public_http_url(item.get("url"))
         title = str(item.get("title") or "").strip()
         snippet = str(item.get("snippet") or "").strip()
         if not url or url in seen:

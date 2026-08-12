@@ -5,18 +5,28 @@ import test from "node:test";
 globalThis.window = {};
 register("./auth-store-loader.mjs", { parentURL: import.meta.url });
 
-const [{ AUTH_KEY_STORAGE_KEY, AUTH_SESSION_STORAGE_KEY, beginStoredAuthValidation, clearStoredAuthSession, getStoredAuthKey, setStoredAuthSessionIfCurrent }, { request }, { state, reset }] = await Promise.all([
+const [{ AUTH_KEY_STORAGE_KEY, AUTH_SESSION_STORAGE_KEY, beginStoredAuthValidation, clearStoredAuthSession, getStoredAuthKey, setStoredAuthSession, setStoredAuthSessionIfCurrent }, { request }, { state, reset }] = await Promise.all([
   import("../src/store/auth.ts"),
   import("../src/lib/request.ts"),
   import("./fixtures/localforage-mock.mjs"),
 ]);
 
 const readAuthConfig = request.interceptors.request.handlers[0].fulfilled;
+const rejectAuthResponse = request.interceptors.response.handlers[0].rejected;
 
-async function authHeader(values) {
-  reset(values);
+async function authHeader() {
   const config = await readAuthConfig({ headers: {} });
   return config.headers.Authorization || "";
+}
+
+async function settleByNextTurn(promise) {
+  return Promise.race([
+    promise.then(
+      (value) => ({ status: "resolved", value }),
+      (error) => ({ status: "rejected", error }),
+    ),
+    new Promise((resolve) => setImmediate(() => resolve({ status: "pending" }))),
+  ]);
 }
 
 test("getStoredAuthKey and request interceptor reject incomplete or mismatched pairs", async () => {
@@ -26,19 +36,20 @@ test("getStoredAuthKey and request interceptor reject incomplete or mismatched p
     { [AUTH_SESSION_STORAGE_KEY]: session },
     { [AUTH_KEY_STORAGE_KEY]: "other-key", [AUTH_SESSION_STORAGE_KEY]: session },
   ]) {
+    reset();
+    await setStoredAuthSession(session);
     reset(values);
     assert.equal(await getStoredAuthKey(), "");
-    assert.equal(await authHeader(values), "");
+    assert.equal(await authHeader(), "");
     assert.equal(state.values.size, 0, "invalid pairs are cleared instead of reused");
   }
 });
 
 test("a valid pair is the only source of the Authorization header", async () => {
   const session = { key: "valid-key", role: "user", subjectId: "2", name: "B" };
-  assert.equal(
-    await authHeader({ [AUTH_KEY_STORAGE_KEY]: "valid-key", [AUTH_SESSION_STORAGE_KEY]: session }),
-    "Bearer valid-key",
-  );
+  reset();
+  await setStoredAuthSession(session);
+  assert.equal(await authHeader(), "Bearer valid-key");
 });
 
 test("logout propagates any deletion failure instead of claiming success", async () => {
@@ -87,4 +98,52 @@ test("the auth store has no single-key mutation exports", async () => {
   const authStore = await import("../src/store/auth.ts");
   assert.equal("setStoredAuthKey" in authStore, false);
   assert.equal("clearStoredAuthKey" in authStore, false);
+});
+
+test("a protected 401 redirects and settles instead of leaving the caller pending", async () => {
+  const session = { key: "expired-key", role: "admin", subjectId: "1", name: "A" };
+  const redirects = [];
+  globalThis.window.location = {
+    pathname: "/settings",
+    replace(path) {
+      redirects.push(path);
+    },
+  };
+  reset({ [AUTH_KEY_STORAGE_KEY]: session.key, [AUTH_SESSION_STORAGE_KEY]: session });
+
+  const outcome = await settleByNextTurn(rejectAuthResponse({
+    config: {},
+    message: "Request failed with status code 401",
+    response: { status: 401, data: { detail: { error: "expired" } } },
+  }));
+
+  assert.equal(outcome.status, "rejected");
+  assert.equal(outcome.error?.message, "登录已失效，请重新登录");
+  assert.deepEqual(redirects, ["/login"]);
+  assert.equal(state.values.size, 0);
+});
+
+test("a protected 401 storage failure is safe and does not claim a redirect", async () => {
+  const storageSecret = "indexeddb-internal-secret";
+  const session = { key: "expired-key", role: "admin", subjectId: "1", name: "A" };
+  const redirects = [];
+  globalThis.window.location = {
+    pathname: "/settings",
+    replace(path) {
+      redirects.push(path);
+    },
+  };
+  reset({ [AUTH_KEY_STORAGE_KEY]: session.key, [AUTH_SESSION_STORAGE_KEY]: session });
+  state.failures.set("remove", new Error(storageSecret));
+
+  const outcome = await settleByNextTurn(rejectAuthResponse({
+    config: {},
+    message: "Request failed with status code 401",
+    response: { status: 401, data: { detail: { error: "expired" } } },
+  }));
+
+  assert.equal(outcome.status, "rejected");
+  assert.equal(outcome.error?.message, "登录状态清理失败，请刷新页面后重试");
+  assert.doesNotMatch(outcome.error?.message || "", new RegExp(storageSecret));
+  assert.deepEqual(redirects, []);
 });

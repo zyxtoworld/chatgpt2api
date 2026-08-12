@@ -1,32 +1,16 @@
 import axios, {AxiosError, type AxiosRequestConfig} from "axios";
 
 import webConfig from "@/constants/common-env";
+import {
+    PUBLIC_AUTH_CLEAR_ERROR_MESSAGE,
+    PUBLIC_UNAUTHORIZED_ERROR_MESSAGE,
+    requestErrorMessage,
+} from "@/lib/request-error-message";
 import {clearStoredAuthSession, getStoredAuthKey} from "@/store/auth";
 
 type RequestConfig = AxiosRequestConfig & {
     redirectOnUnauthorized?: boolean;
 };
-
-type ErrorPayload = {
-    detail?: string | { error?: string | { message?: string } };
-    error?: string | { message?: string };
-    message?: string;
-};
-
-function errorMessageFromValue(value: unknown): string {
-    if (typeof value === "string") {
-        return value;
-    }
-    if (!value || typeof value !== "object") {
-        return "";
-    }
-
-    const item = value as { error?: unknown; message?: unknown };
-    if (typeof item.message === "string") {
-        return item.message;
-    }
-    return errorMessageFromValue(item.error);
-}
 
 export const request = axios.create({
     baseURL: webConfig.apiUrl.replace(/\/$/, ""),
@@ -47,27 +31,24 @@ request.interceptors.request.use(async (config) => {
 
 request.interceptors.response.use(
     (response) => response,
-    async (error: AxiosError<ErrorPayload>) => {
+    async (error: AxiosError<unknown>) => {
         const status = error.response?.status;
         const shouldRedirect = (error.config as RequestConfig | undefined)?.redirectOnUnauthorized !== false;
         if (status === 401 && shouldRedirect && typeof window !== "undefined") {
             // Avoid redirect loop — only redirect if not already on /login
             if (!window.location.pathname.startsWith("/login")) {
-                await clearStoredAuthSession();
+                try {
+                    await clearStoredAuthSession();
+                } catch {
+                    return Promise.reject(new Error(PUBLIC_AUTH_CLEAR_ERROR_MESSAGE));
+                }
                 window.location.replace("/login");
-                // Return a never-resolving promise to prevent further error handling
-                // while the browser navigates away
-                return new Promise(() => {});
+                return Promise.reject(new Error(PUBLIC_UNAUTHORIZED_ERROR_MESSAGE));
             }
         }
 
         const payload = error.response?.data;
-        const message =
-            errorMessageFromValue(payload?.detail) ||
-            errorMessageFromValue(payload?.error) ||
-            payload?.message ||
-            error.message ||
-            `请求失败 (${status || 500})`;
+        const message = requestErrorMessage({status, payload, fallback: error.message});
         return Promise.reject(new Error(message));
     },
 );

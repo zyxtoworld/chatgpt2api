@@ -23,7 +23,6 @@ import {
   deleteCCLoadServer,
   fetchCCLoadChannels,
   fetchCCLoadServers,
-  fetchModels,
   startCCLoadImport,
   updateCCLoadServer,
   type CCLoadChannel,
@@ -40,26 +39,9 @@ import {
   getCCLoadPage,
   getValidCCLoadSelectedIds,
   getSelectableCCLoadChannelIds,
-  replaceCCLoadChannelModels,
+  normalizeCCLoadChannels,
   toggleAllCCLoadChannels,
 } from "@/lib/ccload-selection";
-
-function normalizeChannels(items: CCLoadChannel[]) {
-  const seen = new Set<string>();
-  return items.flatMap((item) => {
-    const id = String(item.id || "").trim();
-    if (!id || seen.has(id)) return [];
-    seen.add(id);
-    return [{
-      id,
-      name: String(item.name || "").trim(),
-      enabled: Boolean(item.enabled),
-      plan_type: String(item.plan_type || "").trim(),
-      subscription_active_until: String(item.subscription_active_until || "").trim(),
-      models: [],
-    }];
-  });
-}
 
 export function CCLoadConnections() {
   const requestGateRef = useRef(createMutationRequestGate());
@@ -252,14 +234,11 @@ export function CCLoadConnections() {
     browsingOwnerRef.current = queryOwner;
     setLoadingChannelsId(server.id);
     try {
-      const [data, modelData] = await Promise.all([
-        fetchCCLoadChannels(server.id),
-        fetchModels(),
-      ]);
+      const data = await fetchCCLoadChannels(server.id);
       if (!gate.acceptsQuery(queryOwner)) return;
       const currentServer = serversRef.current.find((item) => item.id === server.id);
       if (!currentServer) return;
-      const nextChannels = replaceCCLoadChannelModels(normalizeChannels(data.channels), modelData.data);
+      const nextChannels = normalizeCCLoadChannels(data.channels);
       setBrowserServer(currentServer);
       setChannels(nextChannels);
       setSelectedIds([]);
@@ -556,7 +535,7 @@ export function CCLoadConnections() {
           </DialogHeader>
 
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-            <div className="relative min-w-[260px]">
+            <div className="relative w-full min-w-0 sm:min-w-[260px]">
               <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
               <Input
                 value={channelQuery}
@@ -569,7 +548,7 @@ export function CCLoadConnections() {
                 disabled={hasMutation}
               />
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Select
                 value={channelPageSize}
                 onValueChange={(value) => {
@@ -599,7 +578,7 @@ export function CCLoadConnections() {
           </div>
 
           <div className="rounded-xl border border-stone-200">
-            <div className="flex items-center justify-between border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
               <div className="flex items-center gap-3">
                 <Checkbox
                   checked={allChannelsSelected}
@@ -646,7 +625,7 @@ export function CCLoadConnections() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between text-sm text-stone-500">
+          <div className="flex flex-col gap-3 text-sm text-stone-500 sm:flex-row sm:items-center sm:justify-between">
             <span>
               第 {channelPageResult.start} - {channelPageResult.end} 条，共 {channelPageResult.total} 条
             </span>

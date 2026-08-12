@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import {
+  createLifecycleActionOwner,
+  observeLifecycleAction,
+} from "../src/lib/lifecycle-action-owner.js";
 import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
 
 const source = readFileSync(
@@ -46,6 +50,113 @@ test("switching submit or clearing images invalidates only the old action", () =
   assert.equal(imageOwner.accepts(firstRead), false);
   const secondRead = imageOwner.begin();
   assert.equal(imageOwner.accepts(secondRead), true);
+});
+
+test("concurrent editable image reads share an epoch until clear or unmount", () => {
+  const imageOwner = createLifecycleActionOwner();
+  const firstRead = imageOwner.begin();
+  const secondRead = imageOwner.begin();
+
+  assert.equal(imageOwner.accepts(firstRead), true);
+  assert.equal(imageOwner.accepts(secondRead), true);
+
+  imageOwner.invalidate();
+  assert.equal(imageOwner.accepts(firstRead), false);
+  assert.equal(imageOwner.accepts(secondRead), false);
+
+  const afterClear = imageOwner.begin();
+  assert.equal(imageOwner.accepts(afterClear), true);
+  imageOwner.cancel();
+  assert.equal(imageOwner.accepts(afterClear), false);
+});
+
+test("owned persistence failures are consumed and reported while the panel is active", async () => {
+  const owner = createLifecycleActionOwner();
+  const failures = [];
+
+  await observeLifecycleAction(
+    owner,
+    async () => {
+      throw new Error("indexeddb write failed");
+    },
+    {
+      onError: () => failures.push("本地历史记录保存失败"),
+    },
+  );
+
+  assert.deepEqual(failures, ["本地历史记录保存失败"]);
+});
+
+test("an unmounted panel drops a late persistence failure without rejecting", async () => {
+  const owner = createLifecycleActionOwner();
+  const failures = [];
+  let rejectWrite;
+  const write = new Promise((_, reject) => {
+    rejectWrite = reject;
+  });
+
+  const observed = observeLifecycleAction(owner, () => write, {
+    onError: () => failures.push("stale error"),
+  });
+  owner.cancel();
+  rejectWrite(new Error("late indexeddb failure"));
+
+  await observed;
+  assert.deepEqual(failures, []);
+});
+
+test("EditableFilePanel observes every fire-and-forget history operation", () => {
+  assert.match(source, /const historyPersistenceOwnerRef = useRef\(createLifecycleActionOwner\(\)\)/);
+  assert.match(source, /observeLifecycleAction\([\s\S]*?listEditableFileDrafts\(kind\)/);
+  assert.match(source, /observeLifecycleAction\([\s\S]*?listDeletedEditableFileIds\(kind\)/);
+  assert.match(source, /observeLifecycleAction\([\s\S]*?saveEditableFileDrafts\(kind, next\)/);
+  assert.match(source, /observeLifecycleAction\([\s\S]*?saveDeletedEditableFileIds\(kind, nextDeleted\)/);
+  assert.doesNotMatch(source, /void save(?:EditableFileDrafts|DeletedEditableFileIds)\(/);
+});
+
+test("an optional deleted-id read failure cannot discard a successful task response", () => {
+  assert.match(source, /resolveDeletedEditableFileIds\(/);
+  assert.match(source, /storageFailed[\s\S]*?setError\("本地历史记录读取失败"\)[\s\S]*?setTasks\(/);
+});
+
+test("EditableFilePanel wires image reads to the shared lifecycle epoch", () => {
+  assert.match(source, /const imageReadOwnerRef = useRef\(createLifecycleActionOwner\(\)\)/);
+  assert.match(source, /imageReadOwnerRef\.current\.invalidate\(\)/);
+  assert.match(source, /imageReadOwner\.cancel\(\)/);
+});
+
+test("stale image reads cannot clear the pending count of a newer epoch", () => {
+  const imageOwner = createLifecycleActionOwner();
+  let pending = 0;
+  const beginRead = () => {
+    const action = imageOwner.begin();
+    pending += 1;
+    return action;
+  };
+  const settleRead = (action) => {
+    if (imageOwner.accepts(action)) pending = Math.max(0, pending - 1);
+  };
+
+  const first = beginRead();
+  const second = beginRead();
+  assert.equal(pending, 2);
+
+  imageOwner.invalidate();
+  pending = 0;
+  const third = beginRead();
+  settleRead(first);
+  settleRead(second);
+  assert.equal(pending, 1);
+  settleRead(third);
+  assert.equal(pending, 0);
+});
+
+test("EditableFilePanel blocks generation until every selected image is read", () => {
+  assert.match(source, /const \[pendingImageReads, setPendingImageReads\] = useState\(0\)/);
+  assert.match(source, /pendingImageReadsRef\.current \+= 1/);
+  assert.match(source, /setPendingImageReads\(pendingImageReadsRef\.current\)/);
+  assert.match(source, /if \(pendingImageReads > 0\)/);
+  assert.match(source, /disabled=\{submitting \|\| running \|\| pendingImageReads > 0\}/);
 });
 
 test("a stale task fetch cannot clear a newer polling owner", () => {

@@ -16,6 +16,7 @@ from curl_cffi.requests import Session
 
 from services.account_service import account_service
 from services.config import DATA_DIR, parse_public_url
+from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.error_response import (
     PublicSafeValueError,
     canonicalize_import_job_errors,
@@ -324,17 +325,6 @@ def _admin_session(server: dict) -> Iterator[tuple[Session, str, dict[str, str]]
         session.close()
 
 
-def _channel_models(channel: dict) -> list[str]:
-    model_entries = channel.get("models")
-    if not isinstance(model_entries, list):
-        return []
-    return list(dict.fromkeys(
-        model
-        for item in model_entries
-        if isinstance(item, dict) and (model := _clean(item.get("model")))
-    ))
-
-
 def list_remote_channels(server: dict) -> list[dict]:
     """List public metadata for ccLoad Codex OAuth channels."""
     channels: list[dict] = []
@@ -368,7 +358,7 @@ def list_remote_channels(server: dict) -> list[dict]:
                     "enabled": enabled,
                     "plan_type": _clean(item.get("codex_plan_type")),
                     "subscription_active_until": _clean(item.get("codex_subscription_active_until")),
-                    "models": _channel_models(item),
+                    "models": [],
                 })
 
             count = payload.get("count")
@@ -376,6 +366,9 @@ def list_remote_channels(server: dict) -> list[dict]:
             offset += len(data)
             if not data or offset >= total or len(data) < limit:
                 break
+        for channel in channels:
+            credential = _fetch_remote_credential(session, base_url, headers, channel["id"])
+            channel["models"] = _channel_model_ids(credential["access_token"])
     return channels
 
 
@@ -420,6 +413,50 @@ def _normalized_codex_credential(raw: object) -> dict | None:
     return credential
 
 
+def _fetch_remote_credential(
+        session: Session,
+        base_url: str,
+        headers: dict[str, str],
+        channel_id: str,
+) -> dict:
+    response = session.get(
+        f"{base_url}/admin/channels/{channel_id}/editor",
+        headers=headers,
+        timeout=30,
+    )
+    payload = _response_payload(response, "credential fetch")
+    data = payload.get("data")
+    channel = data.get("channel") if isinstance(data, dict) else None
+    raw_credential = data.get("oauth_credential") if isinstance(data, dict) else None
+    credential = _normalized_codex_credential(raw_credential)
+    if (
+        not isinstance(channel, dict)
+        or _clean(channel.get("id")) != channel_id
+        or _clean(channel.get("auth_type")) != "codex_oauth"
+        or credential is None
+    ):
+        raise CCLoadError("ccLoad credential fetch failed")
+    return credential
+
+
+def _channel_model_ids(access_token: str) -> list[str]:
+    backend = OpenAIBackendAPI(access_token=access_token)
+    try:
+        payload = backend.list_models()
+    except Exception as exc:
+        raise CCLoadError("ccLoad channel model list failed") from exc
+    finally:
+        backend.close()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise CCLoadError("ccLoad channel model list failed")
+    return list(dict.fromkeys(
+        model_id
+        for item in data
+        if isinstance(item, dict) and (model_id := _clean(item.get("id")))
+    ))
+
+
 def fetch_remote_credentials(server: dict, channel_ids: list[str]) -> tuple[list[dict], list[dict]]:
     selected = list(dict.fromkeys(_clean(value) for value in channel_ids if _clean(value)))
     if not selected or any(not value.isdecimal() or int(value) <= 0 for value in selected):
@@ -430,23 +467,7 @@ def fetch_remote_credentials(server: dict, channel_ids: list[str]) -> tuple[list
     with _admin_session(server) as (session, base_url, headers):
         for channel_id in selected:
             try:
-                response = session.get(
-                    f"{base_url}/admin/channels/{channel_id}/editor",
-                    headers=headers,
-                    timeout=30,
-                )
-                payload = _response_payload(response, "credential fetch")
-                data = payload.get("data")
-                channel = data.get("channel") if isinstance(data, dict) else None
-                raw_credential = data.get("oauth_credential") if isinstance(data, dict) else None
-                if (
-                    not isinstance(channel, dict)
-                    or _clean(channel.get("id")) != channel_id
-                    or _clean(channel.get("auth_type")) != "codex_oauth"
-                    or (credential := _normalized_codex_credential(raw_credential)) is None
-                ):
-                    raise CCLoadError("ccLoad credential fetch failed")
-                credentials.append(credential)
+                credentials.append(_fetch_remote_credential(session, base_url, headers, channel_id))
             except Exception:
                 errors.append({"name": channel_id, "error": "credential unavailable"})
     return credentials, errors

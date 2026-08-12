@@ -141,10 +141,10 @@ export function TopNav() {
   return (
     <>
       <header className="border-b border-stone-100/50 dark:border-white/10">
-        <div className="flex min-h-12 flex-col gap-1 px-3 py-2 sm:h-12 sm:flex-row sm:items-center sm:justify-between sm:gap-3 sm:px-6 sm:py-0">
-          <div className="flex items-center justify-between gap-2 sm:justify-start sm:gap-3">
+        <div className="flex min-h-12 flex-col gap-1 px-3 py-2 lg:h-12 lg:flex-row lg:items-center lg:justify-between lg:gap-3 lg:px-6 lg:py-0">
+          <div className="flex items-center justify-between gap-2 lg:justify-start lg:gap-3">
             <Sheet>
-              <SheetTrigger className="inline-flex size-8 items-center justify-center text-stone-700 transition hover:text-stone-950 sm:hidden dark:text-stone-200 dark:hover:text-white">
+              <SheetTrigger className="inline-flex size-8 items-center justify-center text-stone-700 transition hover:text-stone-950 lg:hidden dark:text-stone-200 dark:hover:text-white">
                 <Menu className="size-4" />
                 <span className="sr-only">打开导航</span>
               </SheetTrigger>
@@ -195,14 +195,14 @@ export function TopNav() {
             >
               chatgpt2api
             </Link>
-            <HeaderActions className="ml-auto sm:hidden" showGithubText={false} />
+            <HeaderActions className="ml-auto lg:hidden" showGithubText={false} />
           </div>
-          <nav className="hide-scrollbar -mx-1 hidden min-w-0 flex-1 gap-1 overflow-x-auto px-1 sm:mx-0 sm:flex sm:justify-center sm:gap-8 sm:overflow-visible sm:px-0">
+          <nav className="hide-scrollbar -mx-1 hidden min-w-0 flex-1 gap-1 overflow-x-auto px-1 lg:mx-0 lg:flex lg:justify-center lg:gap-8 lg:overflow-visible lg:px-0">
             {canvasHref ? (
               <button
                 type="button"
                 onClick={handleCanvasOpen}
-                className="relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium text-stone-500 transition hover:text-stone-900 sm:rounded-none sm:px-0 sm:text-[15px] dark:text-stone-400 dark:hover:text-stone-100"
+                className="relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium text-stone-500 transition hover:text-stone-900 lg:rounded-none lg:px-0 lg:text-[15px] dark:text-stone-400 dark:hover:text-stone-100"
               >
                 无限画布
               </button>
@@ -214,26 +214,26 @@ export function TopNav() {
                   key={item.href}
                   href={item.href}
                   className={cn(
-                    "relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium transition sm:rounded-none sm:px-0 sm:text-[15px]",
+                    "relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium transition lg:rounded-none lg:px-0 lg:text-[15px]",
                     active
-                      ? "bg-stone-950 text-white sm:bg-transparent sm:font-semibold sm:text-stone-950 dark:bg-white dark:text-stone-950 dark:sm:bg-transparent dark:sm:text-white"
+                      ? "bg-stone-950 text-white lg:bg-transparent lg:font-semibold lg:text-stone-950 dark:bg-white dark:text-stone-950 dark:lg:bg-transparent dark:lg:text-white"
                       : "text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-100",
                   )}
                 >
                   {item.label}
-                  {active ? <span className="absolute inset-x-0 -bottom-[1px] hidden h-0.5 bg-stone-950 dark:bg-white sm:block" /> : null}
+                  {active ? <span className="absolute inset-x-0 -bottom-[1px] hidden h-0.5 bg-stone-950 dark:bg-white lg:block" /> : null}
                 </Link>
               );
             })}
           </nav>
-          <div className="hidden items-center justify-end gap-2 sm:flex sm:gap-3">
+          <div className="hidden items-center justify-end gap-2 lg:flex lg:gap-3">
             <HeaderActions />
-            <span className="hidden rounded-md bg-stone-100 px-2 py-1 text-[10px] font-medium text-stone-500 dark:bg-white/8 dark:text-stone-300 sm:inline-block sm:text-[11px]">
+            <span className="hidden rounded-md bg-stone-100 px-2 py-1 text-[10px] font-medium text-stone-500 dark:bg-white/8 dark:text-stone-300 lg:inline-block lg:text-[11px]">
               {roleLabel} · {displayName}
             </span>
             <button
               type="button"
-              className="py-1 text-xs text-stone-400 transition hover:text-stone-700 dark:text-stone-500 dark:hover:text-stone-200 sm:text-sm"
+              className="py-1 text-xs text-stone-400 transition hover:text-stone-700 dark:text-stone-500 dark:hover:text-stone-200 lg:text-sm"
               onClick={() => void handleLogout()}
             >
               退出

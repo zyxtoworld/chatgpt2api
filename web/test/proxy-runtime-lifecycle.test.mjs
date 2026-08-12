@@ -3,7 +3,18 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createProxyRuntimeRequestGate } from "../src/lib/proxy-runtime-request-gate.js";
+import {
+  createProxyRuntimeRequestGate,
+  runCurrentProxyFollowup,
+} from "../src/lib/proxy-runtime-request-gate.js";
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/settings/components/proxy-runtime-card.tsx", import.meta.url)),
@@ -12,6 +23,7 @@ const source = readFileSync(
 
 test("ProxyRuntimeCard wires independent owners through mount cleanup and guarded effects", () => {
   assert.match(source, /createProxyRuntimeRequestGate/);
+  assert.match(source, /runCurrentProxyFollowup/);
   assert.match(source, /return \(\) => requestGate\.cancel\(\)/);
   assert.match(source, /requestGate\.acceptsProxy\(request\)/);
   assert.match(source, /requestGate\.acceptsClearance\(request, candidate\)/);
@@ -57,4 +69,49 @@ test("component cancellation rejects late proxy and clearance callbacks", () => 
 
   assert.equal(gate.acceptsProxy(proxyRequest), false);
   assert.equal(gate.acceptsClearance(clearanceRequest, "https://example.test/a"), false);
+});
+
+test("an invalidated proxy test does not start its follow-up request after save settles", async () => {
+  const gate = createProxyRuntimeRequestGate();
+  gate.activate();
+  const request = gate.beginProxy();
+  const save = deferred();
+  let followupCalls = 0;
+
+  const result = runCurrentProxyFollowup(
+    () => save.promise,
+    () => gate.acceptsProxy(request),
+    async () => {
+      followupCalls += 1;
+      return "proxy-result";
+    },
+  );
+  gate.invalidateProxy();
+  save.resolve(true);
+
+  assert.deepEqual(await result, { started: false });
+  assert.equal(followupCalls, 0);
+});
+
+test("an unmounted clearance test does not start its follow-up request after save settles", async () => {
+  const gate = createProxyRuntimeRequestGate();
+  gate.activate();
+  const candidate = "https://example.test/a";
+  const request = gate.beginClearance(candidate);
+  const save = deferred();
+  let followupCalls = 0;
+
+  const result = runCurrentProxyFollowup(
+    () => save.promise,
+    () => gate.acceptsClearance(request, candidate),
+    async () => {
+      followupCalls += 1;
+      return "clearance-result";
+    },
+  );
+  gate.cancel();
+  save.resolve(true);
+
+  assert.deepEqual(await result, { started: false });
+  assert.equal(followupCalls, 0);
 });

@@ -89,9 +89,34 @@ class _FakeCCLoadSession:
         self.closed = True
 
 
+class _FakeChannelModelBackend:
+    instances: list["_FakeChannelModelBackend"] = []
+
+    def __init__(self, access_token: str = ""):
+        self.access_token = access_token
+        self.closed = False
+        type(self).instances.append(self)
+
+    def list_models(self):
+        if self.access_token != "access-token-secret":
+            raise AssertionError("channel access token was not used")
+        return {
+            "object": "list",
+            "data": [
+                {"id": "gpt-5.4"},
+                {"id": "gpt-5.4-pro"},
+                {"id": "gpt-5.4-pro"},
+            ],
+        }
+
+    def close(self):
+        self.closed = True
+
+
 class CCLoadServiceContractTests(unittest.TestCase):
     def setUp(self) -> None:
         _FakeCCLoadSession.instances.clear()
+        _FakeChannelModelBackend.instances.clear()
         self.server = {
             "id": "server-1",
             "base_url": "https://ccload.example.test",
@@ -99,7 +124,15 @@ class CCLoadServiceContractTests(unittest.TestCase):
         }
 
     def test_lists_only_public_codex_oauth_channel_metadata_and_revokes_session(self) -> None:
-        with mock.patch.object(ccload_module, "Session", _FakeCCLoadSession):
+        with (
+            mock.patch.object(ccload_module, "Session", _FakeCCLoadSession),
+            mock.patch.object(
+                ccload_module,
+                "OpenAIBackendAPI",
+                _FakeChannelModelBackend,
+                create=True,
+            ),
+        ):
             channels = ccload_module.list_remote_channels(self.server)
 
         self.assertEqual(
@@ -111,7 +144,7 @@ class CCLoadServiceContractTests(unittest.TestCase):
                     "enabled": True,
                     "plan_type": "pro",
                     "subscription_active_until": "2027-01-02T03:04:05Z",
-                    "models": ["gpt-5.4"],
+                    "models": ["gpt-5.4", "gpt-5.4-pro"],
                 }
             ],
         )
@@ -123,11 +156,81 @@ class CCLoadServiceContractTests(unittest.TestCase):
         self.assertEqual([call[0:2] for call in session.calls], [
             ("POST", "https://ccload.example.test/login"),
             ("GET", "https://ccload.example.test/admin/channels"),
+            ("GET", "https://ccload.example.test/admin/channels/7/editor"),
             ("POST", "https://ccload.example.test/logout"),
         ])
         list_kwargs = session.calls[1][2]
         self.assertEqual(list_kwargs["headers"]["Authorization"], "Bearer temporary-session-token")
         self.assertEqual(list_kwargs["params"], {"auth_type": "codex_oauth", "limit": 200, "offset": 0})
+        self.assertEqual([backend.access_token for backend in _FakeChannelModelBackend.instances], ["access-token-secret"])
+        self.assertTrue(_FakeChannelModelBackend.instances[0].closed)
+
+    def test_each_channel_uses_its_own_authenticated_model_catalog(self) -> None:
+        class TwoChannelSession(_FakeCCLoadSession):
+            instances: list["TwoChannelSession"] = []
+
+            def get(self, url: str, **kwargs):
+                self.calls.append(("GET", url, kwargs))
+                if url.endswith("/admin/channels"):
+                    return _FakeResponse({
+                        "success": True,
+                        "data": [
+                            {"id": 1, "name": "Free", "auth_type": "codex_oauth", "enabled": True, "codex_plan_type": "free"},
+                            {"id": 2, "name": "Pro", "auth_type": "codex_oauth", "enabled": True, "codex_plan_type": "pro"},
+                        ],
+                        "count": 2,
+                    })
+                channel_id = "1" if url.endswith("/admin/channels/1/editor") else "2"
+                if not url.endswith(f"/admin/channels/{channel_id}/editor"):
+                    raise AssertionError(f"unexpected GET {url}")
+                return _FakeResponse({
+                    "success": True,
+                    "data": {
+                        "channel": {"id": int(channel_id), "auth_type": "codex_oauth"},
+                        "oauth_credential": {
+                            "id_token": "",
+                            "access_token": f"token-{channel_id}",
+                            "refresh_token": f"refresh-{channel_id}",
+                            "account_id": f"account-{channel_id}",
+                            "email": f"user-{channel_id}@example.test",
+                            "type": "codex",
+                            "expired": "2027-08-09T12:00:00Z",
+                            "plan_type": "free" if channel_id == "1" else "pro",
+                        },
+                    },
+                })
+
+        class PerChannelBackend:
+            instances: list["PerChannelBackend"] = []
+
+            def __init__(self, access_token: str = ""):
+                self.access_token = access_token
+                self.closed = False
+                type(self).instances.append(self)
+
+            def list_models(self):
+                models = ["common", "free-model"] if self.access_token == "token-1" else [
+                    "common",
+                    "free-model",
+                    "pro-model",
+                ]
+                return {"object": "list", "data": [{"id": model} for model in models]}
+
+            def close(self):
+                self.closed = True
+
+        with (
+            mock.patch.object(ccload_module, "Session", TwoChannelSession),
+            mock.patch.object(ccload_module, "OpenAIBackendAPI", PerChannelBackend),
+        ):
+            channels = ccload_module.list_remote_channels(self.server)
+
+        self.assertEqual([channel["models"] for channel in channels], [
+            ["common", "free-model"],
+            ["common", "free-model", "pro-model"],
+        ])
+        self.assertEqual([backend.access_token for backend in PerChannelBackend.instances], ["token-1", "token-2"])
+        self.assertTrue(all(backend.closed for backend in PerChannelBackend.instances))
 
     def test_fetches_selected_complete_codex_credential_and_never_lists_it(self) -> None:
         with mock.patch.object(ccload_module, "Session", _FakeCCLoadSession):

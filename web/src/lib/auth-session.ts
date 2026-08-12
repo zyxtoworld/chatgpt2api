@@ -11,12 +11,12 @@ import {
 
 export async function getValidatedAuthSession(): Promise<StoredAuthSession | null> {
   const validationLease = beginStoredAuthValidation();
-  const storedSession = await getStoredAuthSession(validationLease);
-  if (!storedSession) {
-    return null;
-  }
-
   try {
+    const storedSession = await getStoredAuthSession(validationLease);
+    if (!storedSession) {
+      return null;
+    }
+
     const data = await login(storedSession.key);
     const nextSession: StoredAuthSession = {
       key: storedSession.key,
@@ -27,7 +27,11 @@ export async function getValidatedAuthSession(): Promise<StoredAuthSession | nul
     const committed = await setStoredAuthSessionIfCurrent(nextSession, validationLease);
     return committed ? nextSession : null;
   } catch {
-    await clearStoredAuthSessionIfCurrent(validationLease);
+    try {
+      await clearStoredAuthSessionIfCurrent(validationLease);
+    } catch {
+      // The coordinator already invalidated this persisted pair for the current runtime.
+    }
     return null;
   }
 }

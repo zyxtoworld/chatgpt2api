@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import { scheduleOwnedMicrotask } from "../src/lib/query-lifecycle.js";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/image/page.tsx", import.meta.url)),
@@ -40,4 +41,26 @@ test("an unmounted quota load cannot publish a result or finish state", () => {
   if (owner.accepts(requestOwner)) events.push("finally");
 
   assert.deepEqual(events, []);
+});
+
+test("quota initialization replay starts only the current setup load", () => {
+  const scheduled = [];
+  const calls = [];
+  const setup = () => scheduleOwnedMicrotask(
+    () => calls.push("load"),
+    (callback) => scheduled.push(callback),
+  );
+
+  const cleanupFirst = setup();
+  cleanupFirst();
+  setup();
+  for (const callback of scheduled) callback();
+
+  assert.deepEqual(calls, ["load"]);
+});
+
+test("image quota production setup uses an owned microtask instead of a one-shot ref", () => {
+  assert.doesNotMatch(source, /didLoadQuotaRef/);
+  assert.match(source, /const cancelInitialQuotaLoad = scheduleOwnedMicrotask\(\(\) => loadQuota\(\)\)/);
+  assert.match(source, /cancelInitialQuotaLoad\(\)/);
 });

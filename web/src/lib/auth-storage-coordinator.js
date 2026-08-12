@@ -1,5 +1,6 @@
 export function createAuthStorageCoordinator({ keyName, sessionName, getItem, setItem, removeItem }) {
   let mutationEpoch = 0;
+  let sessionInvalidated = false;
   let tail = Promise.resolve();
 
   /**
@@ -26,6 +27,7 @@ export function createAuthStorageCoordinator({ keyName, sessionName, getItem, se
 
   function beginMutation() {
     mutationEpoch += 1;
+    sessionInvalidated = true;
     return { epoch: mutationEpoch };
   }
 
@@ -47,9 +49,11 @@ export function createAuthStorageCoordinator({ keyName, sessionName, getItem, se
           return false;
         }
       } catch (error) {
+        sessionInvalidated = true;
         await removeBoth();
         throw error;
       }
+      sessionInvalidated = false;
       return true;
     });
   }
@@ -57,7 +61,7 @@ export function createAuthStorageCoordinator({ keyName, sessionName, getItem, se
   /** @returns {Promise<{key: unknown, session: unknown} | null>} */
   function readPairIfCurrent(lease) {
     return enqueue(async () => {
-      if (!isCurrent(lease)) {
+      if (!isCurrent(lease) || sessionInvalidated) {
         return null;
       }
 
@@ -65,7 +69,7 @@ export function createAuthStorageCoordinator({ keyName, sessionName, getItem, se
         getItem(keyName),
         getItem(sessionName),
       ]);
-      return isCurrent(lease) ? { key, session } : null;
+      return isCurrent(lease) && !sessionInvalidated ? { key, session } : null;
     });
   }
 

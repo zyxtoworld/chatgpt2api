@@ -74,3 +74,45 @@ test("concurrent real validations both succeed regardless of login response orde
     assert.deepEqual(storage.state.values.get(authStore.AUTH_SESSION_STORAGE_KEY), oldSession);
   }
 });
+
+test("auth storage read failure resolves as logged out instead of rejecting", async () => {
+  storage.reset({
+    [authStore.AUTH_KEY_STORAGE_KEY]: "stored-key",
+    [authStore.AUTH_SESSION_STORAGE_KEY]: {
+      key: "stored-key",
+      role: "admin",
+      subjectId: "stored",
+      name: "Stored",
+    },
+  });
+  storage.state.failures.set("get", new Error("auth storage unavailable"));
+  api.reset();
+
+  assert.equal(await getValidatedAuthSession(), null);
+  assert.deepEqual(api.state.calls, []);
+});
+
+test("failed validation cannot revive a stored pair when cleanup also fails", async () => {
+  const staleSession = {
+    key: "stale-key",
+    role: "admin",
+    subjectId: "stale",
+    name: "Stale",
+  };
+  storage.reset();
+  await authStore.setStoredAuthSession(staleSession);
+  storage.state.failures.set("remove", new Error("auth storage remove unavailable"));
+  api.reset();
+  const login = api.queueLoginResponse();
+  const validation = getValidatedAuthSession();
+  await new Promise((resolve) => setImmediate(resolve));
+  login.reject(new Error("validation failed"));
+
+  assert.equal(await validation, null);
+  storage.state.failures.clear();
+  assert.equal(await authStore.getStoredAuthKey(), "");
+
+  const freshSession = { key: "fresh-key", role: "user", subjectId: "fresh", name: "Fresh" };
+  await authStore.setStoredAuthSession(freshSession);
+  assert.equal(await authStore.getStoredAuthKey(), freshSession.key);
+});

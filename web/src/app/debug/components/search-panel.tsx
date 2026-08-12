@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ExternalLink, Globe2, LoaderCircle, Search } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import { httpRequest } from "@/lib/request";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { normalizeSearchSources } from "@/lib/search-source-url";
 import { cn } from "@/lib/utils";
 
 import type { SearchResult } from "./types";
@@ -19,8 +20,6 @@ const normalizeMarkdown = (text: string) =>
     .replace(/\ue200[^\ue201]*$/g, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-
-const cleanUrl = (url: string) => url.replace(/[\ue200-\ue202].*$/g, "").trim();
 
 const sourceKind = (url: string) => {
   const host = (() => {
@@ -67,6 +66,7 @@ export function SearchPanel() {
   const [startedAt, setStartedAt] = useState(0);
   const searchOwnerRef = useRef(createLatestActionOwner());
   const searched = loading || !!result || !!error;
+  const safeSources = useMemo(() => normalizeSearchSources(result?.sources), [result?.sources]);
 
   useEffect(() => {
     const searchOwner = searchOwnerRef.current;
@@ -79,6 +79,13 @@ export function SearchPanel() {
     const timer = window.setInterval(() => setElapsedMs(Date.now() - startedAt), 100);
     return () => window.clearInterval(timer);
   }, [loading, startedAt]);
+
+  const handlePromptChange = (value: string) => {
+    setPrompt(value);
+    if (!loading) return;
+    searchOwnerRef.current.invalidate();
+    setLoading(false);
+  };
 
   const runSearch = async () => {
     const value = prompt.trim();
@@ -124,7 +131,7 @@ export function SearchPanel() {
           <img src="/openai.svg" alt="" aria-hidden="true" className="size-5 shrink-0 opacity-80 dark:invert" />
           <input
             value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
+            onChange={(event) => handlePromptChange(event.target.value)}
             placeholder="搜索网页"
             className={cn("min-w-0 flex-1 bg-transparent text-[15px] text-stone-900 outline-none placeholder:text-stone-400 dark:text-stone-100 dark:placeholder:text-stone-500", searched ? "h-8" : "h-10")}
           />
@@ -150,18 +157,18 @@ export function SearchPanel() {
               <div className="mb-5 flex flex-wrap items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
                 <span className="rounded-full border border-stone-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-white/[0.03]">{result.status || "done"}</span>
                 <span className="rounded-full border border-stone-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-white/[0.03]">{(elapsedMs / 1000).toFixed(2)}s</span>
-                <span className="rounded-full border border-stone-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-white/[0.03]">{result.sources?.length || 0} sources</span>
+                <span className="rounded-full border border-stone-200 bg-white px-3 py-1 dark:border-white/10 dark:bg-white/[0.03]">{safeSources.length} sources</span>
               </div>
               <div className="text-[15px]">
                 <MarkdownResult content={normalizeMarkdown(result.answer || "")} />
               </div>
             </div>
-            {result.sources?.length ? (
+            {safeSources.length ? (
               <aside className="lg:sticky lg:top-24 lg:self-start">
                 <div className="mb-3 text-sm font-semibold text-stone-900 dark:text-stone-100">来源</div>
                 <div className="divide-y divide-stone-200 dark:divide-white/10">
-                  {result.sources.map((source, index) => {
-                    const url = cleanUrl(source.url || "");
+                  {safeSources.map((source, index) => {
+                    const url = source.url;
                     const kind = sourceKind(url);
                     return (
                       <a key={`${url || index}`} href={url} target="_blank" rel="noreferrer" className="flex gap-3 py-3 text-xs transition hover:text-stone-950 dark:hover:text-stone-50">

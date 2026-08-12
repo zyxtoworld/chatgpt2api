@@ -4,6 +4,7 @@ import test from "node:test";
 
 import { applyImageConversationUpdate } from "../src/lib/image-conversation-update.js";
 import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner.js";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
 
 const source = readFileSync(new URL("../src/app/image/page.tsx", import.meta.url), "utf8");
 
@@ -24,6 +25,36 @@ function functionBody(signature, nextSignature) {
   return source.slice(start, end >= 0 ? end : source.length);
 }
 
+test("a history mutation fences an in-flight history load and permits a fresh load", () => {
+  const loadOwner = createLatestActionOwner();
+  const staleLoad = loadOwner.begin();
+
+  loadOwner.invalidate();
+  assert.equal(loadOwner.accepts(staleLoad), false);
+
+  const freshLoad = loadOwner.begin();
+  assert.equal(loadOwner.accepts(freshLoad), true);
+});
+
+test("image history production wiring fences reads before recovery or mutation commits", () => {
+  assert.match(source, /const historyLoadOwnerRef = useRef\(createLatestActionOwner\(\)\)/);
+  const loadBody = functionBody("const loadHistory = useCallback(async () => {", "// Handle bfcache");
+  assert.match(loadBody, /const requestOwner = historyLoadOwner\.begin\(\)/);
+  assert.match(loadBody, /recoverConversationHistory\(items, isCurrentRequest\)/);
+
+  const invalidateBody = functionBody("const invalidateHistoryLoad = useCallback", "const beginHistoryMutation = useCallback");
+  assert.match(invalidateBody, /historyLoadOwnerRef\.current\.invalidate\(\)/);
+  assert.match(invalidateBody, /setIsLoadingHistory\(false\)/);
+  const mutationBody = functionBody("const beginHistoryMutation = useCallback", "const persistConversation = useCallback");
+  assert.match(mutationBody, /invalidateHistoryLoad\(\)/);
+  assert.match(mutationBody, /historyMutationOwnerRef\.current\.begin\(\)/);
+  assert.doesNotMatch(source, /const mutationOwner = historyMutationOwner\.begin\(\)/);
+
+  const recoveryBody = functionBody("async function recoverConversationHistory", "function ImagePageContent");
+  assert.match(recoveryBody, /if \(changed && isCurrent\(\)\)/);
+  assert.match(recoveryBody, /syncConversationImageTasks\(normalized, isCurrent\)/);
+});
+
 test("image destructive actions have a component-lifetime owner", () => {
   assert.match(source, /const historyMutationOwnerRef = useRef\(createLifecycleActionOwner\(\)\)/);
   assert.match(source, /historyMutationOwner\.cancel\(\)/);
@@ -35,7 +66,7 @@ test("image destructive actions have a component-lifetime owner", () => {
   ]) {
     const body = functionBody(signature, nextSignature);
     assert.match(body, /const historyMutationOwner = historyMutationOwnerRef\.current;/);
-    assert.match(body, /const mutationOwner = historyMutationOwner\.begin\(\)/);
+    assert.match(body, /const mutationOwner = beginHistoryMutation\(\)/);
     assert.match(body, /historyMutationOwner\.accepts\(mutationOwner\)/);
   }
 });

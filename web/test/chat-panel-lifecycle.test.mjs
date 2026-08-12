@@ -19,8 +19,8 @@ test("ChatPanel owns the chat request and cancels it on unmount", () => {
 });
 
 test("clearing ChatPanel invalidates the current request and immediately clears loading", () => {
-  assert.match(source, /chatRequestGateRef\.current\.clear\(\)/);
-  assert.match(source, /chatRequestGateRef\.current\.clear\(\)[\s\S]*?setLoading\(false\)/);
+  assert.match(source, /const requestGate = chatRequestGateRef\.current;[\s\S]*?requestGate\.clear\(\)/);
+  assert.match(source, /requestGate\.clear\(\)[\s\S]*?setLoading\(false\)/);
 
   const owner = createLatestActionOwner();
   const requestOwner = owner.begin();
@@ -85,6 +85,41 @@ test("concurrent image reads share the active epoch, while clear and cancel inva
   assert.equal(gate.acceptsImageRead(next), true);
   gate.cancel();
   assert.equal(gate.acceptsImageRead(next), false);
+});
+
+test("stale image reads cannot clear the pending count of a newer chat epoch", () => {
+  const gate = createChatPanelRequestGate();
+  gate.activate();
+  let pending = 0;
+  const beginRead = () => {
+    const action = gate.beginImageRead();
+    pending += 1;
+    return action;
+  };
+  const settleRead = (action) => {
+    if (gate.acceptsImageRead(action)) pending = Math.max(0, pending - 1);
+  };
+
+  const first = beginRead();
+  const second = beginRead();
+  assert.equal(pending, 2);
+
+  gate.clear();
+  pending = 0;
+  const third = beginRead();
+  settleRead(first);
+  settleRead(second);
+  assert.equal(pending, 1);
+  settleRead(third);
+  assert.equal(pending, 0);
+});
+
+test("ChatPanel blocks send until every selected image is read", () => {
+  assert.match(source, /const \[pendingImageReads, setPendingImageReads\] = useState\(0\)/);
+  assert.match(source, /pendingImageReadsRef\.current \+= 1/);
+  assert.match(source, /if \(pendingImageReads > 0\)/);
+  assert.match(source, /disabled=\{loading \|\| pendingImageReads > 0 \|\| \(!input\.trim\(\) && !selectedImages\.length\)\}/);
+  assert.match(source, /requestGate\.clear\(\)[\s\S]*?pendingImageReadsRef\.current = 0[\s\S]*?setPendingImageReads\(0\)/);
 });
 
 test("async image reads are owned by ChatPanel lifetime and clear action", () => {

@@ -37,6 +37,7 @@ import {
   type OAuthLoginStartResponse,
 } from "@/lib/api";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { settleAccountJsonFiles } from "@/lib/account-json-file-selection";
 import { cn } from "@/lib/utils";
 
 type ImportMethod = "menu" | "token" | "session" | "codex-auth" | "account-json" | "oauth";
@@ -516,25 +517,23 @@ export function AccountImportDialog({
     const fileReadOwner = fileReadOwnerRef.current;
     const readAction = fileReadOwner.begin("account-json");
     try {
-      const results = await Promise.all(
-        files.map(async (file) => {
+      const selection = await settleAccountJsonFiles(
+        files,
+        async (file: File) => {
           const raw = await readFileAsText(file);
           const parsed = JSON.parse(raw) as unknown;
-          const accounts = getAccountJsonAccounts(parsed);
-          return {
-            accounts,
-          };
-        }),
+          return getAccountJsonAccounts(parsed);
+        },
       );
 
       if (!mountedRef.current || !fileReadOwner.accepts(readAction, "account-json")) {
         return;
       }
 
-      const accounts = results.flatMap((item) => item.accounts);
+      const accounts = selection.accounts as AccountImportPayload[];
       const tokens = accounts.map((item) => item.access_token);
       const parsedAccountCount = accounts.length;
-      const errorCount = results.filter((item) => item.accounts.length === 0).length;
+      const errorCount = selection.errorCount;
 
       if (parsedAccountCount === 0) {
         toast.error("这些账号 JSON 文件里没有读取到可用 access_token");

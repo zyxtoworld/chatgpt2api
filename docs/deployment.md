@@ -22,8 +22,7 @@ git --version
 
 | 路径 | 作用 |
 | --- | --- |
-| `chatgpt2api-config/config.json` | Docker Compose 使用的主配置、后台密钥、代理、图片、备份等配置 |
-| `config.json` | 源码运行和复制配置时使用的模板 |
+| `config.json` | Docker Compose 与源码运行共同使用的主配置，包含后台密钥、代理、图片、备份等配置 |
 | `.env` | Docker compose 环境变量 |
 | `data/` | 账号、日志、图片、任务记录等运行数据 |
 
@@ -38,15 +37,13 @@ git clone git@github.com:basketikun/chatgpt2api.git
 cd chatgpt2api
 ```
 
-Docker Compose 只挂载专用配置目录，不会把项目根目录、`.env`、备份或其他服务文件暴露给应用容器。首次启动先创建该目录并复制配置模板：
+Docker Compose 将项目根目录的 `config.json` 固定挂载到容器内 `/app/config.json`，不会挂载整个项目目录。首次启动前收紧配置文件权限：
 
 ```bash
-mkdir -p chatgpt2api-config
-cp config.json chatgpt2api-config/config.json
-chmod 600 chatgpt2api-config/config.json
+chmod 600 config.json
 ```
 
-设置 `chatgpt2api-config/config.json` 中的 `auth-key`，或在 `docker-compose.yml` 中配置：
+设置 `config.json` 中的 `auth-key`，或在 `docker-compose.yml` 中配置：
 
 ```yaml
 environment:
@@ -200,13 +197,13 @@ environment:
 
 ```bash
 mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz docker-compose*.yml chatgpt2api-config .env data
+tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz docker-compose*.yml config.json .env data
 ```
 
 如果没有 `.env`，可以去掉：
 
 ```bash
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz docker-compose*.yml chatgpt2api-config data
+tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz docker-compose*.yml config.json data
 ```
 
 也可以在后台设置页配置 Cloudflare R2 备份，用于定时备份关键数据。
@@ -223,7 +220,7 @@ cd chatgpt2api
 
 ```bash
 mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz docker-compose*.yml chatgpt2api-config .env data
+tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz docker-compose*.yml config.json .env data
 ```
 
 拉取最新代码和镜像：
@@ -253,7 +250,7 @@ cd chatgpt2api
 
 ```bash
 mkdir -p backups
-tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz docker-compose*.yml chatgpt2api-config .env data
+tar -czf backups/chatgpt2api-$(date +%Y%m%d-%H%M%S).tgz docker-compose*.yml config.json .env data
 ```
 
 拉取最新代码并重新构建：
@@ -365,4 +362,4 @@ docker compose -f docker-compose.warp.yml restart
 docker image prune
 ```
 
-不要直接删除 `data/`、`chatgpt2api-config/`、`.env`，除非已经确认有可用备份。源码根目录的 `config.json` 仅作为模板保留。
+不要直接删除 `data/`、`config.json`、`.env`，除非已经确认有可用备份。

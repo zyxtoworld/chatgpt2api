@@ -11,10 +11,12 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { formatElapsedSeconds, getElapsedSeconds } from "@/lib/elapsed-display";
 import { filenameFromUrl } from "@/lib/file-display";
+import { createLifecycleActionOwner, observeLifecycleAction } from "@/lib/lifecycle-action-owner";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
-import { mergeDeletedEditableFileIds } from "@/lib/editable-file-history-state";
+import { mergeDeletedEditableFileIds, resolveDeletedEditableFileIds } from "@/lib/editable-file-history-state";
 import { httpRequest } from "@/lib/request";
 import { createSerialPoller } from "@/lib/serial-poll";
+import { commitSynchronousSnapshot } from "@/lib/synchronous-snapshot";
 import { cn } from "@/lib/utils";
 import {
   listDeletedEditableFileIds,
@@ -89,6 +91,7 @@ function ResultFile({ href, icon, label }: { href?: string; icon: ReactNode; lab
 export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageRequired }: Props) {
   const [prompt, setPrompt] = useState(defaultPrompt);
   const [images, setImages] = useState<string[]>([]);
+  const [pendingImageReads, setPendingImageReads] = useState(0);
   const [tasks, setTasks] = useState<EditableFileTask[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -102,7 +105,10 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: "one"; id: string } | { type: "all"; ids: string[] } | null>(null);
   const taskFetchRequestRef = useRef(0);
   const submitOwnerRef = useRef(createLatestActionOwner());
-  const imageReadOwnerRef = useRef(createLatestActionOwner());
+  const imageReadOwnerRef = useRef(createLifecycleActionOwner());
+  const historyPersistenceOwnerRef = useRef(createLifecycleActionOwner());
+  const pendingImageReadsRef = useRef(0);
+  const draftsRef = useRef<Record<string, EditableFileDraft>>({});
   const deletedIdsRef = useRef<Set<string>>(new Set());
   const visibleTasks = useMemo(() => tasks.filter((task) => task.kind === kind && !deletedIds.has(taskIdOf(task))).slice(0, MAX_HISTORY), [deletedIds, kind, tasks]);
   const selectedTask = selectedId === DRAFT_ID ? null : visibleTasks.find((task) => taskIdOf(task) === selectedId) || visibleTasks[0] || null;
@@ -111,14 +117,23 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
   const selectedDraft = selectedId ? drafts[selectedId] : undefined;
   const selectedPromptPreview = selectedId ? visibleTasks.find((task) => taskIdOf(task) === selectedId)?.prompt_preview : undefined;
 
+  const commitDrafts = useCallback((next: Record<string, EditableFileDraft> | ((current: Record<string, EditableFileDraft>) => Record<string, EditableFileDraft>)) => {
+    const resolved = commitSynchronousSnapshot(draftsRef, next);
+    setDrafts(resolved);
+    return resolved;
+  }, []);
+
   useEffect(() => {
     const submitOwner = submitOwnerRef.current;
     const imageReadOwner = imageReadOwnerRef.current;
+    const historyPersistenceOwner = historyPersistenceOwnerRef.current;
     submitOwner.activate();
     imageReadOwner.activate();
+    historyPersistenceOwner.activate();
     return () => {
       submitOwner.cancel();
       imageReadOwner.cancel();
+      historyPersistenceOwner.cancel();
     };
   }, []);
 
@@ -136,9 +151,12 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
       const path = taskIds.length ? `/v1/editable-file-tasks?ids=${taskIds.map(encodeURIComponent).join(",")}` : "/v1/editable-file-tasks";
       const result = await httpRequest<{ items: EditableFileTask[]; missing_ids?: string[] }>(path);
       const missingIds = result.missing_ids || [];
-      const storedHidden = await listDeletedEditableFileIds(kind);
-      const hidden = mergeDeletedEditableFileIds(deletedIdsRef.current, [...storedHidden]);
+      const { ids: hidden, storageFailed } = await resolveDeletedEditableFileIds(
+        deletedIdsRef.current,
+        () => listDeletedEditableFileIds(kind),
+      );
       if (requestId !== taskFetchRequestRef.current) return;
+      if (storageFailed) setError("本地历史记录读取失败");
       setTasks((current) => (taskIds.length ? mergeTasks(removeTasks(current, missingIds), result.items || []) : (result.items || [])).filter((task) => !hidden.has(taskIdOf(task))));
       setSelectedId((current) => missingIds.includes(current) ? "" : current);
     } catch (err) {
@@ -151,15 +169,26 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
 
   useEffect(() => {
     let cancelled = false;
-    void listEditableFileDrafts(kind).then((nextDrafts) => {
-      if (!cancelled) setDrafts(nextDrafts);
+    const historyPersistenceOwner = historyPersistenceOwnerRef.current;
+    void observeLifecycleAction(historyPersistenceOwner, () => listEditableFileDrafts(kind), {
+      onSuccess: (nextDrafts: Record<string, EditableFileDraft>) => {
+        if (!cancelled) commitDrafts((current) => ({ ...nextDrafts, ...current }));
+      },
+      onError: () => {
+        if (!cancelled) setError("本地历史记录读取失败");
+      },
     });
-    void listDeletedEditableFileIds(kind).then((nextDeletedIds) => {
-      if (!cancelled) {
-        const mergedDeletedIds = mergeDeletedEditableFileIds(deletedIdsRef.current, [...nextDeletedIds]);
-        deletedIdsRef.current = mergedDeletedIds;
-        setDeletedIds(mergedDeletedIds);
-      }
+    void observeLifecycleAction(historyPersistenceOwner, () => listDeletedEditableFileIds(kind), {
+      onSuccess: (nextDeletedIds: Set<string>) => {
+        if (!cancelled) {
+          const mergedDeletedIds = mergeDeletedEditableFileIds(deletedIdsRef.current, [...nextDeletedIds]);
+          deletedIdsRef.current = mergedDeletedIds;
+          setDeletedIds(mergedDeletedIds);
+        }
+      },
+      onError: () => {
+        if (!cancelled) setError("本地历史记录读取失败");
+      },
     });
     queueMicrotask(() => {
       if (!cancelled) void fetchTasks();
@@ -168,7 +197,19 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
       cancelled = true;
       taskFetchRequestRef.current += 1;
     };
-  }, [fetchTasks, kind]);
+  }, [commitDrafts, fetchTasks, kind]);
+
+  useEffect(() => {
+    imageReadOwnerRef.current.invalidate();
+    pendingImageReadsRef.current = 0;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setPendingImageReads(pendingImageReadsRef.current);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -225,6 +266,8 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
     if (!files?.length) return;
     const imageReadOwner = imageReadOwnerRef.current;
     const readOwner = imageReadOwner.begin();
+    pendingImageReadsRef.current += 1;
+    setPendingImageReads(pendingImageReadsRef.current);
     try {
       const values = await Promise.all(Array.from(files).map(readFile));
       if (imageReadOwner.accepts(readOwner)) {
@@ -234,19 +277,25 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
       if (imageReadOwner.accepts(readOwner)) {
         setError(err instanceof Error ? err.message : String(err));
       }
+    } finally {
+      if (imageReadOwner.accepts(readOwner)) {
+        pendingImageReadsRef.current = Math.max(0, pendingImageReadsRef.current - 1);
+        setPendingImageReads(pendingImageReadsRef.current);
+      }
     }
   };
 
   const persistDrafts = (updater: (current: Record<string, EditableFileDraft>) => Record<string, EditableFileDraft>) => {
-    setDrafts((current) => {
-      const next = updater(current);
-      void saveEditableFileDrafts(kind, next);
-      return next;
+    const next = commitDrafts(updater);
+    void observeLifecycleAction(historyPersistenceOwnerRef.current, () => saveEditableFileDrafts(kind, next), {
+      onError: () => setError("本地历史记录保存失败"),
     });
   };
 
   const createDraft = () => {
     imageReadOwnerRef.current.invalidate();
+    pendingImageReadsRef.current = 0;
+    setPendingImageReads(0);
     submitOwnerRef.current.invalidate();
     setSubmitting(false);
     setError("");
@@ -257,6 +306,8 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
 
   const clearImages = () => {
     imageReadOwnerRef.current.invalidate();
+    pendingImageReadsRef.current = 0;
+    setPendingImageReads(0);
     setImages([]);
   };
 
@@ -272,7 +323,9 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
     setPolling(false);
     const nextDeleted = mergeDeletedEditableFileIds(deletedIdsRef.current, [id]);
     deletedIdsRef.current = nextDeleted;
-    void saveDeletedEditableFileIds(kind, nextDeleted);
+    void observeLifecycleAction(historyPersistenceOwnerRef.current, () => saveDeletedEditableFileIds(kind, nextDeleted), {
+      onError: () => setError("本地历史记录保存失败"),
+    });
     setDeletedIds(nextDeleted);
     setTasks((current) => current.filter((task) => taskIdOf(task) !== id));
     persistDrafts((current) => {
@@ -292,7 +345,9 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
     setSubmitting(false);
     const nextDeleted = mergeDeletedEditableFileIds(deletedIdsRef.current, ids);
     deletedIdsRef.current = nextDeleted;
-    void saveDeletedEditableFileIds(kind, nextDeleted);
+    void observeLifecycleAction(historyPersistenceOwnerRef.current, () => saveDeletedEditableFileIds(kind, nextDeleted), {
+      onError: () => setError("本地历史记录保存失败"),
+    });
     setDeletedIds(nextDeleted);
     setTasks((current) => current.filter((task) => task.kind !== kind || !ids.includes(taskIdOf(task))));
     persistDrafts((current) => {
@@ -311,6 +366,10 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
   };
 
   const submit = async () => {
+    if (pendingImageReads > 0) {
+      setError("请等待图片读取完成");
+      return;
+    }
     const submitOwner = submitOwnerRef.current;
     const requestOwner = submitOwner.begin(kind);
     setError("");
@@ -342,6 +401,8 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
   const refreshAll = () => void fetchTasks();
   const selectTask = (id: string) => {
     imageReadOwnerRef.current.invalidate();
+    pendingImageReadsRef.current = 0;
+    setPendingImageReads(0);
     submitOwnerRef.current.invalidate();
     setSubmitting(false);
     setRenamingId("");
@@ -436,7 +497,7 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
       <section className="flex min-h-0 flex-col border-b border-stone-200 dark:border-white/10 lg:border-r lg:border-b-0">
         <div className="flex h-14 items-center justify-between border-b border-stone-200 px-5 dark:border-white/10">
           <h2 className="text-sm font-semibold text-stone-950 dark:text-stone-50">{title}</h2>
-          <Button size="sm" onClick={() => void submit()} disabled={submitting || running}>
+          <Button size="sm" onClick={() => void submit()} disabled={submitting || running || pendingImageReads > 0}>
             {submitting ? <LoaderCircle className="animate-spin" /> : <Play />}
             生成
           </Button>

@@ -27,3 +27,17 @@ export function createLifecycleActionOwner() {
     },
   };
 }
+
+export async function observeLifecycleAction(owner, operation, handlers = {}) {
+  const action = owner.begin();
+  try {
+    const value = await operation();
+    if (owner.accepts(action)) {
+      handlers.onSuccess?.(value);
+    }
+  } catch (error) {
+    if (owner.accepts(action)) {
+      handlers.onError?.(error);
+    }
+  }
+}

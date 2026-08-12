@@ -1,5 +1,13 @@
 import { createLatestActionOwner } from "./latest-action-owner.js";
 
+export async function runCurrentProxyFollowup(saveConfig, accepts, followup) {
+  const saved = await saveConfig();
+  if (!saved || !accepts()) {
+    return { started: false };
+  }
+  return { started: true, value: await followup() };
+}
+
 export function createProxyRuntimeRequestGate() {
   const proxy = createLatestActionOwner();
   const clearance = createLatestActionOwner();

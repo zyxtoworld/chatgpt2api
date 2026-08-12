@@ -39,3 +39,34 @@ test("each login page setup reactivates its captured gate after cleanup replay",
   assert.ok(cancelIndex > activateIndex);
   assert.doesNotMatch(source, /return \(\) => loginGateRef\.current\.cancel\(\)/);
 });
+
+test("editing the credential invalidates a pending login before changing the field", () => {
+  const handlerStart = source.indexOf("const handleAuthKeyChange");
+  const handlerEnd = source.indexOf("const handleLogin", handlerStart);
+  assert.ok(handlerStart >= 0, "missing auth key change handler");
+  assert.ok(handlerEnd > handlerStart, "missing auth key change handler boundary");
+
+  const handler = source.slice(handlerStart, handlerEnd);
+  const invalidateIndex = handler.indexOf("loginGateRef.current.invalidate()");
+  const clearBusyIndex = handler.indexOf("setIsSubmitting(false)");
+  const updateFieldIndex = handler.indexOf("setAuthKey(value)");
+  assert.ok(invalidateIndex >= 0, "credential edits must invalidate the pending login lease");
+  assert.ok(clearBusyIndex > invalidateIndex, "credential edits must release the old login busy state");
+  assert.ok(updateFieldIndex >= 0, "credential edits must update the field");
+  assert.match(source, /onChange=\{\(event\) => handleAuthKeyChange\(event\.target\.value\)\}/);
+});
+
+test("login checks single-writer admission before starting the request", () => {
+  const handlerStart = source.indexOf("const handleLogin");
+  const handlerEnd = source.indexOf("if (isCheckingAuth)", handlerStart);
+  assert.ok(handlerStart >= 0, "missing login handler");
+  assert.ok(handlerEnd > handlerStart, "missing login handler boundary");
+
+  const handler = source.slice(handlerStart, handlerEnd);
+  const beginIndex = handler.indexOf("loginGateRef.current.begin(normalizedAuthKey)");
+  const rejectedIndex = handler.indexOf("if (!loginOwner) return", beginIndex);
+  const requestIndex = handler.indexOf("await login(normalizedAuthKey)");
+  assert.ok(beginIndex >= 0, "missing login admission");
+  assert.ok(rejectedIndex > beginIndex, "rejected duplicate login must stop before the request");
+  assert.ok(requestIndex > rejectedIndex, "network login must start only after admission");
+});

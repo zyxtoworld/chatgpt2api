@@ -10,11 +10,13 @@ export function reset() {
 
 export function queueLoginResponse() {
   let resolve;
-  const promise = new Promise((nextResolve) => {
+  let reject;
+  const promise = new Promise((nextResolve, nextReject) => {
     resolve = nextResolve;
+    reject = nextReject;
   });
   state.responses.push(promise);
-  return { resolve };
+  return { resolve, reject };
 }
 
 export async function login(key) {

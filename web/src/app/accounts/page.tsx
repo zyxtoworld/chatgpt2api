@@ -59,6 +59,7 @@ import {
   type RefreshProgressResponse,
 } from "@/lib/api";
 import { createCancelableProgress, createSerialPoller, isProgressTerminal } from "@/lib/serial-poll";
+import { writeClipboardText } from "@/lib/clipboard";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { createMutationRequestGate } from "@/lib/mutation-request-gate";
 import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
@@ -145,6 +146,14 @@ function downloadTokens(accounts: Account[]) {
   link.download = `accounts-${Date.now()}.txt`;
   link.click();
   URL.revokeObjectURL(url);
+}
+
+async function copyText(value: string, successMessage: string) {
+  if (await writeClipboardText(value)) {
+    toast.success(successMessage);
+    return;
+  }
+  toast.error("复制失败，请检查浏览器剪贴板权限");
 }
 
 function displayAccountType(account: Account) {
@@ -1039,8 +1048,7 @@ function AccountsPageContent() {
                     type="button"
                     className="inline-flex cursor-pointer items-center rounded-full border border-stone-200 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50"
                     onClick={() => {
-                      void navigator.clipboard.writeText(model.id);
-                      toast.success("模型名已复制");
+                      void copyText(model.id, "模型名已复制");
                     }}
                     title={`点击复制 ${model.id}`}
                   >
@@ -1247,8 +1255,7 @@ function AccountsPageContent() {
                               type="button"
                               className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => {
-                                void navigator.clipboard.writeText(account.access_token);
-                                toast.success("token 已复制");
+                                void copyText(account.access_token, "token 已复制");
                               }}
                             >
                               <Copy className="size-4" />

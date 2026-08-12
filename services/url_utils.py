@@ -1,6 +1,60 @@
 from __future__ import annotations
 
+import ipaddress
+import re
 from urllib.parse import urlsplit, urlunsplit
+
+
+_DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def _canonical_public_hostname(hostname: str) -> str:
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            ascii_hostname = hostname.removesuffix(".").encode("idna").decode("ascii").lower()
+        except (UnicodeError, ValueError):
+            return ""
+        if not ascii_hostname or len(ascii_hostname) > 253:
+            return ""
+        labels = ascii_hostname.split(".")
+        if any(not _DNS_LABEL_RE.fullmatch(label) for label in labels):
+            return ""
+        return ascii_hostname
+    if "%" in hostname:
+        return ""
+    return address.compressed
+
+
+def normalize_public_http_url(value: object) -> str:
+    """Return a canonical, credential-free HTTP(S) link without a fragment."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if (
+        not text
+        or "\\" in text
+        or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in text)
+    ):
+        return ""
+    try:
+        parsed = urlsplit(text)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+            return ""
+        port = parsed.port
+        hostname = _canonical_public_hostname(parsed.hostname or "")
+        if not hostname:
+            return ""
+        authority = f"[{hostname}]" if ":" in hostname else hostname
+        if port is not None:
+            authority = f"{authority}:{port}"
+        return urlunsplit((scheme, authority, parsed.path, parsed.query, ""))
+    except (TypeError, ValueError):
+        return ""
 
 
 def redact_url_credentials(value: object) -> str:

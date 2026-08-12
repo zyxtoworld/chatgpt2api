@@ -14,8 +14,10 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
+import { writeClipboardText } from "@/lib/clipboard";
 import { createMutationRequestGate } from "@/lib/mutation-request-gate";
 import { finishMutationAndRefresh } from "@/lib/mutation-refresh-controller";
+import { loadManagedImagesWithTags } from "@/lib/image-manager-load";
 import { createRequestGate } from "@/lib/query-request-gate";
 import { createReplaceableTimeout } from "@/lib/replaceable-timeout";
 import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
@@ -30,6 +32,14 @@ function formatSize(size: number) {
 
 function imageKey(item: ManagedImage) {
   return item.rel || item.url;
+}
+
+async function copyImageUrl(url: string) {
+  if (await writeClipboardText(url)) {
+    toast.success("图片地址已复制");
+    return;
+  }
+  toast.error("复制失败，请检查浏览器剪贴板权限");
 }
 
 const imageQueryKey = (startDate: string, endDate: string) => JSON.stringify([startDate, endDate]);
@@ -175,14 +185,14 @@ function ImageManagerContent() {
     setIsLoading(true);
     const accepts = () => imageMutationGateRef.current.acceptsQuery(queryOwner) && imageRequestGateRef.current.isCurrent(request);
     try {
-      const [data, tagsData] = await Promise.all([
-        fetchManagedImages({ start_date: query.startDate, end_date: query.endDate }),
-        fetchImageTags(),
-      ]);
+      const { data, tags } = await loadManagedImagesWithTags(
+        () => fetchManagedImages({ start_date: query.startDate, end_date: query.endDate }),
+        () => fetchImageTags(),
+      );
       if (!accepts()) return;
       setItems(data.items);
-      setAllTags(tagsData.tags);
-      setSelectedPaths((current) => current.filter((path) => data.items.some((item) => imageKey(item) === path)));
+      setAllTags(tags);
+      setSelectedPaths((current) => current.filter((path) => data.items.some((item: ManagedImage) => imageKey(item) === path)));
       setPage(1);
     } catch (error) {
       if (!accepts()) return;
@@ -702,8 +712,7 @@ function ImageManagerContent() {
                         size="icon"
                         className="size-8 rounded-lg text-stone-400 hover:bg-stone-100 hover:text-stone-700"
                         onClick={() => {
-                          void navigator.clipboard.writeText(item.url);
-                          toast.success("图片地址已复制");
+                          void copyImageUrl(item.url);
                         }}
                       >
                         <Copy className="size-4" />

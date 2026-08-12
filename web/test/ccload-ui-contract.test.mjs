@@ -24,13 +24,11 @@ test("ccLoad uses stable connection and channel wording without a pinned preview
   assert.doesNotMatch(serviceSource, /ccLoad[^\n]*preview/i);
 });
 
-test("ccLoad reads chatgpt2api models together with remote channels", () => {
-  assert.match(componentSource, /fetchModels/);
-  assert.match(
-    componentSource,
-    /Promise\.all\(\[\s*fetchCCLoadChannels\(server\.id\),\s*fetchModels\(\),?\s*\]\)/,
-  );
-  assert.match(componentSource, /replaceCCLoadChannelModels\(normalizeChannels\(data\.channels\), modelData\.data\)/);
+test("ccLoad uses each remote channel model catalog without a global model overwrite", () => {
+  assert.match(componentSource, /normalizeCCLoadChannels\(data\.channels\)/);
+  assert.match(componentSource, /await fetchCCLoadChannels\(server\.id\)/);
+  assert.doesNotMatch(componentSource, /fetchModels/);
+  assert.doesNotMatch(componentSource, /replaceCCLoadChannelModels/);
 });
 
 test("ccLoad card and dialogs keep the CPA visual structure", () => {
