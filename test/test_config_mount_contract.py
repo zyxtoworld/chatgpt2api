@@ -57,6 +57,13 @@ def test_compose_mounts_config_parent_directory_for_atomic_replacement() -> None
         assert "/opt/services:/app/config_mount" not in text
 
 
+def test_container_runtime_uses_the_frozen_environment_without_syncing_dependencies() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "RUN uv sync --frozen --no-dev --no-install-project" in dockerfile
+    assert 'CMD ["uv", "run", "--no-sync", "uvicorn"' in dockerfile
+
+
 def test_settings_endpoint_persists_global_proxy_through_real_config_store(tmp_path: Path) -> None:
     config_path = tmp_path / "config_mount" / "config.json"
     config_path.parent.mkdir()
