@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Iterator
+from typing import Callable, Iterator
 
 from curl_cffi.requests import Session
 
@@ -33,8 +33,13 @@ from utils.log import logger
 
 CCLOAD_CONFIG_FILE = DATA_DIR / "ccload_config.json"
 CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS = 90.0
+CCLOAD_FETCH_WORKERS = 16
 CCLOAD_MODEL_CATALOG_WORKERS = 8
 CCLOAD_MODEL_BATCH_LIMIT = 50
+_CCLOAD_FETCH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=CCLOAD_FETCH_WORKERS,
+    thread_name_prefix="ccload-fetch",
+)
 
 
 class CCLoadError(RuntimeError):
@@ -556,19 +561,52 @@ def _channel_model_ids(access_token: str, *, deadline: float | None = None) -> l
     ))
 
 
-def fetch_remote_credentials(server: dict, channel_ids: list[str]) -> tuple[list[dict], list[dict]]:
+def _fetch_remote_credential_for_import(
+        base_url: str,
+        headers: dict[str, str],
+        channel_id: str,
+) -> dict:
+    session = Session(verify=True)
+    try:
+        return _fetch_remote_credential(session, base_url, headers, channel_id)
+    finally:
+        session.close()
+
+
+def fetch_remote_credentials(
+        server: dict,
+        channel_ids: list[str],
+        *,
+        on_progress: Callable[[str, str | None], None] | None = None,
+) -> tuple[list[dict], list[dict]]:
     selected = list(dict.fromkeys(_clean(value) for value in channel_ids if _clean(value)))
     if not selected or any(not value.isdecimal() or int(value) <= 0 for value in selected):
         raise CCLoadError("ccLoad channel selection is invalid")
 
     credentials: list[dict] = []
     errors: list[dict] = []
-    with _admin_session(server) as (session, base_url, headers):
-        for channel_id in selected:
-            try:
-                credentials.append(_fetch_remote_credential(session, base_url, headers, channel_id))
-            except Exception:
-                errors.append({"name": channel_id, "error": "credential unavailable"})
+    with _admin_session(server) as (_session, base_url, headers):
+        for offset in range(0, len(selected), CCLOAD_FETCH_WORKERS):
+            batch = selected[offset:offset + CCLOAD_FETCH_WORKERS]
+            future_map = {
+                _CCLOAD_FETCH_EXECUTOR.submit(
+                    _fetch_remote_credential_for_import,
+                    base_url,
+                    headers,
+                    channel_id,
+                ): channel_id
+                for channel_id in batch
+            }
+            for future in as_completed(future_map):
+                channel_id = future_map[future]
+                error: str | None = None
+                try:
+                    credentials.append(future.result())
+                except Exception:
+                    error = "credential unavailable"
+                    errors.append({"name": channel_id, "error": error})
+                if on_progress is not None:
+                    on_progress(channel_id, error)
     return credentials, errors
 
 
@@ -628,13 +666,34 @@ class CCLoadImportService:
 
     def _run_import(self, server_id: str, server: dict, channel_ids: list[str]) -> None:
         self._update_job(server_id, status="running")
+        completed_count = 0
+        failed_count = 0
+
+        def record_progress(channel_id: str, error: str | None) -> None:
+            nonlocal completed_count, failed_count
+            completed_count += 1
+            current = self._config.get_import_job(server_id) or {}
+            updates: dict[str, object] = {"completed": completed_count}
+            if error is not None:
+                failed_count += 1
+                updates["failed"] = failed_count
+                updates["errors"] = canonicalize_import_job_errors([
+                    *(current.get("errors") or []),
+                    {"name": channel_id, "error": error},
+                ])
+            self._update_job(server_id, **updates)
+
         try:
-            credentials, errors = fetch_remote_credentials(server, channel_ids)
+            credentials, errors = fetch_remote_credentials(
+                server,
+                channel_ids,
+                on_progress=record_progress,
+            )
         except Exception:
             credentials = []
             errors = [{"name": channel_id, "error": "credential unavailable"} for channel_id in channel_ids]
 
-        failure_count = min(len(channel_ids), len(errors))
+        failure_count = min(len(channel_ids), max(failed_count, len(errors)))
         safe_errors = canonicalize_import_job_errors(errors)
         if not credentials:
             safe_errors = safe_errors or canonicalize_import_job_errors(

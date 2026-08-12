@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -439,6 +440,71 @@ class CCLoadServiceContractTests(unittest.TestCase):
         )
         self.assertTrue(_FakeCCLoadSession.instances[0].closed)
 
+    def test_credential_import_uses_one_admin_login_and_worker_sized_batches(self) -> None:
+        observations: list[int] = []
+        progress: list[tuple[str, str | None]] = []
+        admin_sessions = 0
+
+        class FakeFuture:
+            def __init__(self, function, args, kwargs) -> None:
+                self.function = function
+                self.args = args
+                self.kwargs = kwargs
+
+            def result(self):
+                return self.function(*self.args, **self.kwargs)
+
+        class RecordingExecutor:
+            def __init__(self) -> None:
+                self.submitted: list[FakeFuture] = []
+
+            def submit(self, function, *args, **kwargs):
+                future = FakeFuture(function, args, kwargs)
+                self.submitted.append(future)
+                return future
+
+        class WorkerSession:
+            def __init__(self, **_kwargs) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        @contextmanager
+        def admin_session(_server, **_kwargs):
+            nonlocal admin_sessions
+            admin_sessions += 1
+            yield object(), "https://ccload.example.test", {"Authorization": "Bearer admin-session"}
+
+        def fetch_credential(_session, _base_url, _headers, channel_id: str, **_kwargs):
+            return {"access_token": f"token-{channel_id}", "plan_type": "free"}
+
+        def recording_as_completed(futures):
+            observations.append(len(futures))
+            return iter(futures)
+
+        executor = RecordingExecutor()
+        channel_ids = [str(index) for index in range(1, 34)]
+        with (
+            mock.patch.object(ccload_module, "_admin_session", side_effect=admin_session),
+            mock.patch.object(ccload_module, "Session", WorkerSession),
+            mock.patch.object(ccload_module, "_fetch_remote_credential", side_effect=fetch_credential),
+            mock.patch.object(ccload_module, "_CCLOAD_FETCH_EXECUTOR", executor, create=True),
+            mock.patch.object(ccload_module, "as_completed", side_effect=recording_as_completed),
+        ):
+            credentials, errors = ccload_module.fetch_remote_credentials(
+                self.server,
+                channel_ids,
+                on_progress=lambda channel_id, error: progress.append((channel_id, error)),
+            )
+
+        self.assertEqual(admin_sessions, 1)
+        self.assertEqual(observations, [16, 16, 1])
+        self.assertEqual(len(executor.submitted), 33)
+        self.assertEqual(len(credentials), 33)
+        self.assertEqual(errors, [])
+        self.assertEqual(progress, [(channel_id, None) for channel_id in channel_ids])
+
     def test_rejects_non_string_or_malformed_codex_credential_fields(self) -> None:
         valid = {
             "id_token": "id-token-secret",
@@ -830,6 +896,67 @@ class CCLoadPersistenceAndImportContractTests(unittest.TestCase):
                 "user@example.test",
             ):
                 self.assertNotIn(secret, persisted)
+
+    def test_import_persists_progress_after_each_ccload_credential_result(self) -> None:
+        credential = {
+            "id_token": "id-token-secret",
+            "access_token": "access-token-secret",
+            "refresh_token": "refresh-token-secret",
+            "account_id": "account-1",
+            "email": "user@example.test",
+            "type": "codex",
+            "expired": "2027-08-09T12:00:00Z",
+            "plan_type": "free",
+        }
+        snapshots: list[tuple[int, int]] = []
+        with TemporaryDirectory() as temp_dir:
+            config = ccload_module.CCLoadConfig(Path(temp_dir) / "ccload_config.json")
+            server = config.add_server(
+                name="ccLoad",
+                base_url="https://ccload.example.test",
+                password="admin-password-secret",
+            )
+            service = ccload_module.CCLoadImportService(config)
+            job = {
+                "job_id": "progress-job",
+                "status": "pending",
+                "created_at": "2026-08-13T00:00:00+00:00",
+                "updated_at": "2026-08-13T00:00:00+00:00",
+                "total": 3,
+                "completed": 0,
+                "added": 0,
+                "skipped": 0,
+                "refreshed": 0,
+                "failed": 0,
+                "errors": [],
+            }
+            config.set_import_job(server["id"], job)
+
+            def fetch_credentials(_server, _channel_ids, *, on_progress):
+                on_progress("1", None)
+                current = config.get_import_job(server["id"])
+                snapshots.append((current["completed"], current["failed"]))
+                on_progress("2", "credential unavailable")
+                current = config.get_import_job(server["id"])
+                snapshots.append((current["completed"], current["failed"]))
+                on_progress("3", None)
+                current = config.get_import_job(server["id"])
+                snapshots.append((current["completed"], current["failed"]))
+                return [credential, {**credential, "access_token": "access-token-secret-2"}], [
+                    {"name": "2", "error": "credential unavailable"},
+                ]
+
+            with (
+                mock.patch.object(ccload_module, "fetch_remote_credentials", side_effect=fetch_credentials),
+                mock.patch.object(ccload_module, "account_service", _RecordingAccountService()),
+            ):
+                service._run_import(server["id"], server, ["1", "2", "3"])
+
+            self.assertEqual(snapshots, [(1, 0), (2, 1), (3, 1)])
+            final_job = config.get_import_job(server["id"])
+            self.assertEqual(final_job["status"], "completed")
+            self.assertEqual(final_job["completed"], 3)
+            self.assertEqual(final_job["failed"], 1)
 
     def test_import_failure_persists_only_fixed_error(self) -> None:
         with TemporaryDirectory() as temp_dir:
