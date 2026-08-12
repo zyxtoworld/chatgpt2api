@@ -232,6 +232,44 @@ class CCLoadServiceContractTests(unittest.TestCase):
         self.assertEqual([backend.access_token for backend in PerChannelBackend.instances], ["token-1", "token-2"])
         self.assertTrue(all(backend.closed for backend in PerChannelBackend.instances))
 
+    def test_one_unavailable_channel_does_not_hide_other_channel_catalogs(self) -> None:
+        class MixedChannelSession(_FakeCCLoadSession):
+            instances: list["MixedChannelSession"] = []
+
+            def get(self, url: str, **kwargs):
+                self.calls.append(("GET", url, kwargs))
+                if not url.endswith("/admin/channels"):
+                    raise AssertionError(f"unexpected GET {url}")
+                return _FakeResponse({
+                    "success": True,
+                    "data": [
+                        {"id": 1, "name": "Disabled", "auth_type": "codex_oauth", "enabled": False, "codex_plan_type": "free"},
+                        {"id": 2, "name": "Broken", "auth_type": "codex_oauth", "enabled": True, "codex_plan_type": "free"},
+                        {"id": 3, "name": "Pro", "auth_type": "codex_oauth", "enabled": True, "codex_plan_type": "pro"},
+                    ],
+                    "count": 3,
+                })
+
+        credential_calls: list[str] = []
+
+        def fetch_credential(_session, _base_url, _headers, channel_id: str):
+            credential_calls.append(channel_id)
+            if channel_id == "2":
+                raise ccload_module.CCLoadError("fixture credential failure")
+            return {"access_token": f"token-{channel_id}"}
+
+        with (
+            mock.patch.object(ccload_module, "Session", MixedChannelSession),
+            mock.patch.object(ccload_module, "_fetch_remote_credential", side_effect=fetch_credential),
+            mock.patch.object(ccload_module, "_channel_model_ids", return_value=["gpt-pro-model"]) as model_ids,
+        ):
+            channels = ccload_module.list_remote_channels(self.server)
+
+        self.assertEqual(credential_calls, ["2", "3"])
+        self.assertEqual([channel["id"] for channel in channels], ["1", "2", "3"])
+        self.assertEqual([channel["models"] for channel in channels], [[], [], ["gpt-pro-model"]])
+        model_ids.assert_called_once_with("token-3")
+
     def test_fetches_selected_complete_codex_credential_and_never_lists_it(self) -> None:
         with mock.patch.object(ccload_module, "Session", _FakeCCLoadSession):
             credentials, errors = ccload_module.fetch_remote_credentials(self.server, ["7"])

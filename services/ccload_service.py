@@ -20,11 +20,13 @@ from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.error_response import (
     PublicSafeValueError,
     canonicalize_import_job_errors,
+    exception_log_message,
     validate_import_job_errors,
 )
 from services.secure_file import atomic_write_bytes
 from services.storage.base import StorageConflictError, StorageDataError
 from services.task_executor import reserve_background_task
+from utils.log import logger
 
 
 CCLOAD_CONFIG_FILE = DATA_DIR / "ccload_config.json"
@@ -367,8 +369,17 @@ def list_remote_channels(server: dict) -> list[dict]:
             if not data or offset >= total or len(data) < limit:
                 break
         for channel in channels:
-            credential = _fetch_remote_credential(session, base_url, headers, channel["id"])
-            channel["models"] = _channel_model_ids(credential["access_token"])
+            if not channel["enabled"]:
+                continue
+            try:
+                credential = _fetch_remote_credential(session, base_url, headers, channel["id"])
+                channel["models"] = _channel_model_ids(credential["access_token"])
+            except Exception as exc:
+                logger.warning({
+                    "event": "ccload_channel_model_catalog_failed",
+                    "channel_id": channel["id"],
+                    "error": exception_log_message(exc),
+                })
     return channels
 
 
