@@ -36,13 +36,11 @@
 ```bash
 git clone git@github.com:basketikun/chatgpt2api.git
 cd chatgpt2api
-mkdir -p chatgpt2api-config
-cp config.json chatgpt2api-config/config.json
-chmod 600 chatgpt2api-config/config.json
+chmod 600 config.json
 docker compose up -d
 ```
 
-启动前请先在 `chatgpt2api-config/config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。Compose 只挂载这个专用配置目录，不会把项目根目录挂入应用容器。
+启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。Compose 使用固定的 `/app/config.json`，不需要额外的配置目录或路径环境变量。
 
 - Web 面板：`http://localhost:3000`
 - API 地址：`http://localhost:3000/v1`

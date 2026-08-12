@@ -7,13 +7,10 @@ services:
       - "3000:80"
     volumes:
       - ./data:/app/data
-      # Mount only the dedicated config directory so atomic replacement cannot
-      # expose the project root, .env, backups, or other services.
-      - ./chatgpt2api-config:/app/config_mount
+      - ./config.json:/app/config.json
     environment:
       # 存储后端配置 (可选值: json, sqlite, postgres, git)
        - STORAGE_BACKEND=json
-       - CHATGPT2API_CONFIG_FILE=/app/config_mount/config.json
       
       # 数据库配置 (当 STORAGE_BACKEND=sqlite/postgres 时使用)
       # - DATABASE_URL=postgresql://user:password@host:5432/dbname

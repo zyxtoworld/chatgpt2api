@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -24,6 +25,32 @@ _CONFIG_FILE_ENV = os.getenv("CHATGPT2API_CONFIG_FILE", "").strip()
 CONFIG_FILE = Path(_CONFIG_FILE_ENV) if _CONFIG_FILE_ENV else BASE_DIR / "config.json"
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
+
+
+def _hot_overwrite_bind_mounted_file(path: Path, payload: bytes) -> None:
+    flags = os.O_WRONLY
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if no_follow:
+        flags |= no_follow
+    binary = getattr(os, "O_BINARY", 0)
+    if binary:
+        flags |= binary
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("config bind mount is not a regular file")
+        os.lseek(fd, 0, os.SEEK_SET)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if not written:
+                raise OSError("short config bind mount write")
+            view = view[written:]
+        os.ftruncate(fd, len(payload))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
 
 DEFAULT_BACKUP_INCLUDE = {
     "config": True,
@@ -527,13 +554,18 @@ class ConfigStore:
         payload = (
             json.dumps(self.data if data is None else data, ensure_ascii=False, indent=2) + "\n"
         ).encode("utf-8")
-        atomic_write_bytes(
-            self.path,
-            self.path.parent,
-            payload,
-            mode=target_mode,
-            owner=target_owner,
-        )
+        try:
+            atomic_write_bytes(
+                self.path,
+                self.path.parent,
+                payload,
+                mode=target_mode,
+                owner=target_owner,
+            )
+        except OSError as exc:
+            if exc.errno != errno.EBUSY or current_revision is None:
+                raise
+            _hot_overwrite_bind_mounted_file(self.path, payload)
         self._snapshot_revision = hashlib.sha256(payload).hexdigest()
 
     @property
