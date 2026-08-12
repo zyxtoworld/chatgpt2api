@@ -870,7 +870,7 @@ export async function fetchSub2APIImportJob(serverId: string) {
   return httpRequest<{ import_job: CPAImportJob | null }>(`/api/sub2api/servers/${serverId}/import`);
 }
 
-// ── ccLoad preview ─────────────────────────────────────────────────
+// ── ccLoad connections ─────────────────────────────────────────────
 
 export type CCLoadServer = {
   id: string;

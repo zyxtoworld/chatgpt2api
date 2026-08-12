@@ -340,7 +340,7 @@ export function CCLoadConnections() {
               </div>
               <div>
                 <h2 className="text-lg font-semibold tracking-tight">ccLoad 连接管理</h2>
-                <p className="text-sm text-stone-500">先配置连接，再读取 Codex OAuth 渠道并选择导入到本地号池。</p>
+                <p className="text-sm text-stone-500">管理 ccLoad 连接，读取可导入渠道并导入到本地号池。</p>
               </div>
             </div>
             <div className="flex items-center gap-2">

@@ -1,4 +1,4 @@
-"""ccLoad preview integration for browsing and importing Codex OAuth channels."""
+"""ccLoad integration for browsing and importing Codex OAuth channels."""
 
 from __future__ import annotations
 
