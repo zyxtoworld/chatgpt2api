@@ -76,6 +76,12 @@ def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _parse_nonnegative_int(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("invalid non-negative integer")
+    return value
+
+
 def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
     if raw is None:
         return None
@@ -710,6 +716,10 @@ class CCLoadImportService:
 
         try:
             add_result = account_service.add_account_items(credentials)
+            if not isinstance(add_result, dict) or not add_result:
+                raise ValueError("invalid account import result")
+            added = _parse_nonnegative_int(add_result["added"])
+            skipped = _parse_nonnegative_int(add_result["skipped"])
         except Exception:
             self._update_job(
                 server_id,
@@ -724,31 +734,29 @@ class CCLoadImportService:
                 ),
             )
             return
-        if not isinstance(add_result, dict) or not add_result:
-            self._update_job(
-                server_id,
-                status="failed",
-                completed=len(channel_ids),
-                added=0,
-                skipped=0,
-                refreshed=0,
-                failed=len(channel_ids),
-                errors=canonicalize_import_job_errors(
-                    [*safe_errors, {"name": "ccLoad", "error": "account import failed"}],
-                ),
-            )
-            return
+        self._update_job(server_id, added=added, skipped=skipped)
+
+        def record_refresh_progress(refreshed: int) -> None:
+            self._update_job(server_id, refreshed=refreshed)
+
         access_tokens = [credential["access_token"] for credential in credentials]
         try:
-            refresh_result = account_service.refresh_accounts(access_tokens)
+            refresh_result = account_service.refresh_accounts(
+                access_tokens,
+                on_progress=record_refresh_progress,
+            )
+            if not isinstance(refresh_result, dict) or not refresh_result:
+                raise ValueError("invalid account refresh result")
+            refreshed = _parse_nonnegative_int(refresh_result["refreshed"])
         except Exception:
+            current = self._config.get_import_job(server_id) or {}
             self._update_job(
                 server_id,
                 status="failed",
                 completed=len(channel_ids),
-                added=int(add_result.get("added") or 0),
-                skipped=int(add_result.get("skipped") or 0),
-                refreshed=0,
+                added=added,
+                skipped=skipped,
+                refreshed=int(current.get("refreshed") or 0),
                 failed=failure_count,
                 errors=canonicalize_import_job_errors(
                     [*safe_errors, {"name": "ccLoad", "error": "account import failed"}],
@@ -760,9 +768,9 @@ class CCLoadImportService:
             server_id,
             status="completed",
             completed=len(channel_ids),
-            added=int(add_result.get("added") or 0),
-            skipped=int(add_result.get("skipped") or 0),
-            refreshed=int(refresh_result.get("refreshed") or 0),
+            added=added,
+            skipped=skipped,
+            refreshed=refreshed,
             failed=failure_count,
             errors=safe_errors,
         )

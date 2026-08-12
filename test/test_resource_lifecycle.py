@@ -332,6 +332,35 @@ class ResourceLifecycleTests(unittest.TestCase):
         self.assertLessEqual(max(observations), 10)
         self.assertEqual(len(executor.submitted), 50)
 
+    def test_account_refresh_reports_cumulative_success_count_after_each_result(self) -> None:
+        class FakeFuture:
+            def result(self):
+                return {}
+
+        class RecordingExecutor:
+            def submit(self, *_args, **_kwargs):
+                return FakeFuture()
+
+        service = account_module.AccountService.__new__(account_module.AccountService)
+        service._lock = account_module.Lock()
+        service._accounts = {}
+        service._token_aliases = {}
+        service.list_accounts = mock.Mock(return_value=[])
+        progress: list[int] = []
+
+        with (
+            mock.patch.object(account_module, "_ACCOUNT_REFRESH_EXECUTOR", RecordingExecutor()),
+            mock.patch.object(account_module, "as_completed", side_effect=lambda futures: iter(futures)),
+            mock.patch.object(account_module, "config", SimpleNamespace(auto_relogin_after_refresh=False)),
+        ):
+            result = service.refresh_accounts(
+                ["access-token-1", "access-token-2", "access-token-3"],
+                on_progress=progress.append,
+            )
+
+        self.assertEqual(result["refreshed"], 3)
+        self.assertEqual(progress, [1, 2, 3])
+
     def test_account_info_reuses_one_process_executor(self) -> None:
         class ImmediateFuture:
             def __init__(self, function) -> None:

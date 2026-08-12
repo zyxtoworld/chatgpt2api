@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urlencode
 
 from services.config import config
@@ -2026,6 +2026,8 @@ class AccountService:
         access_tokens: list[str],
         progress_id: str | None = None,
         defer_invalid_removal: bool = True,
+        *,
+        on_progress: Callable[[int], None] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             access_tokens = list(dict.fromkeys(
@@ -2077,6 +2079,8 @@ class AccountService:
 
                     if progress_id:
                         self.update_refresh_progress(progress_id, token)
+                    if on_progress is not None:
+                        on_progress(refreshed)
         except (KeyboardInterrupt, SystemExit):
             if progress_id:
                 self.finish_refresh_progress(progress_id, error="cancelled")

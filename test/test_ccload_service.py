@@ -620,8 +620,11 @@ class _RecordingAccountService:
         self.imported = [dict(item) for item in items]
         return {"added": len(items), "skipped": 0}
 
-    def refresh_accounts(self, tokens: list[str]) -> dict:
+    def refresh_accounts(self, tokens: list[str], *, on_progress=None) -> dict:
         self.refreshed = list(tokens)
+        if on_progress is not None:
+            for refreshed in range(1, len(tokens) + 1):
+                on_progress(refreshed)
         return {"refreshed": len(tokens)}
 
 
@@ -957,6 +960,142 @@ class CCLoadPersistenceAndImportContractTests(unittest.TestCase):
             self.assertEqual(final_job["status"], "completed")
             self.assertEqual(final_job["completed"], 3)
             self.assertEqual(final_job["failed"], 1)
+
+    def test_import_publishes_add_and_refresh_stage_counts_while_running(self) -> None:
+        credentials = [
+            {
+                "access_token": f"access-token-{index}",
+                "refresh_token": f"refresh-token-{index}",
+                "id_token": f"id-token-{index}",
+                "account_id": f"account-{index}",
+                "email": f"user-{index}@example.test",
+                "type": "codex",
+                "expired": "2027-08-09T12:00:00Z",
+                "plan_type": "free",
+            }
+            for index in range(3)
+        ]
+        snapshots: list[tuple[int, int, int]] = []
+
+        with TemporaryDirectory() as temp_dir:
+            config = ccload_module.CCLoadConfig(Path(temp_dir) / "ccload_config.json")
+            server = config.add_server(
+                name="ccLoad",
+                base_url="https://ccload.example.test",
+                password="admin-password-secret",
+            )
+            config.set_import_job(
+                server["id"],
+                {
+                    "job_id": "stage-count-job",
+                    "status": "pending",
+                    "created_at": "2026-08-13T00:00:00+00:00",
+                    "updated_at": "2026-08-13T00:00:00+00:00",
+                    "total": 3,
+                    "completed": 0,
+                    "added": 0,
+                    "skipped": 0,
+                    "refreshed": 0,
+                    "failed": 0,
+                    "errors": [],
+                },
+            )
+            service = ccload_module.CCLoadImportService(config)
+
+            def fetch_credentials(_server, channel_ids, *, on_progress):
+                for channel_id in channel_ids:
+                    on_progress(channel_id, None)
+                return credentials, []
+
+            class StagedAccountService:
+                def add_account_items(self, _items: list[dict]) -> dict:
+                    return {"added": 2, "skipped": 1}
+
+                def refresh_accounts(self, _tokens: list[str], *, on_progress=None) -> dict:
+                    job = config.get_import_job(server["id"])
+                    snapshots.append((job["added"], job["skipped"], job["refreshed"]))
+                    if on_progress is not None:
+                        for refreshed in (1, 2, 3):
+                            on_progress(refreshed)
+                            job = config.get_import_job(server["id"])
+                            snapshots.append((job["added"], job["skipped"], job["refreshed"]))
+                    return {"refreshed": 3}
+
+            with (
+                mock.patch.object(ccload_module, "fetch_remote_credentials", side_effect=fetch_credentials),
+                mock.patch.object(ccload_module, "account_service", StagedAccountService()),
+            ):
+                service._run_import(server["id"], server, ["1", "2", "3"])
+
+            self.assertEqual(
+                snapshots,
+                [(2, 1, 0), (2, 1, 1), (2, 1, 2), (2, 1, 3)],
+            )
+            final_job = config.get_import_job(server["id"])
+            self.assertEqual(final_job["status"], "completed")
+            self.assertEqual(final_job["added"], 2)
+            self.assertEqual(final_job["skipped"], 1)
+            self.assertEqual(final_job["refreshed"], 3)
+
+    def test_import_preserves_published_refresh_count_when_refresh_fails(self) -> None:
+        credential = {
+            "access_token": "access-token-secret",
+            "refresh_token": "refresh-token-secret",
+            "id_token": "id-token-secret",
+            "account_id": "account-1",
+            "email": "user@example.test",
+            "type": "codex",
+            "expired": "2027-08-09T12:00:00Z",
+            "plan_type": "free",
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            config = ccload_module.CCLoadConfig(Path(temp_dir) / "ccload_config.json")
+            server = config.add_server(
+                name="ccLoad",
+                base_url="https://ccload.example.test",
+                password="admin-password-secret",
+            )
+            config.set_import_job(
+                server["id"],
+                {
+                    "job_id": "partial-refresh-job",
+                    "status": "pending",
+                    "created_at": "2026-08-13T00:00:00+00:00",
+                    "updated_at": "2026-08-13T00:00:00+00:00",
+                    "total": 1,
+                    "completed": 0,
+                    "added": 0,
+                    "skipped": 0,
+                    "refreshed": 0,
+                    "failed": 0,
+                    "errors": [],
+                },
+            )
+            service = ccload_module.CCLoadImportService(config)
+
+            def fetch_credentials(_server, _channel_ids, *, on_progress):
+                on_progress("1", None)
+                return [credential], []
+
+            class FailingRefreshAccountService:
+                def add_account_items(self, _items: list[dict]) -> dict:
+                    return {"added": 1, "skipped": 0}
+
+                def refresh_accounts(self, _tokens: list[str], *, on_progress=None) -> dict:
+                    on_progress(1)
+                    raise RuntimeError("opaque upstream failure")
+
+            with (
+                mock.patch.object(ccload_module, "fetch_remote_credentials", side_effect=fetch_credentials),
+                mock.patch.object(ccload_module, "account_service", FailingRefreshAccountService()),
+            ):
+                service._run_import(server["id"], server, ["1"])
+
+            final_job = config.get_import_job(server["id"])
+            self.assertEqual(final_job["status"], "failed")
+            self.assertEqual(final_job["added"], 1)
+            self.assertEqual(final_job["refreshed"], 1)
 
     def test_import_failure_persists_only_fixed_error(self) -> None:
         with TemporaryDirectory() as temp_dir:
