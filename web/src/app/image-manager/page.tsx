@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { compressAllImages, deleteImageTag, deleteManagedImages, deleteToTarget, downloadImages, downloadSingleImage, fetchImageStorage, fetchImageTags, fetchManagedImages, setImageTags, type ImageStorageStats, type ManagedImage } from "@/lib/api";
@@ -596,7 +596,10 @@ function ImageManagerContent() {
       {/* Delete by date dialog */}
       <Dialog open={deleteMode === "byDate"} onOpenChange={() => setDeleteMode(null)}>
         <DialogContent className="sm:max-w-md rounded-2xl">
-          <DialogHeader><DialogTitle>按日期删除图片</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle>按日期删除图片</DialogTitle>
+            <DialogDescription className="sr-only">选择截止日期并确认永久删除此前的图片及缩略图。</DialogDescription>
+          </DialogHeader>
           <div className="space-y-4">
             <div className="flex items-center gap-2">
               <label className="text-sm text-stone-600 shrink-0">删除</label>
@@ -820,10 +823,10 @@ function ImageManagerContent() {
         <DialogContent className="max-w-sm overflow-hidden rounded-2xl">
           <DialogHeader>
             <DialogTitle className="pr-8">确认删除</DialogTitle>
+            <DialogDescription className="text-sm text-stone-600">
+              确定要删除这张图片吗？此操作不可恢复。
+            </DialogDescription>
           </DialogHeader>
-          <p className="text-sm text-stone-600">
-            确定要删除这张图片吗？此操作不可恢复。
-          </p>
           {deleteTarget ? (
             <div className="flex items-center gap-3 overflow-hidden rounded-xl border border-stone-200 bg-stone-50 p-3">
               <img
@@ -862,10 +865,10 @@ function ImageManagerContent() {
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>{deleteMode === "filtered" ? "删除匹配日期的图片" : "删除所选图片"}</DialogTitle>
+            <DialogDescription className="text-sm text-stone-600">
+              确认删除 {selectedCount} 张图片吗？删除后无法恢复。
+            </DialogDescription>
           </DialogHeader>
-          <p className="text-sm text-stone-600">
-            确认删除 {selectedCount} 张图片吗？删除后无法恢复。
-          </p>
           <DialogFooter>
                 <Button variant="outline" className="rounded-xl" onClick={() => setDeleteMode(null)} disabled={isDeleting || isMutating}>
               取消
@@ -881,10 +884,10 @@ function ImageManagerContent() {
         <DialogContent className="max-w-sm rounded-2xl">
           <DialogHeader>
             <DialogTitle>删除标签</DialogTitle>
+            <DialogDescription className="text-sm text-stone-600">
+              确定要删除标签 <span className="font-semibold">&quot;{tagDeleteTarget}&quot;</span> 吗？将从所有图片中移除该标签。
+            </DialogDescription>
           </DialogHeader>
-          <p className="text-sm text-stone-600">
-            确定要删除标签 <span className="font-semibold">&quot;{tagDeleteTarget}&quot;</span> 吗？将从所有图片中移除该标签。
-          </p>
           <DialogFooter>
             <Button variant="outline" className="rounded-xl" onClick={() => setTagDeleteTarget(null)}>
               取消
