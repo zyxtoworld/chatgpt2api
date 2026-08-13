@@ -26,6 +26,13 @@ test("ccLoad list entry owns initial loading and mutation invalidation", () => {
   assert.match(text, /listQueryRef\.current\?\.clearLoadingForMutation\(\);/);
 });
 
+test("ccLoad import polling remains mounted while another settings tab is active", () => {
+  assert.match(
+    pageSource,
+    /<TabsContent value="ccload" forceMount className="data-\[state=inactive\]:hidden">/,
+  );
+});
+
 test("UserKeys initial load is owned by its setup and canceled before cleanup", () => {
   const text = source("user-keys-card.tsx");
   assert.match(text, /scheduleOwnedMicrotask/);

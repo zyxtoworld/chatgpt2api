@@ -145,7 +145,7 @@ function SettingsPageContent() {
         <TabsContent value="sub2api">
           <Sub2APIConnections />
         </TabsContent>
-        <TabsContent value="ccload">
+        <TabsContent value="ccload" forceMount className="data-[state=inactive]:hidden">
           <CCLoadConnections />
         </TabsContent>
       </Tabs>
