@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 from services.account_service import AccountService, TokenRefreshError
 from services.model_service import ModelRoute, ModelUnavailableError
+from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol import (
     anthropic_v1_messages,
     conversation,
@@ -110,6 +111,81 @@ class TextAccountRoutingTests(unittest.TestCase):
         self.assertEqual(result, ["ok"])
         self.assertEqual(created_tokens, ["bad", "bad", "good"])
         select_fallback.assert_called_once_with(excluded_tokens={"bad"}, model="auto")
+
+    def test_transient_bootstrap_502_fails_over_before_emitting_text(self) -> None:
+        request = conversation.ConversationRequest(
+            model="auto",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        class ErrorResponse:
+            status_code = 502
+
+            def close(self) -> None:
+                pass
+
+        class ErrorSession:
+            def get(self, *_args: object, **_kwargs: object) -> ErrorResponse:
+                return ErrorResponse()
+
+        class BootstrapFailureBackend(OpenAIBackendAPI):
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+                self.base_url = "https://upstream.invalid"
+                self.user_agent = "test-agent"
+                self.pow_script_sources = []
+                self.pow_data_build = ""
+                self.session = ErrorSession()
+                self.closed = 0
+
+            def _bootstrap_headers(self) -> dict[str, str]:
+                return {}
+
+            def close(self) -> None:
+                self.closed += 1
+
+        def events(backend: object, **_kwargs: object):
+            if getattr(backend, "access_token", "") == "bad":
+                yield from backend.stream_conversation()  # type: ignore[attr-defined]
+            else:
+                yield {"type": "conversation.delta", "delta": "ok"}
+
+        initial_backend = BootstrapFailureBackend("bad")
+        with (
+            mock.patch.object(conversation, "account_service", self.service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", BootstrapFailureBackend),
+            mock.patch.object(conversation, "conversation_events", side_effect=events),
+            mock.patch.object(
+                self.service,
+                "get_text_access_token",
+                return_value="good",
+            ) as select_fallback,
+        ):
+            result = list(conversation.stream_text_deltas(initial_backend, request))
+
+        self.assertEqual(result, ["ok"])
+        select_fallback.assert_called_once_with(excluded_tokens={"bad"}, model="auto")
+
+    def test_backend_stage_http_errors_keep_status_and_retry_after(self) -> None:
+        class Response:
+            def __init__(self, status_code: int) -> None:
+                self.status_code = status_code
+                self.headers = {"Retry-After": "7"}
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        backend = OpenAIBackendAPI.__new__(OpenAIBackendAPI)
+        for status_code in (429, 502):
+            with self.subTest(status_code=status_code):
+                response = Response(status_code)
+                with self.assertRaises(UpstreamHTTPError) as raised:
+                    backend._read_json_response(response, "chat_requirements_prepare")
+                self.assertEqual(raised.exception.status_code, status_code)
+                self.assertEqual(raised.exception.retry_after, 7)
+                self.assertEqual(raised.exception.body, {"error": "upstream_error"})
+                self.assertTrue(response.closed)
 
     def test_transient_upstream_failure_allows_only_one_failover(self) -> None:
         request = conversation.ConversationRequest(

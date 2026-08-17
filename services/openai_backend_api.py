@@ -567,7 +567,19 @@ class OpenAIBackendAPI:
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
-        raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
+        headers = getattr(response, "headers", None)
+        retry_after_value = headers.get("Retry-After") if headers is not None else None
+        retry_after = (
+            int(retry_after_value)
+            if str(retry_after_value or "").strip().isdigit()
+            else None
+        )
+        raise UpstreamHTTPError(
+            path,
+            int(response.status_code),
+            {"error": "upstream_error"},
+            retry_after=retry_after,
+        )
 
     def _ensure_status(self, response: Any, path: str) -> None:
         """Validate status without reading an unbounded error body."""
