@@ -220,6 +220,42 @@ def test_direct_search_handler_projects_backend_sources_before_public_response()
     mark_used.assert_called_once_with("fixture-token")
 
 
+def test_direct_search_selects_an_account_for_the_search_model() -> None:
+    backend = mock.Mock()
+    backend.search.return_value = {"answer": "answer", "sources": []}
+    with (
+        mock.patch.object(
+            openai_search.account_service,
+            "get_text_access_token",
+            return_value="fixture-token",
+        ) as select_token,
+        mock.patch.object(openai_search.account_service, "get_account", return_value={}),
+        mock.patch.object(openai_search.account_service, "mark_text_used"),
+        mock.patch.object(openai_search, "OpenAIBackendAPI", return_value=backend),
+    ):
+        openai_search.handle({"prompt": "fixture query"})
+
+    select_token.assert_called_once_with(model=openai_search.MODEL)
+
+
+def test_web_search_selects_an_account_for_the_search_model() -> None:
+    backend = mock.Mock()
+    backend.search.return_value = {"answer": "answer", "sources": []}
+    with (
+        mock.patch.object(
+            web_search_tool.account_service,
+            "get_text_access_token",
+            return_value="fixture-token",
+        ) as select_token,
+        mock.patch.object(web_search_tool.account_service, "get_account", return_value={}),
+        mock.patch.object(web_search_tool.account_service, "mark_text_used"),
+        mock.patch.object(web_search_tool, "OpenAIBackendAPI", return_value=backend),
+    ):
+        web_search_tool.run_web_search("fixture query")
+
+    select_token.assert_called_once_with(model=web_search_tool.SEARCH_MODEL)
+
+
 def test_search_usage_does_not_mutate_replaced_same_token_account() -> None:
     entered = threading.Event()
     release = threading.Event()

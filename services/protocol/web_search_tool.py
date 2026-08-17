@@ -4,7 +4,7 @@ import re
 from typing import Any
 
 from services.account_service import account_service
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import OpenAIBackendAPI, SEARCH_MODEL
 from services.url_utils import normalize_public_http_url
 
 WEB_SEARCH_TOOL_TYPES = {
@@ -170,7 +170,7 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
 
 
 def run_web_search(query: str) -> dict[str, Any]:
-    token = account_service.get_text_access_token()
+    token = account_service.get_text_access_token(model=SEARCH_MODEL)
     expected_account = None
     get_account_lease = getattr(account_service, "_get_account_lease", None)
     if callable(get_account_lease):
