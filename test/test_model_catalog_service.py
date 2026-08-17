@@ -590,6 +590,47 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(calls.count("ready-token"), 1)
         self.assertEqual(calls.count("bad-one") + calls.count("bad-two"), 4)
 
+    def test_cold_ready_model_does_not_wait_for_unrelated_pending_type(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "cold-ready-isolation-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "ready-token", "type": "Ready", "status": "正常"},
+            {"access_token": "blocked-token", "type": "Broken", "status": "正常"},
+        ])
+        ready_returned = Event()
+        blocked_started = Event()
+        release_blocked = Event()
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                if self.access_token == "ready-token":
+                    ready_returned.set()
+                    return model_list("ready-model")
+                if self.access_token == "blocked-token":
+                    blocked_started.set()
+                    if not release_blocked.wait(timeout=3):
+                        raise AssertionError("blocked representative was not released")
+                    raise RuntimeError("unrelated type is unavailable")
+                return model_list("anonymous-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(accounts, backend_factory=Backend)
+        executor = ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(executor.shutdown, wait=True)
+        self.addCleanup(release_blocked.set)
+        future = executor.submit(catalog.route_for_model, "ready-model")
+
+        self.assertTrue(ready_returned.wait(timeout=1))
+        self.assertTrue(blocked_started.wait(timeout=1))
+        route = future.result(timeout=1)
+        self.assertEqual(route.access_tokens, frozenset({"ready-token"}))
+
     def test_refresh_admission_failure_cancels_already_submitted_siblings(self) -> None:
         submitted: list[Future] = []
 

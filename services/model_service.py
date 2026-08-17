@@ -7,7 +7,7 @@ from concurrent.futures import FIRST_COMPLETED, TimeoutError as FutureTimeoutErr
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import partial
-from threading import BoundedSemaphore, Event, RLock, local
+from threading import BoundedSemaphore, Condition, Event, RLock, local
 from typing import Any
 
 import anyio
@@ -107,6 +107,7 @@ class ModelCatalogService:
         self._clock = clock
         self._deadline_clock = deadline_clock
         self._lock = RLock()
+        self._catalog_condition = Condition(self._lock)
         self._expires_at = 0.0
         self._account_signature: tuple[str, ...] = ()
         self._anonymous_models: dict[str, dict[str, Any]] = {}
@@ -442,6 +443,7 @@ class ModelCatalogService:
                     self._clock() + MODEL_CATALOG_RETRY_BACKOFF_SECS
                 )
             self._catalog_loaded = True
+            self._catalog_condition.notify_all()
 
     def _publish_incremental_anonymous_models(
         self,
@@ -462,6 +464,7 @@ class ModelCatalogService:
             self._anonymous_ready = True
             self._anonymous_retry_not_before = 0.0
             self._catalog_loaded = True
+            self._catalog_condition.notify_all()
 
     def _run_incremental_refresh(
         self,
@@ -568,6 +571,7 @@ class ModelCatalogService:
                 )
                 self._refresh_in_progress = False
                 self._refresh_done.set()
+                self._catalog_condition.notify_all()
                 if not self._catalog_loaded:
                     self._catalog_loaded = True
                 self._account_signature = started_signature
@@ -614,6 +618,7 @@ class ModelCatalogService:
             except BaseException:
                 self._refresh_in_progress = False
                 self._refresh_done.set()
+                self._catalog_condition.notify_all()
                 raise
 
     def _ensure_catalog(self) -> None:
@@ -725,6 +730,37 @@ class ModelCatalogService:
             self._catalog_loaded = True
             self._refresh_in_progress = False
             refresh_event.set()
+            self._catalog_condition.notify_all()
+
+    def _model_is_ready(self, model: str) -> bool:
+        groups = self._active_accounts_by_type()
+        with self._lock:
+            if model == "auto":
+                return self._anonymous_ready or any(
+                    account_type in self._ready_account_types
+                    for account_type in groups
+                )
+            if model in self._anonymous_models:
+                return True
+            return any(
+                account_type in self._ready_account_types
+                and model in self._models_by_account_type.get(account_type, {})
+                for account_type in groups
+            )
+
+    def _ensure_catalog_for_model(self, model: str) -> None:
+        self._ensure_catalog_nonblocking()
+        deadline = self._deadline_clock() + MODEL_CATALOG_REFRESH_TIMEOUT_SECS
+        while True:
+            if self._model_is_ready(model):
+                return
+            with self._catalog_condition:
+                if not self._refresh_in_progress:
+                    return
+                remaining = deadline - self._deadline_clock()
+                if remaining <= 0:
+                    return
+                self._catalog_condition.wait(timeout=min(0.05, remaining))
 
     def _ensure_catalog_for_read(self, *, wait_for_cold: bool) -> None:
         if not wait_for_cold:
@@ -764,7 +800,12 @@ class ModelCatalogService:
 
     def route_for_model(self, model: str, *, wait_for_cold: bool = True) -> ModelRoute:
         model = str(model or "").strip()
-        self._ensure_catalog_for_read(wait_for_cold=wait_for_cold)
+        with self._lock:
+            cold = not self._catalog_loaded
+        if wait_for_cold and cold:
+            self._ensure_catalog_for_model(model)
+        else:
+            self._ensure_catalog_for_read(wait_for_cold=False)
         groups = self._active_accounts_by_type()
         with self._lock:
             access_tokens = frozenset(
