@@ -284,11 +284,11 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
     def test_refresh_request_count_scales_with_account_types_not_accounts(self) -> None:
         total_accounts = 1495
-        account_types = ("free", "plus", "pro")
+        account_types = ("free", "pro")
         accounts = [
             {
                 "access_token": f"token-{index}",
-                "type": account_types[index % len(account_types)],
+                "type": "FREE" if index % len(account_types) == 0 else "Pro",
                 "status": "正常",
             }
             for index in range(total_accounts)
@@ -303,7 +303,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
                 return account.get("status") == "正常"
 
             def _normalize_account_type(self, value: object) -> str:
-                return str(value or "")
+                return str(value or "").strip().lower()
 
             def refresh_access_token(self, token: str, **_kwargs: object) -> str:
                 return token
@@ -325,9 +325,11 @@ class ModelCatalogServiceTests(unittest.TestCase):
             def close(self) -> None:
                 pass
 
+        now = [1000.0]
         catalog = ModelCatalogService(
             ManyAccounts(),
             backend_factory=ManyBackend,
+            clock=lambda: now[0],
             cache_ttl_seconds=300,
         )
 
@@ -338,12 +340,31 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(len(non_anonymous_calls), len(account_types))
         self.assertEqual(
             {
-                next(item["type"] for item in accounts if item["access_token"] == token)
+                next(item["type"].strip().lower() for item in accounts if item["access_token"] == token)
                 for token in non_anonymous_calls
             },
             set(account_types),
         )
         self.assertEqual(calls.count(""), 1)
+
+        accounts.pop(0)
+        accounts.append({"access_token": "same-type-replacement", "type": "free", "status": "正常"})
+        catalog.list_models(wait_for_cold=False)
+        self.assertEqual(len(calls), 3)
+
+        now[0] += 301
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        self.assertEqual(calls.count(""), 2)
+        refreshed_non_anonymous = [token for token in calls[3:] if token]
+        self.assertEqual(len(refreshed_non_anonymous), len(account_types))
+        self.assertEqual(
+            {
+                next(item["type"].strip().lower() for item in accounts if item["access_token"] == token)
+                for token in refreshed_non_anonymous
+            },
+            set(account_types),
+        )
 
     def test_nonblocking_route_marks_unscanned_model_as_pending(self) -> None:
         refresh_started = Event()
