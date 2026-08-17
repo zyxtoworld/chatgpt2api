@@ -271,6 +271,21 @@ def test_direct_search_does_not_mark_usage_when_public_projection_fails() -> Non
     mark_used.assert_not_called()
 
 
+def test_web_search_does_not_mark_usage_for_a_non_object_result() -> None:
+    backend = mock.Mock()
+    backend.search.return_value = None
+    with (
+        mock.patch.object(web_search_tool.account_service, "get_text_access_token", return_value="fixture-token"),
+        mock.patch.object(web_search_tool.account_service, "get_account", return_value={}),
+        mock.patch.object(web_search_tool.account_service, "mark_text_used") as mark_used,
+        mock.patch.object(web_search_tool, "OpenAIBackendAPI", return_value=backend),
+        pytest.raises(RuntimeError, match="invalid search result"),
+    ):
+        web_search_tool.run_web_search("fixture query")
+
+    mark_used.assert_not_called()
+
+
 def test_search_usage_does_not_mutate_replaced_same_token_account() -> None:
     entered = threading.Event()
     release = threading.Event()

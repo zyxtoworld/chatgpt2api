@@ -180,6 +180,8 @@ def run_web_search(query: str) -> dict[str, Any]:
         result = backend.search(query)
     finally:
         backend.close()
+    if not isinstance(result, dict):
+        raise RuntimeError("invalid search result")
     if expected_account is None:
         account_service.mark_text_used(token)
     else:
