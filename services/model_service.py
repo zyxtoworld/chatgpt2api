@@ -574,6 +574,22 @@ class ModelCatalogService:
                 self._catalog_condition.notify_all()
                 if not self._catalog_loaded:
                     self._catalog_loaded = True
+                retry_not_before = self._clock() + MODEL_CATALOG_RETRY_BACKOFF_SECS
+                unfinished_account_types = {
+                    account_type
+                    for account_type, _access_tokens in pending
+                }
+                unfinished_anonymous = not anonymous_finished
+                for kind, account_type in futures.values():
+                    if kind == "anonymous":
+                        unfinished_anonymous = True
+                    elif account_type is not None:
+                        unfinished_account_types.add(account_type)
+                for account_type in unfinished_account_types:
+                    if account_type in current_groups:
+                        self._account_type_retry_not_before[account_type] = retry_not_before
+                if unfinished_anonymous:
+                    self._anonymous_retry_not_before = retry_not_before
                 self._account_signature = started_signature
                 self._catalog_complete = (
                     current_signature == started_signature

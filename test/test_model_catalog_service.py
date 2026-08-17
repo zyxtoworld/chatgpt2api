@@ -660,6 +660,51 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertTrue(submitted[0].done())
         self.assertTrue(all(future.cancelled() for future in submitted[1:]))
 
+    def test_refresh_admission_timeout_backs_off_types_that_never_got_a_slot(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "admission-backoff-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "free-token", "type": "free", "status": "正常"},
+            {"access_token": "plus-token", "type": "plus", "status": "正常"},
+        ])
+        now = [1000.0]
+        submissions = 0
+
+        def submit_refresh(_func, *_args, **_kwargs):
+            nonlocal submissions
+            submissions += 1
+            if submissions == 1:
+                future = Future()
+                future.set_result({"anonymous-model": {"id": "anonymous-model"}})
+                return future
+            raise model_service_module.ModelCatalogRefreshTimeout(
+                "model catalog refresh timed out"
+            )
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=FakeBackend,
+            clock=lambda: now[0],
+            deadline_clock=lambda: now[0],
+        )
+        with (
+            mock.patch.object(model_service_module, "MODEL_CATALOG_REFRESH_WORKERS", 1),
+            mock.patch.object(catalog, "_submit_refresh_future", side_effect=submit_refresh),
+        ):
+            catalog.list_models(wait_for_cold=False)
+            self.assertTrue(catalog._refresh_done.wait(timeout=2))
+            first_submissions = submissions
+
+            catalog.list_models(wait_for_cold=False)
+            self.assertTrue(catalog._refresh_done.wait(timeout=2))
+            self.assertEqual(submissions, first_submissions)
+
+            now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
+            catalog.list_models(wait_for_cold=False)
+            self.assertTrue(catalog._refresh_done.wait(timeout=2))
+            self.assertGreater(submissions, first_submissions)
+
     def test_expired_catalog_refresh_returns_old_snapshot_without_waiting_for_late_account_refresh(self) -> None:
         refresh_started = Event()
         release_refresh = Event()
