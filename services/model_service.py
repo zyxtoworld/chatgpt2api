@@ -184,10 +184,11 @@ class ModelCatalogService:
         last_error: Exception | None = None
         resolved_token = candidate_tokens[0] if candidate_tokens else ""
         expected_account: object | None = None
-        # A type is represented by one deterministic account.  Two candidates
-        # are enough to survive one bad token without turning a type refresh
-        # back into an account-wide scan.
-        for access_token in candidate_tokens[:2]:
+        # A type is represented by one deterministic account.  Try each
+        # distinct live candidate until one succeeds or the shared deadline is
+        # exhausted; never truncate a type's candidate set arbitrarily.
+        attempted_tokens: set[str] = set()
+        for access_token in candidate_tokens:
             try:
                 resolved_token = (
                     self._accounts.refresh_access_token(
@@ -197,6 +198,9 @@ class ModelCatalogService:
                     )
                     or access_token
                 )
+                if resolved_token in attempted_tokens:
+                    continue
+                attempted_tokens.add(resolved_token)
                 if self._deadline_clock() >= deadline:
                     raise TimeoutError("model catalog refresh timed out")
                 resolved_token, expected_account = self._get_account_lease(resolved_token)
@@ -280,7 +284,7 @@ class ModelCatalogService:
                 future = self._submit_refresh_future(
                     self._fetch_account_type_models,
                     account_type,
-                    tuple(access_tokens[:2]),
+                    tuple(access_tokens),
                     deadline,
                     submit_deadline=deadline,
                 )
@@ -509,7 +513,7 @@ class ModelCatalogService:
                         future = self._submit_refresh_future(
                             self._fetch_account_type_models,
                             account_type,
-                            tuple(access_tokens[:2]),
+                            tuple(access_tokens),
                             owner_deadline,
                             submit_deadline=owner_deadline,
                         )

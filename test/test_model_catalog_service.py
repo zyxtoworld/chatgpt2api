@@ -480,6 +480,85 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertIn("recovered-model", {item["id"] for item in catalog.list_models()["data"]})
         self.assertEqual(attempts, 2)
 
+    def test_type_refresh_tries_third_candidate_after_first_two_fail(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "third-candidate-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "bad-one", "type": "Pro", "status": "正常"},
+            {"access_token": "bad-two", "type": "Pro", "status": "正常"},
+            {"access_token": "good-three", "type": "Pro", "status": "正常"},
+        ])
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                if self.access_token:
+                    calls.append(self.access_token)
+                if self.access_token in {"bad-one", "bad-two"}:
+                    raise RuntimeError("representative unavailable")
+                return model_list("complete-pro-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(accounts, backend_factory=Backend)
+        catalog.list_models()
+
+        self.assertEqual(calls, ["bad-one", "bad-two", "good-three"])
+        self.assertIn(
+            "complete-pro-model",
+            {item["id"] for item in catalog.list_models(wait_for_cold=False)["data"]},
+        )
+
+    def test_type_refresh_exhausts_all_candidates_and_deduplicates_rotated_aliases(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "all-candidate-failure-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "alias-one", "type": "Pro", "status": "正常"},
+            {"access_token": "alias-two", "type": "Pro", "status": "正常"},
+            {"access_token": "alias-three", "type": "Pro", "status": "正常"},
+        ])
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                if self.access_token:
+                    calls.append(self.access_token)
+                raise RuntimeError("representative unavailable")
+
+            def close(self) -> None:
+                pass
+
+        original_refresh = accounts.refresh_access_token
+        refresh_map = {
+            "alias-one": "canonical",
+            "alias-two": "canonical",
+            "alias-three": "canonical",
+        }
+
+        def refresh(token: str, **kwargs: object) -> str:
+            return refresh_map.get(token, original_refresh(token, **kwargs))
+
+        accounts.refresh_access_token = refresh  # type: ignore[method-assign]
+        accounts._get_account_lease = lambda token: (  # type: ignore[method-assign]
+            token,
+            {"access_token": token, "type": "Pro", "status": "正常"}
+            if token == "canonical"
+            else None,
+        )
+        catalog = ModelCatalogService(accounts, backend_factory=Backend)
+        catalog.list_models()
+
+        self.assertEqual(calls, ["canonical"])
+
     def test_synchronous_failed_type_without_last_good_reopens_on_next_read(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "sync-type-retry-accounts.json")
@@ -1103,6 +1182,24 @@ class ModelCatalogServiceTests(unittest.TestCase):
             self.catalog.route_for_model("pro-only").access_tokens,
             frozenset({"pro", "pro-alt"}),
         )
+
+    def test_same_type_membership_changes_update_routes_without_refetching_catalog(self) -> None:
+        self.catalog.list_models()
+        initial_calls = list(self.calls)
+
+        self.accounts.add_account_items(
+            [{"access_token": "pro-alt", "type": "PRO", "status": "正常"}]
+        )
+        self.assertEqual(
+            self.catalog.route_for_model("pro-only").access_tokens,
+            frozenset({"pro", "pro-alt"}),
+        )
+        self.accounts.delete_accounts(["pro"])
+        self.assertEqual(
+            self.catalog.route_for_model("pro-only").access_tokens,
+            frozenset({"pro-alt"}),
+        )
+        self.assertEqual(self.calls, initial_calls)
 
     def test_rate_limited_account_does_not_publish_its_model_catalog(self) -> None:
         self.accounts.add_account_items([
