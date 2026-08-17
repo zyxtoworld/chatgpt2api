@@ -111,6 +111,139 @@ class TextAccountRoutingTests(unittest.TestCase):
         self.assertEqual(created_tokens, ["bad", "bad", "good"])
         select_fallback.assert_called_once_with(excluded_tokens={"bad"}, model="auto")
 
+    def test_transient_upstream_failure_allows_only_one_failover(self) -> None:
+        request = conversation.ConversationRequest(
+            model="auto",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        backends: list[object] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+                self.closed = 0
+                backends.append(self)
+
+            def close(self) -> None:
+                self.closed += 1
+
+        def events(_backend: Backend, **_kwargs: object):
+            raise UpstreamHTTPError("conversation", 502, {"error": "upstream_error"})
+            yield  # pragma: no cover
+
+        with (
+            mock.patch.object(conversation, "account_service", self.service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", Backend),
+            mock.patch.object(conversation, "conversation_events", side_effect=events),
+            mock.patch.object(
+                self.service,
+                "get_text_access_token",
+                side_effect=["bad-2", "bad-3"],
+            ) as select_fallback,
+        ):
+            with self.assertRaises(UpstreamHTTPError):
+                list(conversation.stream_text_deltas(Backend("bad-1"), request))
+
+        select_fallback.assert_called_once_with(
+            excluded_tokens={"bad-1"}, model="auto"
+        )
+        self.assertEqual([backend.closed for backend in backends], [1, 1, 1])
+
+    def test_transient_error_after_delta_does_not_switch_accounts(self) -> None:
+        request = conversation.ConversationRequest(
+            model="pro-only",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        backends: list[object] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+                self.closed = 0
+                backends.append(self)
+
+            def close(self) -> None:
+                self.closed += 1
+
+        def events(_backend: Backend, **_kwargs: object):
+            yield {"type": "conversation.delta", "delta": "partial"}
+            raise UpstreamHTTPError("conversation", 502, {"error": "upstream_error"})
+
+        with (
+            mock.patch.object(conversation, "account_service", self.service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", Backend),
+            mock.patch.object(conversation, "conversation_events", side_effect=events),
+            mock.patch.object(self.service, "get_text_access_token") as select_fallback,
+        ):
+            with self.assertRaises(UpstreamHTTPError):
+                list(conversation.stream_text_deltas(Backend("pro"), request))
+
+        select_fallback.assert_not_called()
+        self.assertEqual([backend.closed for backend in backends], [1, 1])
+
+    def test_transient_failover_keeps_requested_model_filter(self) -> None:
+        request = conversation.ConversationRequest(
+            model="pro-only",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def close(self) -> None:
+                pass
+
+        def events(backend: Backend, **_kwargs: object):
+            if backend.access_token == "bad":
+                raise UpstreamHTTPError("conversation", 502, {"error": "upstream_error"})
+            yield {"type": "conversation.delta", "delta": "ok"}
+
+        with (
+            mock.patch.object(conversation, "account_service", self.service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", Backend),
+            mock.patch.object(conversation, "conversation_events", side_effect=events),
+            mock.patch.object(
+                self.service,
+                "get_text_access_token",
+                return_value="good",
+            ) as select_fallback,
+        ):
+            self.assertEqual(
+                list(conversation._stream_text_deltas(Backend("bad"), request)),
+                ["ok"],
+            )
+
+        select_fallback.assert_called_once_with(
+            excluded_tokens={"bad"}, model="pro-only"
+        )
+
+    def test_client_errors_do_not_trigger_transient_failover(self) -> None:
+        request = conversation.ConversationRequest(
+            model="auto",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        class Backend:
+            access_token = "bad"
+
+            def close(self) -> None:
+                pass
+
+        def events(_backend: Backend, **_kwargs: object):
+            raise UpstreamHTTPError("conversation", 400, {"error": "bad_request"})
+            yield  # pragma: no cover
+
+        with (
+            mock.patch.object(conversation, "account_service", self.service),
+            mock.patch.object(conversation, "conversation_events", side_effect=events),
+            mock.patch.object(self.service, "get_text_access_token") as select_fallback,
+        ):
+            with self.assertRaises(UpstreamHTTPError):
+                list(conversation._stream_text_deltas(Backend(), request))
+
+        select_fallback.assert_not_called()
+
     def test_late_text_usage_cannot_mutate_replaced_same_token_account(self) -> None:
         entered = threading.Event()
         release = threading.Event()

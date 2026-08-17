@@ -900,6 +900,7 @@ def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest)
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
+    transient_failover_used = False
     while True:
         if token and token in attempted_tokens:
             raise RuntimeError("no available text account")
@@ -968,11 +969,13 @@ def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest)
                 if token:
                     continue
             if (
-                    token
-                    and not emitted
-                    and isinstance(exc, UpstreamHTTPError)
-                    and exc.status_code in {429, 500, 502, 503, 504}
+                token
+                and not emitted
+                and not transient_failover_used
+                and isinstance(exc, UpstreamHTTPError)
+                and exc.status_code in {429, 500, 502, 503, 504}
             ):
+                transient_failover_used = True
                 fallback_token = account_service.get_text_access_token(
                     excluded_tokens=set(attempted_tokens),
                     model=request.model,
