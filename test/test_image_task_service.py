@@ -714,7 +714,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual([item["status"] for item in second_items], ["error", "error"])
             self.assertTrue(all(item["error"] == recovery_error for item in second_items))
 
-    def test_corrupt_task_error_text_fails_closed_without_rewriting_snapshot(self):
+    def test_unknown_task_error_text_is_safely_projected_without_rewriting_snapshot(self):
         canary = "image-error-canary owner@example.com token"
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"
@@ -735,9 +735,10 @@ class ImageTaskServiceTests(unittest.TestCase):
             path.write_text(json.dumps(snapshot), encoding="utf-8")
             original = path.read_bytes()
 
-            with self.assertRaises(StorageDataError):
-                ImageTaskService(path)
-
+            service = ImageTaskService(path)
+            item = service.list_tasks(OWNER, ["corrupt-error"])["items"][0]
+            self.assertEqual(item["error"], "image task failed")
+            self.assertNotIn(canary, repr(item))
             self.assertEqual(path.read_bytes(), original)
 
     def test_resume_poll_uses_the_generation_account_token(self):

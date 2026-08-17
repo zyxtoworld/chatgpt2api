@@ -789,9 +789,7 @@ class ImageTaskService:
                 raise StorageDataError()
             error = _clean(raw_error)
             if error:
-                if error not in _PERSISTED_IMAGE_ERRORS:
-                    raise StorageDataError()
-                task["error"] = error
+                task["error"] = _persisted_image_error(error)
             error_code = item.get("error_code")
             if error_code is not None and not isinstance(error_code, str):
                 raise StorageDataError()
