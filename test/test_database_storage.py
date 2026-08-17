@@ -20,6 +20,21 @@ from services.account_service import AccountService
 from services.auth_service import AuthService
 
 
+def _concurrent_database_startup_worker(database_url, barrier, result_queue):
+    backend = None
+    try:
+        barrier.wait(timeout=15)
+        backend = DatabaseStorageBackend(database_url)
+        backend.load_accounts()
+    except BaseException as exc:
+        result_queue.put(f"{type(exc).__name__}:{str(exc)[:120]}")
+    else:
+        result_queue.put("ok")
+    finally:
+        if backend is not None:
+            backend.close()
+
+
 def test_database_account_token_schema_has_no_artificial_2048_ceiling() -> None:
     ddl = str(CreateTable(AccountModel.__table__).compile(dialect=postgresql.dialect()))
 
@@ -138,6 +153,85 @@ def test_database_storage_legacy_migration_is_idempotent(tmp_path) -> None:
 
     assert second_rows == first_rows
     assert second_indexes == first_indexes
+
+
+def test_database_storage_concurrent_legacy_startup_is_serialized(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'concurrent-legacy.db'}"
+    legacy_engine = create_engine(database_url)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "access_token VARCHAR(2048) NOT NULL, "
+                "data TEXT NOT NULL)"
+            )
+        )
+        connection.execute(
+            text("CREATE UNIQUE INDEX ix_accounts_access_token ON accounts (access_token)")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO accounts (access_token, data) "
+                "VALUES ('legacy', '{\"access_token\":\"legacy\"}')"
+            )
+        )
+    legacy_engine.dispose()
+
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_concurrent_database_startup_worker,
+            args=(database_url, barrier, result_queue),
+        )
+        for _ in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(30)
+        assert [process.exitcode for process in processes] == [0, 0]
+        results = sorted(result_queue.get(timeout=10) for _ in processes)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(10)
+    assert results == ["ok", "ok"]
+
+
+@pytest.mark.parametrize("dialect", ("postgresql", "mysql"))
+def test_database_schema_lock_uses_server_advisory_lock(dialect) -> None:
+    statements = []
+
+    class Result:
+        def scalar(self):
+            return 1
+
+    class Connection:
+        def execute(self, statement, parameters=None):
+            statements.append(str(statement))
+            return Result()
+
+        def close(self):
+            statements.append("CLOSE")
+
+    backend = DatabaseStorageBackend.__new__(DatabaseStorageBackend)
+    backend.engine = SimpleNamespace(
+        dialect=SimpleNamespace(name=dialect),
+        connect=Connection,
+    )
+    backend.database_url = f"{dialect}://local/test"
+
+    with backend._acquire_schema_lock():
+        pass
+
+    assert any("pg_advisory_lock" in statement or "GET_LOCK" in statement for statement in statements)
+    assert any("pg_advisory_unlock" in statement or "RELEASE_LOCK" in statement for statement in statements)
+    assert statements[-1] == "CLOSE"
 
 
 def test_database_storage_rejects_corrupt_account_hash_without_rewriting_row(tmp_path) -> None:

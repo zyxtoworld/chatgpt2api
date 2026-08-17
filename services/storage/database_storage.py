@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import CHAR, Column, Index, String, Text, create_engine, Integer, inspect, text
@@ -15,6 +17,7 @@ from services.storage.base import (
     StorageBackend,
     StorageDataError,
     StorageSnapshot,
+    canonical_path_write_lock,
     make_storage_snapshot,
     validate_storage_records,
 )
@@ -82,17 +85,78 @@ class DatabaseStorageBackend(StorageBackend):
             pool_pre_ping=True,  # 自动检测连接是否有效
             pool_recycle=3600,   # 1小时回收连接
         )
+        schema_lock = self._acquire_schema_lock()
         try:
-            Base.metadata.create_all(self.engine)
-            self.Session = sessionmaker(bind=self.engine)
-            self._ensure_account_token_schema()
-            self._ensure_mutation_lock_rows()
+            with schema_lock:
+                Base.metadata.create_all(self.engine)
+                self.Session = sessionmaker(bind=self.engine)
+                self._ensure_account_token_schema()
+                self._ensure_mutation_lock_rows()
         except BaseException:
             try:
                 self.engine.dispose()
             except BaseException:
                 pass
             raise
+
+    @contextmanager
+    def _acquire_schema_lock(self):
+        """Serialize schema creation and migrations across service processes.
+
+        SQLite has no server-side advisory lock, so a sidecar lock protects the
+        database file.  PostgreSQL and MySQL keep their advisory lock on a
+        dedicated connection for the entire DDL/migration window.
+        """
+        dialect = self.engine.dialect.name
+        if dialect == "sqlite":
+            database = self.engine.url.database
+            if database and database != ":memory:" and not database.startswith("file:"):
+                lock = canonical_path_write_lock(Path(database))
+                with lock:
+                    yield
+                return
+            yield
+            return
+
+        if dialect not in {"postgresql", "mysql"}:
+            yield
+            return
+
+        connection = self.engine.connect()
+        lock_name = "chatgpt2api-schema-" + hashlib.sha256(
+            self.database_url.encode("utf-8")
+        ).hexdigest()[:48]
+        acquired = False
+        try:
+            if dialect == "postgresql":
+                connection.execute(
+                    text("SELECT pg_advisory_lock(hashtext(:lock_name))"),
+                    {"lock_name": lock_name},
+                )
+                acquired = True
+            else:
+                result = connection.execute(
+                    text("SELECT GET_LOCK(:lock_name, 60)"),
+                    {"lock_name": lock_name[:64]},
+                ).scalar()
+                if result != 1:
+                    raise StorageDataError()
+                acquired = True
+            yield
+        finally:
+            try:
+                if acquired and dialect == "postgresql":
+                    connection.execute(
+                        text("SELECT pg_advisory_unlock(hashtext(:lock_name))"),
+                        {"lock_name": lock_name},
+                    )
+                elif acquired:
+                    connection.execute(
+                        text("SELECT RELEASE_LOCK(:lock_name)"),
+                        {"lock_name": lock_name[:64]},
+                    )
+            finally:
+                connection.close()
 
     def _ensure_account_token_schema(self) -> None:
         """Migrate legacy token columns and install the database identity index."""
