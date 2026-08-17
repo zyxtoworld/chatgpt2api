@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -1253,7 +1254,11 @@ def _insert_database_row(backend: DatabaseStorageBackend, kind: str, payload: st
     session = backend.Session()
     try:
         row = (
-            AccountModel(access_token="bad-row", data=payload)
+            AccountModel(
+                access_token="bad-row",
+                access_token_hash=hashlib.sha256(b"bad-row").hexdigest(),
+                data=payload,
+            )
             if kind == "accounts"
             else AuthKeyModel(key_id="bad-row", data=payload)
         )

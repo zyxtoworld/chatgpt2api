@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
-from sqlalchemy import Column, String, Text, create_engine, Integer, text
+from sqlalchemy import CHAR, Column, Index, String, Text, create_engine, Integer, inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -22,13 +23,25 @@ from services.url_utils import redact_url_credentials
 Base = declarative_base()
 
 
+def _access_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 class AccountModel(Base):
     """账号数据模型"""
     __tablename__ = "accounts"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    access_token = Column(String(2048), unique=True, nullable=False, index=True)
+    # Access-token length is provider-controlled; the storage contract has no
+    # 2048-character ceiling.  The fixed-size digest keeps uniqueness in the
+    # database without indexing the raw secret.
+    access_token = Column(Text, nullable=False)
+    access_token_hash = Column(CHAR(64), nullable=False)
     data = Column(Text, nullable=False)  # JSON 格式存储完整账号数据
+
+    __table_args__ = (
+        Index("ux_accounts_access_token_hash", "access_token_hash", unique=True),
+    )
 
 
 class AuthKeyModel(Base):
@@ -72,6 +85,7 @@ class DatabaseStorageBackend(StorageBackend):
         try:
             Base.metadata.create_all(self.engine)
             self.Session = sessionmaker(bind=self.engine)
+            self._ensure_account_token_schema()
             self._ensure_mutation_lock_rows()
         except BaseException:
             try:
@@ -79,6 +93,203 @@ class DatabaseStorageBackend(StorageBackend):
             except BaseException:
                 pass
             raise
+
+    def _ensure_account_token_schema(self) -> None:
+        """Migrate legacy token columns and install the database identity index."""
+        dialect = self.engine.dialect.name
+        inspector = inspect(self.engine)
+        columns = {column["name"]: column for column in inspector.get_columns("accounts")}
+        token_column = columns.get("access_token")
+        if token_column is None:
+            raise StorageDataError()
+
+        if dialect not in {"postgresql", "mysql", "sqlite"}:
+            raise StorageDataError()
+
+        indexes = inspector.get_indexes("accounts")
+        raw_token_indexes = [
+            index
+            for index in indexes
+            if index.get("unique") and index.get("column_names") == ["access_token"]
+        ]
+        unique_constraints = inspector.get_unique_constraints("accounts")
+        raw_token_constraints = [
+            constraint
+            for constraint in unique_constraints
+            if constraint.get("column_names") == ["access_token"]
+        ]
+        index_names = {
+            index.get("name") for index in raw_token_indexes if index.get("name")
+        }
+        constraint_names = {
+            constraint.get("name")
+            for constraint in raw_token_constraints
+            if constraint.get("name")
+        }
+        if dialect == "postgresql":
+            raw_token_indexes = [
+                index for index in raw_token_indexes
+                if index.get("name") not in constraint_names
+            ]
+        elif dialect == "mysql":
+            raw_token_constraints = [
+                constraint for constraint in raw_token_constraints
+                if constraint.get("name") not in index_names
+            ]
+        hash_column = columns.get("access_token_hash")
+        hash_index_name = "ux_accounts_access_token_hash"
+        hash_needs_not_null = hash_column is None or bool(hash_column.get("nullable"))
+        hash_indexes = [
+            index
+            for index in indexes
+            if index.get("unique")
+            and index.get("column_names") == ["access_token_hash"]
+        ]
+
+        with self.engine.begin() as connection:
+            if hash_column is None:
+                connection.execute(
+                    text("ALTER TABLE accounts ADD COLUMN access_token_hash CHAR(64)")
+                )
+
+            rows = connection.execute(
+                text("SELECT id, access_token, access_token_hash FROM accounts")
+            ).mappings()
+            updates: list[dict[str, Any]] = []
+            seen_hashes: set[str] = set()
+            for row in rows:
+                raw_token = row.get("access_token")
+                if not isinstance(raw_token, str) or not raw_token.strip():
+                    raise StorageDataError()
+                token = raw_token.strip()
+                token_hash = _access_token_hash(token)
+                if token_hash in seen_hashes:
+                    raise StorageDataError()
+                seen_hashes.add(token_hash)
+                stored_hash = row.get("access_token_hash")
+                if stored_hash not in (None, token_hash):
+                    raise StorageDataError()
+                if stored_hash != token_hash:
+                    updates.append({"id": row["id"], "token_hash": token_hash})
+
+            if updates:
+                connection.execute(
+                    text(
+                        "UPDATE accounts "
+                        "SET access_token_hash = :token_hash "
+                        "WHERE id = :id"
+                    ),
+                    updates,
+                )
+
+            if dialect == "sqlite" and hash_needs_not_null:
+                migration_table = "accounts__chatgpt2api_token_migration"
+                connection.execute(text(f"DROP TABLE IF EXISTS {migration_table}"))
+                connection.execute(
+                    text(
+                        f"CREATE TABLE {migration_table} ("
+                        "id INTEGER PRIMARY KEY, "
+                        "access_token TEXT NOT NULL, "
+                        "access_token_hash CHAR(64) NOT NULL, "
+                        "data TEXT NOT NULL"
+                        ")"
+                    )
+                )
+                connection.execute(
+                    text(
+                        f"INSERT INTO {migration_table} "
+                        "(id, access_token, access_token_hash, data) "
+                        "SELECT id, access_token, access_token_hash, data FROM accounts"
+                    )
+                )
+                connection.execute(text("DROP TABLE accounts"))
+                connection.execute(
+                    text(f"ALTER TABLE {migration_table} RENAME TO accounts")
+                )
+                raw_token_indexes = []
+                raw_token_constraints = []
+                hash_indexes = []
+
+            if not hash_indexes:
+                connection.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX {hash_index_name} "
+                        "ON accounts (access_token_hash)"
+                    )
+                )
+
+            if dialect == "postgresql" and hash_needs_not_null:
+                connection.execute(
+                    text(
+                        "ALTER TABLE accounts "
+                        "ALTER COLUMN access_token_hash SET NOT NULL"
+                    )
+                )
+            elif dialect == "mysql" and hash_needs_not_null:
+                connection.execute(
+                    text(
+                        "ALTER TABLE accounts MODIFY access_token_hash CHAR(64) NOT NULL"
+                    )
+                )
+
+            # MySQL cannot convert an indexed VARCHAR column to TEXT while the
+            # old raw-token index still exists.  Drop it only after the digest
+            # index is ready and non-null, so a failed backfill/index build
+            # leaves the legacy uniqueness constraint intact.
+            if dialect == "mysql":
+                if raw_token_indexes:
+                    self._drop_raw_token_indexes(connection, raw_token_indexes, dialect)
+                if raw_token_constraints:
+                    self._drop_raw_token_constraints(
+                        connection, raw_token_constraints, dialect
+                    )
+
+            if dialect == "postgresql" and not isinstance(
+                token_column.get("type"), Text
+            ):
+                connection.execute(
+                    text("ALTER TABLE accounts ALTER COLUMN access_token TYPE TEXT")
+                )
+            elif dialect == "mysql" and not isinstance(
+                token_column.get("type"), Text
+            ):
+                connection.execute(
+                    text("ALTER TABLE accounts MODIFY access_token TEXT NOT NULL")
+                )
+
+            if dialect == "postgresql":
+                if raw_token_indexes:
+                    self._drop_raw_token_indexes(connection, raw_token_indexes, dialect)
+                if raw_token_constraints:
+                    self._drop_raw_token_constraints(
+                        connection, raw_token_constraints, dialect
+                    )
+
+    @staticmethod
+    def _drop_raw_token_indexes(connection, indexes: list[dict[str, Any]], dialect: str) -> None:
+        for index in indexes:
+            name = index.get("name")
+            if not isinstance(name, str) or not name.replace("_", "").isalnum():
+                raise StorageDataError()
+            if dialect == "mysql":
+                connection.execute(text(f"DROP INDEX `{name}` ON accounts"))
+            else:
+                connection.execute(text(f'DROP INDEX IF EXISTS "{name}"'))
+
+    @staticmethod
+    def _drop_raw_token_constraints(
+        connection, constraints: list[dict[str, Any]], dialect: str
+    ) -> None:
+        for constraint in constraints:
+            name = constraint.get("name")
+            if not isinstance(name, str) or not name.replace("_", "").isalnum():
+                raise StorageDataError()
+            if dialect == "mysql":
+                connection.execute(text(f"ALTER TABLE accounts DROP INDEX `{name}`"))
+            else:
+                connection.execute(
+                    text(f'ALTER TABLE accounts DROP CONSTRAINT "{name}"')
+                )
 
     def close(self) -> None:
         """Dispose pooled DB connections after application work has drained."""
@@ -259,6 +470,9 @@ class DatabaseStorageBackend(StorageBackend):
                 or raw_key.strip() != str(getattr(row, row_key))
             ):
                 raise StorageDataError()
+            if model is AccountModel:
+                if getattr(row, "access_token_hash", None) != _access_token_hash(raw_key.strip()):
+                    raise StorageDataError()
             items.append(item_data)
         return items
 
@@ -312,14 +526,18 @@ class DatabaseStorageBackend(StorageBackend):
             serialized_data = json.dumps(item, ensure_ascii=False)
             existing_row = existing_rows.get(key_value)
             if existing_row is None:
-                session.add(
-                    model(
-                        **{key_column: key_value},
-                        data=serialized_data,
-                    )
-                )
-            elif existing_row.data != serialized_data:
-                existing_row.data = serialized_data
+                values = {
+                    key_column: key_value,
+                    "data": serialized_data,
+                }
+                if model is AccountModel:
+                    values["access_token_hash"] = _access_token_hash(key_value)
+                session.add(model(**values))
+            else:
+                if model is AccountModel:
+                    existing_row.access_token_hash = _access_token_hash(key_value)
+                if existing_row.data != serialized_data:
+                    existing_row.data = serialized_data
 
         for key_value, row in existing_rows.items():
             if key_value not in incoming_keys:

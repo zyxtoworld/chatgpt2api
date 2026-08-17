@@ -1,10 +1,14 @@
-import json
 import hashlib
+import json
 import multiprocessing
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, String, Text, text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateTable
 
 from services.storage.database_storage import (
     AccountModel,
@@ -14,6 +18,320 @@ from services.storage.database_storage import (
 from services.storage.base import StorageConflictError, StorageDataError
 from services.account_service import AccountService
 from services.auth_service import AuthService
+
+
+def test_database_account_token_schema_has_no_artificial_2048_ceiling() -> None:
+    ddl = str(CreateTable(AccountModel.__table__).compile(dialect=postgresql.dialect()))
+
+    assert isinstance(AccountModel.__table__.c.access_token.type, Text)
+    assert "VARCHAR(2048)" not in ddl
+
+
+def test_database_account_identity_hash_is_database_unique(tmp_path) -> None:
+    token = "token-identity"
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'identity.db'}")
+    first = backend.Session()
+    second = backend.Session()
+    try:
+        first.add(
+            AccountModel(
+                access_token=token,
+                access_token_hash=token_hash,
+                data=json.dumps({"access_token": token}),
+            )
+        )
+        first.commit()
+
+        second.add(
+            AccountModel(
+                access_token=token,
+                access_token_hash=token_hash,
+                data=json.dumps({"access_token": token}),
+            )
+        )
+        with pytest.raises(IntegrityError):
+            second.commit()
+    finally:
+        first.close()
+        second.rollback()
+        second.close()
+
+
+def test_database_storage_migrates_legacy_account_token_schema(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'legacy-accounts.db'}"
+    token = "legacy-token-" + ("x" * 2050)
+    legacy_engine = create_engine(database_url)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "access_token VARCHAR(2048) NOT NULL, "
+                "data TEXT NOT NULL"
+                ")"
+            )
+        )
+        connection.execute(text("CREATE UNIQUE INDEX ix_accounts_access_token "
+                                "ON accounts (access_token)"))
+        connection.execute(
+            text("INSERT INTO accounts (access_token, data) VALUES (:token, :data)"),
+            {"token": token, "data": json.dumps({"access_token": token})},
+        )
+    legacy_engine.dispose()
+
+    backend = DatabaseStorageBackend(database_url)
+    indexes = inspect(backend.engine).get_indexes("accounts")
+    columns = {
+        column["name"]: column
+        for column in inspect(backend.engine).get_columns("accounts")
+    }
+
+    assert backend.load_accounts() == [{"access_token": token}]
+    assert columns["access_token_hash"]["nullable"] is False
+    assert any(
+        index.get("unique")
+        and index.get("column_names") == ["access_token_hash"]
+        for index in indexes
+    )
+    assert not any(index.get("column_names") == ["access_token"] for index in indexes)
+
+
+def test_database_storage_legacy_migration_is_idempotent(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'legacy-idempotent.db'}"
+    token = "legacy-token"
+    legacy_engine = create_engine(database_url)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "access_token VARCHAR(2048) NOT NULL, "
+                "data TEXT NOT NULL"
+                ")"
+            )
+        )
+        connection.execute(
+            text("CREATE UNIQUE INDEX ix_accounts_access_token "
+                 "ON accounts (access_token)")
+        )
+        connection.execute(
+            text("INSERT INTO accounts (access_token, data) VALUES (:token, :data)"),
+            {"token": token, "data": json.dumps({"access_token": token})},
+        )
+    legacy_engine.dispose()
+
+    first = DatabaseStorageBackend(database_url)
+    first_rows = {
+        row.access_token: (row.id, row.access_token_hash, row.data)
+        for row in _account_rows(first).values()
+    }
+    first_indexes = inspect(first.engine).get_indexes("accounts")
+    first.close()
+
+    second = DatabaseStorageBackend(database_url)
+    second_rows = {
+        row.access_token: (row.id, row.access_token_hash, row.data)
+        for row in _account_rows(second).values()
+    }
+    second_indexes = inspect(second.engine).get_indexes("accounts")
+
+    assert second_rows == first_rows
+    assert second_indexes == first_indexes
+
+
+def test_database_storage_rejects_corrupt_account_hash_without_rewriting_row(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'corrupt-hash.db'}"
+    backend = DatabaseStorageBackend(database_url)
+    backend.save_accounts([{"access_token": "token-a", "name": "A"}])
+
+    session = backend.Session()
+    try:
+        row = session.query(AccountModel).one()
+        row.access_token_hash = "0" * 64
+        session.commit()
+    finally:
+        session.close()
+
+    with pytest.raises(StorageDataError):
+        DatabaseStorageBackend(database_url)
+
+    check = create_engine(database_url)
+    with check.connect() as connection:
+        row = connection.execute(
+            text("SELECT access_token, access_token_hash FROM accounts")
+        ).one()
+    check.dispose()
+    assert row.access_token == "token-a"
+    assert row.access_token_hash == "0" * 64
+
+
+def test_database_storage_rejects_legacy_normalized_duplicate_without_rewriting(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'duplicate-legacy.db'}"
+    legacy_engine = create_engine(database_url)
+    with legacy_engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "access_token VARCHAR(2048) NOT NULL, "
+                "data TEXT NOT NULL"
+                ")"
+            )
+        )
+        connection.execute(
+            text("CREATE UNIQUE INDEX ix_accounts_access_token "
+                 "ON accounts (access_token)")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO accounts (access_token, data) VALUES "
+                "(' token ', '{\"access_token\": \" token \"}'), "
+                "('token', '{\"access_token\": \"token\"}')"
+            )
+        )
+    legacy_engine.dispose()
+
+    with pytest.raises(StorageDataError):
+        DatabaseStorageBackend(database_url)
+
+    check = create_engine(database_url)
+    with check.connect() as connection:
+        rows = connection.execute(
+            text("SELECT access_token FROM accounts ORDER BY id")
+        ).scalars().all()
+    check.dispose()
+    assert rows == [" token ", "token"]
+
+
+class _MigrationResult:
+    def mappings(self):
+        return []
+
+
+class _MigrationConnection:
+    def __init__(self, statements: list[str]):
+        self.statements = statements
+
+    def execute(self, statement, parameters=None):
+        self.statements.append(str(statement))
+        return _MigrationResult()
+
+
+class _MigrationContext:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __enter__(self):
+        return self.connection
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+class _MigrationEngine:
+    def __init__(self, dialect: str, statements: list[str]):
+        self.dialect = SimpleNamespace(name=dialect)
+        self.connection = _MigrationConnection(statements)
+
+    def begin(self):
+        return _MigrationContext(self.connection)
+
+
+class _MigrationInspector:
+    def __init__(self, indexes=None, constraints=None):
+        self.indexes = indexes or []
+        self.constraints = constraints or []
+
+    def get_columns(self, table):
+        return [{"name": "access_token", "type": String(2048), "nullable": False}]
+
+    def get_indexes(self, table):
+        return self.indexes
+
+    def get_unique_constraints(self, table):
+        return self.constraints
+
+
+@pytest.mark.parametrize(
+    ("dialect", "raw_drop", "raw_type", "drop_before_type"),
+    (
+        (
+            "postgresql",
+            'DROP INDEX IF EXISTS "ix_accounts_access_token"',
+            "ALTER TABLE accounts ALTER COLUMN access_token TYPE TEXT",
+            False,
+        ),
+        (
+            "mysql",
+            "DROP INDEX `ix_accounts_access_token` ON accounts",
+            "ALTER TABLE accounts MODIFY access_token TEXT NOT NULL",
+            True,
+        ),
+    ),
+)
+def test_database_token_migration_orders_hash_before_raw_drop(
+    dialect, raw_drop, raw_type, drop_before_type
+):
+    statements = []
+    backend = DatabaseStorageBackend.__new__(DatabaseStorageBackend)
+    backend.engine = _MigrationEngine(dialect, statements)
+    inspector = _MigrationInspector(
+        indexes=[
+            {
+                "name": "ix_accounts_access_token",
+                "unique": True,
+                "column_names": ["access_token"],
+            }
+        ]
+    )
+
+    with mock.patch("services.storage.database_storage.inspect", return_value=inspector):
+        backend._ensure_account_token_schema()
+
+    create_position = next(
+        index for index, statement in enumerate(statements)
+        if "CREATE UNIQUE INDEX ux_accounts_access_token_hash" in statement
+    )
+    not_null_position = next(
+        index for index, statement in enumerate(statements)
+        if "access_token_hash" in statement and "NOT NULL" in statement
+    )
+    drop_position = statements.index(raw_drop)
+    raw_type_position = statements.index(raw_type)
+    assert create_position < not_null_position
+    if drop_before_type:
+        assert drop_position < raw_type_position
+    else:
+        assert raw_type_position < drop_position
+
+
+def test_database_token_migration_handles_reflected_unique_constraint():
+    statements = []
+    backend = DatabaseStorageBackend.__new__(DatabaseStorageBackend)
+    backend.engine = _MigrationEngine("postgresql", statements)
+    inspector = _MigrationInspector(
+        constraints=[
+            {
+                "name": "uq_accounts_access_token",
+                "column_names": ["access_token"],
+            }
+        ]
+    )
+
+    with mock.patch("services.storage.database_storage.inspect", return_value=inspector):
+        backend._ensure_account_token_schema()
+
+    assert 'ALTER TABLE accounts DROP CONSTRAINT "uq_accounts_access_token"' in statements
+
+
+def test_database_storage_round_trips_access_token_over_2048_characters(tmp_path) -> None:
+    token = "token-" + ("x" * 2050)
+    backend = DatabaseStorageBackend(f"sqlite:///{tmp_path / 'long-token.db'}")
+
+    backend.save_accounts([{"access_token": token, "name": "long"}])
+
+    assert backend.load_accounts() == [{"access_token": token, "name": "long"}]
 
 
 def _database_revision_writer(
@@ -379,7 +697,13 @@ def test_database_storage_rejects_row_key_mismatch(tmp_path, kind):
     session = backend.Session()
     try:
         if kind == "accounts":
-            session.add(AccountModel(access_token="row-key", data=json.dumps({"access_token": "payload-key"})))
+            session.add(
+                AccountModel(
+                    access_token="row-key",
+                    access_token_hash=hashlib.sha256(b"row-key").hexdigest(),
+                    data=json.dumps({"access_token": "payload-key"}),
+                )
+            )
         else:
             session.add(AuthKeyModel(key_id="row-key", data=json.dumps({"id": "payload-key"})))
         session.commit()
