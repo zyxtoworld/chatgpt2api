@@ -259,9 +259,16 @@ class ModelListTests(unittest.TestCase):
 
     def test_list_models_function(self):
         """测试直接调用服务层获取模型列表。"""
-        result = openai_v1_models.list_models()
-        print("function result:")
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        with (
+            mock.patch.object(
+                openai_v1_models.model_catalog_service,
+                "list_models",
+                return_value={"object": "list", "data": []},
+            ),
+            mock.patch.object(openai_v1_models.account_service, "list_accounts", return_value=[]),
+        ):
+            result = openai_v1_models.list_models()
+        self.assertEqual(result, {"object": "list", "data": []})
 
     def test_list_models_http(self):
         """测试通过 HTTP 接口获取模型列表。"""

@@ -11,7 +11,11 @@ from threading import Event
 
 from services.account_service import AccountService
 import services.model_service as model_service_module
-from services.model_service import ModelCatalogService
+from services.model_service import (
+    ModelCatalogPendingError,
+    ModelCatalogService,
+    ModelUnavailableError,
+)
 from services.storage.json_storage import JSONStorageBackend
 
 
@@ -122,7 +126,10 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertFalse(pro_route.allow_anonymous)
 
         shared_route = self.catalog.route_for_model("shared")
-        self.assertEqual(shared_route.access_tokens, frozenset({"free-good", "plus"}))
+        self.assertEqual(
+            shared_route.access_tokens,
+            frozenset({"free-bad", "free-good", "plus"}),
+        )
         self.assertTrue(shared_route.allow_anonymous)
 
     def test_model_map_rejects_container_ids_instead_of_stringifying_them(self) -> None:
@@ -201,11 +208,303 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         catalog.list_models()
 
-        self.assertEqual(len(deadlines), 5)
+        self.assertEqual(len(deadlines), 4)
         self.assertEqual(deadlines[0], 5090.0)
         self.assertEqual(set(deadlines), {5090.0})
-        self.assertEqual(len(refresh_deadlines), 4)
+        self.assertEqual(len(refresh_deadlines), 3)
         self.assertEqual(set(refresh_deadlines), {5090.0})
+
+    def test_cold_nonblocking_refresh_uses_one_representative_for_large_type(self) -> None:
+        total_accounts = 1495
+        accounts = [
+            {"access_token": f"token-{index}", "type": "free", "status": "正常"}
+            for index in range(total_accounts)
+        ]
+        refresh_started = Event()
+        release_first = Event()
+        request_count: list[str] = []
+
+        class ManyAccounts:
+            def list_accounts(self) -> list[dict[str, object]]:
+                return [dict(item) for item in accounts]
+
+            def _is_text_account_available(self, account: dict[str, object]) -> bool:
+                return account.get("status") == "正常"
+
+            def _normalize_account_type(self, value: object) -> str:
+                return str(value or "")
+
+            def refresh_access_token(self, token: str, **_kwargs: object) -> str:
+                return token
+
+            def _get_account_lease(self, token: str):
+                for item in accounts:
+                    if item["access_token"] == token:
+                        return token, item
+                return token, None
+
+        class ManyBackend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                request_count.append(self.access_token)
+                if self.access_token == "token-0":
+                    refresh_started.set()
+                    release_first.wait(timeout=2)
+                return model_list(
+                    "anonymous-model" if not self.access_token else "shared-free-model"
+                )
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            ManyAccounts(),
+            backend_factory=ManyBackend,
+            cache_ttl_seconds=300,
+        )
+
+        result = catalog.list_models(wait_for_cold=False)
+
+        self.assertIsInstance(result, dict)
+        self.assertTrue(refresh_started.wait(timeout=1))
+        self.assertEqual(request_count.count("token-0"), 1)
+        self.assertEqual(sum(bool(token) for token in request_count), 1)
+        self.assertNotIn(f"token-{total_accounts - 1}", request_count)
+
+        release_first.set()
+        self.assertTrue(catalog._refresh_done.wait(timeout=5))
+        complete = catalog.list_models(wait_for_cold=False)
+        self.assertIn("shared-free-model", {item["id"] for item in complete["data"]})
+        self.assertEqual(sum(bool(token) for token in request_count), 1)
+        self.assertEqual(catalog.route_for_model("shared-free-model").access_tokens, frozenset(
+            f"token-{index}" for index in range(total_accounts)
+        ))
+
+    def test_nonblocking_route_marks_unscanned_model_as_pending(self) -> None:
+        refresh_started = Event()
+        release_refresh = Event()
+
+        class BlockingBackend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                refresh_started.set()
+                release_refresh.wait(timeout=2)
+                return model_list("known-model")
+
+            def close(self) -> None:
+                pass
+
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "pending-route-accounts.json")
+        )
+        accounts.add_account_items([{"access_token": "pending-token", "type": "free", "status": "正常"}])
+        catalog = ModelCatalogService(accounts, backend_factory=BlockingBackend)
+
+        route = catalog.route_for_model("unknown-model", wait_for_cold=False)
+
+        self.assertFalse(route.catalog_complete)
+        self.assertEqual(route.access_tokens, frozenset())
+        release_refresh.set()
+        self.assertTrue(refresh_started.wait(timeout=1))
+
+    def test_nonblocking_refresh_reopens_when_a_new_account_type_appears(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "type-change-accounts.json")
+        )
+        accounts.add_account_items([{"access_token": "free-token", "type": "free", "status": "正常"}])
+        free_started = Event()
+        release_free = Event()
+        plus_started = Event()
+        release_plus = Event()
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                if self.access_token == "free-token" and not free_started.is_set():
+                    free_started.set()
+                    if not release_free.wait(timeout=2):
+                        raise AssertionError("free representative was not released")
+                if self.access_token == "plus-token":
+                    plus_started.set()
+                    if not release_plus.wait(timeout=2):
+                        raise AssertionError("plus representative was not released")
+                return model_list(f"{self.access_token or 'anonymous'}-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(accounts, backend_factory=Backend)
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(free_started.wait(timeout=1))
+
+        accounts.add_account_items([{"access_token": "plus-token", "type": "Plus", "status": "正常"}])
+        release_free.set()
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(plus_started.wait(timeout=1))
+        release_plus.set()
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        self.assertIn("plus-token-model", {item["id"] for item in catalog.list_models()["data"]})
+        self.assertEqual(calls.count("free-token"), 1)
+        self.assertEqual(calls.count("plus-token"), 1)
+
+    def test_failed_type_without_last_good_is_retried_on_next_read(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "type-retry-accounts.json")
+        )
+        accounts.add_account_items([{"access_token": "free-token", "type": "free", "status": "正常"}])
+        attempts = 0
+        now = [1000.0]
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                nonlocal attempts
+                if self.access_token == "free-token":
+                    attempts += 1
+                    if attempts == 1:
+                        raise RuntimeError("representative unavailable")
+                    return model_list("recovered-model")
+                return model_list("anonymous-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: now[0],
+        )
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        self.assertNotIn("recovered-model", {item["id"] for item in catalog.list_models(wait_for_cold=False)["data"]})
+
+        now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        self.assertIn("recovered-model", {item["id"] for item in catalog.list_models()["data"]})
+        self.assertEqual(attempts, 2)
+
+    def test_synchronous_failed_type_without_last_good_reopens_on_next_read(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "sync-type-retry-accounts.json")
+        )
+        accounts.add_account_items([{"access_token": "free-token", "type": "free", "status": "正常"}])
+        attempts = 0
+        now = [1000.0]
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                nonlocal attempts
+                if self.access_token == "free-token":
+                    attempts += 1
+                    if attempts == 1:
+                        raise RuntimeError("representative unavailable")
+                    return model_list("synchronous-recovered-model")
+                return model_list("anonymous-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: now[0],
+        )
+        first = catalog.list_models()
+        self.assertNotIn(
+            "synchronous-recovered-model",
+            {item["id"] for item in first["data"]},
+        )
+
+        now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
+        catalog.list_models()
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        second = catalog.list_models(wait_for_cold=False)
+        self.assertIn(
+            "synchronous-recovered-model",
+            {item["id"] for item in second["data"]},
+        )
+        self.assertEqual(attempts, 2)
+
+    def test_failed_type_does_not_block_ready_routes_or_retry_per_request(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "failed-type-isolation-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "ready-token", "type": "Ready", "status": "正常"},
+            {"access_token": "bad-one", "type": "Broken", "status": "正常"},
+            {"access_token": "bad-two", "type": "Broken", "status": "正常"},
+        ])
+        calls: list[str] = []
+        bad_started = Event()
+        release_bad = Event()
+        block_bad = False
+        now = [1000.0]
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                if self.access_token == "ready-token":
+                    return model_list("ready-model")
+                if self.access_token in {"bad-one", "bad-two"}:
+                    if block_bad:
+                        bad_started.set()
+                        release_bad.wait(timeout=2)
+                    raise RuntimeError("broken representative")
+                return model_list("anonymous-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: now[0],
+        )
+        catalog.list_models()
+        self.assertEqual(calls.count("ready-token"), 1)
+        self.assertEqual(calls.count("bad-one") + calls.count("bad-two"), 2)
+
+        for _ in range(20):
+            route = catalog.route_for_model("ready-model")
+            self.assertEqual(route.access_tokens, frozenset({"ready-token"}))
+        self.assertEqual(calls.count("ready-token"), 1)
+        self.assertEqual(calls.count("bad-one") + calls.count("bad-two"), 2)
+
+        block_bad = True
+        now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
+        route = catalog.route_for_model("ready-model")
+        self.assertEqual(route.access_tokens, frozenset({"ready-token"}))
+        self.assertTrue(bad_started.wait(timeout=1))
+        self.assertEqual(calls.count("ready-token"), 1)
+
+        pending_route = catalog.route_for_model("unknown-while-broken-retry")
+        self.assertFalse(pending_route.catalog_complete)
+        with mock.patch("services.model_service.model_catalog_service", catalog):
+            with self.assertRaises(ModelCatalogPendingError):
+                accounts.get_text_access_token(model="unknown-while-broken-retry")
+        release_bad.set()
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        self.assertEqual(calls.count("ready-token"), 1)
+        self.assertEqual(calls.count("bad-one") + calls.count("bad-two"), 4)
 
     def test_refresh_admission_failure_cancels_already_submitted_siblings(self) -> None:
         submitted: list[Future] = []
@@ -273,7 +572,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
                 "pro-only",
                 {
                     model_id
-                    for model_id in catalog._models_by_access_token["pro"]
+                    for model_id in catalog._models_by_account_type["Pro"]
                 },
             )
         finally:
@@ -409,10 +708,13 @@ class ModelCatalogServiceTests(unittest.TestCase):
                 stale_route = stale_reader.result(timeout=0.2)
             finally:
                 release_refresh.set()
-            refreshed_route = refresh.result(timeout=2)
+            refresh.result(timeout=2)
+            self.assertTrue(catalog._refresh_done.wait(timeout=2))
 
         self.assertTrue(stale_route.allow_anonymous)
-        self.assertFalse(refreshed_route.allow_anonymous)
+        self.assertFalse(
+            catalog.route_for_model("cached-model", wait_for_cold=False).allow_anonymous
+        )
         self.assertEqual(calls, [1, 2])
 
     def test_failed_refresh_keeps_last_successful_models_for_that_type(self) -> None:
@@ -420,7 +722,9 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.outcomes["pro"] = RuntimeError("temporary upstream failure")
         self.now += 301
 
-        result = self.catalog.list_models()
+        self.catalog.list_models(wait_for_cold=False)
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
+        result = self.catalog.list_models(wait_for_cold=False)
 
         self.assertIn("pro-only", {item["id"] for item in result["data"]})
         self.assertEqual(
@@ -452,9 +756,13 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.outcomes["pro"] = RuntimeError("account removed during refresh")
         self.now += 301
 
-        self.catalog.list_models()
+        self.catalog.list_models(wait_for_cold=False)
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
 
-        self.assertEqual(self.catalog.route_for_model("pro-only").access_tokens, frozenset())
+        self.assertEqual(
+            self.catalog.route_for_model("pro-only", wait_for_cold=False).access_tokens,
+            frozenset(),
+        )
 
     def test_account_type_changed_during_refresh_does_not_relabel_old_catalog(self) -> None:
         self.accounts.delete_accounts(["free-bad", "free-good", "plus", "pro", "team-disabled"])
@@ -468,10 +776,11 @@ class ModelCatalogServiceTests(unittest.TestCase):
             return token
 
         self.accounts.refresh_access_token = change_type_during_refresh
-        result = self.catalog.list_models()
-
-        self.assertNotIn("free-only", {item["id"] for item in result["data"]})
-        with mock.patch.object(self.catalog, "_ensure_catalog", return_value=None):
+        self.catalog.list_models(wait_for_cold=False)
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
+        with mock.patch.object(self.catalog, "_ensure_catalog_nonblocking", return_value=None):
+            result = self.catalog.list_models(wait_for_cold=False)
+            self.assertNotIn("free-only", {item["id"] for item in result["data"]})
             self.assertEqual(
                 self.catalog.route_for_model("free-only").access_tokens,
                 frozenset(),
@@ -519,7 +828,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
     def test_type_changed_account_is_not_routable_while_refresh_is_blocked(self) -> None:
         self.catalog.list_models()
-        self.accounts.update_account("pro", {"type": "free"})
+        self.accounts.update_account("pro", {"type": "Enterprise"})
         refresh_started = Event()
         release_refresh = Event()
 
@@ -563,11 +872,54 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         result = self.catalog.list_models()
 
-        self.assertIn("pro-new-only", {item["id"] for item in result["data"]})
-        self.assertNotIn("pro-only", {item["id"] for item in result["data"]})
-        self.assertEqual(self.calls.count("pro-new"), 1)
+        self.assertIn("pro-only", {item["id"] for item in result["data"]})
+        self.assertNotIn("pro-new-only", {item["id"] for item in result["data"]})
+        self.assertEqual(self.calls.count("pro-new"), 0)
+        self.assertEqual(
+            self.catalog.route_for_model("pro-only").access_tokens,
+            frozenset({"pro-new"}),
+        )
 
-    def test_same_type_accounts_keep_distinct_model_capabilities(self) -> None:
+    def test_late_refresh_result_cannot_publish_after_same_token_account_replacement(self) -> None:
+        self.catalog.list_models()
+        refresh_started = Event()
+        release_refresh = Event()
+        original_factory = self.catalog._backend_factory
+
+        def backend_factory(access_token: str = ""):
+            backend = original_factory(access_token=access_token)
+            if access_token != "pro":
+                return backend
+
+            original_list_models = backend.list_models
+
+            def list_models(**kwargs) -> dict:
+                refresh_started.set()
+                self.assertTrue(release_refresh.wait(timeout=2))
+                return model_list("late-pro-model")
+
+            backend.list_models = list_models
+            return backend
+
+        self.catalog._backend_factory = backend_factory
+        self.now += 301
+
+        first = self.catalog.list_models(wait_for_cold=False)
+        self.assertNotIn("late-pro-model", {item["id"] for item in first["data"]})
+        self.assertTrue(refresh_started.wait(timeout=1))
+
+        self.accounts.update_account("pro", {"quota": 99})
+        release_refresh.set()
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
+
+        result = self.catalog.list_models(wait_for_cold=False)
+        self.assertNotIn("late-pro-model", {item["id"] for item in result["data"]})
+        self.assertEqual(
+            self.catalog.route_for_model("late-pro-model", wait_for_cold=False).access_tokens,
+            frozenset(),
+        )
+
+    def test_same_type_accounts_share_one_model_capability_catalog(self) -> None:
         self.accounts.add_account_items([
             {"access_token": "pro-alt", "type": "Pro", "status": "正常"},
         ])
@@ -575,10 +927,11 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         result = self.catalog.list_models()
 
-        self.assertIn("pro-alt-only", {item["id"] for item in result["data"]})
+        self.assertIn("pro-only", {item["id"] for item in result["data"]})
+        self.assertNotIn("pro-alt-only", {item["id"] for item in result["data"]})
         self.assertEqual(
-            self.catalog.route_for_model("pro-alt-only").access_tokens,
-            frozenset({"pro-alt"}),
+            self.catalog.route_for_model("pro-only").access_tokens,
+            frozenset({"pro", "pro-alt"}),
         )
 
     def test_rate_limited_account_does_not_publish_its_model_catalog(self) -> None:
@@ -613,13 +966,15 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         with mock.patch("services.model_service.model_catalog_service", self.catalog):
             self.assertEqual(self.accounts.get_text_access_token(model="model-a"), "pro")
-            self.assertEqual(self.accounts.get_text_access_token(model="model-b"), "pro-alt")
+            with self.assertRaises(ModelUnavailableError):
+                self.accounts.get_text_access_token(model="model-b")
             self.assertEqual(
                 self.catalog.supported_reasoning_efforts("model-a", access_token="pro"),
                 ("minimal",),
             )
-            self.assertIsNone(
+            self.assertEqual(
                 self.catalog.supported_reasoning_efforts("model-a", access_token="pro-alt"),
+                ("minimal",),
             )
             self.assertEqual(
                 self.catalog.supported_reasoning_efforts("model-shared", access_token="pro"),
@@ -627,7 +982,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
             )
             self.assertEqual(
                 self.catalog.supported_reasoning_efforts("model-shared", access_token="pro-alt"),
-                ("high",),
+                ("minimal",),
             )
 
     def test_model_catalog_refresh_uses_rotated_token_identity_for_route(self) -> None:

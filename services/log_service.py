@@ -592,9 +592,19 @@ def _exception_log_message(exc: BaseException) -> str:
 
 def _protocol_error_response(exc: Exception, status_code: int, sse: str) -> JSONResponse:
     message = public_exception_message(exc, PUBLIC_SERVER_ERROR_MESSAGE)
+    from services.model_service import ModelCatalogPendingError
+
+    is_catalog_pending = isinstance(exc, ModelCatalogPendingError)
+    retry_after = getattr(exc, "retry_after_seconds", None) if is_catalog_pending else None
+    retry_headers = (
+        {"Retry-After": str(retry_after)}
+        if type(retry_after) is int and retry_after > 0
+        else None
+    )
+    safe_message = message if is_catalog_pending else None
     if sse == "anthropic":
-        return anthropic_error_response(message, status_code)
-    return openai_error_response(message, status_code)
+        return anthropic_error_response(message, status_code, headers=retry_headers, safe_message=safe_message)
+    return openai_error_response(message, status_code, headers=retry_headers, safe_message=safe_message)
 
 
 def _next_item(items):

@@ -21,6 +21,7 @@ from websockets.http11 import Response
 import api.ai as ai_module
 import services.protocol.responses_websocket as responses_websocket_module
 from services.account_service import AccountService
+from services.model_service import ModelCatalogPendingError
 from services.protocol.responses_websocket import (
     CodexResponsesWebSocketProtocolError,
     CodexResponsesWebSocketTransport,
@@ -1265,6 +1266,25 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         self.assertEqual(sleep.call_args_list, [mock.call(0.2), mock.call(0.4)])
         self.assertNotIn(opaque_secret, str(second.exception))
         self.assertNotIn(opaque_secret, repr(warning.call_args_list))
+
+    def test_catalog_pending_keeps_native_websocket_retryable_error_boundary(self) -> None:
+        transport = CodexResponsesWebSocketTransport()
+        turn = ResponsesWebSocketSession().prepare_turn({
+            "type": "response.create",
+            "model": "gpt-5.5",
+            "input": "catalog pending",
+        })
+
+        with mock.patch.object(
+            responses_websocket_module.account_service,
+            "get_text_access_token",
+            side_effect=ModelCatalogPendingError("private catalog details"),
+        ):
+            with self.assertRaises(CodexResponsesWebSocketUnavailable) as raised:
+                list(transport.events(turn))
+
+        self.assertEqual(str(raised.exception), "native codex websocket is unavailable")
+        self.assertNotIn("private catalog details", str(raised.exception))
 
     def test_native_codex_transient_handshake_failure_retries_before_sending(self) -> None:
         connection = _FakeUpstreamWebSocket()

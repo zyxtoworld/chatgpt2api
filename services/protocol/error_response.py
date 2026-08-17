@@ -270,11 +270,17 @@ def openai_error_payload(
     error_type: str | None = None,
     code: object | None = None,
     param: object | None = None,
+    safe_message: str | None = None,
 ) -> dict[str, Any]:
     if status_code >= 500:
+        public_message = (
+            safe_message
+            if isinstance(safe_message, str) and safe_message
+            else PUBLIC_SERVER_ERROR_MESSAGE
+        )
         return {
             "error": {
-                "message": PUBLIC_SERVER_ERROR_MESSAGE,
+                "message": public_message,
                 "type": _safe_error_type(error_type, _default_error_type(status_code)),
                 "param": _safe_error_param(param),
                 "code": _safe_error_code(code, _default_error_code(status_code)),
@@ -314,10 +320,18 @@ def openai_error_response(
     error_type: str | None = None,
     code: object | None = None,
     param: object | None = None,
+    safe_message: str | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
-        content=openai_error_payload(detail, status_code, error_type=error_type, code=code, param=param),
+        content=openai_error_payload(
+            detail,
+            status_code,
+            error_type=error_type,
+            code=code,
+            param=param,
+            safe_message=safe_message,
+        ),
         headers=headers,
     )
 
@@ -327,19 +341,24 @@ def anthropic_error_response(
     status_code: int,
     *,
     headers: dict[str, str] | None = None,
+    safe_message: str | None = None,
 ) -> JSONResponse:
     error_type = "api_error" if status_code >= 500 else _default_error_type(status_code)
+    if status_code >= 500:
+        message = (
+            safe_message
+            if isinstance(safe_message, str) and safe_message
+            else PUBLIC_SERVER_ERROR_MESSAGE
+        )
+    else:
+        message = error_message_from_detail(detail) or "request failed"
     return JSONResponse(
         status_code=status_code,
         content={
             "type": "error",
             "error": {
                 "type": error_type,
-                "message": (
-                    PUBLIC_SERVER_ERROR_MESSAGE
-                    if status_code >= 500
-                    else error_message_from_detail(detail) or "request failed"
-                ),
+                "message": message,
             },
         },
         headers=headers,

@@ -13,6 +13,37 @@ from services.openai_backend_api import OpenAIBackendAPI
 
 
 class ModelPublicProjectionContractTests(unittest.TestCase):
+    def test_models_route_uses_partial_catalog_without_waiting_for_cold_scan(self) -> None:
+        calls: list[bool] = []
+
+        class ColdCatalog:
+            def list_models(self, *, wait_for_cold: bool = True) -> dict[str, object]:
+                calls.append(wait_for_cold)
+                if wait_for_cold:
+                    raise RuntimeError("full catalog scan is still warming up")
+                return {"object": "list", "data": []}
+
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value="test-identity"),
+            ),
+            mock.patch.object(ai_module.openai_v1_models, "model_catalog_service", ColdCatalog()),
+            mock.patch.object(ai_module.openai_v1_models.account_service, "list_accounts", return_value=[]),
+        ):
+            response = TestClient(app, raise_server_exceptions=False).get(
+                "/v1/models",
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"object": "list", "data": []})
+        self.assertEqual(calls, [False])
+
     def test_backend_catalog_route_rejects_container_model_fields(self) -> None:
         secret = "backend-model-container-canary"
 
@@ -58,6 +89,26 @@ class ModelPublicProjectionContractTests(unittest.TestCase):
         )
         app = FastAPI()
         app.include_router(ai_module.create_router())
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value="test-identity"),
+            ),
+            mock.patch.object(
+                ai_module.openai_v1_models,
+                "model_catalog_service",
+                catalog,
+            ),
+        ):
+            response = TestClient(app, raise_server_exceptions=False).get(
+                "/v1/models",
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(catalog._refresh_done.wait(timeout=5))
 
         with (
             mock.patch.object(

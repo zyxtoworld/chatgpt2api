@@ -24,6 +24,7 @@ from api.errors import install_exception_handlers
 from services.log_service import LogService, LoggedCall
 from services.openai_backend_api import ImagePollTimeoutError
 from services.config import config
+from services.model_service import ModelCatalogPendingError
 from services.protocol.error_response import PublicSafeError, openai_error_payload, public_exception_message
 from utils.helper import UpstreamHTTPError, anthropic_sse_stream, responses_sse_stream, sse_json_stream
 
@@ -910,6 +911,80 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertEqual(payload["error"]["type"], "invalid_request_error")
         self.assertNotIn("missing-model", response.body.decode("utf-8"))
 
+    def test_model_catalog_pending_is_retryable_for_chat_and_responses_http(self) -> None:
+        for endpoint, module in (
+            ("/v1/chat/completions", ai_module.openai_v1_chat_complete),
+            ("/v1/responses", ai_module.openai_v1_response),
+        ):
+            with self.subTest(endpoint=endpoint):
+                with (
+                    mock.patch.object(
+                        ai_module,
+                        "require_identity_async",
+                        return_value={"id": "user-1", "role": "user"},
+                    ),
+                    mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                    mock.patch.object(
+                        module.account_service,
+                        "get_text_access_token",
+                        side_effect=ModelCatalogPendingError("private catalog details"),
+                    ),
+                    mock.patch("services.log_service.log_service.add"),
+                ):
+                    body = (
+                        {"model": "pending-model", "messages": [{"role": "user", "content": "hello"}]}
+                        if endpoint.endswith("chat/completions")
+                        else {"model": "pending-model", "input": "hello"}
+                    )
+                    response = TestClient(_app_with_ai_router()).post(
+                        endpoint,
+                        headers=AUTH_HEADERS,
+                        json=body,
+                    )
+
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertEqual(response.headers.get("Retry-After"), "5")
+                self.assertIn("warming", response.json()["error"]["message"])
+                self.assertNotIn("private catalog details", response.text)
+
+    def test_model_unavailable_remains_a_client_error_for_chat_and_responses_http(self) -> None:
+        from services.model_service import ModelUnavailableError
+
+        for endpoint, module in (
+            ("/v1/chat/completions", ai_module.openai_v1_chat_complete),
+            ("/v1/responses", ai_module.openai_v1_response),
+        ):
+            with self.subTest(endpoint=endpoint):
+                with (
+                    mock.patch.object(
+                        ai_module,
+                        "require_identity_async",
+                        return_value={"id": "user-1", "role": "user"},
+                    ),
+                    mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                    mock.patch.object(
+                        module.account_service,
+                        "get_text_access_token",
+                        side_effect=ModelUnavailableError("private unavailable details"),
+                    ),
+                    mock.patch("services.log_service.log_service.add"),
+                ):
+                    body = (
+                        {"model": "missing-model", "messages": [{"role": "user", "content": "hello"}]}
+                        if endpoint.endswith("chat/completions")
+                        else {"model": "missing-model", "input": "hello"}
+                    )
+                    response = TestClient(_app_with_ai_router()).post(
+                        endpoint,
+                        headers=AUTH_HEADERS,
+                        json=body,
+                    )
+
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+                self.assertIsNone(response.headers.get("Retry-After"))
+                self.assertNotIn("private unavailable details", response.text)
+
     def test_model_unavailable_is_a_client_error_when_stream_starts(self) -> None:
         from services.model_service import ModelUnavailableError
 
@@ -937,6 +1012,11 @@ class PublicErrorContractTests(unittest.TestCase):
         with (
             mock.patch.object(ai_module, "require_identity_async", return_value={"id": "user-1", "role": "user"}),
             mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete.account_service,
+                "get_text_access_token",
+                return_value="selected-token",
+            ),
             mock.patch.object(
                 ai_module.openai_v1_chat_complete,
                 "text_backend",

@@ -2060,6 +2060,10 @@ class AccountService:
                    and token not in excluded
             ]
             if not candidates:
+                if route is not None and not route.catalog_complete:
+                    from services.model_service import ModelCatalogPendingError
+
+                    raise ModelCatalogPendingError("model catalog is still loading")
                 if requested_source:
                     from services.model_service import ModelUnavailableError
 
@@ -2099,6 +2103,10 @@ class AccountService:
         resolved_token = str((resolved_account or {}).get("access_token") or resolved_token)
         if requested_model != "auto":
             refreshed_route = model_catalog_service.route_for_model(requested_model)
+            if not refreshed_route.catalog_complete:
+                from services.model_service import ModelCatalogPendingError
+
+                raise ModelCatalogPendingError("model catalog is still loading")
             if resolved_token not in refreshed_route.access_tokens:
                 from services.model_service import ModelUnavailableError
 

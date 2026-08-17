@@ -82,7 +82,9 @@ def _public_model_item(item: object) -> dict[str, Any] | None:
 
 
 def list_models() -> dict[str, Any]:
-    result = model_catalog_service.list_models()
+    # The public discovery route returns the last-good/partial snapshot while
+    # the bounded background owner fills one representative catalog per type.
+    result = model_catalog_service.list_models(wait_for_cold=False)
     if not isinstance(result, dict):
         return {"object": "list", "data": []}
     data = result.get("data")
