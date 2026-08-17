@@ -22,6 +22,7 @@ from services.protocol.image_options import (
     normalize_supported_image_moderation,
     normalize_supported_partial_images,
 )
+from utils.helper import is_supported_image_model
 from utils.image_tokens import _decode_bounded_base64
 
 ImageInput = tuple[bytes, str, str]
@@ -141,6 +142,8 @@ def _validate_json_edit_option_types(fields: dict[str, Any]) -> None:
 
 
 def validate_image_api_options(payload: dict[str, Any], *, editing: bool = False) -> dict[str, Any]:
+    if not is_supported_image_model(payload.get("model")):
+        raise HTTPException(status_code=400, detail={"error": "model must be a supported image model"})
     output_compression = _parse_optional_int(payload.get("output_compression"), "output_compression")
     partial_images = _parse_optional_int(payload.get("partial_images"), "partial_images")
     try:

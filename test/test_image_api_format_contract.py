@@ -848,6 +848,23 @@ class ImageAPIFormatContractTests(unittest.TestCase):
                 self.assertNotIn("9999999999999999", response.text)
         self.assertEqual(handler.call_count, 1)
 
+    def test_generation_rejects_unsupported_model_before_backend_selection(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        with (
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.openai_v1_image_generations, "handle") as handler,
+        ):
+            response = TestClient(app).post(
+                "/v1/images/generations",
+                headers=AUTH_HEADERS,
+                json={"model": "gpt-image-1", "prompt": "cat"},
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["detail"]["error"], "model must be a supported image model")
+        handler.assert_not_called()
+
     def test_generation_accepts_official_gpt_image_2_max_landscape_and_portrait_sizes(self) -> None:
         app = FastAPI()
         app.include_router(ai_module.create_router())
