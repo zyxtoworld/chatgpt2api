@@ -256,6 +256,21 @@ def test_web_search_selects_an_account_for_the_search_model() -> None:
     select_token.assert_called_once_with(model=web_search_tool.SEARCH_MODEL)
 
 
+def test_direct_search_does_not_mark_usage_when_public_projection_fails() -> None:
+    backend = mock.Mock()
+    backend.search.return_value = None
+    with (
+        mock.patch.object(openai_search.account_service, "get_text_access_token", return_value="fixture-token"),
+        mock.patch.object(openai_search.account_service, "get_account", return_value={}),
+        mock.patch.object(openai_search.account_service, "mark_text_used") as mark_used,
+        mock.patch.object(openai_search, "OpenAIBackendAPI", return_value=backend),
+        pytest.raises(RuntimeError, match="invalid search result"),
+    ):
+        openai_search.handle({"prompt": "fixture query"})
+
+    mark_used.assert_not_called()
+
+
 def test_search_usage_does_not_mutate_replaced_same_token_account() -> None:
     entered = threading.Event()
     release = threading.Event()

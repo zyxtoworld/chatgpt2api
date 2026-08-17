@@ -39,8 +39,9 @@ def handle(body: dict[str, object]) -> dict[str, object]:
         result = backend.search(str(body["prompt"]))
     finally:
         backend.close()
+    projected = _public_search_result(result)
     if expected_account is None:
         account_service.mark_text_used(token)
     else:
         account_service.mark_text_used(token, expected_account=expected_account)
-    return _public_search_result(result)
+    return projected
