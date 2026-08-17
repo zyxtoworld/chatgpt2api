@@ -8,12 +8,16 @@ from typing import Any
 
 from PIL import Image
 
+from utils.helper import MAX_JSON_IMAGE_BYTES
+from utils.bounded_base64 import decode_bounded_base64
+
 DEFAULT_IMAGE_SIZE = (1024, 1024)
 IMAGE_INPUT_TOKEN_MODEL = "gpt-5.4-mini"
 
 PATCH_SIZE = 32
 TILE_SIZE = 512
 TILE_HIGH_SHORT_SIDE = 768
+_MAX_OUTPUT_IMAGE_BYTES = 50 * 1024 * 1024
 
 PATCH_1536_MODELS = (
     "gpt-5.4-mini",
@@ -62,7 +66,14 @@ def image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
 def _decode_data_url(value: str) -> bytes:
     text = str(value or "").strip()
     payload = text.split(",", 1)[1] if text.startswith("data:") and "," in text else text
-    return base64.b64decode(payload)
+    decoded = _decode_bounded_base64(payload, max_bytes=MAX_JSON_IMAGE_BYTES)
+    if decoded is None:
+        raise ValueError("image data is too large")
+    return decoded
+
+
+def _decode_bounded_base64(value: object, *, max_bytes: int) -> bytes | None:
+    return decode_bounded_base64(value, max_bytes=max_bytes)
 
 
 def image_size_from_data_url(value: str) -> tuple[int, int] | None:
@@ -184,12 +195,9 @@ def count_image_input_tokens(
 
 
 def _part_size(part: dict[str, Any]) -> tuple[int, int] | None:
-    try:
-        width = int(part.get("width") or 0)
-        height = int(part.get("height") or 0)
-    except (TypeError, ValueError):
-        width = height = 0
-    if width > 0 and height > 0:
+    width = part.get("width")
+    height = part.get("height")
+    if type(width) is int and type(height) is int and width > 0 and height > 0:
         return width, height
 
     data = part.get("data")
@@ -204,10 +212,8 @@ def _part_size(part: dict[str, Any]) -> tuple[int, int] | None:
 
     source = part.get("source")
     if isinstance(source, dict) and str(source.get("type") or "") == "base64":
-        try:
-            return image_size_from_bytes(base64.b64decode(str(source.get("data") or "")))
-        except Exception:
-            return None
+        decoded = _decode_bounded_base64(source.get("data"), max_bytes=MAX_JSON_IMAGE_BYTES)
+        return image_size_from_bytes(decoded) if decoded else None
     return None
 
 
@@ -276,12 +282,9 @@ def count_image_output_items_tokens(
     for item in items:
         image_size = None
         if isinstance(item, dict):
-            b64_json = str(item.get("b64_json") or "").strip()
-            if b64_json:
-                try:
-                    image_size = image_size_from_bytes(base64.b64decode(b64_json))
-                except Exception:
-                    image_size = None
+            decoded = _decode_bounded_base64(item.get("b64_json"), max_bytes=_MAX_OUTPUT_IMAGE_BYTES)
+            if decoded:
+                image_size = image_size_from_bytes(decoded)
         width, height = image_size or fallback_size
         total += count_generated_image_tokens(width, height, quality)
     return total

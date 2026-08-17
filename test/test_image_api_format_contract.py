@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import unittest
 from unittest import mock
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
+from starlette.datastructures import FormData, UploadFile
+from starlette.requests import Request as StarletteRequest
 
 import api.ai as ai_module
 import api.image_inputs as image_inputs_module
 import services.protocol.openai_v1_image_edit as image_edit_module
 import services.protocol.openai_v1_image_generations as image_generation_module
-from services.protocol.conversation import ImageOutput, format_image_result
+import services.protocol.conversation as conversation_module
+import utils.helper as helper_module
+import utils.image_tokens as image_tokens_module
+from services.protocol.conversation import (
+    ImageGenerationError,
+    ImageOutput,
+    format_image_result,
+    stream_image_events,
+)
+from services.protocol.openai_v1_response import image_output_items
 from test.fixtures.image_inputs import image_fixture_bytes
+from utils.helper import build_chat_image_markdown_content
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -31,6 +44,351 @@ def _image_data_url(*, mode: str, size: tuple[int, int], image_format: str) -> s
 
 
 class ImageAPIFormatContractTests(unittest.TestCase):
+    def test_multipart_parse_rejection_closes_uploaded_files(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        client = TestClient(app, raise_server_exceptions=False)
+        source = UploadFile(filename="image.png", file=io.BytesIO(PNG_BYTES))
+        source.close = mock.AsyncMock()
+        form = FormData([
+            ("image", source),
+            ("future_parameter", "rejected"),
+        ])
+
+        with (
+            mock.patch.object(ai_module, "require_identity_async", new=mock.AsyncMock(return_value={"id": "test"})),
+            mock.patch.object(StarletteRequest, "form", new=mock.AsyncMock(return_value=form)),
+        ):
+            response = client.post("/v1/images/edits", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 400, response.text)
+        source.close.assert_awaited_once_with()
+
+    def test_edit_rejection_after_parse_closes_uploaded_files(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        client = TestClient(app, raise_server_exceptions=False)
+        source = UploadFile(filename="image.png", file=io.BytesIO(PNG_BYTES))
+        source.close = mock.AsyncMock()
+        form = FormData([
+            ("image", source),
+            ("prompt", "edit cat"),
+            ("client_task_id", "not-supported-here"),
+        ])
+
+        with (
+            mock.patch.object(ai_module, "require_identity_async", new=mock.AsyncMock(return_value={"id": "test"})),
+            mock.patch.object(StarletteRequest, "form", new=mock.AsyncMock(return_value=form)),
+        ):
+            response = client.post("/v1/images/edits", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 400, response.text)
+        source.close.assert_awaited_once_with()
+
+    def test_edit_filter_failure_closes_uploaded_files(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        client = TestClient(app, raise_server_exceptions=False)
+        source = UploadFile(filename="image.png", file=io.BytesIO(PNG_BYTES))
+        source.close = mock.AsyncMock()
+        form = FormData([
+            ("image", source),
+            ("prompt", "edit cat"),
+        ])
+
+        with (
+            mock.patch.object(ai_module, "require_identity_async", new=mock.AsyncMock(return_value={"id": "test"})),
+            mock.patch.object(StarletteRequest, "form", new=mock.AsyncMock(return_value=form)),
+            mock.patch.object(
+                ai_module,
+                "filter_or_log",
+                new=mock.AsyncMock(side_effect=HTTPException(status_code=400, detail={"error": "rejected"})),
+            ),
+        ):
+            response = client.post("/v1/images/edits", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 400, response.text)
+        source.close.assert_awaited_once_with()
+
+    def test_upload_close_failure_remains_retryable_for_outer_cleanup(self) -> None:
+        source = UploadFile(filename="image.png", file=io.BytesIO(PNG_BYTES))
+        source.close = mock.AsyncMock(side_effect=[RuntimeError("first close failed"), None])
+
+        async def scenario() -> None:
+            await image_inputs_module.read_image_sources([source])
+            await image_inputs_module.close_image_sources([source])
+
+        asyncio.run(scenario())
+        self.assertEqual(source.close.await_count, 2)
+
+    def test_upload_image_is_read_with_a_bounded_chunk_before_size_rejection(self) -> None:
+        source = UploadFile(filename="huge.png", file=io.BytesIO())
+        read_sizes: list[int] = []
+
+        async def read(size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return b"x" * (image_inputs_module.MAX_IMAGE_REFERENCE_BYTES + 1)
+
+        source.read = read
+        source.close = mock.AsyncMock()
+
+        async def scenario() -> None:
+            with self.assertRaises(HTTPException):
+                await image_inputs_module.read_image_sources([source])
+
+        asyncio.run(scenario())
+        self.assertEqual(len(read_sizes), 1)
+        self.assertGreater(read_sizes[0], 0)
+        self.assertLessEqual(read_sizes[0], image_inputs_module.MAX_IMAGE_REFERENCE_BYTES + 1)
+        source.close.assert_awaited_once_with()
+
+    def test_upload_image_reads_valid_payload_in_bounded_chunks(self) -> None:
+        source = UploadFile(filename="image.png", file=io.BytesIO())
+        cursor = 0
+        read_sizes: list[int] = []
+
+        async def read(size: int = -1) -> bytes:
+            nonlocal cursor
+            read_sizes.append(size)
+            if cursor >= len(PNG_BYTES):
+                return b""
+            chunk = PNG_BYTES[cursor:cursor + size]
+            cursor += len(chunk)
+            return chunk
+
+        source.read = read
+        source.close = mock.AsyncMock()
+
+        async def scenario() -> list[image_inputs_module.ImageInput]:
+            return await image_inputs_module.read_image_sources([source])
+
+        result = asyncio.run(scenario())
+        self.assertEqual(result, [(PNG_BYTES, "image.png", "image/png")])
+        self.assertTrue(read_sizes)
+        self.assertTrue(all(0 < size <= image_inputs_module.MAX_IMAGE_REFERENCE_BYTES + 1 for size in read_sizes))
+        source.close.assert_awaited_once_with()
+
+    def test_image_reference_expansion_rejects_count_and_depth_before_recursion(self) -> None:
+        with self.assertRaises(HTTPException):
+            image_inputs_module._sources_from_value([PNG_DATA_URL] * 17)
+
+        deeply_nested: object = PNG_DATA_URL
+        for _ in range(1000):
+            deeply_nested = [deeply_nested]
+        with self.assertRaises(HTTPException):
+            image_inputs_module._sources_from_value(deeply_nested)
+
+    def test_chat_image_input_rejects_predicted_overflow_before_decode(self) -> None:
+        encoded = "A" * 8  # 6 decoded bytes; the patched contract limit is 4.
+
+        with (
+            mock.patch.object(helper_module, "MAX_JSON_IMAGE_BYTES", 4),
+            mock.patch.object(
+                image_tokens_module.base64,
+                "b64decode",
+                wraps=image_tokens_module.base64.b64decode,
+            ) as decode,
+        ):
+            with self.assertRaises(HTTPException):
+                helper_module.normalize_json_edit_images(image=encoded)
+
+        decode.assert_not_called()
+
+    def test_image_input_base64_paths_reject_predicted_overflow_before_decode(self) -> None:
+        encoded = "A" * 8  # 6 decoded bytes; the patched contract limit is 4.
+
+        with (
+            mock.patch.object(image_inputs_module, "MAX_IMAGE_REFERENCE_BYTES", 4),
+            mock.patch.object(
+                image_tokens_module.base64,
+                "b64decode",
+                wraps=image_tokens_module.base64.b64decode,
+            ) as decode,
+        ):
+            with self.assertRaises(HTTPException):
+                image_inputs_module._decode_base64_image(encoded, "image.png", "image/png")
+            with self.assertRaises(HTTPException):
+                image_inputs_module._decode_data_url("data:image/png;base64," + encoded)
+
+        decode.assert_not_called()
+
+    def test_image_input_base64_rejects_container_without_stringifying_it(self) -> None:
+        class ExplodingValue:
+            def __str__(self):
+                raise AssertionError("container must not be stringified")
+
+        with mock.patch.object(image_tokens_module.base64, "b64decode") as decode:
+            with self.assertRaises(HTTPException):
+                image_inputs_module._decode_base64_image(ExplodingValue(), "image.png", "image/png")
+
+        decode.assert_not_called()
+
+    def test_image_input_base64_type_gate_does_not_call_string_conversion(self) -> None:
+        class StringifyProbe:
+            calls = 0
+
+            def __str__(self):
+                type(self).calls += 1
+                return "QUJD"
+
+        value = StringifyProbe()
+        with mock.patch.object(image_tokens_module.base64, "b64decode") as decode:
+            with self.assertRaises(HTTPException):
+                image_inputs_module._decode_base64_image(value, "image.png", "image/png")
+
+        self.assertEqual(StringifyProbe.calls, 0)
+        decode.assert_not_called()
+
+    def test_non_base64_data_url_preflights_decoded_size_before_unquote(self) -> None:
+        cases = (
+            ("raw exact", "abc", 3, True),
+            ("percent exact", "%41%42", 2, True),
+            ("percent utf8 exact", "%E4%BD%A0", 3, True),
+            ("utf8 exact", "你", 3, True),
+            ("raw overflow", "abcd", 3, False),
+            ("percent overflow", "%41%42%43", 2, False),
+            ("overflow before invalid percent", "abcd%G1", 3, False),
+            ("invalid percent", "%G1", 8, False),
+        )
+
+        for label, payload, max_bytes, should_decode in cases:
+            with self.subTest(label=label):
+                with (
+                    mock.patch.object(image_inputs_module, "MAX_IMAGE_REFERENCE_BYTES", max_bytes),
+                    mock.patch.object(
+                        image_inputs_module,
+                        "_validated_image_input",
+                        side_effect=lambda data, filename, mime: (data, filename, mime),
+                    ),
+                    mock.patch.object(
+                        image_inputs_module,
+                        "unquote_to_bytes",
+                        wraps=image_inputs_module.unquote_to_bytes,
+                    ) as unquote,
+                ):
+                    if should_decode:
+                        result = image_inputs_module._decode_data_url("data:image/png," + payload)
+                        expected = {
+                            "你": "你".encode("utf-8"),
+                            "%E4%BD%A0": "你".encode("utf-8"),
+                        }.get(payload, payload.replace("%41", "A").replace("%42", "B").encode())
+                        self.assertEqual(result[0], expected)
+                        unquote.assert_called_once_with(payload)
+                    else:
+                        with self.assertRaises(HTTPException):
+                            image_inputs_module._decode_data_url("data:image/png," + payload)
+                        unquote.assert_not_called()
+
+    def test_chat_image_markdown_does_not_stringify_container_b64(self) -> None:
+        canary = "chat-markdown-container-secret"
+
+        rendered = build_chat_image_markdown_content({
+            "data": [{"b64_json": {"secret": canary}}],
+        })
+
+        self.assertNotIn(canary, rendered)
+        self.assertEqual(rendered, "Image generation completed.")
+
+    def test_stream_image_events_rejects_container_b64_without_serializing_it(self) -> None:
+        canary = "image-stream-container-secret"
+        output = ImageOutput(
+            kind="result",
+            model="gpt-image-2",
+            index=1,
+            total=1,
+            data=[{"b64_json": {"secret": canary}}],
+        )
+
+        stream = stream_image_events([output], lambda _items: {"total_tokens": 1})
+        with self.assertRaises(ImageGenerationError) as raised:
+            next(stream)
+
+        self.assertNotIn(canary, str(raised.exception))
+
+    def test_stream_image_events_rejects_malformed_b64_before_emitting(self) -> None:
+        output = ImageOutput(
+            kind="result",
+            model="gpt-image-2",
+            index=1,
+            total=1,
+            data=[{"b64_json": "not-base64"}],
+        )
+        stream = stream_image_events([output], lambda _items: {"total_tokens": 1})
+
+        with self.assertRaises(ImageGenerationError):
+            next(stream)
+
+    def test_malformed_upstream_base64_maps_to_safe_image_error(self) -> None:
+        with self.assertRaises(ImageGenerationError) as raised:
+            format_image_result(
+                [{"b64_json": "not-base64-canary"}],
+                "cat",
+                "b64_json",
+            )
+
+        self.assertEqual(raised.exception.code, "upstream_error")
+        self.assertNotIn("not-base64-canary", str(raised.exception))
+
+    def test_upstream_base64_decoded_size_is_bounded_before_image_processing(self) -> None:
+        with mock.patch.object(conversation_module, "_MAX_CODEX_IMAGE_BYTES", 4):
+            with self.assertRaises(ImageGenerationError) as raised:
+                format_image_result(
+                    [{"b64_json": base64.b64encode(b"12345").decode("ascii")}],
+                    "cat",
+                    "b64_json",
+                )
+
+        self.assertEqual(raised.exception.code, "upstream_error")
+
+    def test_upstream_base64_predicted_overflow_is_rejected_before_decode(self) -> None:
+        with (
+            mock.patch.object(conversation_module, "_MAX_CODEX_IMAGE_BYTES", 4),
+            mock.patch.object(
+                conversation_module.base64,
+                "b64decode",
+                wraps=conversation_module.base64.b64decode,
+            ) as decode,
+        ):
+            with self.assertRaises(ImageGenerationError):
+                format_image_result(
+                    [{"b64_json": "A" * 8}],
+                    "cat",
+                    "b64_json",
+                )
+
+        decode.assert_not_called()
+
+    def test_malformed_upstream_image_payload_is_not_stringified_into_public_output(self) -> None:
+        canary = "image-output-container-secret"
+        item = {"b64_json": {"secret": canary}}
+
+        with mock.patch(
+            "services.protocol.conversation.image_storage_service.save",
+            side_effect=AssertionError("malformed image must not be stored"),
+        ):
+            result = format_image_result([item], "cat", "b64_json")
+
+        self.assertEqual(result["data"], [])
+        self.assertNotIn(canary, str(result))
+        response_items = image_output_items("cat", [item])
+        self.assertEqual(response_items, [])
+        self.assertNotIn(canary, str(response_items))
+
+    def test_malformed_revised_prompt_is_not_stringified_into_public_output(self) -> None:
+        canary = "revised-prompt-container-secret"
+        encoded = base64.b64encode(PNG_BYTES).decode("ascii")
+        item = {"b64_json": encoded, "revised_prompt": {"secret": canary}}
+
+        with mock.patch(
+            "services.protocol.conversation.image_storage_service.save",
+            return_value=type("Stored", (), {"url": "/images/generated.png"})(),
+        ):
+            result = format_image_result([item], "cat", "b64_json")
+
+        response_items = image_output_items("cat", [item])
+        self.assertNotIn(canary, str(result))
+        self.assertNotIn(canary, str(response_items))
+
     def test_generation_stream_emits_official_completed_event_metadata(self) -> None:
         output = ImageOutput(
             kind="result",
@@ -268,6 +626,25 @@ class ImageAPIFormatContractTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 400, response.text)
         handler.assert_not_called()
 
+    def test_edit_rejects_non_integer_form_count_as_bad_request(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with (
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.openai_v1_image_edit, "handle") as handler,
+        ):
+            response = client.post(
+                "/v1/images/edits",
+                headers=AUTH_HEADERS,
+                data={"model": "gpt-image-2", "prompt": "edit cat", "n": "not-an-integer"},
+                files={"image": ("image.png", PNG_BYTES, "image/png")},
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        handler.assert_not_called()
+
     def test_edit_rejects_multipart_image_over_byte_limit_before_backend_selection(self) -> None:
         app = FastAPI()
         app.include_router(ai_module.create_router())
@@ -286,6 +663,30 @@ class ImageAPIFormatContractTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 400, response.text)
+        handler.assert_not_called()
+
+    def test_edit_rejects_overlong_multipart_integer_options_before_backend_selection(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with (
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.openai_v1_image_edit, "handle") as handler,
+        ):
+            responses = [
+                client.post(
+                    "/v1/images/edits",
+                    headers=AUTH_HEADERS,
+                    data={"model": "gpt-image-2", "prompt": "edit cat", field: "9" * 5000},
+                    files={"image": ("image.png", PNG_BYTES, "image/png")},
+                )
+                for field in ("output_compression", "partial_images")
+            ]
+
+        for response in responses:
+            with self.subTest(status=response.status_code):
+                self.assertEqual(response.status_code, 400, response.text)
         handler.assert_not_called()
 
     def test_single_mask_is_applied_only_to_first_input_image(self) -> None:
@@ -473,6 +874,28 @@ class ImageAPIFormatContractTests(unittest.TestCase):
             [call.args[0]["size"] for call in handler.call_args_list],
             ["3840x2160", "2160x3840"],
         )
+
+    def test_generation_rejects_non_ascii_dimension_digits_before_handler(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        client = TestClient(app)
+
+        with (
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(
+                ai_module.openai_v1_image_generations,
+                "handle",
+                return_value={"created": 1, "data": []},
+            ) as handler,
+        ):
+            response = client.post(
+                "/v1/images/generations",
+                headers=AUTH_HEADERS,
+                json={"model": "gpt-image-2", "prompt": "cat", "size": "102٤x1024"},
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        handler.assert_not_called()
 
     def test_edit_preserves_supported_official_image_fields(self) -> None:
         seen: list[dict[str, object]] = []

@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+import tempfile
+import threading
 import unittest
 import uuid
 import weakref
+from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI, HTTPException
@@ -17,6 +20,7 @@ from websockets.http11 import Response
 
 import api.ai as ai_module
 import services.protocol.responses_websocket as responses_websocket_module
+from services.account_service import AccountService
 from services.protocol.responses_websocket import (
     CodexResponsesWebSocketProtocolError,
     CodexResponsesWebSocketTransport,
@@ -24,6 +28,7 @@ from services.protocol.responses_websocket import (
     ResponsesWebSocketRequestError,
     ResponsesWebSocketSession,
 )
+from services.storage.json_storage import JSONStorageBackend
 
 
 class _FakeUpstreamWebSocket:
@@ -73,6 +78,492 @@ class _FakeUpstreamWebSocket:
 
 
 class ResponsesWebSocketContractTests(unittest.TestCase):
+    def test_late_websocket_usage_does_not_mutate_replaced_same_token_account(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingConnection:
+            def __init__(self) -> None:
+                self.events = [
+                    json.dumps({"type": "response.created", "response": {"id": "resp_1"}}),
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": "resp_1",
+                                "status": "completed",
+                                "output": [],
+                            },
+                        }
+                    ),
+                ]
+                self.closed = False
+
+            def send(self, _message: str) -> None:
+                pass
+
+            def recv(self, timeout: float | None = None) -> str:
+                del timeout
+                if len(self.events) == 1:
+                    entered.set()
+                    if not release.wait(5):
+                        raise AssertionError("websocket did not receive release")
+                return self.events.pop(0)
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = AccountService(JSONStorageBackend(Path(temp_dir) / "accounts.json"))
+            service.add_account_items([
+                {
+                    "access_token": "websocket-token",
+                    "type": "Pro",
+                    "source_type": "codex",
+                    "account_id": "account-1",
+                    "status": "正常",
+                },
+            ])
+            service.get_text_access_token = lambda **_kwargs: "websocket-token"
+            connection = BlockingConnection()
+            transport = CodexResponsesWebSocketTransport(
+                connector=lambda *_args, **_kwargs: connection,
+            )
+            turn = ResponsesWebSocketSession().prepare_turn(
+                {"type": "response.create", "model": "auto", "input": "hello"}
+            )
+            result: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+
+            def consume() -> None:
+                try:
+                    result.extend(transport.events(turn))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                mock.patch.object(responses_websocket_module, "account_service", service),
+                mock.patch.object(
+                    responses_websocket_module.proxy_settings,
+                    "get_profile",
+                    return_value=mock.Mock(proxy_url=""),
+                ),
+                mock.patch.object(responses_websocket_module, "resolve_codex_reasoning_effort"),
+            ):
+                worker = threading.Thread(target=consume)
+                worker.start()
+                self.assertTrue(entered.wait(5), errors)
+                service.update_account(
+                    "websocket-token",
+                    {"last_used_at": "2000-01-01 00:00:00", "success": 99},
+                )
+                release.set()
+                worker.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual([event["type"] for event in result], ["response.created", "response.completed"])
+            current = service.get_account("websocket-token")
+            self.assertIsNotNone(current)
+            self.assertEqual(current["last_used_at"], "2000-01-01 00:00:00")
+            self.assertEqual(current["success"], 99)
+            transport.close()
+            self.assertTrue(connection.closed)
+
+    def test_websocket_lease_capture_failure_does_not_create_connection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = AccountService(JSONStorageBackend(Path(temp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "websocket-token", "type": "Pro", "status": "正常"}])
+            service.get_text_access_token = lambda **_kwargs: "websocket-token"
+            connector = mock.Mock()
+            transport = CodexResponsesWebSocketTransport(connector=connector)
+            turn = ResponsesWebSocketSession().prepare_turn(
+                {"type": "response.create", "model": "auto", "input": "hello"}
+            )
+            with (
+                mock.patch.object(
+                    service,
+                    "_get_account_lease",
+                    side_effect=RuntimeError("lease capture failed"),
+                ),
+                mock.patch.object(responses_websocket_module, "account_service", service),
+                self.assertRaisesRegex(RuntimeError, "lease capture failed"),
+            ):
+                list(transport.events(turn))
+
+            connector.assert_not_called()
+    def test_public_event_rejects_container_event_type_without_raw_type_error(self) -> None:
+        canary = "responses-event-type-container-canary owner@example.com"
+        event = {
+            "type": {"secret": canary},
+            "response": {
+                "id": "resp-safe",
+                "status": "completed",
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "malformed public response event") as raised:
+            responses_websocket_module.project_public_codex_response_event(event)
+
+        self.assertNotIn(canary, str(raised.exception))
+
+    def test_public_event_projection_drops_container_for_scalar_event_fields(self) -> None:
+        canary = "responses-scalar-container-canary owner@example.com"
+        event = {
+            "type": "response.output_text.delta",
+            "item_id": {"text": canary},
+            "delta": [canary],
+            "response": {
+                "id": "resp-safe",
+                "created_at": {"text": canary},
+                "usage": {"input_tokens": {"text": canary}},
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "malformed public response event"):
+            responses_websocket_module.project_public_codex_response_event(event)
+
+    def test_public_event_projection_rejects_wrong_scalar_primitives(self) -> None:
+        cases = [
+            {"type": "response.output_text.delta", "delta": 123},
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-safe",
+                    "status": "completed",
+                    "usage": {"input_tokens": "12", "output_tokens": 1, "total_tokens": 13},
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-safe",
+                    "status": "completed",
+                    "parallel_tool_calls": 1,
+                },
+            },
+        ]
+        for event in cases:
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(RuntimeError, "malformed"):
+                    responses_websocket_module.project_public_codex_response_event(event)
+
+    def test_public_event_rejects_malformed_incomplete_details(self) -> None:
+        canary = "responses-incomplete-detail-canary owner@example.test"
+        cases = [
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-safe",
+                    "status": "incomplete",
+                    "incomplete_details": canary,
+                },
+            },
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp-safe",
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": {"secret": canary}},
+                },
+            },
+        ]
+        for event in cases:
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(RuntimeError, "malformed") as raised:
+                    responses_websocket_module.project_public_codex_response_event(event)
+                self.assertNotIn(canary, str(raised.exception))
+
+    def test_public_event_projects_incomplete_reason_only(self) -> None:
+        event = {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp-safe",
+                "status": "incomplete",
+                "incomplete_details": {
+                    "reason": "content_filter",
+                    "internal_detail": "dropped",
+                },
+            },
+        }
+
+        projected = responses_websocket_module.project_public_codex_response_event(event)
+
+        self.assertEqual(projected["response"]["incomplete_details"], {"reason": "content_filter"})
+        self.assertNotIn("internal_detail", json.dumps(projected))
+
+    def test_public_event_rejects_scalar_error_and_output_items(self) -> None:
+        canary = "responses-error-output-canary owner@example.test"
+        cases = [
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp-safe",
+                    "status": "failed",
+                    "error": canary,
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-safe",
+                    "status": "completed",
+                    "output": [canary],
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-safe",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "content": [canary],
+                    }],
+                },
+            },
+        ]
+
+        for event in cases:
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(RuntimeError, "malformed"):
+                    responses_websocket_module.project_public_codex_response_event(event)
+
+    def test_public_event_projects_content_and_annotation_object_arrays(self) -> None:
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-safe",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "hello",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://example.test",
+                            "title": "Example",
+                            "start_index": 0,
+                            "end_index": 5,
+                            "internal_secret": "dropped",
+                        }],
+                        "internal_secret": "dropped",
+                    }],
+                }],
+            },
+        }
+
+        projected = responses_websocket_module.project_public_codex_response_event(event)
+
+        self.assertEqual(
+            projected["response"]["output"][0]["content"][0]["text"],
+            "hello",
+        )
+        self.assertEqual(
+            projected["response"]["output"][0]["content"][0]["annotations"][0]["url"],
+            "https://example.test",
+        )
+        self.assertNotIn("internal_secret", json.dumps(projected))
+
+    def test_public_event_preserves_legal_tool_search_output_definitions(self) -> None:
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-tools",
+                "status": "completed",
+                "output": [{
+                    "type": "tool_search_output",
+                    "id": "tool-output-1",
+                    "call_id": "search-1",
+                    "status": "completed",
+                    "execution": "client",
+                    "tools": [{
+                        "type": "function",
+                        "name": "get_calendar",
+                        "description": "Read calendar events",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "internal_schema_secret": "drop-me-too",
+                        },
+                        "strict": True,
+                        "defer_loading": False,
+                        "internal_secret": "drop-me",
+                    }],
+                }],
+            },
+        }
+
+        projected = responses_websocket_module.project_public_codex_response_event(event)
+
+        tools = projected["response"]["output"][0]["tools"]
+        self.assertEqual(tools[0]["type"], "function")
+        self.assertEqual(tools[0]["name"], "get_calendar")
+        self.assertEqual(tools[0]["description"], "Read calendar events")
+        self.assertEqual(tools[0]["parameters"], {"type": "object", "properties": {}})
+        self.assertTrue(tools[0]["strict"])
+        self.assertFalse(tools[0]["defer_loading"])
+        self.assertNotIn("internal_secret", json.dumps(projected))
+
+    def test_public_event_rejects_untyped_tool_description_and_logprobs(self) -> None:
+        canary = "responses-public-scalar-container-canary"
+        cases = [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-tool-description",
+                    "status": "completed",
+                    "output": [{
+                        "type": "tool_search_output",
+                        "tools": [{"type": "function", "name": "lookup", "description": [canary]}],
+                    }],
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-logprobs",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "answer",
+                            "logprobs": [canary],
+                        }],
+                    }],
+                },
+            },
+        ]
+
+        for event in cases:
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(RuntimeError, "malformed") as raised:
+                    responses_websocket_module.project_public_codex_response_event(event)
+                self.assertNotIn(canary, str(raised.exception))
+
+    def test_public_event_projects_legal_logprobs(self) -> None:
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-logprobs-safe",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "answer",
+                        "logprobs": [{
+                            "token": "answer",
+                            "logprob": -0.25,
+                            "bytes": [97, 110],
+                            "top_logprobs": [],
+                            "internal_secret": "drop-me",
+                        }],
+                    }],
+                }],
+            },
+        }
+
+        projected = responses_websocket_module.project_public_codex_response_event(event)
+        self.assertEqual(
+            projected["response"]["output"][0]["content"][0]["logprobs"],
+            [{"token": "answer", "logprob": -0.25, "bytes": [97, 110], "top_logprobs": []}],
+        )
+
+    def test_public_event_rejects_non_string_web_search_queries(self) -> None:
+        canary = "web-search-query-container-canary owner@example.com"
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-search",
+                "status": "completed",
+                "output": [{
+                    "type": "web_search_call",
+                    "id": "search-call-1",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "queries": [{"text": canary}],
+                    },
+                }],
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "malformed") as raised:
+            responses_websocket_module.project_public_codex_response_event(event)
+        self.assertNotIn(canary, str(raised.exception))
+
+    def test_public_event_preserves_string_web_search_queries(self) -> None:
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-search-safe",
+                "status": "completed",
+                "output": [{
+                    "type": "web_search_call",
+                    "id": "search-call-safe",
+                    "status": "completed",
+                    "action": {
+                        "type": "search",
+                        "query": "latest release",
+                        "queries": ["latest release", "project changelog"],
+                    },
+                }],
+            },
+        }
+
+        projected = responses_websocket_module.project_public_codex_response_event(event)
+
+        self.assertEqual(
+            projected["response"]["output"][0]["action"]["queries"],
+            ["latest release", "project changelog"],
+        )
+
+    def test_malformed_validation_error_detail_does_not_stringify_container(self) -> None:
+        canary = "responses-validation-container-secret"
+        validation_error = HTTPException(
+            status_code=400,
+            detail={"error": {"secret": canary}},
+        )
+        with mock.patch.object(
+            responses_websocket_module,
+            "validate_response_core_parameters",
+            side_effect=validation_error,
+        ):
+            with self.assertRaises(ResponsesWebSocketRequestError) as raised:
+                ResponsesWebSocketSession().prepare_turn({
+                    "type": "response.create",
+                    "model": "gpt-test",
+                    "input": "hello",
+                })
+
+        self.assertEqual(raised.exception.message, "invalid Responses WebSocket request")
+        self.assertNotIn(canary, raised.exception.message)
+
+    def test_malformed_payload_error_detail_does_not_stringify_container(self) -> None:
+        canary = "responses-payload-container-secret"
+        validation_error = HTTPException(
+            status_code=400,
+            detail={"error": [canary]},
+        )
+        with mock.patch.object(
+            responses_websocket_module,
+            "codex_response_payload",
+            side_effect=validation_error,
+        ):
+            with self.assertRaises(ResponsesWebSocketRequestError) as raised:
+                ResponsesWebSocketSession().prepare_turn({
+                    "type": "response.create",
+                    "model": "gpt-test",
+                    "input": "hello",
+                })
+
+        self.assertEqual(raised.exception.message, "invalid Responses WebSocket request")
+        self.assertNotIn(canary, raised.exception.message)
+
     def test_context_management_selects_native_websocket_without_tools(self) -> None:
         terminal = {
             "type": "response.completed",
@@ -378,6 +869,43 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         self.assertEqual(connection.sent[1]["input"][0]["content"][0]["text"], "second")
         self.assertNotIn("first", json.dumps(connection.sent[1]))
         self.assertEqual(mark_used.call_args_list, [mock.call("codex-access-token")] * 2)
+        transport.close()
+        self.assertTrue(connection.closed)
+
+    def test_mark_text_used_failure_preserves_terminal_event_and_closes_connection(self) -> None:
+        connection = _FakeUpstreamWebSocket()
+        session = ResponsesWebSocketSession()
+        transport = CodexResponsesWebSocketTransport(connector=lambda _uri, **_kwargs: connection)
+        turn = session.prepare_turn(
+            {"type": "response.create", "model": "gpt-5.5", "input": "hello"}
+        )
+
+        with (
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "get_text_access_token",
+                return_value="codex-access-token",
+            ),
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "get_account",
+                return_value={"source_type": "codex", "account_id": "account-7"},
+            ),
+            mock.patch.object(
+                responses_websocket_module.proxy_settings,
+                "get_profile",
+                return_value=mock.Mock(proxy_url=""),
+            ),
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "mark_text_used",
+                side_effect=RuntimeError("telemetry failed"),
+            ),
+        ):
+            events = list(transport.events(turn))
+
+        self.assertEqual([event["type"] for event in events], ["response.created", "response.completed"])
+        self.assertFalse(connection.closed)
         transport.close()
         self.assertTrue(connection.closed)
 
@@ -1036,6 +1564,94 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
 
         self.assertTrue(connection.closed)
 
+    def test_native_codex_websocket_rejects_malformed_scalar_event_before_yield(self) -> None:
+        canary = "responses-delta-container-canary"
+
+        class MalformedScalarConnection(_FakeUpstreamWebSocket):
+            def send(self, message: str) -> None:
+                self.sent.append(json.loads(message))
+                self._events.extend([
+                    json.dumps({
+                        "type": "response.output_text.delta",
+                        "item_id": {"secret": canary},
+                        "delta": [canary],
+                    }),
+                    json.dumps({
+                        "type": "response.completed",
+                        "response": {"id": "resp_completed", "status": "completed", "output": []},
+                    }),
+                ])
+
+        connection = MalformedScalarConnection()
+        transport = CodexResponsesWebSocketTransport(connector=lambda *_args, **_kwargs: connection)
+        turn = ResponsesWebSocketSession().prepare_turn(
+            {"type": "response.create", "model": "gpt-5.5", "input": "hello"}
+        )
+        with (
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "get_text_access_token",
+                return_value="token-1",
+            ),
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "get_account",
+                return_value={"source_type": "codex", "account_id": "account-1"},
+            ),
+            mock.patch.object(
+                responses_websocket_module.proxy_settings,
+                "get_profile",
+                return_value=mock.Mock(proxy_url=""),
+            ),
+        ):
+            with self.assertRaisesRegex(CodexResponsesWebSocketProtocolError, "invalid codex websocket event"):
+                list(transport.events(turn))
+
+        self.assertTrue(connection.closed)
+
+    def test_native_codex_websocket_rejects_malformed_incomplete_details_before_yield(self) -> None:
+        canary = "responses-incomplete-details-transport-canary"
+
+        class MalformedIncompleteConnection(_FakeUpstreamWebSocket):
+            def send(self, message: str) -> None:
+                self.sent.append(json.loads(message))
+                self._events.append(json.dumps({
+                    "type": "response.incomplete",
+                    "response": {
+                        "id": "resp_incomplete",
+                        "status": "incomplete",
+                        "incomplete_details": canary,
+                    },
+                }))
+
+        connection = MalformedIncompleteConnection()
+        transport = CodexResponsesWebSocketTransport(connector=lambda *_args, **_kwargs: connection)
+        turn = ResponsesWebSocketSession().prepare_turn(
+            {"type": "response.create", "model": "gpt-5.5", "input": "hello"}
+        )
+        with (
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "get_text_access_token",
+                return_value="token-1",
+            ),
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "get_account",
+                return_value={"source_type": "codex", "account_id": "account-1"},
+            ),
+            mock.patch.object(
+                responses_websocket_module.proxy_settings,
+                "get_profile",
+                return_value=mock.Mock(proxy_url=""),
+            ),
+        ):
+            with self.assertRaisesRegex(CodexResponsesWebSocketProtocolError, "invalid codex websocket event") as raised:
+                list(transport.events(turn))
+
+        self.assertNotIn(canary, str(raised.exception))
+        self.assertTrue(connection.closed)
+
     def test_plain_turn_prefers_native_codex_websocket(self) -> None:
         class TrackingTransport:
             def __init__(self) -> None:
@@ -1206,6 +1822,97 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
 
         self.assertEqual(len(instances), 1)
         self.assertEqual(len(instances[0].turns), 1)
+
+    def test_post_terminal_usage_failure_does_not_emit_second_error_frame(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        connections: list[_FakeUpstreamWebSocket] = []
+
+        def transport_factory() -> CodexResponsesWebSocketTransport:
+            connection = _FakeUpstreamWebSocket()
+            connections.append(connection)
+            return CodexResponsesWebSocketTransport(
+                connector=lambda _uri, **_kwargs: connection,
+            )
+
+        with (
+            mock.patch.object(ai_module, "require_identity_async", return_value={"id": "user-1", "role": "user"}),
+            mock.patch.object(ai_module, "CodexResponsesWebSocketTransport", new=transport_factory),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "get_text_access_token",
+                return_value="codex-access-token",
+            ),
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "get_account",
+                return_value={"source_type": "codex", "account_id": "account-7"},
+            ),
+            mock.patch.object(
+                responses_websocket_module.proxy_settings,
+                "get_profile",
+                return_value=mock.Mock(proxy_url=""),
+            ),
+            mock.patch.object(
+                responses_websocket_module.account_service,
+                "mark_text_used",
+                side_effect=RuntimeError("usage accounting failed"),
+            ) as mark_used,
+            mock.patch.object(responses_websocket_module, "resolve_codex_reasoning_effort"),
+        ):
+            with TestClient(app).websocket_connect(
+                "/v1/responses",
+                headers={"Authorization": "Bearer user-key"},
+            ) as websocket:
+                websocket.send_json({"type": "response.create", "model": "gpt-test", "input": "first"})
+                self.assertEqual(websocket.receive_json()["type"], "response.created")
+                self.assertEqual(websocket.receive_json()["type"], "response.completed")
+
+                websocket.send_json({"type": "response.create", "model": "gpt-test", "input": "second"})
+                self.assertEqual(websocket.receive_json()["type"], "response.created")
+
+        self.assertEqual(len(connections), 1)
+        self.assertEqual(mark_used.call_count, 2)
+        self.assertEqual(mark_used.call_args_list, [mock.call("codex-access-token")] * 2)
+
+    def test_malformed_json_frame_is_recoverable_and_does_not_end_session(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+
+        class FakeNativeTransport:
+            def events(self, _turn):
+                yield {
+                    "type": "response.completed",
+                    "response": {"id": "resp_after_malformed", "status": "completed", "output": []},
+                }
+
+            def close(self) -> None:
+                pass
+
+        with (
+            mock.patch.object(ai_module, "require_identity_async", return_value={"id": "user-1", "role": "user"}),
+            mock.patch.object(ai_module, "CodexResponsesWebSocketTransport", FakeNativeTransport),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+        ):
+            with TestClient(app).websocket_connect(
+                "/v1/responses",
+                headers={"Authorization": "Bearer user-key"},
+            ) as websocket:
+                websocket.send_text("{malformed-json")
+                error = websocket.receive_json()
+                self.assertEqual(error["type"], "error")
+                self.assertEqual(error["error"]["type"], "invalid_request_error")
+                self.assertEqual(error["error"]["code"], "invalid_json")
+
+                websocket.send_bytes(b"\xff")
+                binary_error = websocket.receive_json()
+                self.assertEqual(binary_error["type"], "error")
+                self.assertEqual(binary_error["error"]["type"], "invalid_request_error")
+                self.assertEqual(binary_error["error"]["code"], "invalid_json")
+
+                websocket.send_json({"type": "response.create", "model": "gpt-test", "input": "valid"})
+                self.assertEqual(websocket.receive_json()["type"], "response.completed")
 
     def test_content_filter_4xx_is_recoverable_before_any_upstream_call(self) -> None:
         app = FastAPI()
@@ -1679,7 +2386,8 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         client = TestClient(app)
         seen_inputs: list[object] = []
 
-        def fake_response_events(body: dict[str, object]):
+        def fake_response_events(body: dict[str, object], *, cache_scope: str = ""):
+            del cache_scope
             seen_inputs.append(body.get("input"))
             response_id = f"resp_{len(seen_inputs)}"
             yield {
@@ -1731,13 +2439,108 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         self.assertEqual(require.call_args_list, [mock.call("Bearer user-key")] * 3)
         self.assertEqual(seen_inputs, ["first", "second"])
 
+    def test_http_fallback_keeps_authenticated_cache_scope_per_websocket(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        scopes: list[str] = []
+
+        class UnavailableNativeTransport:
+            def events(self, _turn):
+                raise CodexResponsesWebSocketUnavailable("native transport unavailable")
+
+            def close(self) -> None:
+                pass
+
+        def authenticate(authorization: str | None):
+            return {"id": str(authorization or "").split()[-1], "role": "user"}
+
+        def fake_response_events(body: dict[str, object], *, cache_scope: str = ""):
+            del body
+            scopes.append(cache_scope)
+            yield {
+                "type": "response.completed",
+                "response": {
+                    "id": f"resp-{cache_scope}",
+                    "status": "completed",
+                    "output": [],
+                },
+            }
+
+        with (
+            mock.patch.object(ai_module, "require_identity_async", side_effect=authenticate),
+            mock.patch.object(ai_module, "CodexResponsesWebSocketTransport", UnavailableNativeTransport),
+            mock.patch.object(ai_module.openai_v1_response, "response_events", side_effect=fake_response_events),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+        ):
+            client = TestClient(app)
+            for token, expected_scope in (("alpha", "alpha"), ("beta", "beta")):
+                with client.websocket_connect(
+                    "/v1/responses",
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as websocket:
+                    websocket.send_json({
+                        "type": "response.create",
+                        "model": "gpt-test",
+                        "input": "same request",
+                    })
+                    completed = websocket.receive_json()
+                    self.assertEqual(completed["type"], "response.completed")
+        self.assertEqual(completed["response"]["id"], f"resp-{expected_scope}")
+        self.assertEqual(scopes, ["alpha", "beta"])
+
+    def test_fallback_stops_consuming_a_turn_after_terminal_event(self) -> None:
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        completed_ids = ["resp-first", "resp-second"]
+
+        def fallback(_body, **_kwargs):
+            response_id = completed_ids.pop(0)
+            yield {
+                "type": "response.completed",
+                "response": {"id": response_id, "status": "completed", "output": []},
+            }
+            if response_id == "resp-first":
+                yield {
+                    "type": "response.output_text.delta",
+                    "item_id": "late-item",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "must-not-follow-terminal",
+                }
+
+        class UnavailableNativeTransport:
+            def events(self, _turn):
+                raise CodexResponsesWebSocketUnavailable("native websocket unavailable")
+
+            def close(self) -> None:
+                pass
+
+        with (
+            mock.patch.object(ai_module, "require_identity_async", return_value={"id": "user-1", "role": "user"}),
+            mock.patch.object(ai_module, "CodexResponsesWebSocketTransport", UnavailableNativeTransport),
+            mock.patch.object(ai_module.openai_v1_response, "response_events", side_effect=fallback) as response_events,
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+        ):
+            with TestClient(app).websocket_connect(
+                "/v1/responses",
+                headers={"Authorization": "Bearer user-key"},
+            ) as websocket:
+                websocket.send_json({"type": "response.create", "model": "gpt-test", "input": "first"})
+                self.assertEqual(websocket.receive_json()["response"]["id"], "resp-first")
+
+                websocket.send_json({"type": "response.create", "model": "gpt-test", "input": "second"})
+                self.assertEqual(websocket.receive_json()["response"]["id"], "resp-second")
+
+        self.assertEqual(response_events.call_count, 2)
+
     def test_previous_response_id_reuses_only_the_current_connection_transcript(self) -> None:
         app = FastAPI()
         app.include_router(ai_module.create_router())
         client = TestClient(app)
         seen_inputs: list[object] = []
 
-        def fake_response_events(body: dict[str, object]):
+        def fake_response_events(body: dict[str, object], *, cache_scope: str = ""):
+            del cache_scope
             seen_inputs.append(body.get("input"))
             response_id = f"resp_{len(seen_inputs)}"
             yield {
@@ -1798,7 +2601,8 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         app.include_router(ai_module.create_router())
         calls: list[dict[str, object]] = []
 
-        def fake_response_events(body: dict[str, object]):
+        def fake_response_events(body: dict[str, object], *, cache_scope: str = ""):
+            del cache_scope
             calls.append(body)
             if len(calls) == 1:
                 yield {
@@ -2008,6 +2812,64 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         self.assertEqual(len(native_instances), 1)
         self.assertTrue(native_instances[0].closed)
         session_close.assert_called_once()
+
+    def test_ws_reports_error_when_upstream_ends_without_terminal_event(self) -> None:
+        sent: list[dict[str, object]] = []
+
+        class FakeNativeTransport:
+            def events(self, _turn):
+                raise CodexResponsesWebSocketUnavailable("native websocket unavailable")
+
+            def close(self) -> None:
+                return None
+
+        class FakeLoggedCall:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def stream(self, items):
+                return items
+
+        class FakeWebSocket:
+            headers = {"authorization": "Bearer user-key"}
+            reads = 0
+
+            async def accept(self) -> None:
+                return None
+
+            async def receive_json(self):
+                self.reads += 1
+                if self.reads == 1:
+                    return {"type": "response.create", "model": "gpt-test", "input": "valid"}
+                raise WebSocketDisconnect(code=1000)
+
+            async def send_json(self, event) -> None:
+                sent.append(event)
+
+            async def close(self, **_kwargs) -> None:
+                return None
+
+        app = FastAPI()
+        app.include_router(ai_module.create_router())
+        with (
+            mock.patch.object(ai_module, "require_identity_async", return_value={"id": "user-1", "role": "user"}),
+            mock.patch.object(ai_module, "CodexResponsesWebSocketTransport", FakeNativeTransport),
+            mock.patch.object(ai_module, "LoggedCall", FakeLoggedCall),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(
+                ai_module.openai_v1_response,
+                "response_events",
+                return_value=[{"type": "response.created", "response": {"id": "resp-1"}}],
+            ),
+        ):
+            asyncio.run(next(
+                route.endpoint
+                for route in app.router.routes
+                if getattr(route, "path", "") == "/v1/responses" and "websocket" in route.name
+            )(FakeWebSocket()))
+
+        self.assertEqual([event["type"] for event in sent], ["response.created", "error"])
+        self.assertEqual(sent[-1]["error"]["code"], "upstream_error")
 
     def test_connection_lifetime_limit_closes_before_reading_another_turn(self) -> None:
         sent: list[dict[str, object]] = []

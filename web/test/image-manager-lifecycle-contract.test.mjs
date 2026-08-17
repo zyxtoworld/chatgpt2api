@@ -177,3 +177,13 @@ test("tag long press replaces stale targets and cleanup cancels the active timer
   assert.match(pageSource, /tagPressTimerRef\.current\.cancel\(\)/);
   assert.match(pageSource, /const tagPressTimer = tagPressTimerRef\.current;[\s\S]*?tagPressTimer\.cancel\(\)/);
 });
+
+test("long press owns its timer and cancels it when the hook unmounts", () => {
+  const hookSource = pageSource.slice(
+    pageSource.indexOf("function useLongPress"),
+    pageSource.indexOf("function ImageManagerContent"),
+  );
+
+  assert.match(hookSource, /const longPressTimerRef = useRef\(createReplaceableTimeout\(\)\)/);
+  assert.match(hookSource, /useEffect\(\(\) => \{[\s\S]*?return \(\) => \{[\s\S]*?longPressTimer\.cancel\(\)/);
+});

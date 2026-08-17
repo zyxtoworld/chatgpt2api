@@ -12,6 +12,7 @@ import {
 } from "motion/react"
 
 import { cn } from "@/lib/utils"
+import { createReplaceableTimeout } from "@/lib/replaceable-timeout"
 
 const DEFAULT_COLORS = ["#c679c4", "#fa3d1d", "#ffb005", "#e1e1fe", "#0358f7"]
 const BAND_HALF = 17
@@ -156,7 +157,8 @@ export function DiaTextReveal({
 
   const indexRef = useRef(0)
   const hasPlayedRef = useRef(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
+  const repeatTimerRef = useRef<ReturnType<typeof createReplaceableTimeout> | null>(null)
+  if (repeatTimerRef.current === null) repeatTimerRef.current = createReplaceableTimeout()
   const playRef = useRef<() => void>(null!)
   const stopRef = useRef<(() => void) | null>(null)
 
@@ -181,6 +183,7 @@ export function DiaTextReveal({
       repeatDelay,
       texts,
     }
+    if (!repeat) repeatTimerRef.current?.cancel()
   }, [colors, delay, duration, repeat, repeatDelay, textColor, texts])
 
   useEffect(() => {
@@ -201,7 +204,7 @@ export function DiaTextReveal({
         ease: sweepEase,
         onComplete() {
           if (!repeat) return
-          timerRef.current = setTimeout(() => {
+          repeatTimerRef.current?.schedule(() => {
             const next = (indexRef.current + 1) % texts.length
             indexRef.current = next
             setActiveIndex(next)
@@ -226,7 +229,7 @@ export function DiaTextReveal({
 
     return () => {
       stopRef.current?.()
-      clearTimeout(timerRef.current)
+      repeatTimerRef.current?.cancel()
     }
   }, [isInView, startOnView, once, prefersReducedMotion, sweepPos])
 

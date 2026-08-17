@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { normalizeSearchSources } from "../src/lib/search-source-url.js";
+import { normalizeSkillBaseUrl } from "../src/lib/skill-base-url.js";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/debug/components/search-panel.tsx", import.meta.url)),
@@ -60,6 +61,27 @@ test("search source links normalize one DNS root dot", () => {
   );
 });
 
+test("search source metadata rejects containers without coercing them", () => {
+  const canary = "search-metadata-container-canary";
+  let coercions = 0;
+  const hostile = {
+    toString() {
+      coercions += 1;
+      return canary;
+    },
+  };
+
+  const sources = normalizeSearchSources([
+    { title: hostile, url: "https://example.test/result", snippet: hostile },
+  ]);
+
+  assert.equal(coercions, 0);
+  assert.deepEqual(sources, [
+    { title: "", url: "https://example.test/result", snippet: "" },
+  ]);
+  assert.doesNotMatch(JSON.stringify(sources), new RegExp(canary));
+});
+
 test("search source links preserve valid IPv6 and non-default ports", () => {
   assert.deepEqual(
     normalizeSearchSources([
@@ -73,4 +95,19 @@ test("search source links preserve valid IPv6 and non-default ports", () => {
       },
     ],
   );
+});
+
+test("skill base URL rejects containers without coercing them", () => {
+  let coercions = 0;
+  const hostile = {
+    toString() {
+      coercions += 1;
+      return "https://canary.example.test";
+    },
+  };
+
+  assert.equal(normalizeSkillBaseUrl(hostile), "");
+  assert.equal(coercions, 0);
+  assert.equal(normalizeSkillBaseUrl("https://api.example.test/"), "https://api.example.test");
+  assert.equal(normalizeSkillBaseUrl("https://api.example.test/v1?token=skill-canary#fragment"), "");
 });

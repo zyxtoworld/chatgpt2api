@@ -78,6 +78,21 @@ class WebAssetBoundaryTests(unittest.TestCase):
             self.assertEqual(fallback_response.status_code, 200)
             self.assertEqual(fallback_response.text, "<main>home</main>")
 
+    def test_unknown_api_and_protocol_routes_do_not_fallback_to_spa(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "web_dist"
+            root.mkdir()
+            (root / "index.html").write_text("<main>home</main>", encoding="utf-8")
+            with mock.patch.object(support_module, "WEB_DIST_DIR", root):
+                client = TestClient(create_app())
+                api_response = client.get("/api/not-a-route")
+                v1_response = client.get("/v1/not-a-route")
+
+        self.assertEqual(api_response.status_code, 404)
+        self.assertEqual(v1_response.status_code, 404)
+        self.assertNotIn("<main>home</main>", api_response.text)
+        self.assertNotIn("<main>home</main>", v1_response.text)
+
     def test_nested_link_and_traversal_assets_fail_closed_without_foreign_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "web_dist"

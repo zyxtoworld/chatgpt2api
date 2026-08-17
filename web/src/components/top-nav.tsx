@@ -121,7 +121,8 @@ export function TopNav() {
   const baseUrl = webConfig.apiUrl.replace(/\/$/, "") || window.location.origin;
   const thirdPartyApps = thirdPartyState?.owner === session ? thirdPartyState.apps : null;
   const canvas = thirdPartyApps?.infinite_canvas;
-  const canvasHref = canvas?.enabled && canvas.url.trim() ? buildThirdPartyHref(canvas.url, baseUrl) : "";
+  const canvasUrl = canvas && typeof canvas.url === "string" ? canvas.url.trim() : "";
+  const canvasHref = canvas?.enabled === true && canvasUrl ? buildThirdPartyHref(canvasUrl, baseUrl) : "";
   const canvasDisplayHref = canvasHref ? formatThirdPartyDisplayHref(canvasHref) : "";
 
   const handleCanvasOpen = () => {

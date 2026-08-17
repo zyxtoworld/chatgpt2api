@@ -123,8 +123,7 @@ environment:
 - Chat Completions 与 Responses 支持官方函数工具调用格式；函数调用和显式网页搜索通过 Codex Responses 上游原生执行，需要可用的 Codex OAuth 账号
 - 兼容 Responses WebSocket 模式：连接 `ws(s)://<host>/v1/responses` 后连续发送 `response.create`；`previous_response_id` 仅引用当前连接内最近一次完成响应
 - 图片生成与编辑支持 `png`、`jpeg`、`webp` 输出；流式响应分别使用官方 `image_generation.completed` / `image_edit.completed` SSE 事件，不发送 `[DONE]`
-- `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
-  `gpt-5-mini`
+- `GET /v1/models` 按当前可用账号、账号类型和上游模型目录动态返回模型；图片模型只有在对应账号能力可用时才会出现，普通模型由上游目录提供
 - 支持通过 `n` 返回多张生成结果
 - 支持生成可编辑 PPT 文件
 - 支持生成可编辑 PSD 文件
@@ -134,7 +133,7 @@ environment:
 ### 在线画图功能
 
 - 内置在线画图工作台，支持生成、图片编辑与多图组图编辑
-- 支持 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` 模型选择
+- 支持从 `/v1/models` 动态选择当前账号池和上游目录实际可用的图片模型；无可用账号时不展示也不提交图片模型
 - 编辑模式支持参考图上传
 - 前端支持多图生成交互
 - 本地保存图片会话历史，支持回看、删除和清空
@@ -152,7 +151,7 @@ environment:
 - 支持网页端配置全局 HTTP / HTTPS / SOCKS5 / SOCKS5H 代理
 - 支持 WARP / FlareSolverr 稳定代理运行时
 - 支持搜索、筛选、批量刷新、导出、手动编辑和清理账号
-- 支持五种导入方式：本地 CPA JSON 文件导入、远程 CPA 服务器导入、`sub2api` 服务器导入、ccLoad Codex OAuth 渠道导入、`access_token` 导入
+- 支持五种导入方式：本地账号 JSON（项目、CPA、Sub2API 导出）导入、远程 CPA 服务器导入、`sub2api` 服务器导入、ccLoad Codex OAuth 渠道导入、`access_token` 导入
 - 支持在设置页配置 `sub2api` 服务器，筛选并批量导入其中的 OpenAI OAuth 账号
 - 支持连接 ccLoad，读取 `codex_oauth` 渠道并导入 access/refresh token 及其可选 id token；管理员密码、临时会话令牌和 OAuth 凭据不会返回浏览器
 
@@ -188,7 +187,7 @@ Authorization: Bearer <auth-key>
 <summary><code>GET /v1/models</code></summary>
 <br>
 
-返回当前暴露的图片模型列表。
+返回当前账号池和上游模型目录确认可用的模型列表；图片模型会随账号可用性动态变化。
 
 ```bash
 curl http://localhost:8000/v1/models \
@@ -201,7 +200,7 @@ curl http://localhost:8000/v1/models \
 
 | 字段   | 说明                                                                                                         |
 |:-----|:-----------------------------------------------------------------------------------------------------------|
-| 返回模型 | `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、`gpt-5-mini` |
+| 返回模型 | 由当前可用账号、账号类型和上游模型目录动态决定；对应图片账号不可用时不返回图片模型 |
 | 接入场景 | 可接入 Cherry Studio、New API 等上游或客户端                                                                          |
 
 <br>

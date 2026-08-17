@@ -5,9 +5,9 @@ from functools import partial
 
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictFloat
 
-from api.image_inputs import parse_image_edit_request, read_image_sources
+from api.image_inputs import close_image_sources, parse_image_edit_request, read_image_sources
 from api.support import require_identity_async, resolve_image_base_url
 from services.content_filter import check_request_async
 from services.image_task_service import (
@@ -20,6 +20,7 @@ from services.protocol.error_response import exception_log_message, public_excep
 
 
 _IMAGE_TASK_IO_CAPACITY = 8
+_MAX_CLIENT_TASK_ID_LENGTH = 256
 _IMAGE_TASK_IO_STATE = threading.local()
 
 
@@ -39,7 +40,7 @@ async def run_image_task_io(func, *args, **kwargs):
 
 
 class ImageGenerationTaskRequest(BaseModel):
-    client_task_id: str = Field(..., min_length=1)
+    client_task_id: str = Field(..., min_length=1, max_length=256, pattern=r"^[^,]+$")
     prompt: str = Field(..., min_length=1)
     model: str = "gpt-image-2"
     size: str | None = None
@@ -47,7 +48,7 @@ class ImageGenerationTaskRequest(BaseModel):
 
 
 class ResumePollRequest(BaseModel):
-    extra_timeout_secs: float = Field(default=30.0, ge=5.0, le=120.0)
+    extra_timeout_secs: StrictFloat = Field(default=30.0, ge=5.0, le=120.0)
 
 
 def _parse_task_ids(value: str) -> list[str]:
@@ -105,15 +106,19 @@ def create_router() -> APIRouter:
     ):
         identity = await require_identity_async(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
-        client_task_id = str(payload.get("client_task_id") or "").strip()
-        if not client_task_id:
-            raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
-        prompt = str(payload["prompt"])
-        model = str(payload["model"])
-        await filter_or_log(LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=prompt), prompt)
-        images = await read_image_sources(image_sources)
-        masks = await read_image_sources(mask_sources) if mask_sources else None
         try:
+            client_task_id = str(payload.get("client_task_id") or "").strip()
+            if not client_task_id:
+                raise HTTPException(status_code=400, detail={"error": "client_task_id is required"})
+            if len(client_task_id) > _MAX_CLIENT_TASK_ID_LENGTH:
+                raise HTTPException(status_code=400, detail={"error": "client_task_id length exceeded"})
+            if "," in client_task_id:
+                raise HTTPException(status_code=400, detail={"error": "client_task_id must not contain comma"})
+            prompt = str(payload["prompt"])
+            model = str(payload["model"])
+            await filter_or_log(LoggedCall(identity, "/api/image-tasks/edits", model, "图生图任务", request_text=prompt), prompt)
+            images = await read_image_sources(image_sources)
+            masks = await read_image_sources(mask_sources) if mask_sources else None
             return await run_image_task_io(
                 image_task_service.submit_edit,
                 identity,
@@ -131,6 +136,8 @@ def create_router() -> APIRouter:
                 status_code=400,
                 detail={"error": public_exception_message(exc, "image task request failed")},
             ) from exc
+        finally:
+            await close_image_sources([*image_sources, *mask_sources])
 
     @router.post("/api/image-tasks/{task_id}/resume-poll")
     async def resume_image_poll(

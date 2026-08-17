@@ -37,7 +37,7 @@ def test_third_party_handoff_never_puts_session_credentials_in_url_or_dom() -> N
 
     assert "session.key" not in source
     assert "apiKey" not in source
-    assert "buildThirdPartyHref(canvas.url, baseUrl)" in source
+    assert "buildThirdPartyHref(canvasUrl, baseUrl)" in source
     assert "buildThirdPartyHref(appUrl, baseUrl)" in helper
     assert "apiKey" not in helper
     assert "thirdPartyState?.owner === session" in source

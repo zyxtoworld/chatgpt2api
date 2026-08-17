@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { NextConfig } from 'next'
-import { parseChangelog } from './src/lib/release'
+import { parseChangelog } from './src/lib/release.ts'
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 

@@ -5,6 +5,12 @@ import test from "node:test";
 
 import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner.js";
 import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import { runBackupMutation } from "../src/lib/backup-detail-lifecycle.js";
+import {
+  createAbortableLifecycleOwner,
+  releaseStaleResponse,
+  runBackupDownload,
+} from "../src/lib/backup-download-lifecycle.js";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/settings/components/backup-settings-card.tsx", import.meta.url)),
@@ -73,11 +79,37 @@ test("closing backup details invalidates the pending read before late callbacks"
   assert.deepEqual(events, []);
 });
 
+test("production backup removal invalidates an in-flight detail read before the delete settles", async () => {
+  assert.match(source, /const handleRemoveBackup = async \(key: string\) => \{/);
+  assert.match(source, /runBackupMutation\(/);
+  assert.match(source, /onClick=\{\(\) => void handleRemoveBackup\(item\.key\)\}/);
+
+  const owner = createLatestActionOwner();
+  owner.activate();
+  const detailRequest = owner.begin("A");
+  let resolveDelete;
+  const deletePromise = new Promise((resolve) => {
+    resolveDelete = resolve;
+  });
+
+  const removing = runBackupMutation(
+    () => owner.invalidate(),
+    () => deletePromise,
+  );
+
+  assert.equal(owner.accepts(detailRequest), false);
+  resolveDelete(true);
+  assert.equal(await removing, true);
+
+  const replacement = owner.begin("B");
+  assert.equal(owner.accepts(replacement), true);
+});
+
 test("backup downloads share a lifecycle owner and reject late completion after unmount", () => {
-  assert.match(source, /createLifecycleActionOwner/);
+  assert.match(source, /createAbortableLifecycleOwner/);
   assert.match(source, /backupDownloadOwnerRef/);
   assert.match(source, /backupDownloadOwner\.cancel\(\)/);
-  assert.match(source, /backupDownloadOwner\.accepts\(downloadOwner\)/);
+  assert.match(source, /runBackupDownload\(/);
 
   const owner = createLifecycleActionOwner();
   owner.activate();
@@ -92,4 +124,76 @@ test("backup downloads share a lifecycle owner and reject late completion after 
   owner.cancel();
   assert.equal(owner.accepts(first), false);
   assert.equal(owner.accepts(second), false);
+});
+
+test("a stale backup download releases the response body", async () => {
+  let cancelled = 0;
+  const response = {
+    body: {
+      cancel: async () => {
+        cancelled += 1;
+      },
+    },
+  };
+
+  await releaseStaleResponse(response);
+  assert.equal(cancelled, 1);
+});
+
+test("backup download cancellation aborts the in-flight request and rejects late callbacks", () => {
+  const owner = createAbortableLifecycleOwner();
+  const download = owner.begin();
+
+  assert.equal(download.controller.signal.aborted, false);
+  assert.equal(owner.accepts(download), true);
+
+  owner.cancel();
+
+  assert.equal(download.controller.signal.aborted, true);
+  assert.equal(owner.accepts(download), false);
+});
+
+test("the production backup download flow passes signal and drops a response after unmount", async () => {
+  const owner = createAbortableLifecycleOwner();
+  owner.activate();
+  let resolveFetch;
+  let requestOptions;
+  let cancelled = 0;
+  const fetchPromise = new Promise((resolve) => {
+    resolveFetch = resolve;
+  });
+  const events = [];
+  const download = runBackupDownload({
+    owner,
+    getAuthKey: async () => "test-key",
+    fetchImpl: async (_url, options) => {
+      requestOptions = options;
+      return fetchPromise;
+    },
+    url: "/api/backups/download?key=backup-key",
+    fallbackName: "backup.bin",
+    filenameFromContentDisposition: () => "backup.bin",
+    requestErrorMessage: () => "download failed",
+    onDownload: () => events.push("download"),
+    onSuccess: () => events.push("success"),
+    onError: () => events.push("error"),
+  });
+
+  await new Promise((resolve) => queueMicrotask(resolve));
+  assert.ok(requestOptions?.signal instanceof AbortSignal);
+  assert.equal(requestOptions.signal.aborted, false);
+  owner.cancel();
+  assert.equal(requestOptions.signal.aborted, true);
+
+  resolveFetch({
+    ok: true,
+    headers: { get: () => "" },
+    blob: async () => new Blob(["late"]),
+    body: { cancel: async () => { cancelled += 1; } },
+  });
+  await download;
+
+  assert.deepEqual(events, []);
+  assert.equal(cancelled, 1);
+  assert.equal(owner.activeCount(), 0);
 });

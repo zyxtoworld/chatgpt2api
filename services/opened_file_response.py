@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import os
 import threading
 from secrets import token_hex
 from typing import Mapping
@@ -41,8 +43,26 @@ class OpenedFileResponse(FileResponse):
         if not self._opened_file.closed:
             self._opened_file.close()
 
+    def _refresh_opened_file_size(self) -> None:
+        """Use the already-open handle as the response's size authority."""
+        try:
+            file_descriptor = self._opened_file.fileno()
+        except (AttributeError, io.UnsupportedOperation):
+            return
+        current_stat = os.fstat(file_descriptor)
+        if self.stat_result is None or current_stat.st_size == self.stat_result.st_size:
+            return
+        self.stat_result = current_stat
+        for header_name in ("content-length", "last-modified", "etag"):
+            try:
+                del self.headers[header_name]
+            except KeyError:
+                pass
+        self.set_stat_headers(current_stat)
+
     async def __call__(self, scope, receive, send):
         try:
+            self._refresh_opened_file_size()
             return await super().__call__(scope, receive, send)
         finally:
             self._close_opened_file()
@@ -66,11 +86,16 @@ class OpenedFileResponse(FileResponse):
         if send_header_only:
             await send({"type": "http.response.body", "body": b"", "more_body": False})
             return
-        more_body = True
-        while more_body:
-            chunk = await self._read_opened_file(self.chunk_size)
-            more_body = len(chunk) == self.chunk_size
-            await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+        remaining = self.stat_result.st_size
+        if remaining == 0:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+            return
+        while remaining:
+            chunk = await self._read_opened_file(min(self.chunk_size, remaining))
+            if not chunk:
+                raise RuntimeError("file changed while streaming")
+            remaining -= len(chunk)
+            await send({"type": "http.response.body", "body": chunk, "more_body": bool(remaining)})
 
     async def _handle_single_range(
         self,
@@ -88,12 +113,13 @@ class OpenedFileResponse(FileResponse):
             await send({"type": "http.response.body", "body": b"", "more_body": False})
             return
         await self._seek_opened_file(start)
-        more_body = True
-        while more_body:
-            chunk = await self._read_opened_file(min(self.chunk_size, end - start))
-            start += len(chunk)
-            more_body = len(chunk) == self.chunk_size and start < end
-            await send({"type": "http.response.body", "body": chunk, "more_body": more_body})
+        remaining = end - start
+        while remaining:
+            chunk = await self._read_opened_file(min(self.chunk_size, remaining))
+            if not chunk:
+                raise RuntimeError("file changed while streaming")
+            remaining -= len(chunk)
+            await send({"type": "http.response.body", "body": chunk, "more_body": bool(remaining)})
 
     async def _handle_multiple_ranges(
         self,
@@ -119,11 +145,12 @@ class OpenedFileResponse(FileResponse):
         for start, end in ranges:
             await send({"type": "http.response.body", "body": header_generator(start, end), "more_body": True})
             await self._seek_opened_file(start)
-            while start < end:
-                chunk = await self._read_opened_file(min(self.chunk_size, end - start))
+            remaining = end - start
+            while remaining:
+                chunk = await self._read_opened_file(min(self.chunk_size, remaining))
                 if not chunk:
-                    break
-                start += len(chunk)
+                    raise RuntimeError("file changed while streaming")
+                remaining -= len(chunk)
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
             await send({"type": "http.response.body", "body": b"\r\n", "more_body": True})
         await send({"type": "http.response.body", "body": f"--{boundary}--".encode("latin-1"), "more_body": False})

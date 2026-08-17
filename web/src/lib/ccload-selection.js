@@ -2,7 +2,7 @@ function uniqueEnabledIds(channels) {
   const seen = new Set();
   const ids = [];
   for (const channel of Array.isArray(channels) ? channels : []) {
-    const id = String(channel?.id || "").trim();
+    const id = channelIdText(channel?.id);
     if (!id || channel?.enabled !== true || seen.has(id)) {
       continue;
     }
@@ -12,10 +12,41 @@ function uniqueEnabledIds(channels) {
   return ids;
 }
 
+function scalarText(value) {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return "";
+}
+
+function channelIdText(value) {
+  let text = "";
+  if (typeof value === "string") {
+    text = value.trim();
+  } else if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) {
+    text = String(value);
+  }
+  if (
+    text.length === 0
+    || text.length > 64
+    || !/^[0-9]+$/.test(text)
+    || !/[1-9]/.test(text)
+  ) {
+    return "";
+  }
+  return text;
+}
+
+export function resetCCLoadModelState() {
+  return {
+    loadingModelIds: [],
+    modelLoadErrorIds: [],
+  };
+}
+
 export function normalizeCCLoadChannels(channels) {
   const seen = new Set();
   return (Array.isArray(channels) ? channels : []).flatMap((channel) => {
-    const id = String(channel?.id || "").trim();
+    const id = channelIdText(channel?.id);
     if (!id || seen.has(id)) return [];
     seen.add(id);
     const modelIds = [];
@@ -26,28 +57,24 @@ export function normalizeCCLoadChannels(channels) {
       seenModels.add(modelId);
       modelIds.push(modelId);
     }
-    return [{
+    const normalized = {
       id,
-      name: String(channel?.name || "").trim(),
+      name: scalarText(channel?.name),
       enabled: channel?.enabled === true,
-      plan_type: String(channel?.plan_type || "").trim(),
-      subscription_active_until: String(channel?.subscription_active_until || "").trim(),
+      plan_type: scalarText(channel?.plan_type),
+      subscription_active_until: scalarText(channel?.subscription_active_until),
       models: modelIds,
       models_loaded: channel?.models_loaded === true,
-    }];
+    };
+    return [normalized];
   });
 }
 
 export function getUnloadedCCLoadChannelIds(channels) {
-  const seenPlans = new Set();
   const ids = [];
   for (const channel of Array.isArray(channels) ? channels : []) {
-    const id = String(channel?.id || "").trim();
+    const id = channelIdText(channel?.id);
     if (!id || channel?.enabled !== true || channel?.models_loaded === true) continue;
-    const planType = String(channel?.plan_type || "").trim().toLowerCase();
-    const catalogKey = planType ? `plan:${planType}` : `channel:${id}`;
-    if (seenPlans.has(catalogKey)) continue;
-    seenPlans.add(catalogKey);
     ids.push(id);
   }
   return ids;
@@ -56,21 +83,33 @@ export function getUnloadedCCLoadChannelIds(channels) {
 export function mergeCCLoadChannelModels(channels, catalogs) {
   const normalizedCatalogs = normalizeCCLoadChannels(catalogs);
   const byId = new Map(normalizedCatalogs.map((channel) => [channel.id, channel]));
-  const byPlanType = new Map();
-  for (const catalog of normalizedCatalogs) {
-    const planType = catalog.plan_type.toLowerCase();
-    if (planType && !byPlanType.has(planType)) {
-      byPlanType.set(planType, catalog);
-    }
-  }
   return (Array.isArray(channels) ? channels : []).map((channel) => {
-    const id = String(channel?.id || "").trim();
-    const planType = String(channel?.plan_type || "").trim().toLowerCase();
-    const catalog = byId.get(id) || (planType ? byPlanType.get(planType) : undefined);
-    return catalog
-      ? { ...channel, models: catalog.models, models_loaded: catalog.models_loaded }
-      : channel;
+    const id = channelIdText(channel?.id);
+    const directCatalog = byId.get(id);
+    const catalog = directCatalog;
+    if (!catalog) return channel;
+    return {
+      ...channel,
+      models: catalog.models,
+      models_loaded: catalog.models_loaded,
+    };
   });
+}
+
+export function getCCLoadModelErrorIds(catalogs, requestedIds = []) {
+  const returnedIds = new Set();
+  const failedIds = [];
+  for (const catalog of Array.isArray(catalogs) ? catalogs : []) {
+    const id = channelIdText(catalog?.id);
+    if (!id) continue;
+    returnedIds.add(id);
+    if (catalog?.models_loaded !== true) failedIds.push(id);
+  }
+  for (const rawId of Array.isArray(requestedIds) ? requestedIds : []) {
+    const id = channelIdText(rawId);
+    if (id && !returnedIds.has(id)) failedIds.push(id);
+  }
+  return [...new Set(failedIds)];
 }
 
 export function filterCCLoadChannels(channels, query) {
@@ -136,7 +175,7 @@ export function getValidCCLoadSelectedIds(selectedIds, channels) {
   const selectable = new Set(uniqueEnabledIds(channels));
   const seen = new Set();
   return (Array.isArray(selectedIds) ? selectedIds : []).filter((rawId) => {
-    const id = String(rawId || "").trim();
+    const id = channelIdText(rawId);
     if (!selectable.has(id) || seen.has(id)) {
       return false;
     }

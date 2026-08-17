@@ -309,6 +309,282 @@ class AIThreadPoolIsolationContractTests(unittest.TestCase):
 
         anyio.run(scenario)
 
+    def test_refresh_all_accounts_loads_tokens_off_the_asgi_event_loop(self) -> None:
+        def list_tokens() -> list[str]:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return ["account-token"]
+            raise AssertionError("account token storage ran on the ASGI event loop")
+
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.post(
+                    "/api/accounts/refresh",
+                    headers={"Authorization": "Bearer chatgpt2api"},
+                    json={"access_tokens": []},
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertIn("progress_id", response.json())
+
+        with (
+            mock.patch.object(accounts_api_module.account_service, "list_tokens", side_effect=list_tokens),
+            mock.patch.object(accounts_api_module, "_schedule_management_task"),
+        ):
+            anyio.run(scenario)
+
+    def test_account_read_routes_load_state_off_the_asgi_event_loop(self) -> None:
+        def assert_worker_thread(*_args: object, **_kwargs: object) -> None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            raise AssertionError("account state storage ran on the ASGI event loop")
+
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            progress = {"total": 0, "completed": 0, "added": 0, "skipped": 0, "refreshed": 0, "failed": 0}
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                responses = []
+                with (
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "list_accounts",
+                        side_effect=lambda: (assert_worker_thread(), [])[1],
+                    ),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "get_refresh_progress",
+                        side_effect=lambda _progress_id: (assert_worker_thread(), progress)[1],
+                    ),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "get_relogin_progress",
+                        side_effect=lambda _progress_id: (assert_worker_thread(), progress)[1],
+                    ),
+                ):
+                    responses.append(await client.get("/api/accounts", headers={"Authorization": "Bearer chatgpt2api"}))
+                    responses.append(
+                        await client.get(
+                            "/api/accounts/refresh/progress/progress-1",
+                            headers={"Authorization": "Bearer chatgpt2api"},
+                        )
+                    )
+                    responses.append(
+                        await client.get(
+                            "/api/accounts/re-login/progress/progress-2",
+                            headers={"Authorization": "Bearer chatgpt2api"},
+                        )
+                    )
+            self.assertTrue(all(response.status_code == 200 for response in responses))
+
+        anyio.run(scenario)
+
+    def test_storage_backend_initialization_stays_off_the_asgi_event_loop(self) -> None:
+        def get_storage_backend():
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return SimpleNamespace(
+                    health_check=lambda: {"status": "healthy", "backend": "json"},
+                    get_backend_info=lambda: {"type": "json"},
+                )
+            raise AssertionError("storage backend initialization ran on the ASGI event loop")
+
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                with (
+                    mock.patch.object(system_module.config, "get_storage_backend", side_effect=get_storage_backend),
+                    mock.patch.object(
+                        system_module,
+                        "_account_stats_async",
+                        new=mock.AsyncMock(return_value={"active": 1}),
+                    ),
+                ):
+                    health = await client.get("/health?format=json")
+                    info = await client.get(
+                        "/api/storage/info",
+                        headers={"Authorization": "Bearer chatgpt2api"},
+                    )
+            self.assertEqual(health.status_code, 200, health.text)
+            self.assertEqual(info.status_code, 200, info.text)
+
+        anyio.run(scenario)
+
+    def test_backup_state_and_settings_reads_stay_off_the_asgi_event_loop(self) -> None:
+        def assert_worker_thread(*_args: object, **_kwargs: object) -> dict[str, object]:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return {}
+            raise AssertionError("backup state/settings storage ran on the ASGI event loop")
+
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                with (
+                    mock.patch.object(
+                        system_module,
+                        "require_admin_async",
+                        new=mock.AsyncMock(return_value={"id": "admin", "role": "admin"}),
+                    ),
+                    mock.patch.object(system_module.backup_service, "list_backups", return_value=[]),
+                    mock.patch.object(
+                        system_module.backup_service,
+                        "get_status",
+                        side_effect=assert_worker_thread,
+                    ),
+                    mock.patch.object(
+                        system_module.backup_service,
+                        "get_settings",
+                        side_effect=assert_worker_thread,
+                    ),
+                ):
+                    response = await client.get(
+                        "/api/backups",
+                        headers={"Authorization": "Bearer admin-key"},
+                    )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        anyio.run(scenario)
+
+    def test_progress_failure_finalization_stays_off_the_asgi_event_loop(self) -> None:
+        def assert_worker_thread(*_args: object, **_kwargs: object) -> None:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            raise AssertionError("progress persistence ran on the ASGI event loop")
+
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            factories: list[object] = []
+
+            def capture(factory) -> None:
+                factories.append(factory)
+
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                with (
+                    mock.patch.object(accounts_api_module, "_schedule_management_task", side_effect=capture),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "refresh_accounts",
+                        side_effect=RuntimeError("refresh failed"),
+                    ),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "finish_refresh_progress",
+                        side_effect=assert_worker_thread,
+                    ),
+                ):
+                    response = await client.post(
+                        "/api/accounts/refresh",
+                        headers={"Authorization": "Bearer chatgpt2api"},
+                        json={"access_tokens": ["account-token"]},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    await factories[-1]()
+
+                factories.clear()
+                with (
+                    mock.patch.object(accounts_api_module, "_schedule_management_task", side_effect=capture),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "re_login_accounts",
+                        side_effect=RuntimeError("re-login failed"),
+                    ),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "finish_relogin_progress",
+                        side_effect=assert_worker_thread,
+                    ),
+                ):
+                    response = await client.post(
+                        "/api/accounts/re-login",
+                        headers={"Authorization": "Bearer chatgpt2api"},
+                        json={"access_tokens": ["account-token"]},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    await factories[-1]()
+
+        anyio.run(scenario)
+
+    def test_cancelled_refresh_finalizes_progress_before_propagating(self) -> None:
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            factories: list[object] = []
+            finalized: list[dict[str, object]] = []
+
+            def capture(factory) -> None:
+                factories.append(factory)
+
+            def cancel_refresh(*_args: object, **_kwargs: object) -> None:
+                raise asyncio.CancelledError()
+
+            def finish_progress(*_args: object, **kwargs: object) -> None:
+                finalized.append(kwargs)
+
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                with (
+                    mock.patch.object(accounts_api_module, "_schedule_management_task", side_effect=capture),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "refresh_accounts",
+                        side_effect=cancel_refresh,
+                    ),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "finish_refresh_progress",
+                        side_effect=finish_progress,
+                    ),
+                ):
+                    response = await client.post(
+                        "/api/accounts/refresh",
+                        headers={"Authorization": "Bearer chatgpt2api"},
+                        json={"access_tokens": ["account-token"]},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await factories[-1]()
+
+                factories.clear()
+                with (
+                    mock.patch.object(accounts_api_module, "_schedule_management_task", side_effect=capture),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "re_login_accounts",
+                        side_effect=cancel_refresh,
+                    ),
+                    mock.patch.object(
+                        accounts_api_module.account_service,
+                        "finish_relogin_progress",
+                        side_effect=finish_progress,
+                    ),
+                ):
+                    response = await client.post(
+                        "/api/accounts/re-login",
+                        headers={"Authorization": "Bearer chatgpt2api"},
+                        json={"access_tokens": ["account-token"]},
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await factories[-1]()
+
+            self.assertEqual(
+                finalized,
+                [{"error": "刷新任务已取消"}, {"error": "重新登录任务已取消"}],
+            )
+
+        anyio.run(scenario)
+
     def test_non_stream_call_log_io_does_not_run_on_the_asgi_event_loop(self) -> None:
         def add_log(*_args, **_kwargs) -> None:
             try:
@@ -558,6 +834,35 @@ class AIThreadPoolIsolationContractTests(unittest.TestCase):
                 new=mock.AsyncMock(return_value={"id": "admin", "role": "admin"}),
             ),
             mock.patch.object(system_module.config, "update", side_effect=update_config),
+        ):
+            anyio.run(scenario)
+
+    def test_settings_read_does_not_run_on_the_asgi_event_loop(self) -> None:
+        def get_config() -> dict[str, object]:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return {}
+            raise AssertionError("config storage ran on the ASGI event loop")
+
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.get(
+                    "/api/settings",
+                    headers={"Authorization": "Bearer admin-key"},
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json(), {"config": {}})
+
+        with (
+            mock.patch.object(
+                system_module,
+                "require_admin_async",
+                new=mock.AsyncMock(return_value={"id": "admin", "role": "admin"}),
+            ),
+            mock.patch.object(system_module.config, "get", side_effect=get_config),
         ):
             anyio.run(scenario)
 

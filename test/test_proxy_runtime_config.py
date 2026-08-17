@@ -34,7 +34,7 @@ class ProxyRuntimeConfigTests(unittest.TestCase):
             expected_public["clearance"]["has_cf_cookies"] = False
             expected_public["clearance"]["has_cf_clearance"] = False
             public_config = store.get()
-            self.assertEqual(public_config["proxy"], " http://legacy.example:8080 ")
+            self.assertEqual(public_config["proxy"], "http://legacy.example:8080")
             self.assertEqual(public_config["proxy_runtime"], expected_public)
             self.assertNotIn("auth-key", public_config)
 

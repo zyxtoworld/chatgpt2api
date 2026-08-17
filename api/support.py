@@ -13,13 +13,14 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config, parse_public_url
+from services.model_contract import parse_model_text
 from services.protocol.error_response import (
     PUBLIC_SERVER_ERROR_MESSAGE,
     exception_log_message,
     sanitize_import_job_errors,
 )
 from services.secure_file import OpenedFile, authorized_root, open_checked_file, resolve_under_root
-from services.url_utils import redact_url_credentials
+from services.task_executor import BackgroundTaskQueueFullError, reserve_background_task
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -141,7 +142,20 @@ def raise_image_quota_error(exc: Exception) -> None:
 def sanitize_import_job(value: object) -> dict | None:
     if not isinstance(value, dict):
         return None
-    sanitized = dict(value)
+    sanitized: dict[str, object] = {}
+    allowed_statuses = {"pending", "running", "completed", "failed"}
+    for key in ("job_id", "status", "created_at", "updated_at"):
+        field_value = value.get(key)
+        if isinstance(field_value, str):
+            normalized = field_value.strip()
+            if key == "status":
+                sanitized[key] = normalized if normalized in allowed_statuses else "failed"
+            elif len(normalized) <= 256:
+                sanitized[key] = normalized
+    for key in ("total", "completed", "added", "skipped", "refreshed", "failed"):
+        field_value = value.get(key)
+        if type(field_value) is int and field_value >= 0:
+            sanitized[key] = field_value
     sanitized["errors"] = sanitize_import_job_errors(value.get("errors"))
     return sanitized
 
@@ -149,11 +163,17 @@ def sanitize_import_job(value: object) -> dict | None:
 def sanitize_cpa_pool(pool: dict | None) -> dict | None:
     if not isinstance(pool, dict):
         return None
-    sanitized = {key: value for key, value in pool.items() if key != "secret_key"}
-    if "base_url" in sanitized:
-        sanitized["base_url"] = redact_url_credentials(sanitized.get("base_url"))
-    if "import_job" in sanitized:
-        sanitized["import_job"] = sanitize_import_job(sanitized.get("import_job"))
+    sanitized = {
+        key: pool[key]
+        for key in ("id", "name")
+        if isinstance(pool.get(key), str)
+    }
+    if isinstance(pool.get("base_url"), str):
+        safe_base_url = _sanitize_management_base_url(pool["base_url"])
+        if safe_base_url:
+            sanitized["base_url"] = safe_base_url
+    if "import_job" in pool:
+        sanitized["import_job"] = sanitize_import_job(pool.get("import_job"))
     return sanitized
 
 
@@ -161,15 +181,29 @@ def sanitize_cpa_pools(pools: list[dict]) -> list[dict]:
     return [sanitized for pool in pools if (sanitized := sanitize_cpa_pool(pool)) is not None]
 
 
+def _has_nonempty_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _sanitize_management_base_url(value: object) -> str:
+    return parse_public_url(value)
+
+
 def sanitize_sub2api_server(server: dict | None) -> dict | None:
     if not isinstance(server, dict):
         return None
-    sanitized = {key: value for key, value in server.items() if key not in {"password", "api_key"}}
-    if "base_url" in sanitized:
-        sanitized["base_url"] = redact_url_credentials(sanitized.get("base_url"))
-    sanitized["has_api_key"] = bool(str(server.get("api_key") or "").strip())
-    if "import_job" in sanitized:
-        sanitized["import_job"] = sanitize_import_job(sanitized.get("import_job"))
+    sanitized = {
+        key: server[key]
+        for key in ("id", "name", "email", "group_id")
+        if isinstance(server.get(key), str)
+    }
+    if isinstance(server.get("base_url"), str):
+        safe_base_url = _sanitize_management_base_url(server["base_url"])
+        if safe_base_url:
+            sanitized["base_url"] = safe_base_url
+    sanitized["has_api_key"] = _has_nonempty_text(server.get("api_key"))
+    if "import_job" in server:
+        sanitized["import_job"] = sanitize_import_job(server.get("import_job"))
     return sanitized
 
 
@@ -180,12 +214,18 @@ def sanitize_sub2api_servers(servers: list[dict]) -> list[dict]:
 def sanitize_ccload_server(server: dict | None) -> dict | None:
     if not isinstance(server, dict):
         return None
-    sanitized = {key: value for key, value in server.items() if key != "password"}
-    if "base_url" in sanitized:
-        sanitized["base_url"] = redact_url_credentials(sanitized.get("base_url"))
-    sanitized["has_password"] = bool(str(server.get("password") or "").strip())
-    if "import_job" in sanitized:
-        sanitized["import_job"] = sanitize_import_job(sanitized.get("import_job"))
+    sanitized = {
+        key: server[key]
+        for key in ("id", "name")
+        if isinstance(server.get(key), str)
+    }
+    if isinstance(server.get("base_url"), str):
+        safe_base_url = _sanitize_management_base_url(server["base_url"])
+        if safe_base_url:
+            sanitized["base_url"] = safe_base_url
+    sanitized["has_password"] = _has_nonempty_text(server.get("password"))
+    if "import_job" in server:
+        sanitized["import_job"] = sanitize_import_job(server.get("import_job"))
     return sanitized
 
 
@@ -193,8 +233,69 @@ def sanitize_ccload_servers(servers: list[dict]) -> list[dict]:
     return [sanitized for server in servers if (sanitized := sanitize_ccload_server(server)) is not None]
 
 
+def sanitize_ccload_channel_catalogs(value: object) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    sanitized: list[dict] = []
+    for catalog in value:
+        if not isinstance(catalog, dict):
+            continue
+        channel_id = catalog.get("id")
+        plan_type = catalog.get("plan_type")
+        models = catalog.get("models")
+        models_loaded = catalog.get("models_loaded")
+        if (
+            not isinstance(channel_id, str)
+            or not channel_id.strip()
+            or len(channel_id.strip()) > 64
+            or not isinstance(plan_type, str)
+            or type(models_loaded) is not bool
+            or not isinstance(models, list)
+        ):
+            continue
+        public_models: list[str] = []
+        malformed_model = False
+        for model in models:
+            normalized = parse_model_text(model)
+            if not normalized:
+                malformed_model = True
+                break
+            public_models.append(normalized)
+        if malformed_model:
+            continue
+        sanitized.append({
+            "id": channel_id.strip(),
+            "plan_type": plan_type.strip(),
+            "models": public_models,
+            "models_loaded": models_loaded,
+        })
+    return sanitized
+
+
 def start_limited_account_watcher(stop_event: Event) -> Thread:
     interval_seconds = config.refresh_account_interval_minute * 60
+    begin_owner = getattr(account_service, "begin_watcher_refresh", None)
+    owner = begin_owner() if callable(begin_owner) else None
+    owner_kwargs = {"watcher_owner": owner} if owner is not None else {}
+
+    def run_watcher_operation(function, *args, **kwargs):
+        if stop_event.is_set():
+            return None
+        try:
+            reservation = reserve_background_task()
+        except BackgroundTaskQueueFullError:
+            return None
+        try:
+            if stop_event.is_set():
+                reservation.cancel()
+                return None
+            future = reservation.submit(function, *args, **kwargs)
+        except Exception:
+            return None
+        while not future.done():
+            if stop_event.wait(0.05):
+                return None
+        return future.result()
 
     def worker() -> None:
         while not stop_event.is_set():
@@ -213,11 +314,21 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
                         f"{len(normal_tokens)} normal accounts, "
                         f"{len(expiring_tokens)} expiring access tokens"
                     )
-                    account_service.refresh_accounts(tokens)
+                    run_watcher_operation(
+                        account_service.refresh_accounts,
+                        tokens,
+                        **owner_kwargs,
+                    )
+                if stop_event.is_set():
+                    return
                 if keepalive_tokens:
                     print(f"[account-watcher] keepalive {len(keepalive_tokens)} refresh tokens")
-                    result = account_service.keepalive_refresh_tokens(keepalive_tokens)
-                    if result.get("errors"):
+                    result = run_watcher_operation(
+                        account_service.keepalive_refresh_tokens,
+                        keepalive_tokens,
+                        **owner_kwargs,
+                    )
+                    if isinstance(result, dict) and result.get("errors"):
                         print(f"[account-watcher] keepalive errors: {len(result['errors'])}")
             except Exception as exc:
                 print(f"[account-watcher] fail {exception_log_message(exc)}")
@@ -226,6 +337,16 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
     thread = Thread(target=worker, name="account-watcher", daemon=True)
     thread.start()
     return thread
+
+
+def stop_limited_account_watcher(stop_event: Event, thread: Thread | None) -> None:
+    """Invalidate watcher writes before stopping its polling thread."""
+    invalidate = getattr(account_service, "invalidate_all_watcher_refreshes", None)
+    if callable(invalidate):
+        invalidate()
+    stop_event.set()
+    if thread is not None:
+        thread.join(timeout=1)
 
 
 def _web_asset_candidates(requested_path: str) -> list[str]:

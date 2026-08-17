@@ -57,32 +57,11 @@ import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
 import { createSerialPoller } from "@/lib/serial-poll";
 import { commitSynchronousSnapshot } from "@/lib/synchronous-snapshot";
+import { normalizeSub2APIRemoteAccounts } from "@/lib/sub2api-selection";
 
 const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 type AuthMode = "password" | "api_key";
-
-function normalizeAccounts(items: Sub2APIRemoteAccount[]) {
-  const seen = new Set<string>();
-  const accounts: Sub2APIRemoteAccount[] = [];
-  for (const item of items) {
-    const id = String(item.id || "").trim();
-    if (!id || seen.has(id)) {
-      continue;
-    }
-    seen.add(id);
-    accounts.push({
-      id,
-      name: String(item.name || "").trim(),
-      email: String(item.email || "").trim(),
-      plan_type: String(item.plan_type || "").trim(),
-      status: String(item.status || "").trim(),
-      expires_at: String(item.expires_at || "").trim(),
-      has_refresh_token: Boolean(item.has_refresh_token),
-    });
-  }
-  return accounts;
-}
 
 export function Sub2APIConnections() {
   const requestGateRef = useRef(createMutationRequestGate());
@@ -405,7 +384,7 @@ export function Sub2APIConnections() {
       if (!gate.acceptsQuery(queryOwner)) return;
       const currentServer = serversRef.current.find((item) => item.id === server.id);
       if (!currentServer) return;
-      const accounts = normalizeAccounts(data.accounts);
+      const accounts = normalizeSub2APIRemoteAccounts(data.accounts);
       setBrowserServer(currentServer);
       setRemoteAccounts(accounts);
       setSelectedIds([]);
@@ -552,8 +531,9 @@ export function Sub2APIConnections() {
           ) : (
             <div className="space-y-3">
               {servers.map((server) => {
-                const isBusy = hasMutation || loadingAccountsId === server.id;
                 const importJob = server.import_job ?? null;
+                const importRunning = importJob?.status === "pending" || importJob?.status === "running";
+                const isBusy = hasMutation || importRunning || loadingAccountsId === server.id;
                 return (
                   <div
                     key={server.id}

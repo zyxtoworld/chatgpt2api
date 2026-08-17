@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import threading
 import time
+from contextlib import contextmanager
 from typing import Callable, Mapping
 from urllib import request as urllib_request
 from urllib.parse import quote, urlparse
@@ -17,6 +19,8 @@ from services.protocol.error_response import public_exception_message
 
 
 FlareSolverrRequestMethod = Callable[[str, bytes, dict[str, str], float], bytes]
+FLARESOLVERR_MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+FLARESOLVERR_READ_CHUNK_BYTES = 64 * 1024
 
 
 def normalize_proxy_url(url: str) -> str:
@@ -138,7 +142,8 @@ class FlareSolverrClearanceProvider:
 
         target_host = _host_from_url(target_url)
         cookies = _filter_flaresolverr_cookies(solution.get("cookies"), target_host)
-        user_agent = str(solution.get("userAgent") or "").strip()
+        raw_user_agent = solution.get("userAgent")
+        user_agent = _safe_header_value(raw_user_agent, max_length=1024)
         if not cookies and not user_agent:
             return None
         return ClearanceBundle(
@@ -152,7 +157,19 @@ class FlareSolverrClearanceProvider:
     def _urllib_post(endpoint: str, body: bytes, headers: dict[str, str], timeout: float) -> bytes:
         req = urllib_request.Request(endpoint, data=body, headers=headers, method="POST")
         with urllib_request.urlopen(req, timeout=timeout) as response:
-            return response.read()
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = response.read(FLARESOLVERR_READ_CHUNK_BYTES)
+                if not isinstance(chunk, bytes):
+                    raise RuntimeError("clearance response body is invalid")
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > FLARESOLVERR_MAX_RESPONSE_BYTES:
+                    raise RuntimeError("clearance response body is too large")
+                chunks.append(chunk)
+            return b"".join(chunks)
 
 
 class ProxySettingsStore:
@@ -163,9 +180,12 @@ class ProxySettingsStore:
     ) -> None:
         self._config = config_store or config
         self._clearance_provider_factory = clearance_provider_factory or FlareSolverrClearanceProvider
-        self._clearance_cache: dict[tuple[str, str], ClearanceBundle] = {}
+        self._clearance_cache: dict[tuple[str, str, str], ClearanceBundle] = {}
+        self._clearance_generations: dict[tuple[str, str, str], int] = {}
         self._provider_cache: dict[str, FlareSolverrClearanceProvider] = {}
-        self._flight_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._flight_locks: dict[tuple[str, str, str], threading.Lock] = {}
+        self._flight_lock_refs: dict[tuple[str, str, str], int] = {}
+        self._flight_generations: dict[tuple[str, str, str], int] = {}
         self._lock = threading.RLock()
 
     def get_profile(
@@ -223,12 +243,15 @@ class ProxySettingsStore:
         proxy: str = "",
         resource: bool = False,
         upstream: bool = False,
+        require_tls_verification: bool = False,
         **session_kwargs,
     ) -> dict[str, object]:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
         if profile.proxy_url:
             session_kwargs["proxy"] = profile.proxy_url
-        if profile.runtime_enabled and profile.skip_ssl_verify:
+        if require_tls_verification:
+            session_kwargs["verify"] = True
+        elif profile.runtime_enabled and profile.skip_ssl_verify and "verify" not in session_kwargs:
             session_kwargs["verify"] = False
         return session_kwargs
 
@@ -276,29 +299,40 @@ class ProxySettingsStore:
             return None
 
         target_host = _host_from_url(target_url)
-        key = self._cache_key(profile.proxy_url, target_host)
+        key = self._cache_key(profile.proxy_url, target_host, profile.clearance)
         if profile.clearance_mode == "manual":
+            with self._lock:
+                generation = self._clearance_generations.get(key, 0)
             bundle = self._build_manual_bundle(profile, target_host)
             if bundle is not None:
-                self._set_cached_bundle(key, bundle)
+                if not self._set_cached_bundle_if_current(key, bundle, generation):
+                    return None
             return bundle
         if profile.clearance_mode != "flaresolverr":
             return None
 
-        cached_before = self._get_cached_bundle(key)
+        with self._lock:
+            cached_before = self._clearance_cache.get(key)
+            request_generation = self._clearance_generations.get(key, 0)
         if cached_before is not None and not force and cached_before.is_valid_for(target_host, profile.proxy_url):
             return cached_before
 
-        lock = self._get_flight_lock(key)
-        if not lock.acquire(blocking=False):
-            with lock:
-                pass
-            return self._get_cached_bundle(key) or cached_before
+        with self._flight_lock(key, request_generation) as acquired:
+            if not acquired:
+                with self._lock:
+                    current_generation = self._clearance_generations.get(key, 0)
+                    if current_generation != request_generation:
+                        return self._clearance_cache.get(key)
+                    if self._flight_generations.get(key) == request_generation:
+                        return self._clearance_cache.get(key) or cached_before
+                    self._flight_generations[key] = request_generation
 
-        try:
             cached_now = self._get_cached_bundle(key)
             if cached_now is not None and not force and cached_now.is_valid_for(target_host, profile.proxy_url):
                 return cached_now
+
+            with self._lock:
+                generation = self._clearance_generations.get(key, 0)
 
             flaresolverr_url = str(profile.clearance.get("flaresolverr_url") or "").strip()
             provider = self._get_provider(flaresolverr_url)
@@ -316,11 +350,13 @@ class ProxySettingsStore:
                         proxy_url=profile.proxy_url,
                         expires_at=expires_at,
                     )
-                self._set_cached_bundle(key, new_bundle)
+                if not self._set_cached_bundle_if_current(key, new_bundle, generation):
+                    return None
                 return new_bundle
-            return cached_now or cached_before
-        finally:
-            lock.release()
+            with self._lock:
+                if self._clearance_generations.get(key, 0) != generation:
+                    return self._clearance_cache.get(key)
+                return self._clearance_cache.get(key) or cached_before
 
     def invalidate_clearance(
         self,
@@ -332,14 +368,15 @@ class ProxySettingsStore:
     ) -> None:
         profile = self.get_profile(account=account, proxy=proxy, resource=resource, upstream=upstream)
         target_host = _host_from_url(target_url)
-        key = self._cache_key(profile.proxy_url, target_host)
+        key = self._cache_key(profile.proxy_url, target_host, profile.clearance)
         with self._lock:
             self._clearance_cache.pop(key, None)
+            self._clearance_generations[key] = self._clearance_generations.get(key, 0) + 1
 
     def get_runtime_status(self) -> dict[str, object]:
         profile = self.get_profile(upstream=True)
         with self._lock:
-            cached_hosts = [host for _proxy, host in self._clearance_cache]
+            cached_hosts = [host for _proxy, host, _clearance in self._clearance_cache]
             cached_count = len(self._clearance_cache)
         return {
             "enabled": profile.runtime_enabled,
@@ -360,7 +397,7 @@ class ProxySettingsStore:
         return runtime if isinstance(runtime, dict) else {}
 
     def _bundle_for_headers(self, profile: ProxyRuntimeProfile, target_host: str) -> ClearanceBundle | None:
-        key = self._cache_key(profile.proxy_url, target_host)
+        key = self._cache_key(profile.proxy_url, target_host, profile.clearance)
         if profile.clearance_mode == "manual":
             bundle = self._build_manual_bundle(profile, target_host)
             if bundle is not None:
@@ -399,25 +436,64 @@ class ProxySettingsStore:
                 self._provider_cache[url] = provider
             return provider
 
-    def _get_flight_lock(self, key: tuple[str, str]) -> threading.Lock:
+    @contextmanager
+    def _flight_lock(self, key: tuple[str, str, str], generation: int):
         with self._lock:
             lock = self._flight_locks.get(key)
             if lock is None:
                 lock = threading.Lock()
                 self._flight_locks[key] = lock
-            return lock
+                self._flight_generations[key] = generation
+            self._flight_lock_refs[key] = self._flight_lock_refs.get(key, 0) + 1
 
-    def _get_cached_bundle(self, key: tuple[str, str]) -> ClearanceBundle | None:
+        fast_path = lock.acquire(blocking=False)
+        if not fast_path:
+            lock.acquire()
+        try:
+            yield fast_path
+        finally:
+            lock.release()
+            with self._lock:
+                refs = self._flight_lock_refs.get(key, 0) - 1
+                if refs <= 0:
+                    self._flight_lock_refs.pop(key, None)
+                    if self._flight_locks.get(key) is lock:
+                        self._flight_locks.pop(key, None)
+                        self._flight_generations.pop(key, None)
+                else:
+                    self._flight_lock_refs[key] = refs
+
+    def _get_cached_bundle(self, key: tuple[str, str, str]) -> ClearanceBundle | None:
         with self._lock:
             return self._clearance_cache.get(key)
 
-    def _set_cached_bundle(self, key: tuple[str, str], bundle: ClearanceBundle) -> None:
+    def _set_cached_bundle(self, key: tuple[str, str, str], bundle: ClearanceBundle) -> None:
         with self._lock:
             self._clearance_cache[key] = bundle
 
+    def _set_cached_bundle_if_current(
+        self,
+        key: tuple[str, str, str],
+        bundle: ClearanceBundle,
+        generation: int,
+    ) -> bool:
+        with self._lock:
+            if self._clearance_generations.get(key, 0) != generation:
+                return False
+            self._clearance_cache[key] = bundle
+            return True
+
     @staticmethod
-    def _cache_key(proxy_url: str, target_host: str) -> tuple[str, str]:
-        return (normalize_proxy_url(proxy_url), _normalize_host(target_host))
+    def _cache_key(proxy_url: str, target_host: str, clearance: Mapping[str, object] | None = None) -> tuple[str, str, str]:
+        normalized_clearance = json.dumps(
+            dict(clearance or {}),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        ).encode("utf-8")
+        clearance_signature = hashlib.sha256(normalized_clearance).hexdigest()
+        return (normalize_proxy_url(proxy_url), _normalize_host(target_host), clearance_signature)
 
 
 def _clean(value: object) -> str:
@@ -490,14 +566,33 @@ def _filter_flaresolverr_cookies(raw_cookies: object, target_host: str) -> dict[
     for item in raw_cookies:
         if not isinstance(item, dict):
             continue
-        name = str(item.get("name") or "").strip()
-        if not name:
+        name = item.get("name")
+        value = item.get("value")
+        domain = item.get("domain")
+        name = _safe_header_value(name, max_length=256)
+        value = _safe_header_value(value, max_length=4096)
+        if (
+            not name
+            or not value
+            or any(character in name for character in "=;,\r\n")
+            or any(character in value for character in ";,\r\n")
+        ):
             continue
-        value = str(item.get("value") or "")
-        domain = str(item.get("domain") or "").strip()
+        domain = domain.strip() if isinstance(domain, str) else ""
         if not domain or _domain_matches(target_host, domain):
             filtered_cookies[name] = value
     return filtered_cookies
+
+
+def _safe_header_value(value: object, *, max_length: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or len(text) > max_length:
+        return ""
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in text):
+        return ""
+    return text
 
 
 def _parse_cookie_header(header: str) -> dict[str, str]:
@@ -560,22 +655,32 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
             "error": "invalid proxy url",
             **result_base,
         }
-    session = Session(impersonate="edge101", verify=True, proxy=candidate)
     started = time.perf_counter()
+    session = None
     try:
+        session = Session(impersonate="edge101", verify=True, proxy=candidate)
         response = session.get(
             "https://chatgpt.com/api/auth/csrf",
             headers={"user-agent": "Mozilla/5.0 (chatgpt2api proxy test)"},
             timeout=timeout,
+            stream=True,
         )
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        return {
-            "ok": response.status_code < 500,
-            "status": int(response.status_code),
-            "latency_ms": latency_ms,
-            "error": None if response.status_code < 500 else f"HTTP {response.status_code}",
-            **result_base,
-        }
+        try:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            return {
+                "ok": response.status_code < 500,
+                "status": int(response.status_code),
+                "latency_ms": latency_ms,
+                "error": None if response.status_code < 500 else f"HTTP {response.status_code}",
+                **result_base,
+            }
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
     except Exception as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         return {
@@ -586,7 +691,11 @@ def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
             **result_base,
         }
     finally:
-        session.close()
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def test_clearance(target_url: str = "https://chatgpt.com") -> dict:
@@ -634,7 +743,7 @@ def test_clearance(target_url: str = "https://chatgpt.com") -> dict:
         "status": "ok",
         "latency_ms": latency_ms,
         "has_cookies": bool(bundle.cookies),
-        "user_agent": bundle.user_agent or "",
+        "user_agent": bundle.user_agent if isinstance(bundle.user_agent, str) else "",
         "error": None,
         "runtime": runtime,
     }

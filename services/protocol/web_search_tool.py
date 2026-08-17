@@ -18,6 +18,8 @@ SEARCH_CHAT_MODEL_PREFIXES = (
     "gpt-4o-mini-search-preview",
     "gpt-5-search-api",
 )
+_MAX_PUBLIC_SEARCH_SOURCES = 100
+_MAX_PUBLIC_SEARCH_FIELD_CHARS = 4096
 
 
 def _tool_type(tool: object) -> str:
@@ -60,7 +62,10 @@ def message_text(value: object) -> str:
             if isinstance(item, str):
                 text = item.strip()
             elif isinstance(item, dict):
-                text = str(item.get("text") or item.get("input_text") or "").strip()
+                value = item.get("text")
+                if not isinstance(value, str):
+                    value = item.get("input_text")
+                text = value.strip() if isinstance(value, str) else ""
             else:
                 text = ""
             if text:
@@ -118,11 +123,15 @@ def normalized_sources(result: dict[str, Any]) -> list[dict[str, str]]:
     output: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in sources:
+        if len(output) >= _MAX_PUBLIC_SEARCH_SOURCES:
+            break
         if not isinstance(item, dict):
             continue
         url = normalize_public_http_url(item.get("url"))
-        title = str(item.get("title") or "").strip()
-        snippet = str(item.get("snippet") or "").strip()
+        title_value = item.get("title")
+        snippet_value = item.get("snippet")
+        title = title_value.strip()[:_MAX_PUBLIC_SEARCH_FIELD_CHARS] if isinstance(title_value, str) else ""
+        snippet = snippet_value.strip()[:_MAX_PUBLIC_SEARCH_FIELD_CHARS] if isinstance(snippet_value, str) else ""
         if not url or url in seen:
             continue
         seen.add(url)
@@ -131,7 +140,8 @@ def normalized_sources(result: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    text = clean_search_text(str(result.get("answer") or ""))
+    answer = result.get("answer")
+    text = clean_search_text(answer if isinstance(answer, str) else "")
     annotations: list[dict[str, Any]] = []
     sources = normalized_sources(result)
     if sources:
@@ -161,10 +171,17 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
 
 def run_web_search(query: str) -> dict[str, Any]:
     token = account_service.get_text_access_token()
+    expected_account = None
+    get_account_lease = getattr(account_service, "_get_account_lease", None)
+    if callable(get_account_lease):
+        _, expected_account = get_account_lease(token)
     backend = OpenAIBackendAPI(token)
     try:
         result = backend.search(query)
     finally:
         backend.close()
-    account_service.mark_text_used(token)
+    if expected_account is None:
+        account_service.mark_text_used(token)
+    else:
+        account_service.mark_text_used(token, expected_account=expected_account)
     return result

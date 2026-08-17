@@ -8,7 +8,9 @@ from urllib.parse import quote
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from starlette.concurrency import iterate_in_threadpool
+from pydantic import BaseModel, ConfigDict, StrictBool
+from starlette.background import BackgroundTask
 
 from api.support import require_admin_async, require_identity_async, resolve_image_base_url
 from services.backup_service import BackupError, backup_service
@@ -23,6 +25,7 @@ from services.image_service import (
     get_thumbnail_response,
     list_images,
     storage_stats,
+    _MAX_IMAGE_ZIP_ITEMS,
 )
 from services.image_storage_service import ImageStorageError, image_storage_service
 from services.image_tags_service import delete_tag, get_all_tags, set_tags
@@ -95,6 +98,45 @@ class SettingsUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+_SETTINGS_UPDATE_FIELDS = frozenset(
+    {
+        "proxy",
+        "base_url",
+        "global_system_prompt",
+        "default_upstream_model_name",
+        "default_thinking_effort",
+        "sensitive_words",
+        "ai_review",
+        "refresh_account_interval_minute",
+        "image_retention_days",
+        "image_poll_timeout_secs",
+        "image_poll_interval_secs",
+        "image_poll_initial_wait_secs",
+        "image_account_concurrency",
+        "image_parallel_generation",
+        "image_settle_enabled",
+        "image_check_before_hit_enabled",
+        "image_remove_conversation_after_result",
+        "image_remove_conversation_always",
+        "image_settle_secs",
+        "image_timeout_retry_secs",
+        "auto_remove_invalid_accounts",
+        "auto_remove_rate_limited_accounts",
+        "auto_relogin_after_refresh",
+        "log_levels",
+        "image_storage",
+        "proxy_runtime",
+        "third_party_apps",
+        "backup",
+    }
+)
+
+
+def _validate_settings_update_fields(payload: dict[str, object]) -> None:
+    if set(payload).difference(_SETTINGS_UPDATE_FIELDS):
+        raise HTTPException(status_code=400, detail={"error": "配置更新包含不支持的字段"})
+
+
 class ProxyTestRequest(BaseModel):
     url: str = ""
 
@@ -107,10 +149,46 @@ class ImageDeleteRequest(BaseModel):
     paths: list[str] = []
     start_date: str = ""
     end_date: str = ""
-    all_matching: bool = False
+    all_matching: StrictBool = False
 
 class ImageDownloadRequest(BaseModel):
     paths: list[str]
+
+
+class _ClosableSyncBody:
+    def __init__(self, source: object) -> None:
+        self._source = source
+        self._iterator = None
+        self._closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._closed:
+            raise StopAsyncIteration
+        if self._iterator is None:
+            self._iterator = iterate_in_threadpool(self._source)
+        try:
+            return await self._iterator.__anext__()
+        except StopAsyncIteration:
+            await self.aclose()
+            raise
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._iterator is not None:
+                await self._iterator.aclose()
+        finally:
+            close = getattr(self._source, "close", None)
+            if callable(close):
+                close()
 
 class ImageTagsRequest(BaseModel):
     path: str
@@ -123,6 +201,53 @@ class BackupDeleteRequest(BaseModel):
 
 
 _PUBLIC_STORAGE_BACKEND_TYPES = frozenset({"json", "database", "git"})
+_PUBLIC_ACCOUNT_TYPES = frozenset({"free", "Plus", "Pro", "ProLite", "Team", "Enterprise"})
+_ACCOUNT_STAT_FIELDS = (
+    "total",
+    "cumulative_total",
+    "active",
+    "limited",
+    "abnormal",
+    "disabled",
+    "total_quota",
+    "total_success",
+    "total_fail",
+)
+
+
+def _empty_account_stats() -> dict[str, object]:
+    return {
+        "total": 0,
+        "cumulative_total": 0,
+        "active": 0,
+        "limited": 0,
+        "abnormal": 0,
+        "disabled": 0,
+        "total_quota": 0,
+        "total_success": 0,
+        "total_fail": 0,
+        "by_type": {},
+    }
+
+
+def _public_account_stats(value: object) -> dict[str, object]:
+    """Project health counters and bucket unknown account metadata."""
+    source = value if isinstance(value, dict) else {}
+    projected: dict[str, object] = {}
+    for field in _ACCOUNT_STAT_FIELDS:
+        item = source.get(field)
+        projected[field] = item if type(item) is int and item >= 0 else 0
+
+    by_type: dict[str, int] = {}
+    raw_by_type = source.get("by_type")
+    if isinstance(raw_by_type, dict):
+        for raw_type, raw_count in raw_by_type.items():
+            if type(raw_count) is not int or raw_count < 0:
+                continue
+            bucket = raw_type if isinstance(raw_type, str) and raw_type in _PUBLIC_ACCOUNT_TYPES else "other"
+            by_type[bucket] = by_type.get(bucket, 0) + raw_count
+    projected["by_type"] = by_type
+    return projected
 
 
 def _public_storage_snapshot(storage_info: object, storage_health: object) -> tuple[dict[str, object], bool]:
@@ -139,11 +264,92 @@ def _public_storage_snapshot(storage_info: object, storage_health: object) -> tu
     return {"backend": backend_type, "health": health}, storage_healthy
 
 
+def _public_storage_info(storage_info: object, storage_health: object) -> dict[str, object]:
+    """Project storage diagnostics without exposing paths or backend internals."""
+    info = storage_info if isinstance(storage_info, dict) else {}
+    backend_type = info.get("type") or info.get("backend")
+    if not isinstance(backend_type, str) or backend_type not in _PUBLIC_STORAGE_BACKEND_TYPES:
+        backend_type = "unknown"
+    backend: dict[str, object] = {"type": backend_type}
+    db_type = info.get("db_type")
+    if (
+        backend_type == "database"
+        and isinstance(db_type, str)
+        and db_type in {"sqlite", "postgresql", "mysql", "unknown"}
+    ):
+        backend["db_type"] = db_type
+
+    healthy = isinstance(storage_health, dict) and storage_health.get("status") == "healthy"
+    health: dict[str, object] = {"status": "healthy" if healthy else "unhealthy"}
+    if not healthy:
+        health["error"] = STORAGE_HEALTH_ERROR_MESSAGE
+    return {"backend": backend, "health": health}
+
+
 def _public_proxy_runtime_snapshot(runtime_status: object) -> dict[str, bool]:
     status = runtime_status if isinstance(runtime_status, dict) else {}
     return {
         "enabled": status.get("enabled") is True,
         "clearance_enabled": status.get("clearance_enabled") is True,
+    }
+
+
+def _public_proxy_runtime_status(value: object) -> dict[str, object]:
+    """Expose proxy state without cached hosts or operational internals."""
+    source = value if isinstance(value, dict) else {}
+    egress_mode = source.get("egress_mode")
+    if not isinstance(egress_mode, str) or egress_mode not in {"direct", "single_proxy"}:
+        egress_mode = "unknown"
+    proxy_source = source.get("proxy_source")
+    if not isinstance(proxy_source, str) or proxy_source not in {"direct", "account", "runtime", "runtime_resource", "proxy_runtime", "explicit", "global"}:
+        proxy_source = "unknown"
+    clearance_mode = source.get("clearance_mode")
+    if not isinstance(clearance_mode, str) or clearance_mode not in {"none", "manual", "flaresolverr"}:
+        clearance_mode = "unknown"
+    return {
+        "enabled": source.get("enabled") is True,
+        "egress_mode": egress_mode,
+        "proxy_source": proxy_source,
+        "has_proxy": source.get("has_proxy") is True,
+        "clearance_enabled": source.get("clearance_enabled") is True,
+        "clearance_mode": clearance_mode,
+        "has_clearance_bundle": source.get("has_clearance_bundle") is True,
+        "cached_clearance_hosts": [],
+    }
+
+
+_PUBLIC_CLEARANCE_STATUSES = frozenset({"disabled", "error", "failed", "ok"})
+_PUBLIC_CLEARANCE_ERRORS = frozenset({
+    "clearance is disabled",
+    "通关测试失败，请稍后重试",
+    "clearance refresh returned no bundle",
+})
+
+
+def _public_clearance_test_result(value: object) -> dict[str, object]:
+    """Project clearance diagnostics without returning runtime internals."""
+    source = value if isinstance(value, dict) else {}
+    status = source.get("status")
+    if not isinstance(status, str) or status not in _PUBLIC_CLEARANCE_STATUSES:
+        status = "error"
+    latency_ms = source.get("latency_ms")
+    if type(latency_ms) is not int or latency_ms < 0:
+        latency_ms = 0
+    raw_error = source.get("error")
+    if raw_error is None:
+        error = None
+    elif isinstance(raw_error, str) and raw_error in _PUBLIC_CLEARANCE_ERRORS:
+        error = raw_error
+    else:
+        error = "通关测试失败，请稍后重试"
+    return {
+        "ok": source.get("ok") is True,
+        "status": status,
+        "latency_ms": latency_ms,
+        "has_cookies": source.get("has_cookies") is True,
+        "user_agent": "",
+        "error": error,
+        "runtime": _public_proxy_runtime_status(source.get("runtime")),
     }
 
 
@@ -172,7 +378,7 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/settings")
     async def get_settings(authorization: str | None = Header(default=None)):
         await require_admin_async(authorization)
-        return {"config": config.get()}
+        return {"config": await run_system_management_io(config.get)}
 
     @router.get("/api/third-party-apps")
     async def get_third_party_apps(authorization: str | None = Header(default=None)):
@@ -182,11 +388,13 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/settings")
     async def save_settings(body: SettingsUpdateRequest, authorization: str | None = Header(default=None)):
         await require_admin_async(authorization)
+        payload = body.model_dump(mode="python")
+        _validate_settings_update_fields(payload)
         try:
             return {
                 "config": await run_system_management_io(
                     config.update,
-                    body.model_dump(mode="python"),
+                    payload,
                 )
             }
         except PublicSafeValueError as exc:
@@ -229,12 +437,19 @@ def create_router(app_version: str) -> APIRouter:
     @router.post("/api/images/download")
     async def download_images_endpoint(body: ImageDownloadRequest, authorization: str | None = Header(default=None)):
         await require_admin_async(authorization)
+        if len(body.paths) > _MAX_IMAGE_ZIP_ITEMS:
+            raise HTTPException(status_code=413, detail="too many images in archive request")
         buf = await run_image_io(download_images_zip, body.paths)
-        return StreamingResponse(
-            buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": 'attachment; filename="images.zip"'},
-        )
+        try:
+            return StreamingResponse(
+                _ClosableSyncBody(buf),
+                media_type="application/zip",
+                headers={"Content-Disposition": 'attachment; filename="images.zip"'},
+                background=BackgroundTask(buf.close),
+            )
+        except Exception:
+            buf.close()
+            raise
 
     @router.get("/api/images/download/{image_path:path}")
     async def download_single_image_endpoint(image_path: str, authorization: str | None = Header(default=None)):
@@ -267,7 +482,7 @@ def create_router(app_version: str) -> APIRouter:
         await require_admin_async(authorization)
         return {
             "runtime": config.get_public_proxy_runtime_settings(),
-            "status": proxy_settings.get_runtime_status(),
+            "status": _public_proxy_runtime_status(proxy_settings.get_runtime_status()),
         }
 
     @router.post("/api/proxy/runtime")
@@ -287,22 +502,26 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=400, detail={"error": "代理运行时配置更新失败，请稍后重试"}) from exc
         return {
             "runtime": config.get_public_proxy_runtime_settings(),
-            "status": proxy_settings.get_runtime_status(),
+            "status": _public_proxy_runtime_status(proxy_settings.get_runtime_status()),
         }
 
     @router.post("/api/proxy/clearance/test")
     async def test_proxy_clearance_endpoint(body: ClearanceTestRequest, authorization: str | None = Header(default=None)):
         await require_admin_async(authorization)
-        return {"result": await run_system_management_io(test_clearance, body.target_url)}
+        return {
+            "result": _public_clearance_test_result(
+                await run_system_management_io(test_clearance, body.target_url)
+            )
+        }
 
     @router.get("/api/storage/info")
     async def get_storage_info(authorization: str | None = Header(default=None)):
         await require_admin_async(authorization)
-        storage = config.get_storage_backend()
-        return {
-            "backend": storage.get_backend_info(),
-            "health": await _storage_health_async(storage),
-        }
+        storage = await run_system_management_io(config.get_storage_backend)
+        return _public_storage_info(
+            await run_system_management_io(storage.get_backend_info),
+            await _storage_health_async(storage),
+        )
 
     @router.post("/api/backup/test")
     async def test_backup_connection(authorization: str | None = Header(default=None)):
@@ -337,8 +556,8 @@ def create_router(app_version: str) -> APIRouter:
         try:
             return {
                 "items": await run_system_management_io(backup_service.list_backups),
-                "state": backup_service.get_status(),
-                "settings": backup_service.get_settings(),
+                "state": await run_system_management_io(backup_service.get_status),
+                "settings": await run_system_management_io(backup_service.get_settings),
             }
         except BackupError as exc:
             raise HTTPException(
@@ -414,7 +633,10 @@ def create_router(app_version: str) -> APIRouter:
         rel = body.path.strip().lstrip("/")
         if not rel:
             raise HTTPException(status_code=400, detail={"error": "path is required"})
-        tags = await run_image_io(set_tags, rel, body.tags)
+        try:
+            tags = await run_image_io(set_tags, rel, body.tags)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": "标签数量或长度超出限制"}) from exc
         return {"ok": True, "tags": tags}
 
     @router.delete("/api/images/tags/{tag}")
@@ -445,21 +667,39 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):
         from services.account_service import account_service as acct_svc
-        stats = await _account_stats_async(acct_svc)
-        storage = config.get_storage_backend()
-        storage_health = await _storage_health_async(storage)
+        try:
+            raw_stats = await _account_stats_async(acct_svc)
+        except Exception:
+            raw_stats = _empty_account_stats()
+        stats = _public_account_stats(raw_stats)
+        storage_health: object = {}
+        backend_info: object = {}
+        try:
+            storage = await run_system_management_io(config.get_storage_backend)
+            storage_health = await _storage_health_async(storage)
+            backend_info = await run_system_management_io(storage.get_backend_info)
+        except Exception:
+            # An anonymous health probe must stay available and fail closed if
+            # storage initialization or either probe fails.
+            storage_health = {}
+            backend_info = {}
         public_storage, storage_healthy = _public_storage_snapshot(
-            storage.get_backend_info(),
+            backend_info,
             storage_health,
         )
         healthy = stats["active"] > 0 and storage_healthy
+
+        try:
+            raw_proxy_runtime = proxy_settings.get_runtime_status()
+        except Exception:
+            raw_proxy_runtime = {}
 
         stats_json = {
             "status": "ok" if healthy else "degraded",
             "healthy": healthy,
             "version": app_version,
             "storage": public_storage,
-            "proxy_runtime": _public_proxy_runtime_snapshot(proxy_settings.get_runtime_status()),
+            "proxy_runtime": _public_proxy_runtime_snapshot(raw_proxy_runtime),
             "accounts": stats,
         }
         if format == "json":

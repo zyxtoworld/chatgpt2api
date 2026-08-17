@@ -12,6 +12,8 @@ const source = readFileSync(
 
 test("continue-edit results are owned by the current conversation and component lifetime", () => {
   assert.match(source, /continueEditOwnerRef/);
+  assert.match(source, /continueEditAbortRef\.current\?\.abort\(\)/);
+  assert.match(source, /buildReferenceImageFromStoredImage\([\s\S]*abortController\.signal/);
   assert.match(source, /continueEditOwner\.cancel\(\)/);
   assert.match(source, /continueEditOwner\.accepts\(requestOwner, conversationId\)/);
 });

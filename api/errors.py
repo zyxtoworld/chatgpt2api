@@ -24,11 +24,10 @@ def _public_validation_errors(exc: RequestValidationError) -> list[dict[str, obj
     for error in exc.errors():
         if not isinstance(error, dict):
             continue
-        location = error.get("loc")
         projected.append({
-            "type": str(error.get("type") or "validation_error"),
-            "loc": list(location) if isinstance(location, (list, tuple)) else [],
-            "msg": str(error.get("msg") or "request validation failed"),
+            "type": error["type"] if isinstance(error.get("type"), str) else "validation_error",
+            "loc": [],
+            "msg": "request validation failed",
         })
     return projected
 

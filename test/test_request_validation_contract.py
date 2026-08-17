@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
+from api.ai import AnthropicMessageRequest
 from api.accounts import create_router
 from api.errors import install_exception_handlers
 from services.protocol import openai_v1_chat_complete, openai_v1_response
@@ -20,6 +21,15 @@ class RequestValidationContractTests(unittest.TestCase):
     def _consume_protocol_result(result: object) -> None:
         if not isinstance(result, dict):
             list(result)
+
+    def test_anthropic_request_rejects_noncanonical_scalar_types(self) -> None:
+        for field, value in (("model", 7), ("stream", "false")):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    AnthropicMessageRequest(**{
+                        "messages": [{"role": "user", "content": "hello"}],
+                        field: value,
+                    })
 
     def test_responses_text_stream_emits_content_part_lifecycle(self) -> None:
         with mock.patch.object(
@@ -67,6 +77,7 @@ class RequestValidationContractTests(unittest.TestCase):
                 index=1,
                 total=1,
                 text="policy summary",
+                public_safe_text=True,
             )],
             "draw a cat",
             "gpt-5",
@@ -207,6 +218,29 @@ class RequestValidationContractTests(unittest.TestCase):
                     with self.assertRaises(HTTPException) as raised:
                         self._consume_protocol_result(openai_v1_chat_complete.handle(request))
                     self.assertEqual(raised.exception.status_code, 400)
+
+    def test_chat_messages_require_content_for_non_assistant_roles(self) -> None:
+        for role in ("system", "developer", "user", "tool"):
+            with self.subTest(role=role):
+                with self.assertRaises(HTTPException) as raised:
+                    openai_v1_chat_complete.validate_chat_core_parameters({
+                        "model": "auto",
+                        "messages": [{"role": role}],
+                    })
+                self.assertEqual(raised.exception.status_code, 400)
+
+        # Assistant tool-call messages may omit content by contract.
+        openai_v1_chat_complete.validate_chat_core_parameters({
+            "model": "auto",
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }],
+            }],
+        })
 
     def test_responses_core_fields_reject_json_coercion_before_backend_selection(self) -> None:
         requests = (
@@ -386,6 +420,131 @@ class RequestValidationContractTests(unittest.TestCase):
                         self._consume_protocol_result(openai_v1_response.handle(request))
                     self.assertEqual(raised.exception.status_code, 400)
 
+    def test_responses_enum_fields_reject_containers_as_bad_requests(self) -> None:
+        cases = (
+            ("status", "user"),
+            ("phase", "assistant"),
+        )
+        for field, role in cases:
+            with self.subTest(field=field):
+                body = {
+                    "model": "auto",
+                    "input": [{
+                        "type": "message",
+                        "role": role,
+                        "content": "hello",
+                        field: {"enum_canary": "must-not-500"},
+                    }],
+                }
+                with self.assertRaises(HTTPException) as raised:
+                    openai_v1_response.validate_response_core_parameters(body)
+                self.assertEqual(raised.exception.status_code, 400)
+
+    def test_responses_nested_enum_containers_are_rejected_before_protocol_dispatch(self) -> None:
+        cases = (
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "ok",
+                    "status": [],
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "function_call",
+                    "call_id": "call-1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                    "status": {},
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "reasoning",
+                    "summary": [],
+                    "status": {"bad": True},
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": [{"type": {"bad": True}, "text": "detail"}],
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "image_generation_call",
+                    "status": {"bad": True},
+                    "result": "image-result",
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "web_search_call",
+                    "status": {"bad": True},
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "tool_search_call",
+                    "status": {"bad": True},
+                    "execution": "server",
+                    "arguments": "{}",
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "tool_search_output",
+                    "status": {"bad": True},
+                    "execution": "server",
+                    "tools": [],
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_image",
+                        "image_url": "https://example.test/image.png",
+                        "detail": [],
+                    }],
+                }],
+            },
+            {
+                "model": "auto",
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": [{"type": {"bad": True}}],
+                }],
+            },
+        )
+        for body in cases:
+            with self.subTest(body=body):
+                with self.assertRaises(HTTPException) as raised:
+                    openai_v1_response.validate_response_core_parameters(body)
+                self.assertEqual(raised.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException) as raised:
+            openai_v1_response.codex_response_payload({
+                "model": "auto",
+                "input": "hello",
+                "service_tier": {"bad": True},
+            })
+        self.assertEqual(raised.exception.status_code, 400)
+
     def test_public_json_routes_reject_scalar_type_coercion(self) -> None:
         app = FastAPI()
         install_exception_handlers(app)
@@ -474,6 +633,206 @@ class RequestValidationContractTests(unittest.TestCase):
                     response = client.post(path, json=body)
                     self.assertEqual(response.status_code, status_code, response.text)
         run.assert_not_awaited()
+
+    def test_anthropic_route_rejects_non_array_messages_before_backend(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+        app.include_router(ai_module.create_router())
+
+        async def invoke(_call, handler, payload, **_kwargs):
+            return handler(payload)
+
+        for messages in (None, {"secret": "message-container-canary"}):
+            with self.subTest(messages=messages):
+                with (
+                    mock.patch.object(
+                        ai_module,
+                        "require_identity_async",
+                        new=mock.AsyncMock(return_value={"id": "user-1", "role": "user"}),
+                    ),
+                    mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                    mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+                    mock.patch.object(
+                        ai_module.anthropic_v1_messages.account_service,
+                        "get_text_access_token",
+                        return_value="fixture-token",
+                    ) as selector,
+                    mock.patch.object(ai_module.anthropic_v1_messages, "OpenAIBackendAPI") as backend,
+                ):
+                    response = TestClient(app).post(
+                        "/v1/messages",
+                        headers={"x-api-key": "fixture-key", "anthropic-version": "2023-06-01"},
+                        json={"model": "auto", "messages": messages},
+                    )
+
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertNotIn("fixture-token", response.text)
+                self.assertNotIn("message-container-canary", response.text)
+                selector.assert_not_called()
+                backend.assert_not_called()
+
+    def test_anthropic_route_rejects_malformed_image_block_before_backend(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+        app.include_router(ai_module.create_router())
+
+        async def invoke(_call, handler, payload, **_kwargs):
+            return handler(payload)
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "user-1", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+            mock.patch.object(
+                ai_module.anthropic_v1_messages.account_service,
+                "get_text_access_token",
+                return_value="fixture-token",
+            ) as selector,
+            mock.patch.object(ai_module.anthropic_v1_messages, "OpenAIBackendAPI") as backend,
+        ):
+            response = TestClient(app).post(
+                "/v1/messages",
+                headers={"x-api-key": "fixture-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "auto",
+                    "messages": [{
+                        "role": "user",
+                        "content": [{
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": {"canary": "route-image-canary"},
+                            },
+                        }],
+                    }],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn("route-image-canary", response.text)
+        selector.assert_not_called()
+        backend.assert_not_called()
+
+    def test_anthropic_route_rejects_malformed_content_tools_and_system_before_backend(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+        app.include_router(ai_module.create_router())
+
+        async def invoke(_call, handler, payload, **_kwargs):
+            return handler(payload)
+
+        cases = (
+            (
+                {
+                    "messages": [{
+                        "role": "user",
+                        "content": [{"type": "text", "text": "valid"}, "route-content-canary"],
+                    }],
+                },
+                "route-content-canary",
+            ),
+            (
+                {
+                    "messages": [{"role": "user", "content": "use tools"}],
+                    "tools": [{"name": "valid"}, "route-tool-canary"],
+                },
+                "route-tool-canary",
+            ),
+            (
+                {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "system": ["route-system-canary"],
+                },
+                "route-system-canary",
+            ),
+            (
+                {
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "system": [{"type": "image", "source": {"url": "route-system-type-canary"}}],
+                },
+                "route-system-type-canary",
+            ),
+        )
+
+        for body, canary in cases:
+            with self.subTest(canary=canary):
+                with (
+                    mock.patch.object(
+                        ai_module,
+                        "require_identity_async",
+                        new=mock.AsyncMock(return_value={"id": "user-1", "role": "user"}),
+                    ),
+                    mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                    mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+                    mock.patch.object(
+                        ai_module.anthropic_v1_messages.account_service,
+                        "get_text_access_token",
+                        return_value="fixture-token",
+                    ) as selector,
+                    mock.patch.object(ai_module.anthropic_v1_messages, "OpenAIBackendAPI") as backend,
+                ):
+                    response = TestClient(app).post(
+                        "/v1/messages",
+                        headers={"x-api-key": "fixture-key", "anthropic-version": "2023-06-01"},
+                        json={"model": "auto", **body},
+                    )
+
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertNotIn(canary, response.text)
+                self.assertNotIn("fixture-token", response.text)
+                selector.assert_not_called()
+                backend.assert_not_called()
+
+    def test_anthropic_tool_result_content_array_requires_object_blocks(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            ai_module.anthropic_v1_messages.message_request({
+                "model": "auto",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_fixture",
+                        "content": [{"type": "text", "text": "valid"}, "tool-result-canary"],
+                    }],
+                }],
+            })
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertNotIn("tool-result-canary", str(raised.exception.detail))
+
+    def test_anthropic_tool_result_object_blocks_are_preserved(self) -> None:
+        backend = mock.Mock()
+        with (
+            mock.patch.object(
+                ai_module.anthropic_v1_messages.account_service,
+                "get_text_access_token",
+                return_value="fixture-token",
+            ),
+            mock.patch.object(
+                ai_module.anthropic_v1_messages,
+                "OpenAIBackendAPI",
+                return_value=backend,
+            ),
+        ):
+            request = ai_module.anthropic_v1_messages.message_request({
+                "model": "auto",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_fixture",
+                        "content": [{"type": "text", "text": "valid result"}],
+                    }],
+                }],
+            })
+
+        self.assertIs(request.backend, backend)
+        self.assertIn("valid result", request.messages[0]["content"])
 
     def test_public_responses_preserves_context_management(self) -> None:
         app = FastAPI()

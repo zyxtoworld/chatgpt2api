@@ -10,6 +10,7 @@
 """
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 import sys
@@ -21,20 +22,82 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 
 from services.storage.factory import create_storage_backend
+from services.secure_file import atomic_write_bytes
+
+
+def _close_storage(storage: object) -> None:
+    close = getattr(storage, "close", None)
+    if callable(close):
+        close()
+
+
+@contextmanager
+def _managed_storage(storage: object):
+    try:
+        yield storage
+    except BaseException as primary_error:
+        try:
+            _close_storage(storage)
+        except BaseException:
+            primary_error.add_note("storage close failed while handling the primary error")
+        raise
+    else:
+        _close_storage(storage)
+
+
+def _load_account_snapshot(storage: object) -> tuple[list[dict], int | None]:
+    accounts = storage.load_accounts()
+    load_total = getattr(storage, "load_cumulative_total", None)
+    supports_total = bool(getattr(storage, "supports_cumulative_snapshot", False))
+    cumulative_total = load_total() if supports_total and callable(load_total) else None
+    if cumulative_total is not None and (type(cumulative_total) is not int or cumulative_total < 0):
+        raise ValueError("invalid cumulative_total in storage snapshot")
+    return accounts, cumulative_total
+
+
+def _save_account_snapshot(storage: object, accounts: list[dict], cumulative_total: int | None) -> None:
+    if cumulative_total is None:
+        storage.save_accounts(accounts)
+        return
+    save_with_total = getattr(storage, "save_accounts_with_cumulative_total", None)
+    supports_total = bool(getattr(storage, "supports_cumulative_snapshot", False))
+    load_snapshot = getattr(storage, "load_accounts_snapshot", None)
+    if not supports_total or not callable(save_with_total) or not callable(load_snapshot):
+        raise ValueError("target storage does not support cumulative account snapshots")
+    save_with_total(load_snapshot(), accounts, cumulative_total)
+
+
+def _parse_account_document(value: object) -> tuple[list[dict], int | None]:
+    if isinstance(value, list):
+        return value, None
+    if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+        raise ValueError("invalid JSON format, expected account array or snapshot object")
+    cumulative_total = value.get("cumulative_total")
+    if type(cumulative_total) is not int or cumulative_total < 0:
+        raise ValueError("invalid cumulative_total in account snapshot")
+    return value["items"], cumulative_total
 
 
 def export_to_json(output_file: str):
     """导出当前存储后端的数据到 JSON 文件"""
     print(f"[migrate] Exporting data to {output_file}")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    storage = create_storage_backend(DATA_DIR)
-    accounts = storage.load_accounts()
+    with _managed_storage(create_storage_backend(DATA_DIR)) as storage:
+        accounts, cumulative_total = _load_account_snapshot(storage)
     
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(accounts, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    parent_stat = output_path.parent.stat()
+    document: object = accounts
+    if cumulative_total is not None:
+        document = {"items": accounts, "cumulative_total": cumulative_total}
+    payload = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    atomic_write_bytes(
+        output_path,
+        output_path.parent,
+        payload,
+        mode=0o600,
+        expected_root_identity=(parent_stat.st_dev, parent_stat.st_ino),
     )
     
     print(f"[migrate] Exported {len(accounts)} accounts to {output_file}")
@@ -50,16 +113,15 @@ def import_from_json(input_file: str):
         sys.exit(1)
     
     try:
-        accounts = json.loads(input_path.read_text(encoding="utf-8"))
-        if not isinstance(accounts, list):
-            print(f"[migrate] Error: Invalid JSON format, expected array")
-            sys.exit(1)
-    except json.JSONDecodeError as e:
+        accounts, cumulative_total = _parse_account_document(
+            json.loads(input_path.read_text(encoding="utf-8"))
+        )
+    except (json.JSONDecodeError, ValueError) as e:
         print(f"[migrate] Error: Invalid JSON: {e}")
         sys.exit(1)
     
-    storage = create_storage_backend(DATA_DIR)
-    storage.save_accounts(accounts)
+    with _managed_storage(create_storage_backend(DATA_DIR)) as storage:
+        _save_account_snapshot(storage, accounts, cumulative_total)
     
     print(f"[migrate] Imported {len(accounts)} accounts")
 
@@ -74,14 +136,14 @@ def migrate_data(from_backend: str, to_backend: str):
     try:
         # 从源后端读取数据
         os.environ["STORAGE_BACKEND"] = from_backend
-        from_storage = create_storage_backend(DATA_DIR)
-        accounts = from_storage.load_accounts()
+        with _managed_storage(create_storage_backend(DATA_DIR)) as from_storage:
+            accounts, cumulative_total = _load_account_snapshot(from_storage)
         print(f"[migrate] Loaded {len(accounts)} accounts from {from_backend}")
         
         # 写入目标后端
         os.environ["STORAGE_BACKEND"] = to_backend
-        to_storage = create_storage_backend(DATA_DIR)
-        to_storage.save_accounts(accounts)
+        with _managed_storage(create_storage_backend(DATA_DIR)) as to_storage:
+            _save_account_snapshot(to_storage, accounts, cumulative_total)
         print(f"[migrate] Saved {len(accounts)} accounts to {to_backend}")
         
         print(f"[migrate] Migration completed successfully!")

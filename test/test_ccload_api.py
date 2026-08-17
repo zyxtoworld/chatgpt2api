@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.accounts as accounts_module
+import services.ccload_service as ccload_module
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -115,6 +116,61 @@ class CCLoadAPIContractTests(unittest.TestCase):
         serialized = json.dumps(response.json(), ensure_ascii=False)
         self.assertNotIn("admin-password-secret", serialized)
         self.assertNotIn("access_token", serialized)
+
+    def test_channel_model_invalid_selection_is_client_error_not_upstream_error(self) -> None:
+        with mock.patch.object(accounts_module, "ccload_config", self.config):
+            response = self.client.post(
+                "/api/ccload/servers/server-1/channel-models",
+                headers=AUTH_HEADERS,
+                json={"channel_ids": ["١٢"]},
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json(), {"detail": {"error": "ccLoad channel model request failed"}})
+
+    def test_channel_model_upstream_failure_remains_502(self) -> None:
+        with (
+            mock.patch.object(accounts_module, "ccload_config", self.config),
+            mock.patch.object(
+                accounts_module,
+                "ccload_list_remote_channel_models",
+                side_effect=RuntimeError("opaque upstream failure"),
+            ),
+        ):
+            response = self.client.post(
+                "/api/ccload/servers/server-1/channel-models",
+                headers=AUTH_HEADERS,
+                json={"channel_ids": ["7"]},
+            )
+
+        self.assertEqual(response.status_code, 502, response.text)
+        self.assertNotIn("opaque upstream failure", response.text)
+
+    def test_channel_model_route_drops_unknown_catalog_fields_and_bad_models(self) -> None:
+        canary = "ccload-catalog-secret-canary"
+        catalogs = [{
+            "id": "7",
+            "plan_type": "pro",
+            "models": ["gpt-5.4-pro", {"secret": canary}],
+            "models_loaded": True,
+            "access_token": canary,
+            "internal_metadata": {"secret": canary},
+        }]
+        with (
+            mock.patch.object(accounts_module, "ccload_config", self.config),
+            mock.patch.object(accounts_module, "ccload_list_remote_channel_models", return_value=catalogs),
+        ):
+            response = self.client.post(
+                "/api/ccload/servers/server-1/channel-models",
+                headers=AUTH_HEADERS,
+                json={"channel_ids": ["7"]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        serialized = json.dumps(response.json(), ensure_ascii=False)
+        self.assertNotIn(canary, serialized)
+        self.assertNotIn("internal_metadata", serialized)
+        self.assertEqual(response.json()["channels"], [])
 
     def test_import_route_returns_only_job_metadata(self) -> None:
         import_service = _FakeImportService()

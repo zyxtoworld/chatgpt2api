@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 import stat
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -51,14 +52,21 @@ def resolve_under_root(root: Path, relative_path: str | Path) -> Path:
 
 
 def has_link(root: Path, relative_parts: tuple[str, ...]) -> bool:
-    current = root
-    if current.is_symlink():
-        return True
-    is_junction = getattr(current, "is_junction", None)
-    if os.name == "nt" and not callable(is_junction):
-        raise ValueError("reparse-point inspection is unavailable")
-    if callable(is_junction) and is_junction():
-        return True
+    current = _lexical_absolute(Path(root))
+    while True:
+        if current.is_symlink():
+            return True
+        is_junction = getattr(current, "is_junction", None)
+        if os.name == "nt" and not callable(is_junction):
+            raise ValueError("reparse-point inspection is unavailable")
+        if callable(is_junction) and is_junction():
+            return True
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    current = _lexical_absolute(Path(root))
     for part in relative_parts:
         current = current / part
         if current.is_symlink():
@@ -263,6 +271,244 @@ def open_checked_file(path: Path, root: Path, expected_dir: Path) -> OpenedFile:
         raise
 
 
+def _open_posix_append_file(
+    path: Path,
+    root: Path,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> BinaryIO:
+    try:
+        relative_parts = path.relative_to(root).parts
+    except ValueError as exc:
+        raise OSError("file is outside the configured root") from exc
+    if (
+        not relative_parts
+        or any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in relative_parts)
+    ):
+        raise OSError("file path is invalid")
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if no_follow is None or directory is None or os.open not in os.supports_dir_fd:
+        raise OSError("safe relative file append is unavailable")
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    current_fd = os.open(root, os.O_RDONLY | directory | no_follow | close_on_exec)
+    try:
+        if expected_root_identity is not None:
+            root_stat = os.fstat(current_fd)
+            if (root_stat.st_dev, root_stat.st_ino) != expected_root_identity:
+                raise OSError("authorized root changed")
+        for part in relative_parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | directory | no_follow | close_on_exec, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        try:
+            expected_stat = os.stat(relative_parts[-1], dir_fd=current_fd, follow_symlinks=False)
+            existed = True
+        except FileNotFoundError:
+            expected_stat = None
+            existed = False
+        flags = os.O_WRONLY | os.O_APPEND | no_follow | close_on_exec
+        if not existed:
+            flags |= os.O_CREAT | os.O_EXCL
+        file_descriptor = os.open(relative_parts[-1], flags, 0o600, dir_fd=current_fd)
+        try:
+            opened_stat = os.fstat(file_descriptor)
+            if expected_stat is not None and (
+                expected_stat.st_dev != opened_stat.st_dev or expected_stat.st_ino != opened_stat.st_ino
+            ):
+                raise OSError("file changed during safe append open")
+            if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+                raise OSError("file is not a regular file")
+            return os.fdopen(file_descriptor, "ab", closefd=True)
+        except Exception:
+            os.close(file_descriptor)
+            raise
+    finally:
+        os.close(current_fd)
+
+
+def _open_windows_append_file(
+    path: Path,
+    root: Path,
+    expected_dir: Path,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> BinaryIO:
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle_type = ctypes.c_void_p
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, handle_type,
+        ctypes.c_uint32, ctypes.c_uint32, handle_type,
+    ]
+    create_file.restype = handle_type
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [handle_type]
+    close_handle.restype = ctypes.c_int
+    get_file_information = getattr(kernel32, "GetFileInformationByHandleEx", None)
+    get_final_path = getattr(kernel32, "GetFinalPathNameByHandleW", None)
+    if get_file_information is None or get_final_path is None:
+        raise OSError("safe Windows file append is unavailable")
+    get_file_information.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+    get_file_information.restype = ctypes.c_int
+    get_final_path.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+    get_final_path.restype = ctypes.c_uint32
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", ctypes.c_uint32), ("reparse_tag", ctypes.c_uint32)]
+
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    share_all = 0x00000001 | 0x00000002 | 0x00000004
+    share_read_write = 0x00000001 | 0x00000002
+    open_existing = 3
+    create_new = 1
+    file_attribute_normal = 0x00000080
+    file_flag_backup_semantics = 0x02000000
+    file_flag_open_reparse_point = 0x00200000
+    file_attribute_tag_info = 9
+    file_attribute_reparse_point = 0x00000400
+    invalid_handle = ctypes.c_void_p(-1).value
+    try:
+        directory_parts = expected_dir.relative_to(root).parts
+    except ValueError as exc:
+        raise OSError("safe Windows append directory is outside the root") from exc
+    locked_directories = []
+    current_dir = root
+    handle = None
+    file_descriptor = None
+    try:
+        for part in (None, *directory_parts):
+            if part is not None:
+                current_dir = current_dir / part
+            directory_handle = _windows_open_directory_handle(
+                create_file,
+                current_dir,
+                generic_read,
+                share_read_write,
+                open_existing,
+                file_flag_backup_semantics | file_flag_open_reparse_point,
+            )
+            if directory_handle in {None, invalid_handle}:
+                raise OSError(ctypes.get_last_error(), "safe Windows append directory open failed")
+            locked_directories.append(directory_handle)
+            directory_info = FileAttributeTagInfo()
+            if not get_file_information(
+                directory_handle,
+                file_attribute_tag_info,
+                ctypes.byref(directory_info),
+                ctypes.sizeof(directory_info),
+            ):
+                raise OSError(ctypes.get_last_error(), "Windows append directory attributes unavailable")
+            if directory_info.file_attributes & file_attribute_reparse_point:
+                raise OSError("reparse-point directory is not appendable")
+            validate_windows_handle_path(_windows_final_path(kernel32, directory_handle), current_dir, root)
+            if part is None and expected_root_identity is not None:
+                if not _windows_identity_matches(
+                    expected_root_identity,
+                    _windows_handle_identity(kernel32, directory_handle),
+                ):
+                    raise OSError("authorized root changed")
+
+        try:
+            expected_stat = os.stat(path, follow_symlinks=False)
+            existed = True
+        except FileNotFoundError:
+            expected_stat = None
+            existed = False
+        creation = open_existing if existed else create_new
+        handle = create_file(
+            str(path), generic_write, share_all, None, creation,
+            file_attribute_normal | file_flag_open_reparse_point, None,
+        )
+        if handle in {None, invalid_handle}:
+            raise OSError(ctypes.get_last_error(), "safe Windows file append failed")
+        tag_info = FileAttributeTagInfo()
+        if not get_file_information(handle, file_attribute_tag_info, ctypes.byref(tag_info), ctypes.sizeof(tag_info)):
+            raise OSError(ctypes.get_last_error(), "Windows file attributes unavailable")
+        if tag_info.file_attributes & file_attribute_reparse_point:
+            raise OSError("reparse-point file is not appendable")
+        if _windows_handle_link_count(kernel32, handle) != 1:
+            raise OSError("hard-linked file is not appendable")
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_final_path(handle, buffer, len(buffer), 0)
+        if not length or length >= len(buffer):
+            raise OSError("Windows final file path unavailable")
+        validate_windows_handle_path(buffer.value[:length], path, expected_dir)
+        file_descriptor = msvcrt.open_osfhandle(int(handle), os.O_WRONLY | os.O_APPEND | os.O_BINARY)
+        handle = None
+        if expected_stat is not None:
+            opened_stat = os.fstat(file_descriptor)
+            if expected_stat.st_dev != opened_stat.st_dev or expected_stat.st_ino != opened_stat.st_ino:
+                os.close(file_descriptor)
+                file_descriptor = None
+                raise OSError("file changed during safe append open")
+        stream = os.fdopen(file_descriptor, "ab", closefd=True)
+        file_descriptor = None
+        return stream
+    finally:
+        if handle not in {None, invalid_handle}:
+            close_handle(handle)
+        elif file_descriptor is not None:
+            try:
+                os.close(file_descriptor)
+            except OSError:
+                pass
+        for directory_handle in reversed(locked_directories):
+            close_handle(directory_handle)
+
+
+def append_checked_file_bytes(
+    path: Path,
+    root: Path,
+    payload: bytes,
+    *,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> None:
+    """Append bytes through an authorized, no-follow file handle."""
+    if not isinstance(payload, bytes):
+        raise TypeError("payload must be bytes")
+    path = _lexical_absolute(Path(path))
+    root = authorized_root(root)
+    expected_dir = path.parent
+    try:
+        expected_dir.relative_to(root)
+    except ValueError as exc:
+        raise OSError("file is outside its authorized directory") from exc
+    relative_parts = path.relative_to(root).parts
+    if not relative_parts or has_link(root, relative_parts):
+        raise OSError("linked file path is not appendable")
+    file = (
+        _open_windows_append_file(path, root, expected_dir, expected_root_identity)
+        if os.name == "nt"
+        else _open_posix_append_file(path, root, expected_root_identity)
+    )
+    try:
+        file.write(payload)
+        file.flush()
+    finally:
+        file.close()
+
+
+def read_checked_file_bytes(path: Path, root: Path, *, max_bytes: int | None = None) -> bytes:
+    """Read an existing regular file through one fixed, no-follow handle."""
+    path = _lexical_absolute(Path(path))
+    root = authorized_root(root)
+    opened = open_checked_file(path, root, path.parent)
+    try:
+        if max_bytes is None:
+            return opened.file.read()
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer")
+        payload = opened.file.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            raise OSError("file exceeds the configured read limit")
+        return payload
+    finally:
+        opened.file.close()
+
+
 def _relative_file_parts(path: Path, root: Path) -> tuple[str, ...]:
     path = _lexical_absolute(path)
     root = _lexical_absolute(root)
@@ -278,7 +524,11 @@ def _relative_file_parts(path: Path, root: Path) -> tuple[str, ...]:
     return parts
 
 
-def _open_posix_directory(root: Path, relative_parts: tuple[str, ...]) -> int:
+def _open_posix_directory(
+    root: Path,
+    relative_parts: tuple[str, ...],
+    expected_root_identity: tuple[int, int] | None = None,
+) -> int:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     directory = getattr(os, "O_DIRECTORY", None)
     if no_follow is None or directory is None or os.open not in os.supports_dir_fd:
@@ -286,6 +536,10 @@ def _open_posix_directory(root: Path, relative_parts: tuple[str, ...]) -> int:
     close_on_exec = getattr(os, "O_CLOEXEC", 0)
     current_fd = os.open(root, os.O_RDONLY | directory | no_follow | close_on_exec)
     try:
+        if expected_root_identity is not None:
+            root_stat = os.fstat(current_fd)
+            if (root_stat.st_dev, root_stat.st_ino) != expected_root_identity:
+                raise OSError("authorized root changed")
         for part in relative_parts:
             next_fd = os.open(
                 part,
@@ -467,14 +721,16 @@ def _apply_file_metadata(
 def _atomic_write_posix(
     path: Path,
     root: Path,
-    payload: bytes,
+    payload: bytes | Iterable[bytes],
     mode: int = 0o600,
     owner: tuple[int, int] | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> None:
     parts = _relative_file_parts(path, root)
-    parent_fd = _open_posix_directory(root, parts[:-1])
+    parent_fd = _open_posix_directory(root, parts[:-1], expected_root_identity)
     temp_name = f".{parts[-1]}.{secrets.token_hex(12)}.tmp"
     temp_fd = None
+    temp_created = False
     try:
         temp_fd = os.open(
             temp_name,
@@ -482,12 +738,17 @@ def _atomic_write_posix(
             0o600,
             dir_fd=parent_fd,
         )
-        view = memoryview(payload)
-        while view:
-            written = os.write(temp_fd, view)
-            if not written:
-                raise OSError("short secure file write")
-            view = view[written:]
+        temp_created = True
+        chunks = (payload,) if isinstance(payload, bytes) else payload
+        for chunk in chunks:
+            if not isinstance(chunk, bytes):
+                raise OSError("secure file chunks must be bytes")
+            view = memoryview(chunk)
+            while view:
+                written = os.write(temp_fd, view)
+                if not written:
+                    raise OSError("short secure file write")
+                view = view[written:]
         _apply_file_metadata(temp_fd, mode, owner)
         os.fsync(temp_fd)
         os.close(temp_fd)
@@ -497,10 +758,11 @@ def _atomic_write_posix(
     finally:
         if temp_fd is not None:
             os.close(temp_fd)
-        try:
-            os.unlink(temp_name, dir_fd=parent_fd)
-        except FileNotFoundError:
-            pass
+        if temp_created:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
         os.close(parent_fd)
 
 
@@ -670,13 +932,111 @@ def _windows_final_path(kernel32, handle) -> str:
     return buffer.value[:length]
 
 
+def _windows_handle_identity(kernel32, handle) -> tuple[int, int]:
+    """Return the native Windows volume serial and file-index identity."""
+    import ctypes
+
+    get_file_information = getattr(kernel32, "GetFileInformationByHandle", None)
+    if get_file_information is None:
+        raise OSError("Windows file identity is unavailable")
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    class ByHandleInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", ctypes.c_uint32),
+            ("creation_time", FileTime),
+            ("last_access_time", FileTime),
+            ("last_write_time", FileTime),
+            ("volume_serial_number", ctypes.c_uint32),
+            ("file_size_high", ctypes.c_uint32),
+            ("file_size_low", ctypes.c_uint32),
+            ("number_of_links", ctypes.c_uint32),
+            ("file_index_high", ctypes.c_uint32),
+            ("file_index_low", ctypes.c_uint32),
+        ]
+
+    get_file_information.argtypes = [ctypes.c_void_p, ctypes.POINTER(ByHandleInformation)]
+    get_file_information.restype = ctypes.c_int
+    info = ByHandleInformation()
+    if not get_file_information(handle, ctypes.byref(info)):
+        raise OSError(ctypes.get_last_error(), "Windows file identity unavailable")
+    file_index = (int(info.file_index_high) << 32) | int(info.file_index_low)
+    return int(info.volume_serial_number), file_index
+
+
+def _windows_handle_link_count(kernel32, handle) -> int:
+    """Return the hard-link count for one already-open Windows file handle."""
+    import ctypes
+
+    get_file_information = getattr(kernel32, "GetFileInformationByHandle", None)
+    if get_file_information is None:
+        raise OSError("Windows file link metadata unavailable")
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    class ByHandleInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", ctypes.c_uint32),
+            ("creation_time", FileTime),
+            ("last_access_time", FileTime),
+            ("last_write_time", FileTime),
+            ("volume_serial_number", ctypes.c_uint32),
+            ("file_size_high", ctypes.c_uint32),
+            ("file_size_low", ctypes.c_uint32),
+            ("number_of_links", ctypes.c_uint32),
+            ("file_index_high", ctypes.c_uint32),
+            ("file_index_low", ctypes.c_uint32),
+        ]
+
+    get_file_information.argtypes = [ctypes.c_void_p, ctypes.POINTER(ByHandleInformation)]
+    get_file_information.restype = ctypes.c_int
+    info = ByHandleInformation()
+    if not get_file_information(handle, ctypes.byref(info)):
+        raise OSError(ctypes.get_last_error(), "Windows file link metadata unavailable")
+    return int(info.number_of_links)
+
+
+def _windows_identity_matches(
+    expected: tuple[int, int],
+    actual: tuple[int, int],
+) -> bool:
+    """Match a Python Windows stat identity to native handle identity."""
+    # CPython keeps the volume serial in the low 32 bits of st_dev while
+    # GetFileInformationByHandle returns that serial directly.
+    return (int(expected[0]) & 0xFFFFFFFF, int(expected[1])) == actual
+
+
+def _windows_open_directory_handle(
+    create_file,
+    path: Path,
+    access: int,
+    share_mode: int,
+    open_existing: int,
+    flags: int,
+):
+    """Open one directory by handle; callers keep the handle until the operation ends."""
+    return create_file(
+        str(path),
+        access,
+        share_mode,
+        None,
+        open_existing,
+        flags,
+        None,
+    )
+
+
 def _atomic_write_windows(
     path: Path,
     root: Path,
     expected_dir: Path,
-    payload: bytes,
+    payload: bytes | Iterable[bytes],
     mode: int,
     owner: tuple[int, int] | None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> None:
     import ctypes
 
@@ -743,20 +1103,20 @@ def _atomic_write_windows(
     locked_directories = []
     current_dir = root
     temp_handle = None
+    temp_created = False
     temp_path = expected_dir / f".{path.name}.{secrets.token_hex(12)}.tmp"
     renamed = False
     try:
         for part in (None, *directory_parts):
             if part is not None:
                 current_dir = current_dir / part
-            directory_handle = create_file(
-                str(current_dir),
+            directory_handle = _windows_open_directory_handle(
+                create_file,
+                current_dir,
                 generic_read,
                 share_read_write,
-                None,
                 open_existing,
                 file_flag_backup_semantics | file_flag_open_reparse_point,
-                None,
             )
             if directory_handle in {None, invalid_handle}:
                 raise OSError(ctypes.get_last_error(), "safe Windows directory open failed")
@@ -772,6 +1132,12 @@ def _atomic_write_windows(
             if directory_info.file_attributes & file_attribute_reparse_point:
                 raise OSError("reparse-point directory is not writable")
             validate_windows_handle_path(_windows_final_path(kernel32, directory_handle), current_dir, root)
+            if part is None and expected_root_identity is not None:
+                if not _windows_identity_matches(
+                    expected_root_identity,
+                    _windows_handle_identity(kernel32, directory_handle),
+                ):
+                    raise OSError("authorized root changed")
 
         temp_handle = create_file(
             str(temp_path),
@@ -784,16 +1150,21 @@ def _atomic_write_windows(
         )
         if temp_handle in {None, invalid_handle}:
             raise OSError(ctypes.get_last_error(), "safe Windows temporary file open failed")
+        temp_created = True
         validate_windows_handle_path(_windows_final_path(kernel32, temp_handle), temp_path, expected_dir)
 
-        remaining = memoryview(payload)
-        while remaining:
-            chunk = remaining[:1024 * 1024]
-            buffer = ctypes.create_string_buffer(bytes(chunk))
-            written = ctypes.c_uint32()
-            if not write_file(temp_handle, buffer, len(chunk), ctypes.byref(written), None) or written.value != len(chunk):
-                raise OSError(ctypes.get_last_error(), "safe Windows file write failed")
-            remaining = remaining[written.value:]
+        chunks = (payload,) if isinstance(payload, bytes) else payload
+        for raw_chunk in chunks:
+            if not isinstance(raw_chunk, bytes):
+                raise OSError("secure file chunks must be bytes")
+            remaining = memoryview(raw_chunk)
+            while remaining:
+                chunk = remaining[:1024 * 1024]
+                buffer = ctypes.create_string_buffer(bytes(chunk))
+                written = ctypes.c_uint32()
+                if not write_file(temp_handle, buffer, len(chunk), ctypes.byref(written), None) or written.value != len(chunk):
+                    raise OSError(ctypes.get_last_error(), "safe Windows file write failed")
+                remaining = remaining[written.value:]
         chmod = getattr(os, "chmod", None)
         if not callable(chmod):
             raise OSError("safe Windows file mode restoration is unavailable")
@@ -817,19 +1188,20 @@ def _atomic_write_windows(
     finally:
         if temp_handle not in {None, invalid_handle}:
             close_handle(temp_handle)
-        if not renamed:
+        if not renamed and temp_created:
             delete_file(str(temp_path))
         for directory_handle in reversed(locked_directories):
             close_handle(directory_handle)
 
 
-def atomic_write_bytes(
+def atomic_write_stream(
     path: Path,
     root: Path,
-    payload: bytes,
+    chunks: Iterable[bytes],
     *,
     mode: int = 0o600,
     owner: tuple[int, int] | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> None:
     path = _lexical_absolute(Path(path))
     root = authorized_root(root)
@@ -843,6 +1215,25 @@ def atomic_write_bytes(
     if has_link(root, path.relative_to(root).parts):
         raise OSError("linked file path is not writable")
     if os.name == "nt":
-        _atomic_write_windows(path, root, expected_dir, bytes(payload), mode, owner)
+        _atomic_write_windows(path, root, expected_dir, chunks, mode, owner, expected_root_identity)
     else:
-        _atomic_write_posix(path, root, bytes(payload), mode, owner)
+        _atomic_write_posix(path, root, chunks, mode, owner, expected_root_identity)
+
+
+def atomic_write_bytes(
+    path: Path,
+    root: Path,
+    payload: bytes,
+    *,
+    mode: int = 0o600,
+    owner: tuple[int, int] | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
+) -> None:
+    atomic_write_stream(
+        path,
+        root,
+        (bytes(payload),),
+        mode=mode,
+        owner=owner,
+        expected_root_identity=expected_root_identity,
+    )

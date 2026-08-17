@@ -41,6 +41,66 @@ class ImageStreamHardTimeoutTests(unittest.TestCase):
 
         self.assertTrue(response.closed.wait(1.0))
 
+    def test_watchdog_close_exception_is_mapped_before_clock_reaches_deadline(self) -> None:
+        response = FakeResponse()
+        backend = object.__new__(OpenAIBackendAPI)
+        timer_holder: dict[str, object] = {}
+
+        class FakeTimer:
+            def __init__(self, _delay, callback):
+                self.callback = callback
+                timer_holder["timer"] = self
+
+            def start(self) -> None:
+                pass
+
+            def cancel(self) -> None:
+                pass
+
+        def closed_stream(_response):
+            timer_holder["timer"].callback()
+            raise RuntimeError("closed by curl")
+
+        with (
+            mock.patch("services.openai_backend_api.threading.Timer", FakeTimer),
+            mock.patch("services.openai_backend_api.time.monotonic", side_effect=[0.0, 0.9]),
+            mock.patch("services.openai_backend_api.iter_sse_payloads", side_effect=closed_stream),
+        ):
+            with self.assertRaises(ImageStreamHardTimeoutError):
+                next(backend._iter_sse_payloads_capped(response, 1.0))
+
+        self.assertTrue(response.closed.is_set())
+
+    def test_watchdog_close_eof_is_still_a_hard_timeout(self) -> None:
+        response = FakeResponse()
+        backend = object.__new__(OpenAIBackendAPI)
+        timer_holder: dict[str, object] = {}
+
+        class FakeTimer:
+            def __init__(self, _delay, callback):
+                self.callback = callback
+                timer_holder["timer"] = self
+
+            def start(self) -> None:
+                pass
+
+            def cancel(self) -> None:
+                pass
+
+        def closed_stream(_response):
+            timer_holder["timer"].callback()
+            return iter(())
+
+        with (
+            mock.patch("services.openai_backend_api.threading.Timer", FakeTimer),
+            mock.patch("services.openai_backend_api.time.monotonic", side_effect=[0.0, 0.9]),
+            mock.patch("services.openai_backend_api.iter_sse_payloads", side_effect=closed_stream),
+        ):
+            with self.assertRaises(ImageStreamHardTimeoutError):
+                list(backend._iter_sse_payloads_capped(response, 1.0))
+
+        self.assertTrue(response.closed.is_set())
+
 
 if __name__ == "__main__":
     unittest.main()

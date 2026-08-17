@@ -67,6 +67,83 @@ def make_access_token(
 
 
 class AccountDeduplicationTests(unittest.TestCase):
+    def test_account_payload_rejects_container_access_token(self) -> None:
+        canary = "account-payload-container-canary"
+        service = InMemoryAccountService(MemoryStorage())
+
+        result = service.add_account_items([{
+            "access_token": {"secret": canary},
+            "type": "free",
+        }])
+
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(service.list_tokens(), [])
+        self.assertNotIn(canary, repr(result))
+
+    def test_account_normalization_rejects_container_access_token(self) -> None:
+        canary = "account-normalize-container-canary"
+        service = InMemoryAccountService(MemoryStorage())
+
+        normalized = service._normalize_account({
+            "access_token": {"secret": canary},
+            "type": "free",
+            "status": "正常",
+        })
+
+        self.assertIsNone(normalized)
+        self.assertNotIn(canary, repr(normalized))
+
+    def test_account_payload_rejects_container_proxy(self) -> None:
+        canary = "account-proxy-container-canary"
+        service = InMemoryAccountService(MemoryStorage())
+
+        result = service.add_account_items([{
+            "access_token": "proxy-token",
+            "proxy": {"secret": canary},
+            "type": "free",
+        }])
+
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(service.list_tokens(), [])
+        self.assertNotIn(canary, repr(result))
+
+    def test_account_payload_rejects_container_plan_type(self) -> None:
+        canary = "account-plan-type-container-canary"
+        service = InMemoryAccountService(MemoryStorage())
+
+        result = service.add_account_items([{
+            "access_token": "plan-type-token",
+            "type": {"secret": canary},
+        }])
+
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(service.list_tokens(), [])
+        self.assertNotIn(canary, repr(result))
+
+    def test_account_normalization_rejects_container_identity_metadata(self) -> None:
+        fields = (
+            "email",
+            "user_id",
+            "default_model_slug",
+            "restore_at",
+            "source_type",
+            "export_type",
+            "password",
+            "refresh_token",
+            "id_token",
+        )
+        service = InMemoryAccountService(MemoryStorage())
+
+        for field in fields:
+            with self.subTest(field=field):
+                normalized = service._normalize_account({
+                    "access_token": "metadata-token",
+                    "type": "free",
+                    "status": "正常",
+                    field: {"secret": f"{field}-canary"},
+                })
+                self.assertIsNone(normalized)
+
     def test_cpa_batch_keeps_only_the_token_with_the_latest_expiry(self) -> None:
         old_token = make_access_token(
             account_id="acct-1",
@@ -219,7 +296,7 @@ class AccountDeduplicationTests(unittest.TestCase):
         with mock.patch.object(
             service,
             "fetch_remote_info",
-            side_effect=lambda token, *_args: service.get_account(token),
+            side_effect=lambda token, *_args, **_kwargs: service.get_account(token),
         ) as fetch_remote_info:
             result = service.refresh_accounts([old_token, new_token])
 

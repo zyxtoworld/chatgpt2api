@@ -61,6 +61,29 @@ class ImageIndexRecoveryContractTests(unittest.TestCase):
             with self.assertRaises(StorageDataError):
                 service._load_clean_index()
 
+    def test_oversized_image_index_is_rejected_before_unbounded_json_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_index.json"
+            path.write_bytes(b"x" * 5)
+            service = ImageStorageService(path)
+
+            with mock.patch.object(image_storage_module, "_MAX_IMAGE_INDEX_BYTES", 4):
+                with self.assertRaises(StorageDataError):
+                    service._load_clean_index()
+
+    def test_image_index_write_rejects_payload_over_the_read_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_index.json"
+            path.write_bytes(b'{"items": {}}\n')
+            service = ImageStorageService(path)
+            original = path.read_bytes()
+
+            with mock.patch.object(image_storage_module, "_MAX_IMAGE_INDEX_BYTES", 4):
+                with self.assertRaises(StorageDataError):
+                    service._save_index({"2026/08/15/image.png": {"rel": "image"}})
+
+            self.assertEqual(path.read_bytes(), original)
+
     def test_image_save_does_not_overwrite_corrupt_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_index.json"

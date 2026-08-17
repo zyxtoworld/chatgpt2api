@@ -7,12 +7,20 @@ from __future__ import annotations
 import base64
 import json
 import random
+import re
 import time
 import uuid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from curl_cffi.requests import Session
+
+from services.remote_response import close_response, parse_json_response
+
+
+_MAX_SENTINEL_RESPONSE_BYTES = 1 * 1024 * 1024
+_MAX_SENTINEL_POW_FIELD_CHARS = 256
+_MAX_SENTINEL_TOKEN_CHARS = 4096
 
 
 class SentinelTokenGenerator:
@@ -132,28 +140,65 @@ def build_sentinel_token(
             "sec-ch-ua-platform": '"Windows"',
         },
         timeout=20,
-        verify=False,
+        verify=True,
+        stream=True,
     )
 
     try:
-        data = resp.json() if resp.text else {}
-    except Exception:
-        fallback = json.dumps(
-            {"p": generator.generate_requirements_token(), "t": "", "c": "", "id": device_id, "flow": flow},
-            separators=(",", ":"),
-        )
-        return fallback, ""
+        if resp.status_code != 200:
+            raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+        try:
+            data = parse_json_response(
+                resp,
+                "sentinel response",
+                max_bytes=_MAX_SENTINEL_RESPONSE_BYTES,
+                require_ok=False,
+                close=False,
+            )
+        except Exception:
+            fallback = json.dumps(
+                {"p": generator.generate_requirements_token(), "t": "", "c": "", "id": device_id, "flow": flow},
+                separators=(",", ":"),
+            )
+            return fallback, ""
 
-    token = str(data.get("token") or "").strip()
-    if resp.status_code != 200 or not token:
-        raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
-    pow_data = data.get("proofofwork") or {}
-    p_value = (
-        generator.generate_token(str(pow_data.get("seed") or ""), str(pow_data.get("difficulty") or "0"))
-        if pow_data.get("required") and pow_data.get("seed")
-        else generator.generate_requirements_token()
-    )
-    sentinel_value = json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
-    # oai-sc cookie = "0" + sentinel token "c" value (the challenge token from the server)
-    oai_sc_value = "0" + token
-    return sentinel_value, oai_sc_value
+        if not isinstance(data, dict):
+            raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+        token = data.get("token")
+        token = token.strip() if isinstance(token, str) else ""
+        if not token:
+            raise RuntimeError(f"sentinel_req_failed_{resp.status_code}")
+        if len(token) > _MAX_SENTINEL_TOKEN_CHARS:
+            raise RuntimeError("sentinel response is invalid")
+        raw_pow_data = data.get("proofofwork")
+        if raw_pow_data is None:
+            pow_data = {}
+        elif isinstance(raw_pow_data, dict):
+            pow_data = raw_pow_data
+        else:
+            raise RuntimeError("sentinel challenge is invalid")
+        required = pow_data.get("required", False)
+        if type(required) is not bool:
+            raise RuntimeError("sentinel challenge is invalid")
+        if required:
+            seed = pow_data.get("seed")
+            difficulty = pow_data.get("difficulty")
+            if (
+                not isinstance(seed, str)
+                or not seed
+                or len(seed) > _MAX_SENTINEL_POW_FIELD_CHARS
+                or not isinstance(difficulty, str)
+                or not difficulty
+                or len(difficulty) > _MAX_SENTINEL_POW_FIELD_CHARS
+                or re.fullmatch(r"[0-9a-fA-F]+", difficulty) is None
+            ):
+                raise RuntimeError("sentinel challenge is invalid")
+            p_value = generator.generate_token(seed, difficulty)
+        else:
+            p_value = generator.generate_requirements_token()
+        sentinel_value = json.dumps({"p": p_value, "t": "", "c": token, "id": device_id, "flow": flow}, separators=(",", ":"))
+        # oai-sc cookie = "0" + sentinel token "c" value (the challenge token from the server)
+        oai_sc_value = "0" + token
+        return sentinel_value, oai_sc_value
+    finally:
+        close_response(resp)

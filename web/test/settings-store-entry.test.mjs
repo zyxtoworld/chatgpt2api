@@ -20,6 +20,110 @@ function pool(id, name) {
   };
 }
 
+test("malformed config model values fail closed instead of stringifying containers", async () => {
+  const originalRequest = request.request;
+  request.request = async () => ({
+    data: {
+      config: {
+        proxy: "",
+        default_upstream_model_name: { canary: "do-not-forward" },
+        global_system_prompt: { canary: "do-not-render" },
+        ai_review: { base_url: { canary: "do-not-request" } },
+        image_storage: { webdav_url: { canary: "do-not-connect" } },
+        third_party_apps: { infinite_canvas: { url: { canary: "do-not-download" } } },
+        backup: { bucket: { canary: "do-not-upload" } },
+      },
+    },
+  });
+
+  try {
+    useSettingsStore.getState().cancelConfigOperations();
+    useSettingsStore.getState().loadConfig();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const model = useSettingsStore.getState().config.default_upstream_model_name;
+    assert.equal(model, "gpt-5-5");
+    assert.notEqual(model, "[object Object]");
+    const config = useSettingsStore.getState().config;
+    assert.equal(config.global_system_prompt, "");
+    assert.equal(config.ai_review.base_url, "");
+    assert.equal(config.image_storage.webdav_url, "");
+    assert.equal(config.third_party_apps.infinite_canvas.url, "https://canvas.best");
+    assert.equal(config.backup.bucket, "");
+  } finally {
+    request.request = originalRequest;
+    useSettingsStore.getState().cancelConfigOperations();
+  }
+});
+
+test("malformed third-party enabled values fail closed instead of truthiness coercion", async () => {
+  const originalRequest = request.request;
+  request.request = async () => ({
+    data: {
+      config: {
+        proxy: "",
+        third_party_apps: {
+          infinite_canvas: {
+            enabled: "false",
+            url: "https://canvas.example.test",
+          },
+        },
+      },
+    },
+  });
+
+  try {
+    useSettingsStore.getState().cancelConfigOperations();
+    await useSettingsStore.getState().loadConfig();
+    assert.equal(useSettingsStore.getState().config.third_party_apps.infinite_canvas.enabled, false);
+  } finally {
+    request.request = originalRequest;
+    useSettingsStore.getState().cancelConfigOperations();
+  }
+});
+
+test("malformed numeric config values fail closed instead of publishing NaN", async () => {
+  const originalRequest = request.request;
+  request.request = async () => ({
+    data: {
+      config: {
+        proxy: "",
+        refresh_account_interval_minute: "not-a-number",
+        image_retention_days: "not-a-number",
+        image_poll_timeout_secs: "not-a-number",
+        image_account_concurrency: "not-a-number",
+        image_settle_secs: "not-a-number",
+        image_timeout_retry_secs: "not-a-number",
+        backup: {
+          interval_minutes: "not-a-number",
+          rotation_keep: "not-a-number",
+        },
+      },
+    },
+  });
+
+  try {
+    useSettingsStore.getState().cancelConfigOperations();
+    await useSettingsStore.getState().loadConfig();
+    const config = useSettingsStore.getState().config;
+    assert.ok(config);
+    for (const value of [
+      config.refresh_account_interval_minute,
+      config.image_retention_days,
+      config.image_poll_timeout_secs,
+      config.image_account_concurrency,
+      config.image_settle_secs,
+      config.image_timeout_retry_secs,
+      config.backup.interval_minutes,
+      config.backup.rotation_keep,
+    ]) {
+      assert.equal(Number.isFinite(value), true);
+    }
+  } finally {
+    request.request = originalRequest;
+    useSettingsStore.getState().cancelConfigOperations();
+  }
+});
+
 test("settings config save admits one writer and reopens after it finishes", async () => {
   const originalRequest = request.request;
   const calls = [];

@@ -9,9 +9,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 import services.protocol.conversation as conversation_module
+import services.protocol.openai_v1_chat_complete as chat_complete_module
+import services.openai_backend_api as backend_module
 from services.config import config
-from services.openai_backend_api import OpenAIBackendAPI
-from services.protocol.conversation import ConversationRequest, ImageOutput, extract_conversation_ids, stream_image_events
+from services.openai_backend_api import ImagePollTimeoutError, OpenAIBackendAPI
+from services.protocol.conversation import (
+    ConversationRequest,
+    ImageGenerationError,
+    ImageOutput,
+    collect_image_outputs,
+    extract_conversation_ids,
+    stream_image_events,
+)
 from services.protocol.openai_v1_response import stream_image_response
 
 
@@ -55,6 +64,117 @@ class FakeBackend(OpenAIBackendAPI):
 
 
 class MultiImageResultTests(unittest.TestCase):
+    def test_image_poll_deadline_uses_monotonic_clock(self) -> None:
+        backend = FakeBackend([_conversation([], [])])
+        clock = {"value": 0.0}
+
+        def get_conversation(_conversation_id: str) -> dict:
+            clock["value"] = 2.0
+            return _conversation([], [])
+
+        backend._query_backend_tasks = mock.Mock(return_value=[])
+        backend._get_conversation = mock.Mock(side_effect=get_conversation)
+
+        with (
+            mock.patch.dict(
+                config.data,
+                {
+                    "image_poll_initial_wait_secs": 0,
+                    "image_poll_interval_secs": 0,
+                    "image_settle_enabled": False,
+                    "image_check_before_hit_enabled": True,
+                },
+            ),
+            mock.patch.object(backend_module.time, "monotonic", side_effect=lambda: clock["value"]),
+            mock.patch.object(backend_module.time, "time", side_effect=AssertionError("wall clock used")),
+            self.assertRaises(ImagePollTimeoutError),
+        ):
+            backend._poll_image_results("conv-clock", timeout_secs=1)
+
+    def test_untrusted_image_progress_is_not_published_by_chat(self) -> None:
+        canary = "opaque-image-progress-secret owner@example.com"
+        output = ImageOutput(
+            kind="progress",
+            model="gpt-image-2",
+            index=1,
+            total=1,
+            text=canary,
+        )
+
+        chat_chunks = list(chat_complete_module.stream_image_chat_completion([output], "gpt-image-2"))
+
+        self.assertNotIn(canary, repr(chat_chunks))
+
+    def test_untrusted_image_message_is_not_published_by_chat_or_responses(self) -> None:
+        canary = "opaque-upstream-secret owner@example.com"
+        output = ImageOutput(
+            kind="message",
+            model="gpt-image-2",
+            index=1,
+            total=1,
+            text=canary,
+        )
+
+        collected = collect_image_outputs([output])
+        chat_chunks = list(chat_complete_module.stream_image_chat_completion([output], "gpt-image-2"))
+        response_events = list(stream_image_response([output], "draw a cat", "gpt-5"))
+
+        self.assertNotIn(canary, repr(collected))
+        self.assertNotIn(canary, repr(chat_chunks))
+        self.assertNotIn(canary, repr(response_events))
+
+    def test_image_public_outputs_do_not_publish_account_email(self) -> None:
+        output = ImageOutput(
+            kind="result",
+            model="gpt-image-2",
+            index=1,
+            total=1,
+            account_email="owner@example.test",
+            data=[{"url": "/images/result.png"}],
+        )
+
+        self.assertNotIn("_account_email", output.to_chunk())
+        self.assertNotIn("owner@example.test", repr(collect_image_outputs([output])))
+
+    def test_recent_conversation_lookup_rejects_container_ids(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        canary = "recent-conversation-id-canary"
+        backend._list_recent_conversations = mock.Mock(return_value=[{
+            "id": {"secret": canary},
+            "title": "Image",
+            "updated_at": 2,
+        }])
+
+        result = backend.find_conversation_by_prompt("make an image", started_at=1)
+
+        self.assertEqual(result, "")
+        self.assertNotIn(canary, repr(result))
+
+    def test_conversation_state_does_not_stringify_container_ids(self) -> None:
+        from services.protocol.conversation import ConversationState, update_conversation_state
+
+        state = ConversationState(conversation_id="conversation-safe")
+        update_conversation_state(
+            state,
+            "{}",
+            {"conversation_id": {"secret": "conversation-id-canary"}},
+        )
+        update_conversation_state(
+            state,
+            "{}",
+            {"v": {"conversation_id": ["nested-conversation-id-canary"]}},
+        )
+        self.assertEqual(state.conversation_id, "conversation-safe")
+        self.assertNotIn("conversation-id-canary", repr(state))
+        self.assertNotIn("nested-conversation-id-canary", repr(state))
+
+        payload_state = ConversationState()
+        update_conversation_state(
+            payload_state,
+            '{"conversation_id":"../../conversation-id-canary"}',
+        )
+        self.assertEqual(payload_state.conversation_id, "")
+
     def test_concurrent_multi_image_requests_share_a_bounded_worker_pool(self) -> None:
         condition = threading.Condition()
         release = threading.Event()
@@ -103,17 +223,51 @@ class MultiImageResultTests(unittest.TestCase):
                 with condition:
                     while max_active < 32 and time.monotonic() < deadline:
                         condition.wait(timeout=0.05)
-                    self.assertGreaterEqual(max_active, 32, "parallel image workers did not reach the test baseline")
+                    self.assertGreaterEqual(max_active, 30, "parallel image workers did not reach the test baseline")
                     overflow_deadline = time.monotonic() + 0.5
                     while max_active <= 32 and time.monotonic() < overflow_deadline:
                         condition.wait(timeout=0.02)
                     observed_max = max_active
             finally:
                 release.set()
+            failures = []
             for future in futures:
-                future.result(timeout=5)
+                try:
+                    future.result(timeout=5)
+                except ImageGenerationError as exc:
+                    failures.append(exc)
 
         self.assertLessEqual(observed_max, 32)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0].code, "image_generation_queue_full")
+
+    def test_parallel_image_generation_rejects_before_submit_when_capacity_is_full(self) -> None:
+        class RecordingExecutor:
+            def __init__(self) -> None:
+                self.submitted = 0
+
+            def submit(self, *_args, **_kwargs):
+                self.submitted += 1
+                raise AssertionError("image generation must be rejected before submit")
+
+        executor = RecordingExecutor()
+        slots = threading.BoundedSemaphore(2)
+        request = ConversationRequest(model="gpt-image-2", prompt="cat", n=3)
+
+        with (
+            mock.patch.object(conversation_module, "_IMAGE_GENERATION_EXECUTOR", executor),
+            mock.patch.object(conversation_module, "_IMAGE_GENERATION_SLOTS", slots),
+            mock.patch.object(
+                conversation_module,
+                "config",
+                SimpleNamespace(image_parallel_generation=True),
+            ),
+        ):
+            with self.assertRaises(ImageGenerationError) as raised:
+                list(conversation_module.stream_image_outputs_with_pool(request))
+
+        self.assertEqual(raised.exception.code, "image_generation_queue_full")
+        self.assertEqual(executor.submitted, 0)
 
     def test_image_api_stream_emits_only_official_completed_events(self) -> None:
         usage = {

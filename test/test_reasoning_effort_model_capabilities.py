@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,10 +15,18 @@ from services.protocol.reasoning_effort import normalize_conversation_effort
 from services.storage.json_storage import JSONStorageBackend
 
 
+def _stream_response(payload: dict) -> mock.Mock:
+    response = mock.Mock(status_code=200)
+    response.json.return_value = payload
+    response.iter_content.side_effect = lambda **_kwargs: iter([
+        json.dumps(payload).encode("utf-8")
+    ])
+    return response
+
+
 class UpstreamModelEffortContractTests(unittest.TestCase):
     def test_backend_model_list_preserves_only_normalized_effort_capabilities(self) -> None:
-        response = mock.Mock(status_code=200)
-        response.json.return_value = {
+        response = _stream_response({
             "models": [
                 {
                     "slug": "gpt-capable",
@@ -30,7 +39,7 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
                     "opaque_upstream_field": "must-not-be-forwarded",
                 }
             ]
-        }
+        })
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "account-token"
         backend.base_url = "https://chatgpt.com"
@@ -47,16 +56,50 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         )
         self.assertNotIn("opaque_upstream_field", result["data"][0])
 
+    def test_backend_model_list_downgrades_malformed_created_timestamp(self) -> None:
+        response = _stream_response({
+            "models": [
+                {"slug": "gpt-valid", "created": 1700000000},
+                {"slug": "gpt-malformed", "created": "not-a-timestamp"},
+            ]
+        })
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "account-token"
+        backend.base_url = "https://chatgpt.com"
+        backend.session = mock.Mock()
+        backend.session.get.return_value = response
+        backend._bootstrap = mock.Mock()
+        backend._headers = mock.Mock(return_value={})
+
+        result = backend.list_models()
+
+        created = {item["id"]: item["created"] for item in result["data"]}
+        self.assertEqual(created["gpt-valid"], 1700000000)
+        self.assertEqual(created["gpt-malformed"], 0)
+
+    def test_backend_model_list_closes_upstream_response(self) -> None:
+        response = _stream_response({"models": [{"slug": "gpt-model"}]})
+        response.close = mock.Mock()
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "account-token"
+        backend.base_url = "https://chatgpt.com"
+        backend.session = mock.Mock()
+        backend.session.get.return_value = response
+        backend._bootstrap = mock.Mock()
+        backend._headers = mock.Mock(return_value={})
+
+        backend.list_models()
+
+        response.close.assert_called_once_with()
+
     def test_model_catalog_requests_full_account_catalog_without_changing_conversation_history_mode(self) -> None:
-        limited_response = mock.Mock(status_code=200)
-        limited_response.json.return_value = {"models": [{"slug": "gpt-basic"}]}
-        full_response = mock.Mock(status_code=200)
-        full_response.json.return_value = {
+        limited_response = _stream_response({"models": [{"slug": "gpt-basic"}]})
+        full_response = _stream_response({
             "models": [
                 {"slug": "gpt-basic"},
                 {"slug": "gpt-pro-extra"},
             ],
-        }
+        })
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "account-token"
         backend.base_url = "https://chatgpt.com"
@@ -102,7 +145,7 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
                 def __init__(self, access_token: str = "") -> None:
                     self.access_token = access_token
 
-                def list_models(self) -> dict:
+                def list_models(self, **_kwargs) -> dict:
                     efforts = ["min", "standard"] if not self.access_token else [
                         "min",
                         "standard",

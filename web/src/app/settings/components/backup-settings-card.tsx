@@ -13,8 +13,10 @@ import { Input } from "@/components/ui/input";
 import webConfig from "@/constants/common-env";
 import { fetchBackupDetail, getBackupDownloadUrl, type BackupDetail, type BackupInclude } from "@/lib/api";
 import { filenameFromContentDisposition } from "@/lib/content-disposition";
-import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { downloadBlobFile } from "@/lib/download-text.js";
+import { createAbortableLifecycleOwner, runBackupDownload } from "@/lib/backup-download-lifecycle";
+import { runBackupMutation } from "@/lib/backup-detail-lifecycle";
 import { requestErrorMessage } from "@/lib/request-error-message";
 import { getStoredAuthKey } from "@/store/auth";
 import { useSettingsStore } from "../store";
@@ -64,7 +66,7 @@ const includeLabels: Array<{ key: keyof BackupInclude; label: string }> = [
 
 export function BackupSettingsCard() {
   const backupDetailOwnerRef = useRef(createLatestActionOwner());
-  const backupDownloadOwnerRef = useRef(createLifecycleActionOwner());
+  const backupDownloadOwnerRef = useRef(createAbortableLifecycleOwner());
   const [detailOpen, setDetailOpen] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detail, setDetail] = useState<BackupDetail | null>(null);
@@ -143,66 +145,27 @@ export function BackupSettingsCard() {
     setDetailOpen(open);
   };
 
+  const handleRemoveBackup = async (key: string) => {
+    await runBackupMutation(
+      () => backupDetailOwnerRef.current.invalidate(),
+      () => removeBackup(key),
+    );
+  };
+
   const handleDownload = async (key: string, name: string) => {
     const backupDownloadOwner = backupDownloadOwnerRef.current;
-    const downloadOwner = backupDownloadOwner.begin();
-    try {
-      const authKey = await getStoredAuthKey();
-      if (!backupDownloadOwner.accepts(downloadOwner)) {
-        return;
-      }
-      if (!authKey) {
-        toast.error("当前登录态已失效，请重新登录后再下载");
-        return;
-      }
-      const response = await fetch(`${webConfig.apiUrl.replace(/\/$/, "")}${getBackupDownloadUrl(key)}`, {
-        headers: {
-          Authorization: `Bearer ${authKey}`,
-        },
-      });
-      if (!backupDownloadOwner.accepts(downloadOwner)) {
-        return;
-      }
-      if (!response.ok) {
-        let message = "下载备份失败";
-        try {
-          const data = await response.json() as unknown;
-          if (!backupDownloadOwner.accepts(downloadOwner)) {
-            return;
-          }
-          message = requestErrorMessage({ status: response.status, payload: data });
-        } catch {
-          if (!backupDownloadOwner.accepts(downloadOwner)) {
-            return;
-          }
-          message = response.status === 401 ? "登录已失效，请重新登录后再试" : message;
-        }
-        throw new Error(message);
-      }
-      const downloadName = filenameFromContentDisposition(response.headers.get("Content-Disposition")) || name || "backup.bin";
-      const blob = await response.blob();
-      if (!backupDownloadOwner.accepts(downloadOwner)) {
-        return;
-      }
-      const url = window.URL.createObjectURL(blob);
-      try {
-        const anchor = document.createElement("a");
-        anchor.href = url;
-        anchor.download = downloadName;
-        document.body.append(anchor);
-        anchor.click();
-        anchor.remove();
-      } finally {
-        window.URL.revokeObjectURL(url);
-      }
-      if (backupDownloadOwner.accepts(downloadOwner)) {
-        toast.success("备份下载已开始");
-      }
-    } catch (error) {
-      if (backupDownloadOwner.accepts(downloadOwner)) {
-        toast.error(error instanceof Error ? error.message : "下载备份失败");
-      }
-    }
+    await runBackupDownload({
+      owner: backupDownloadOwner,
+      getAuthKey: getStoredAuthKey,
+      fetchImpl: fetch,
+      url: `${webConfig.apiUrl.replace(/\/$/, "")}${getBackupDownloadUrl(key)}`,
+      fallbackName: name,
+      filenameFromContentDisposition,
+      requestErrorMessage,
+      onDownload: downloadBlobFile,
+      onSuccess: () => toast.success("备份下载已开始"),
+      onError: (error: unknown) => toast.error(error instanceof Error ? error.message : "下载备份失败"),
+    });
   };
 
   return (
@@ -397,7 +360,7 @@ export function BackupSettingsCard() {
                         type="button"
                         variant="outline"
                         className="h-9 rounded-xl border-rose-200 bg-white px-4 text-rose-700"
-                        onClick={() => void removeBackup(item.key)}
+                        onClick={() => void handleRemoveBackup(item.key)}
                         disabled={backupMutationBusy}
                       >
                         {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}

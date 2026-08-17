@@ -26,7 +26,111 @@ class _FakeSub2APIConfig:
         return {"id": server_id}
 
 
+class _BusyCPAConfig:
+    def delete_pool(self, _pool_id: str):
+        raise accounts_module.ImportJobActiveError("import is already running")
+
+
+class _BusySub2APIConfig:
+    def delete_server(self, _server_id: str):
+        raise accounts_module.ImportJobActiveError("import is already running")
+
+
+class _BusyCCLoadConfig:
+    def delete_server(self, _server_id: str):
+        raise accounts_module.ImportJobActiveError("import is already running")
+
+
+class _InvalidCPAConfig:
+    def delete_pool(self, _pool_id: str):
+        raise accounts_module.PublicSafeValueError(SECRET)
+
+
+class _InvalidSub2APIConfig:
+    def delete_server(self, _server_id: str):
+        raise accounts_module.PublicSafeValueError(SECRET)
+
+
+class _InvalidCCLoadConfig:
+    def delete_server(self, _server_id: str):
+        raise accounts_module.PublicSafeValueError(SECRET)
+
+
 class ManagementValueErrorContractTests(unittest.TestCase):
+    def test_delete_connection_reports_active_import_as_conflict(self) -> None:
+        app = FastAPI()
+        app.include_router(create_accounts_router())
+        with (
+            mock.patch.object(accounts_module, "require_admin_async", return_value={"role": "admin"}),
+            mock.patch.object(accounts_module, "cpa_config", _BusyCPAConfig()),
+            mock.patch.object(accounts_module, "sub2api_config", _BusySub2APIConfig()),
+            mock.patch.object(accounts_module, "ccload_config", _BusyCCLoadConfig()),
+        ):
+            client = TestClient(app)
+            responses = [
+                client.delete("/api/cpa/pools/pool-1"),
+                client.delete("/api/sub2api/servers/server-1"),
+                client.delete("/api/ccload/servers/server-1"),
+            ]
+
+        for response in responses:
+            with self.subTest(path=response.request.url):
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(response.json(), {"detail": {"error": "import is already running"}})
+
+    def test_generic_safe_value_error_is_not_misclassified_as_conflict(self) -> None:
+        app = FastAPI()
+        app.include_router(create_accounts_router())
+        with (
+            mock.patch.object(accounts_module, "require_admin_async", return_value={"role": "admin"}),
+            mock.patch.object(accounts_module, "cpa_config", _InvalidCPAConfig()),
+            mock.patch.object(accounts_module, "sub2api_config", _InvalidSub2APIConfig()),
+            mock.patch.object(accounts_module, "ccload_config", _InvalidCCLoadConfig()),
+        ):
+            client = TestClient(app, raise_server_exceptions=False)
+            responses = [
+                client.delete("/api/cpa/pools/pool-1"),
+                client.delete("/api/sub2api/servers/server-1"),
+                client.delete("/api/ccload/servers/server-1"),
+            ]
+
+        for response in responses:
+            with self.subTest(path=response.request.url):
+                self.assertEqual(response.status_code, 500, response.text)
+                self.assertNotIn(SECRET, response.text)
+
+    def test_delete_missing_connection_preserves_not_found_contract(self) -> None:
+        class _MissingCPAConfig:
+            def delete_pool(self, _pool_id: str):
+                return False
+
+        class _MissingSub2APIConfig:
+            def delete_server(self, _server_id: str):
+                return False
+
+        class _MissingCCLoadConfig:
+            def delete_server(self, _server_id: str):
+                return False
+
+        app = FastAPI()
+        app.include_router(create_accounts_router())
+        with (
+            mock.patch.object(accounts_module, "require_admin_async", return_value={"role": "admin"}),
+            mock.patch.object(accounts_module, "cpa_config", _MissingCPAConfig()),
+            mock.patch.object(accounts_module, "sub2api_config", _MissingSub2APIConfig()),
+            mock.patch.object(accounts_module, "ccload_config", _MissingCCLoadConfig()),
+        ):
+            client = TestClient(app)
+            responses = [
+                client.delete("/api/cpa/pools/missing"),
+                client.delete("/api/sub2api/servers/missing"),
+                client.delete("/api/ccload/servers/missing"),
+            ]
+
+        for response in responses:
+            with self.subTest(path=response.request.url):
+                self.assertEqual(response.status_code, 404, response.text)
+
     def test_generic_value_errors_are_not_reflected_by_management_routes(self) -> None:
         app = FastAPI()
         app.include_router(create_accounts_router())

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 import os
+import re
 import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
@@ -17,9 +21,15 @@ from services.openai_backend_api import ImagePollTimeoutError
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 from services.protocol.error_response import PublicSafeError, public_exception_message
 from services.protocol.image_options import normalize_image_quality, normalize_image_size
-from services.secure_file import atomic_write_bytes
-from services.storage.base import StorageConflictError, StorageDataError, make_storage_snapshot
+from services.secure_file import atomic_write_bytes, read_checked_file_bytes
+from services.storage.base import (
+    StorageConflictError,
+    StorageDataError,
+    canonical_path_write_lock,
+    make_storage_snapshot,
+)
 from services.task_executor import reserve_background_task
+from services.task_contract import canonical_task_timestamp
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -28,18 +38,31 @@ TASK_STATUS_ERROR = "error"
 TERMINAL_STATUSES = {TASK_STATUS_SUCCESS, TASK_STATUS_ERROR}
 UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 _KEEP_RESUME_CREDENTIAL = object()
-_TASK_FILE_LOCKS_GUARD = threading.Lock()
-_TASK_FILE_LOCKS: dict[str, threading.RLock] = {}
+_IMAGE_POLL_TIMEOUT_CODE = "image_poll_timeout"
+_IMAGE_RESTART_ERROR_CODE = "image_task_interrupted_on_restart"
+_IMAGE_RESTART_ERROR_MESSAGE = "服务已重启，未完成的图片任务已中断"
+_MAX_CLIENT_TASK_ID_LENGTH = 256
+_PERSISTED_IMAGE_PROGRESS = frozenset({
+    "getting_account",
+    "image_stream_resolve_start",
+    "receiving_image",
+})
+_PERSISTED_IMAGE_ERRORS = frozenset({
+    "image task failed",
+    _IMAGE_RESTART_ERROR_MESSAGE,
+    "图片任务未生成图片，请稍后重试",
+    "The image generation request failed. Please try again later.",
+    "The image generation request was invalid.",
+    "Image generation was rejected by upstream policy.",
+    "The upstream service did not generate an image.",
+    "Image generation failed: the upstream model returned a text description instead of an image. Please try again later.",
+})
+_SAFE_CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
+_IMAGE_TASK_LOGGER = logging.getLogger(__name__)
 
 
-def _task_file_lock(path: Path) -> threading.RLock:
-    key = os.path.normcase(os.path.abspath(path))
-    with _TASK_FILE_LOCKS_GUARD:
-        lock = _TASK_FILE_LOCKS.get(key)
-        if lock is None:
-            lock = threading.RLock()
-            _TASK_FILE_LOCKS[key] = lock
-        return lock
+def _task_file_lock(path: Path):
+    return canonical_path_write_lock(path)
 
 
 class ImageTaskNotFoundError(ValueError):
@@ -72,12 +95,41 @@ def _clean(value: object, default: str = "") -> str:
     return str(value or default).strip()
 
 
+def _persisted_image_error(value: object) -> str:
+    return value if isinstance(value, str) and value in _PERSISTED_IMAGE_ERRORS else "image task failed"
+
+
+def _public_image_error(task: dict[str, Any]) -> str:
+    if task.get("error_code") == _IMAGE_RESTART_ERROR_CODE:
+        return _IMAGE_RESTART_ERROR_MESSAGE
+    value = task.get("error")
+    return value if isinstance(value, str) and value in _PERSISTED_IMAGE_ERRORS else "image task failed"
+
+
+def _finite_nonnegative_number(value: object, *, default: float = 0.0, maximum: float = 1_000_000_000_000_000.0) -> float:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise StorageDataError()
+    number = float(value)
+    if not math.isfinite(number) or number < 0 or number > maximum:
+        raise StorageDataError()
+    return number
+
+
 def _owner_id(identity: dict[str, object]) -> str:
     return _clean(identity.get("id")) or "anonymous"
 
 
 def _task_key(owner_id: str, task_id: str) -> str:
     return f"{owner_id}:{task_id}"
+
+
+def _validate_client_task_id(task_id: str) -> None:
+    if not task_id or len(task_id) > _MAX_CLIENT_TASK_ID_LENGTH:
+        raise ValueError("client_task_id length exceeded")
+    if "," in task_id:
+        raise ValueError("client_task_id must not contain comma")
 
 
 def _collect_image_urls(data: list[Any]) -> list[str]:
@@ -88,6 +140,89 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
             if isinstance(url, str) and url:
                 urls.append(url)
     return urls
+
+
+def _safe_log_image_url(value: object) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    text = value.strip()
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme in {"http", "https"} and parsed.hostname:
+            host = parsed.hostname
+            if ":" in host:
+                host = f"[{host}]"
+            port = parsed.port
+            authority = f"{host}:{port}" if port is not None else host
+            return urlunsplit((parsed.scheme, authority, parsed.path, "", ""))
+        if text.startswith("/"):
+            return text.split("?", 1)[0].split("#", 1)[0]
+    except ValueError:
+        return "[redacted-image-url]"
+    return "[redacted-image-url]"
+
+
+def _is_public_image_url(value: object) -> bool:
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        return False
+    if any(character == "\\" or ord(character) < 32 or ord(character) == 127 for character in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.username or parsed.password or parsed.fragment:
+        return False
+    if parsed.netloc and not parsed.scheme:
+        return False
+    if parsed.scheme:
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    return parsed.path.startswith("/") and not parsed.path.startswith("//")
+
+
+def _public_image_data(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    allowed_fields = ("b64_json", "url", "revised_prompt")
+    projected: list[dict[str, str]] = []
+    for raw_item in value:
+        if not isinstance(raw_item, dict):
+            continue
+        item: dict[str, str] = {}
+        for field in allowed_fields:
+            field_value = raw_item.get(field)
+            if isinstance(field_value, str) and (field != "url" or _is_public_image_url(field_value)):
+                item[field] = field_value
+        if item:
+            projected.append(item)
+    return projected
+
+
+def _public_usage(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    usage: dict[str, Any] = {}
+    for field in ("input_tokens", "output_tokens", "total_tokens"):
+        field_value = value.get(field)
+        if type(field_value) is int and field_value >= 0:
+            usage[field] = field_value
+
+    detail_fields = {
+        "input_tokens_details": ("text_tokens", "image_tokens", "cached_tokens"),
+        "output_tokens_details": ("text_tokens", "image_tokens", "reasoning_tokens"),
+    }
+    for detail_name, fields in detail_fields.items():
+        raw_details = value.get(detail_name)
+        if not isinstance(raw_details, dict):
+            continue
+        details: dict[str, int] = {}
+        for field in fields:
+            field_value = raw_details.get(field)
+            if type(field_value) is int and field_value >= 0:
+                details[field] = field_value
+        if details:
+            usage[detail_name] = details
+    return usage or None
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -104,11 +239,12 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     if task.get("conversation_id"):
         item["conversation_id"] = task.get("conversation_id")
     if task.get("data") is not None:
-        item["data"] = task.get("data")
-    if task.get("usage") is not None:
-        item["usage"] = task.get("usage")
+        item["data"] = _public_image_data(task.get("data"))
+    usage = _public_usage(task.get("usage"))
+    if usage is not None:
+        item["usage"] = usage
     if task.get("error"):
-        item["error"] = task.get("error")
+        item["error"] = _public_image_error(task)
     if task.get("progress"):
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
@@ -239,6 +375,7 @@ class ImageTaskService:
         task_id = _clean(client_task_id)
         if not task_id:
             raise ValueError("client_task_id is required")
+        _validate_client_task_id(task_id)
         owner = _owner_id(identity)
         key = _task_key(owner, task_id)
         now = _now_iso()
@@ -280,7 +417,10 @@ class ImageTaskService:
                 )
             except Exception:
                 self._tasks.pop(key, None)
-                self._save_locked()
+                try:
+                    self._save_locked()
+                except Exception:
+                    _IMAGE_TASK_LOGGER.error("image task submission rollback persistence failed")
                 raise
         return _public_task(task)
 
@@ -297,6 +437,25 @@ class ImageTaskService:
             self._update_task(key, status=TASK_STATUS_RUNNING, error="")
         except StorageConflictError:
             return
+        except Exception as exc:
+            # The worker was accepted, but its first durable transition
+            # failed. Do not leave the task looking queued forever while the
+            # worker has already exited; keep a safe terminal projection in
+            # memory until the next durable recovery opportunity.
+            with self._lock:
+                task = self._tasks.get(key)
+                if task is not None and task.get("status") not in TERMINAL_STATUSES:
+                    task.update({
+                        "status": TASK_STATUS_ERROR,
+                        "error": _persisted_image_error(public_exception_message(exc, "image task failed")),
+                        "error_code": "",
+                        "data": [],
+                        "duration_ms": 0,
+                        "updated_at": _now_iso(),
+                        "updated_ts": time.time(),
+                    })
+            _IMAGE_TASK_LOGGER.error("image task initial state persistence failed")
+            return
         # 创建进度回调，每个步骤完成后更新任务状态
         def progress_callback(step: str) -> None:
             if step == "image_stream_resolve_start":
@@ -312,15 +471,19 @@ class ImageTaskService:
             data = result.get("data")
             if not isinstance(data, list) or not data:
                 raise PublicSafeError("图片任务未生成图片，请稍后重试")
-            usage = result.get("usage")
+            safe_data = _public_image_data(data)
+            if not safe_data:
+                raise PublicSafeError("图片任务未生成图片，请稍后重试")
+            usage = _public_usage(result.get("usage"))
             duration_ms = int((time.time() - started) * 1000)
             self._transition_task(
                 key,
                 resume_credential=None,
                 status=TASK_STATUS_SUCCESS,
-                data=data,
+                data=safe_data,
                 usage=usage,
                 error="",
+                error_code="",
                 duration_ms=duration_ms,
             )
             self._log_call(
@@ -330,12 +493,14 @@ class ImageTaskService:
                 started,
                 "调用完成",
                 request_preview=request_text(payload.get("prompt")),
-                urls=_collect_image_urls(data),
+                urls=_collect_image_urls(safe_data),
             )
         except StorageConflictError:
             return
         except Exception as exc:
             error_message = public_exception_message(exc, "image task failed")
+            persisted_error = _persisted_image_error(error_message)
+            error_code = _IMAGE_POLL_TIMEOUT_CODE if isinstance(exc, ImagePollTimeoutError) else ""
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
             access_token = _clean(getattr(exc, "access_token", ""))
             duration_ms = int((time.time() - started) * 1000)
@@ -349,13 +514,28 @@ class ImageTaskService:
                     key,
                     resume_credential=resume_credential,
                     status=TASK_STATUS_ERROR,
-                    error=error_message,
+                    error=persisted_error,
+                    error_code=error_code,
                     data=[],
                     duration_ms=duration_ms,
                     **({"conversation_id": conversation_id} if conversation_id else {}),
                 )
             except StorageConflictError:
                 return
+            except Exception:
+                with self._lock:
+                    task = self._tasks.get(key)
+                    if task is not None and task.get("status") not in TERMINAL_STATUSES:
+                        task.update({
+                            "status": TASK_STATUS_ERROR,
+                            "error": persisted_error,
+                            "error_code": error_code,
+                            "data": [],
+                            "duration_ms": duration_ms,
+                            "updated_at": _now_iso(),
+                            "updated_ts": time.time(),
+                        })
+                _IMAGE_TASK_LOGGER.error("image task terminal state persistence failed")
             self._log_call(
                 identity,
                 mode,
@@ -364,7 +544,7 @@ class ImageTaskService:
                 "调用失败",
                 request_preview=request_text(payload.get("prompt")),
                 status="failed",
-                error=error_message,
+                error=persisted_error,
             )
 
     def _log_call(
@@ -398,11 +578,15 @@ class ImageTaskService:
         if error:
             detail["error"] = error
         if urls:
-            detail["urls"] = list(dict.fromkeys(urls))
+            detail["urls"] = list(
+                dict.fromkeys(
+                    safe_url for url in urls if (safe_url := _safe_log_image_url(url))
+                )
+            )
         try:
             log_service.add(LOG_TYPE_CALL, f"{summary_prefix}{suffix}", detail)
         except Exception:
-            pass
+            _IMAGE_TASK_LOGGER.error("image task log persistence failed")
 
     def _update_task(self, key: str, **updates: Any) -> None:
         self._transition_task(key, **updates)
@@ -496,7 +680,7 @@ class ImageTaskService:
         if not self.path.exists():
             return []
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(read_checked_file_bytes(self.path, self.path.parent).decode("utf-8"))
             raw_items = raw.get("tasks") if isinstance(raw, dict) else raw
             return make_storage_snapshot(raw_items).records
         except StorageDataError:
@@ -536,37 +720,88 @@ class ImageTaskService:
                 mode = mode_value
             else:
                 raise StorageDataError()
+            model_value = item.get("model")
+            if model_value is not None and not isinstance(model_value, str):
+                raise StorageDataError()
+            size_value = item.get("size")
+            if size_value is not None and not isinstance(size_value, str):
+                raise StorageDataError()
+            quality_value = item.get("quality")
+            if quality_value is not None and not isinstance(quality_value, str):
+                raise StorageDataError()
+            created_at_value = item.get("created_at")
+            if not isinstance(created_at_value, str) or not created_at_value.strip():
+                raise StorageDataError()
+            updated_at_value = item.get("updated_at")
+            if not isinstance(updated_at_value, str) or not updated_at_value.strip():
+                raise StorageDataError()
+            created_ts = _finite_nonnegative_number(item.get("created_ts"))
+            updated_ts = _finite_nonnegative_number(item.get("updated_ts"))
+            started_ts = _finite_nonnegative_number(item.get("started_ts"))
+            duration_ms = _finite_nonnegative_number(item.get("duration_ms"), maximum=31_536_000_000.0)
+            conversation_id = item.get("conversation_id")
+            if conversation_id is not None:
+                if not isinstance(conversation_id, str) or not _SAFE_CONVERSATION_ID.fullmatch(conversation_id):
+                    raise StorageDataError()
+            created_at = canonical_task_timestamp(created_at_value, "")
+            updated_at = canonical_task_timestamp(updated_at_value, created_at)
             task = {
                 "id": task_id,
                 "owner_id": owner,
                 "status": status,
                 "mode": mode,
-                "model": _clean(item.get("model"), "gpt-image-2"),
-                "size": _clean(item.get("size")),
-                "quality": _clean(item.get("quality"), "auto"),
-                "created_at": _clean(item.get("created_at"), _now_iso()),
-                "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
-                "created_ts": item.get("created_ts"),
-                "updated_ts": item.get("updated_ts"),
-                "started_ts": item.get("started_ts"),
-                "duration_ms": item.get("duration_ms"),
+                "model": _clean(model_value, "gpt-image-2"),
+                "size": _clean(size_value),
+                "quality": _clean(quality_value, "auto"),
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "created_ts": created_ts,
+                "updated_ts": updated_ts,
+                "started_ts": started_ts,
             }
+            if conversation_id:
+                task["conversation_id"] = conversation_id
+            if duration_ms:
+                task["duration_ms"] = int(duration_ms) if duration_ms.is_integer() else duration_ms
+            raw_progress = item.get("progress")
+            if raw_progress is not None:
+                if not isinstance(raw_progress, str) or raw_progress not in _PERSISTED_IMAGE_PROGRESS:
+                    raise StorageDataError()
+                task["progress"] = raw_progress
             data = item.get("data")
             if data is not None and not isinstance(data, list):
                 raise StorageDataError()
             if data is not None:
-                task["data"] = data
+                safe_data = _public_image_data(data)
+                if safe_data != data:
+                    raise StorageDataError()
+                task["data"] = safe_data
             usage = item.get("usage")
             if usage is not None and not isinstance(usage, dict):
                 raise StorageDataError()
             if usage is not None:
-                task["usage"] = usage
+                safe_usage = _public_usage(usage)
+                if safe_usage is None or safe_usage != usage:
+                    raise StorageDataError()
+                task["usage"] = safe_usage
             raw_error = item.get("error")
             if raw_error is not None and not isinstance(raw_error, str):
                 raise StorageDataError()
             error = _clean(raw_error)
             if error:
+                if error not in _PERSISTED_IMAGE_ERRORS:
+                    raise StorageDataError()
                 task["error"] = error
+            error_code = item.get("error_code")
+            if error_code is not None and not isinstance(error_code, str):
+                raise StorageDataError()
+            if error_code not in (None, "", _IMAGE_POLL_TIMEOUT_CODE):
+                if error_code != _IMAGE_RESTART_ERROR_CODE:
+                    raise StorageDataError()
+            if error_code == _IMAGE_RESTART_ERROR_CODE and error != _IMAGE_RESTART_ERROR_MESSAGE:
+                raise StorageDataError()
+            if error_code:
+                task["error_code"] = error_code
             key = _task_key(owner, task_id)
             if key in tasks:
                 raise StorageDataError()
@@ -590,7 +825,8 @@ class ImageTaskService:
         for task in self._tasks.values():
             if task.get("status") in UNFINISHED_STATUSES:
                 task["status"] = TASK_STATUS_ERROR
-                task["error"] = "服务已重启，未完成的图片任务已中断"
+                task["error"] = _IMAGE_RESTART_ERROR_MESSAGE
+                task["error_code"] = _IMAGE_RESTART_ERROR_CODE
                 task["updated_at"] = _now_iso()
                 changed = True
         return changed
@@ -627,7 +863,7 @@ class ImageTaskService:
             if task.get("status") != TASK_STATUS_ERROR:
                 raise ImageTaskResumeConflictError("task is not in error state")
             error_msg = _clean(task.get("error"))
-            if "超时" not in error_msg:
+            if task.get("error_code") != _IMAGE_POLL_TIMEOUT_CODE:
                 raise ImageTaskResumeConflictError("task error is not a timeout error")
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
@@ -640,7 +876,7 @@ class ImageTaskService:
             reservation = reserve_background_task()
             # 将任务状态重置为 running
             try:
-                self._update_task(key, status=TASK_STATUS_RUNNING, error="")
+                self._update_task(key, status=TASK_STATUS_RUNNING, error="", error_code="")
             except Exception:
                 reservation.cancel()
                 raise
@@ -657,7 +893,7 @@ class ImageTaskService:
                 model,
             )
         except Exception:
-            self._transition_task(key, status=TASK_STATUS_ERROR, error=error_msg)
+            self._transition_task(key, status=TASK_STATUS_ERROR, error=error_msg, error_code=_IMAGE_POLL_TIMEOUT_CODE)
             raise
         return _public_task(task)
 
@@ -723,6 +959,7 @@ class ImageTaskService:
                 status=TASK_STATUS_SUCCESS,
                 data=data,
                 error="",
+                error_code="",
                 duration_ms=int((time.time() - started) * 1000),
             )
             self._log_call(
@@ -738,18 +975,34 @@ class ImageTaskService:
             return
         except Exception as exc:
             error_message = public_exception_message(exc, "resume poll failed")
+            persisted_error = _persisted_image_error(error_message)
             duration_ms = int((time.time() - started) * 1000)
             try:
                 self._transition_task(
                     key,
                     resume_credential=access_token if isinstance(exc, ImagePollTimeoutError) else None,
                     status=TASK_STATUS_ERROR,
-                    error=error_message,
+                    error=persisted_error,
+                    error_code=_IMAGE_POLL_TIMEOUT_CODE if isinstance(exc, ImagePollTimeoutError) else "",
                     data=[],
                     duration_ms=duration_ms,
                 )
             except StorageConflictError:
                 return
+            except Exception:
+                with self._lock:
+                    task = self._tasks.get(key)
+                    if task is not None and task.get("status") not in TERMINAL_STATUSES:
+                        task.update({
+                            "status": TASK_STATUS_ERROR,
+                            "error": persisted_error,
+                            "error_code": _IMAGE_POLL_TIMEOUT_CODE if isinstance(exc, ImagePollTimeoutError) else "",
+                            "data": [],
+                            "duration_ms": duration_ms,
+                            "updated_at": _now_iso(),
+                            "updated_ts": time.time(),
+                        })
+                _IMAGE_TASK_LOGGER.error("image task terminal state persistence failed")
             self._log_call(
                 identity,
                 mode,

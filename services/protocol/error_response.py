@@ -117,6 +117,10 @@ class PublicSafeValueError(ValueError, PublicSafeErrorMarker):
         return self._public_safe_message
 
 
+class ImportJobActiveError(PublicSafeValueError):
+    """The connection cannot be mutated while its import job is active."""
+
+
 def project_public_responses_event(event: object, *, model: str) -> object:
     """Project untrusted upstream Responses failures to a fixed public contract."""
     if not isinstance(event, dict):
@@ -180,18 +184,38 @@ def error_message_from_detail(detail: object) -> str:
         for item in detail:
             if not isinstance(item, dict):
                 continue
-            location = ".".join(str(part) for part in item.get("loc", []) if part != "body")
-            message = str(item.get("msg") or "").strip()
+            raw_location = item.get("loc", [])
+            location = ".".join(
+                part if isinstance(part, str) else str(part)
+                for part in (raw_location if isinstance(raw_location, (list, tuple)) else ())
+                if isinstance(part, (str, int)) and part != "body"
+            )
+            raw_message = item.get("msg")
+            message = raw_message.strip() if isinstance(raw_message, str) else ""
             if location and message:
                 messages.append(f"{location}: {message}")
             elif message:
                 messages.append(message)
-        return "; ".join(messages)
+        if messages and all(message == "request validation failed" for message in messages):
+            return "request validation failed"
+        return ""
     if isinstance(detail, dict):
-        message = _message_from_value(detail.get("error")) or _message_from_value(detail)
+        message = _message_from_value(detail.get("error"))
         if message:
             return message
-    return str(detail or "").strip()
+    return detail.strip() if isinstance(detail, str) else ""
+
+
+def _safe_error_type(value: object, fallback: str) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def _safe_error_code(value: object, fallback: str) -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def _safe_error_param(value: object, fallback: object = None) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else fallback if value is None else None
 
 
 def public_exception_message(exc: BaseException, fallback: str) -> str:
@@ -251,9 +275,9 @@ def openai_error_payload(
         return {
             "error": {
                 "message": PUBLIC_SERVER_ERROR_MESSAGE,
-                "type": error_type or _default_error_type(status_code),
-                "param": param,
-                "code": code if code is not None else _default_error_code(status_code),
+                "type": _safe_error_type(error_type, _default_error_type(status_code)),
+                "param": _safe_error_param(param),
+                "code": _safe_error_code(code, _default_error_code(status_code)),
             }
         }
     error_detail = detail.get("error") if isinstance(detail, dict) else None
@@ -261,17 +285,23 @@ def openai_error_payload(
         return {
             "error": {
                 "message": error_message_from_detail(error_detail) or "request failed",
-                "type": str(error_detail.get("type") or error_type or _default_error_type(status_code)),
-                "param": error_detail.get("param", param),
-                "code": error_detail.get("code", code if code is not None else _default_error_code(status_code)),
+                "type": _safe_error_type(
+                    error_detail.get("type") or error_type,
+                    _default_error_type(status_code),
+                ),
+                "param": _safe_error_param(error_detail.get("param", param)),
+                "code": _safe_error_code(
+                    error_detail.get("code") or code,
+                    _default_error_code(status_code),
+                ),
             }
         }
     return {
         "error": {
             "message": error_message_from_detail(detail) or "request failed",
-            "type": error_type or _default_error_type(status_code),
-            "param": param,
-            "code": code if code is not None else _default_error_code(status_code),
+            "type": _safe_error_type(error_type, _default_error_type(status_code)),
+            "param": _safe_error_param(param),
+            "code": _safe_error_code(code, _default_error_code(status_code)),
         }
     }
 

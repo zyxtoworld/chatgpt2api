@@ -10,10 +10,17 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
-from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
+from services.account_service import account_service
+from services.protocol.chat_completion_cache import (
+    cache_key,
+    chat_completion_cache,
+    normalize_text_messages,
+    resolve_access_token_cache_scope,
+)
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
+    PUBLIC_IMAGE_PROGRESS_MESSAGE,
     collect_image_outputs,
     collect_text,
     count_message_image_tokens,
@@ -213,6 +220,11 @@ def validate_chat_core_parameters(body: dict[str, Any]) -> None:
             allowed_fields = CHAT_MESSAGE_FIELDS_BY_ROLE[role]
             if any(value is not None and key not in allowed_fields for key, value in message.items()):
                 raise _chat_codex_error("message field is not supported by the configured backend")
+            if "content" not in message:
+                if role != "assistant" or "tool_calls" not in message:
+                    raise _chat_codex_error("message content is required")
+            elif message.get("content") is None and role != "assistant":
+                raise _chat_codex_error("message content is required")
             _chat_content_parts(
                 message.get("content"),
                 "developer" if role == "system" else role,
@@ -326,6 +338,26 @@ def completion_response(
     }
 
 
+def _fresh_completion_id() -> str:
+    return f"chatcmpl-{uuid.uuid4().hex}"
+
+
+def replay_chat_completion_response(value: dict[str, Any]) -> dict[str, Any]:
+    value["id"] = _fresh_completion_id()
+    value["created"] = int(time.time())
+    return value
+
+
+def replay_chat_completion_stream(value: list[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+    completion_id = _fresh_completion_id()
+    created = int(time.time())
+    for chunk in value:
+        if isinstance(chunk, dict):
+            chunk["id"] = completion_id
+            chunk["created"] = created
+        yield chunk
+
+
 def stream_text_chat_completion(
     backend,
     messages: list[dict[str, Any]],
@@ -381,10 +413,22 @@ def stream_text_chat_completion(
 def collect_chat_content(chunks: Iterable[dict[str, Any]]) -> str:
     parts: list[str] = []
     for chunk in chunks:
+        if not isinstance(chunk, dict):
+            raise RuntimeError("malformed upstream chat chunk")
         choices = chunk.get("choices")
-        first = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
-        delta = first.get("delta") if isinstance(first.get("delta"), dict) else {}
-        content = str(delta.get("content") or "")
+        if choices in (None, []):
+            first = {}
+        elif not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise RuntimeError("malformed upstream chat chunk")
+        else:
+            first = choices[0]
+        raw_delta = first.get("delta")
+        if raw_delta is not None and not isinstance(raw_delta, dict):
+            raise RuntimeError("malformed upstream chat chunk")
+        content_value = raw_delta.get("content") if isinstance(raw_delta, dict) else None
+        if content_value is not None and not isinstance(content_value, str):
+            raise RuntimeError("malformed upstream text delta")
+        content = content_value or ""
         if content:
             parts.append(content)
     return "".join(parts)
@@ -933,7 +977,9 @@ def _stream_chat_response_from_codex(body: dict[str, Any]) -> Iterator[dict[str,
             yield from ensure_role()
             continue
         if event_type == "response.output_item.added":
-            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            item = event.get("item")
+            if not isinstance(item, dict):
+                raise RuntimeError("codex returned a malformed output item")
             if item.get("type") != "function_call":
                 continue
             yield from ensure_role()
@@ -975,7 +1021,9 @@ def _stream_chat_response_from_codex(body: dict[str, Any]) -> Iterator[dict[str,
             )
             continue
         if event_type == "response.output_item.done":
-            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            item = event.get("item")
+            if not isinstance(item, dict):
+                raise RuntimeError("codex returned a malformed output item")
             if item.get("type") == "function_call":
                 item_id, _, _, arguments = _codex_function_call_fields(item)
             else:
@@ -994,16 +1042,17 @@ def _stream_chat_response_from_codex(body: dict[str, Any]) -> Iterator[dict[str,
                     )
             elif item.get("type") == "message":
                 annotations: list[dict[str, Any]] = []
-                for part in item.get("content") or []:
+                raw_content = item.get("content")
+                if not isinstance(raw_content, list):
+                    raise RuntimeError("codex returned malformed message content")
+                for part in raw_content:
                     if not isinstance(part, dict):
-                        continue
+                        raise RuntimeError("codex returned malformed message content")
                     raw_annotations = part.get("annotations")
+                    if raw_annotations is not None and not isinstance(raw_annotations, list):
+                        raise RuntimeError("codex returned malformed text annotations")
                     if isinstance(raw_annotations, list):
-                        annotations.extend(
-                            annotation
-                            for annotation in raw_annotations
-                            if isinstance(annotation, dict)
-                        )
+                        annotations.extend(annotation for annotation in raw_annotations if isinstance(annotation, dict))
                 chat_annotations = chat_completion_annotations(annotations)
                 if chat_annotations:
                     yield from ensure_role()
@@ -1080,13 +1129,26 @@ def chat_completion_annotations(annotations: list[dict[str, Any]]) -> list[dict[
     for item in annotations:
         if item.get("type") != "url_citation":
             continue
+        url = item.get("url", "")
+        title = item.get("title", "")
+        start_index = item.get("start_index", 0)
+        end_index = item.get("end_index", 0)
+        if (
+            not isinstance(url, str)
+            or not isinstance(title, str)
+            or type(start_index) is not int
+            or start_index < 0
+            or type(end_index) is not int
+            or end_index < 0
+        ):
+            raise RuntimeError("codex returned a malformed citation")
         output.append({
             "type": "url_citation",
             "url_citation": {
-                "start_index": item.get("start_index", 0),
-                "end_index": item.get("end_index", 0),
-                "url": item.get("url", ""),
-                "title": item.get("title", ""),
+                "start_index": start_index,
+                "end_index": end_index,
+                "url": url,
+                "title": title,
             },
         })
     return output
@@ -1186,17 +1248,21 @@ def stream_image_chat_completion(
     created = int(time.time())
     sent_role = False
     sent_text = ""
+    progress_sent = False
     result_items: list[dict[str, Any]] = []
     for output in image_outputs:
         content = ""
         if output.kind == "progress":
-            content = output.text
-            sent_text += content
+            if progress_sent:
+                continue
+            content = PUBLIC_IMAGE_PROGRESS_MESSAGE
+            progress_sent = True
         elif output.kind == "result":
             content = build_chat_image_markdown_content({"data": output.data})
             result_items.extend(item for item in output.data if isinstance(item, dict))
         elif output.kind == "message":
-            content = output.text[len(sent_text):] if output.text.startswith(sent_text) else output.text
+            message = output.public_message()
+            content = message[len(sent_text):] if message.startswith(sent_text) else message
         if not content:
             continue
         if not sent_role:
@@ -1237,7 +1303,7 @@ def stream_image_chat_completion(
         yield completion_usage_chunk(model, chat_usage_from_image_usage(usage), completion_id, created)
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+def handle(body: dict[str, Any], *, cache_scope: str = "") -> dict[str, Any] | Iterator[dict[str, Any]]:
     validate_chat_core_parameters(body)
     openai_v1_response.validate_tool_container(body)
     if uses_chat_native_codex(body):
@@ -1257,16 +1323,20 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model, include_usage=include_usage)
         thinking_effort = thinking_effort_from_body(body)
-        key = cache_key(body, messages, stream=True)
+        selected_token = account_service.get_text_access_token(model=model) if cache_scope else None
+        effective_scope = resolve_access_token_cache_scope(cache_scope, selected_token or "")
+        compute = lambda: stream_text_chat_completion(
+            text_backend(model, access_token=selected_token) if selected_token is not None else text_backend(model),
+            messages,
+            model,
+            thinking_effort,
+            include_usage,
+        )
+        key = cache_key(body, messages, stream=True, cache_scope=effective_scope)
         return chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_chat_completion(
-                text_backend(model),
-                messages,
-                model,
-                thinking_effort,
-                include_usage,
-            ),
+            compute,
+            replay=replay_chat_completion_stream,
         )
     if image_request:
         return image_chat_response(body)
@@ -1274,12 +1344,21 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
     thinking_effort = thinking_effort_from_body(body)
-    key = cache_key(body, messages, stream=False)
+    selected_token = account_service.get_text_access_token(model=model) if cache_scope else None
+    effective_scope = resolve_access_token_cache_scope(cache_scope, selected_token or "")
+    compute = lambda: completion_response(
+        model,
+        collect_text(
+            text_backend(model, access_token=selected_token)
+            if selected_token is not None
+            else text_backend(model),
+            ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort),
+        ),
+        messages=messages,
+    )
+    key = cache_key(body, messages, stream=False, cache_scope=effective_scope)
     return chat_completion_cache.get_or_compute_response(
         key,
-        lambda: completion_response(
-            model,
-            collect_text(text_backend(model), ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)),
-            messages=messages,
-        ),
+        compute,
+        replay=replay_chat_completion_response,
     )

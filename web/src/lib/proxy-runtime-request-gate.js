@@ -8,6 +8,11 @@ export async function runCurrentProxyFollowup(saveConfig, accepts, followup) {
   return { started: true, value: await followup() };
 }
 
+export async function runProxyRuntimeSave(invalidate, saveConfig) {
+  invalidate();
+  return saveConfig();
+}
+
 export function createProxyRuntimeRequestGate() {
   const proxy = createLatestActionOwner();
   const clearance = createLatestActionOwner();

@@ -13,6 +13,10 @@ const backupSettingsSource = readFileSync(
   new URL("../src/app/settings/components/backup-settings-card.tsx", import.meta.url),
   "utf8",
 );
+const backupDownloadLifecycleSource = readFileSync(
+  new URL("../src/lib/backup-download-lifecycle.js", import.meta.url),
+  "utf8",
+);
 
 test("proxy-generated 5xx text never reaches the page", () => {
   const proxyText = "The origin web server did not return a complete response within the 120-second Proxy Read Timeout window.";
@@ -49,7 +53,7 @@ test("backup download errors use the same public projection contract", () => {
   assert.ok(helperImport, "backup download bypasses the shared request error projection");
   assert.match(helperImport[1], /\brequestErrorMessage\b/);
   assert.match(
-    backupSettingsSource,
+    backupDownloadLifecycleSource,
     /requestErrorMessage\(\{\s*status:\s*response\.status,\s*payload:\s*data\s*\}\)/,
   );
   assert.doesNotMatch(

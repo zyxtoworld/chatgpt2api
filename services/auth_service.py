@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import secrets
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Literal
@@ -19,6 +20,7 @@ from services.storage.base import (
 )
 
 AuthRole = Literal["admin", "user"]
+_MAX_AUTH_KEY_NAME_LENGTH = 256
 
 
 def _now_iso() -> str:
@@ -84,7 +86,13 @@ class AuthService:
             return None
         item_id = raw_id.strip()
 
-        name = self._clean(raw.get("name")) or self._default_name(role)
+        if "name" in raw:
+            raw_name = raw.get("name")
+            if not isinstance(raw_name, str) or len(raw_name) > _MAX_AUTH_KEY_NAME_LENGTH:
+                return None
+            name = raw_name.strip() or self._default_name(role)
+        else:
+            name = self._default_name(role)
 
         if "created_at" in raw:
             raw_created_at = raw.get("created_at")
@@ -120,7 +128,7 @@ class AuthService:
             "last_used_at": last_used_at,
         }
 
-    def _load(self) -> list[dict[str, object]]:
+    def _load(self, *, migrate_legacy: bool = False) -> list[dict[str, object]]:
         load_snapshot = getattr(self.storage, "load_auth_keys_snapshot", None)
         if callable(load_snapshot):
             snapshot = load_snapshot()
@@ -135,10 +143,13 @@ class AuthService:
         normalized_items: list[dict[str, object]] = []
         seen_ids: set[str] = set()
         seen_key_hashes: set[str] = set()
+        needs_created_at_migration = False
         for item in items:
             normalized = self._normalize_item(item)
             if normalized is None:
                 raise StorageDataError()
+            if "created_at" not in item:
+                needs_created_at_migration = True
             item_id = self._clean(normalized.get("id"))
             key_hash = self._clean(normalized.get("key_hash"))
             if (
@@ -152,6 +163,18 @@ class AuthService:
                 seen_key_hashes.add(key_hash)
             normalized_items.append(normalized)
         self._auth_keys_snapshot = snapshot
+        if migrate_legacy and needs_created_at_migration:
+            save_if_revision = getattr(self.storage, "save_auth_keys_if_revision", None)
+            if callable(save_if_revision):
+                saved_snapshot = save_if_revision(snapshot, normalized_items)
+                self._auth_keys_snapshot = (
+                    saved_snapshot
+                    if isinstance(saved_snapshot, StorageSnapshot)
+                    else make_storage_snapshot(normalized_items)
+                )
+            else:
+                self.storage.save_auth_keys(normalized_items)
+                self._auth_keys_snapshot = make_storage_snapshot(normalized_items)
         return normalized_items
 
     def _save(self) -> None:
@@ -171,8 +194,43 @@ class AuthService:
             self.storage.save_auth_keys(auth_keys)
             self._auth_keys_snapshot = make_storage_snapshot(auth_keys)
 
-    def _reload_locked(self) -> None:
-        self._items = self._load()
+    def _reload_locked(self, *, migrate_legacy: bool = False) -> None:
+        self._items = self._load(migrate_legacy=migrate_legacy)
+
+    def _reload_current_authentication_locked(
+        self,
+        candidate_hash: str,
+        *,
+        attempted_last_used_at: str | None = None,
+    ) -> dict[str, object] | None:
+        """Reconfirm a key against the authoritative snapshot after a failed write."""
+        self._auth_reload_invalidated = True
+        try:
+            self._reload_locked()
+        except Exception:
+            return None
+        for current_item in self._items:
+            if (
+                bool(current_item.get("enabled", True))
+                and hmac.compare_digest(
+                    self._clean(current_item.get("key_hash")),
+                    candidate_hash,
+                )
+            ):
+                public_item = self._public_item(current_item)
+                if attempted_last_used_at:
+                    public_item["last_used_at"] = attempted_last_used_at
+                return public_item
+        return None
+
+    def _capture_mutation_state_locked(self) -> tuple[list[dict[str, object]], StorageSnapshot]:
+        return deepcopy(self._items), self._auth_keys_snapshot
+
+    def _restore_mutation_state_locked(
+        self,
+        state: tuple[list[dict[str, object]], StorageSnapshot],
+    ) -> None:
+        self._items, self._auth_keys_snapshot = state
 
     @staticmethod
     def _public_item(item: dict[str, object]) -> dict[str, object]:
@@ -187,7 +245,7 @@ class AuthService:
 
     def list_keys(self, role: AuthRole | None = None) -> list[dict[str, object]]:
         with self._lock:
-            self._reload_locked()
+            self._reload_locked(migrate_legacy=True)
             items = [item for item in self._items if role is None or item.get("role") == role]
             return [self._public_item(item) for item in items]
 
@@ -242,6 +300,8 @@ class AuthService:
         candidate = self._clean(name)
         if not candidate:
             return self._build_default_name_locked(role, exclude_id=exclude_id)
+        if len(candidate) > _MAX_AUTH_KEY_NAME_LENGTH:
+            raise PublicSafeValueError("密钥名称长度不能超过 256 个字符")
         if self._has_name_locked(candidate, role=role, exclude_id=exclude_id):
             raise PublicSafeValueError("这个名称已经在使用中了，换一个更容易区分的名称吧")
         return candidate
@@ -266,8 +326,13 @@ class AuthService:
                 "created_at": _now_iso(),
                 "last_used_at": None,
             }
+            mutation_state = self._capture_mutation_state_locked()
             self._items.append(item)
-            self._save()
+            try:
+                self._save()
+            except BaseException:
+                self._restore_mutation_state_locked(mutation_state)
+                raise
             return self._public_item(item), raw_key
 
     def update_key(
@@ -299,8 +364,13 @@ class AuthService:
                     next_item["enabled"] = bool(updates.get("enabled"))
                 if "key" in updates and updates.get("key") is not None:
                     next_item["key_hash"] = self._build_key_hash_locked(str(updates.get("key") or ""), exclude_id=normalized_id)
+                mutation_state = self._capture_mutation_state_locked()
                 self._items[index] = next_item
-                self._save()
+                try:
+                    self._save()
+                except BaseException:
+                    self._restore_mutation_state_locked(mutation_state)
+                    raise
                 return self._public_item(next_item)
         return None
 
@@ -311,6 +381,7 @@ class AuthService:
         with self._lock:
             self._reload_locked()
             before = len(self._items)
+            mutation_state = self._capture_mutation_state_locked()
             self._items = [
                 item
                 for item in self._items
@@ -318,7 +389,11 @@ class AuthService:
             ]
             if len(self._items) == before:
                 return False
-            self._save()
+            try:
+                self._save()
+            except BaseException:
+                self._restore_mutation_state_locked(mutation_state)
+                raise
             return True
 
     def authenticate(self, raw_key: str) -> dict[str, object] | None:
@@ -345,6 +420,7 @@ class AuthService:
                 stored_hash = self._clean(item.get("key_hash"))
                 if not stored_hash or not hmac.compare_digest(stored_hash, candidate_hash):
                     continue
+                previous_item = item
                 next_item = dict(item)
                 now = datetime.now(timezone.utc)
                 next_item["last_used_at"] = now.isoformat()
@@ -359,9 +435,21 @@ class AuthService:
                         self._auth_reload_invalidated = True
                         raise
                     except StorageConflictError:
-                        pass
+                        # The audit timestamp is best effort, but a CAS
+                        # conflict means the candidate may have been revoked
+                        # while this request was writing it.  Re-read the
+                        # authoritative snapshot before returning identity.
+                        return self._reload_current_authentication_locked(candidate_hash)
                     except Exception:
-                        pass
+                        # A generic persistence failure is also an uncertain
+                        # generation boundary: another instance may have
+                        # revoked or replaced this key.  Re-read before
+                        # authorizing; never return the memory-only candidate.
+                        self._items[index] = previous_item
+                        return self._reload_current_authentication_locked(
+                            candidate_hash,
+                            attempted_last_used_at=str(next_item.get("last_used_at") or "") or None,
+                        )
                 return self._public_item(next_item)
         return None
 

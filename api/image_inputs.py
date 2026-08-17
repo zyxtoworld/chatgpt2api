@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import re
 import threading
@@ -24,14 +22,18 @@ from services.protocol.image_options import (
     normalize_supported_image_moderation,
     normalize_supported_partial_images,
 )
+from utils.image_tokens import _decode_bounded_base64
 
 ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
 MAX_IMAGE_EDIT_INPUTS = 16
+_MAX_IMAGE_REFERENCE_DEPTH = 32
+_UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 _REMOTE_IMAGE_THREAD_CAPACITY = 4
 _REMOTE_IMAGE_THREAD_STATE = threading.local()
+_UPLOAD_CLOSED_MARKER = "_chatgpt2api_image_input_closed"
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 IMAGE_EDIT_OPTION_FIELDS = {
@@ -68,6 +70,7 @@ _IMAGE_EDIT_JSON_STRING_FIELDS = {
     "user",
 }
 _IMAGE_EDIT_JSON_INTEGER_FIELDS = {"n", "output_compression", "partial_images"}
+_MAX_OPTIONAL_INTEGER_TEXT_LENGTH = 10
 
 
 def _clean(value: object, default: str = "") -> str:
@@ -113,8 +116,13 @@ def _parse_optional_int(value: object, field: str) -> int | None:
         return None
     if type(value) is int:
         return value
-    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
-        return int(value.strip())
+    if isinstance(value, str):
+        text = value.strip()
+        if len(text) <= _MAX_OPTIONAL_INTEGER_TEXT_LENGTH and re.fullmatch(r"[+-]?\d+", text):
+            try:
+                return int(text)
+            except (TypeError, ValueError, OverflowError):
+                pass
     raise HTTPException(status_code=400, detail={"error": f"{field} must be an integer"})
 
 
@@ -207,9 +215,11 @@ def _json_reference_value(value: object) -> object:
 
 def _decode_base64_image(value: object, filename: str, mime_type: str) -> ImageInput:
     try:
-        data = base64.b64decode(str(value).strip(), validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
+        data = _decode_bounded_base64(value, max_bytes=MAX_IMAGE_REFERENCE_BYTES)
+    except (TypeError, ValueError):
+        data = None
+    if data is None:
+        raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"})
     if not data:
         raise HTTPException(status_code=400, detail={"error": "image file is empty"})
     if len(data) > MAX_IMAGE_REFERENCE_BYTES:
@@ -217,7 +227,13 @@ def _decode_base64_image(value: object, filename: str, mime_type: str) -> ImageI
     return _validated_image_input(data, filename, mime_type)
 
 
-def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
+def _source_from_object(
+    value: dict[str, Any],
+    *,
+    max_sources: int,
+    depth: int,
+    limit_error: str,
+) -> list[ImageSource]:
     """提取图片引用对象：支持 image_url 或 url，明确拒绝 file_id。"""
     has_url = "image_url" in value or "url" in value
     if value.get("file_id"):
@@ -235,30 +251,62 @@ def _source_from_object(value: dict[str, Any]) -> list[ImageSource]:
     image_url = value.get("image_url", value.get("url"))
     if isinstance(image_url, dict):
         image_url = image_url.get("url")
-    return _sources_from_value(image_url)
+    return _sources_from_value(
+        image_url,
+        max_sources=max_sources,
+        depth=depth + 1,
+        limit_error=limit_error,
+    )
 
 
-def _sources_from_value(value: object) -> list[ImageSource]:
+def _sources_from_value(
+    value: object,
+    *,
+    max_sources: int = MAX_IMAGE_EDIT_INPUTS,
+    depth: int = 0,
+    limit_error: str = "images must contain at most 16 items",
+) -> list[ImageSource]:
     """展开图片引用：把字符串、数组和对象统一成图片来源列表。"""
+    if depth > _MAX_IMAGE_REFERENCE_DEPTH:
+        raise HTTPException(status_code=400, detail={"error": "image references are too deeply nested"})
     value = _json_reference_value(value)
+    if value is None:
+        return []
     if _is_upload(value):
+        if max_sources < 1:
+            raise HTTPException(status_code=400, detail={"error": limit_error})
         return [value]
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return []
+        if max_sources < 1:
+            raise HTTPException(status_code=400, detail={"error": limit_error})
         if text.lower().startswith(("data:", "http://", "https://")):
             return [text]
         return [_decode_base64_image(text, "image.png", "image/png")]
     if isinstance(value, list):
+        if len(value) > max_sources:
+            raise HTTPException(status_code=400, detail={"error": limit_error})
         sources: list[ImageSource] = []
         for item in value:
-            sources.extend(_sources_from_value(item))
+            child_sources = _sources_from_value(
+                item,
+                max_sources=max_sources - len(sources),
+                depth=depth + 1,
+                limit_error=limit_error,
+            )
+            sources.extend(child_sources)
         return sources
     if isinstance(value, dict):
-        return _source_from_object(value)
-    if value is None:
-        return []
+        if max_sources < 1:
+            raise HTTPException(status_code=400, detail={"error": limit_error})
+        return _source_from_object(
+            value,
+            max_sources=max_sources,
+            depth=depth,
+            limit_error=limit_error,
+        )
     raise HTTPException(status_code=400, detail={"error": "invalid image reference"})
 
 
@@ -267,7 +315,10 @@ def _json_image_sources(body: dict[str, Any]) -> list[ImageSource]:
     sources: list[ImageSource] = []
     for key in ("images", "image", "image_url"):
         if key in body:
-            sources.extend(_sources_from_value(body.get(key)))
+            sources.extend(_sources_from_value(
+                body.get(key),
+                max_sources=MAX_IMAGE_EDIT_INPUTS - len(sources),
+            ))
     return sources
 
 
@@ -275,7 +326,11 @@ def _json_mask_sources(body: dict[str, Any]) -> list[ImageSource]:
     """读取 JSON mask 引用。"""
     mask = body.get("mask")
     if mask is not None:
-        return _sources_from_value(mask)
+        return _sources_from_value(
+            mask,
+            max_sources=1,
+            limit_error="mask must contain at most one image",
+        )
     return []
 
 
@@ -284,6 +339,32 @@ def _validate_edit_reference_counts(images: list[ImageSource], masks: list[Image
         raise HTTPException(status_code=400, detail={"error": "images must contain at most 16 items"})
     if len(masks) > 1:
         raise HTTPException(status_code=400, detail={"error": "mask must contain at most one image"})
+
+
+async def _close_form_uploads(form: Any) -> None:
+    seen: set[int] = set()
+    for _key, value in form.multi_items():
+        if not _is_upload(value) or id(value) in seen:
+            continue
+        seen.add(id(value))
+        await _close_upload(value)
+
+
+async def _close_upload(source: UploadFile) -> None:
+    if getattr(source, _UPLOAD_CLOSED_MARKER, False):
+        return
+    try:
+        await source.close()
+    except Exception:
+        pass
+    else:
+        setattr(source, _UPLOAD_CLOSED_MARKER, True)
+
+
+async def close_image_sources(sources: list[ImageSource]) -> None:
+    for source in sources:
+        if _is_upload(source):
+            await _close_upload(source)
 
 
 async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], list[ImageSource], list[ImageSource]]:
@@ -308,22 +389,35 @@ async def parse_image_edit_request(request: Request) -> tuple[dict[str, Any], li
         return _payload_from_fields(body), images, masks
 
     form = await request.form()
-    if any(key not in IMAGE_EDIT_REQUEST_FIELDS for key, _value in form.multi_items()):
-        raise HTTPException(status_code=400, detail={"error": "parameter is not supported by the image edit endpoint"})
-    fields: dict[str, Any] = {}
-    for key in IMAGE_EDIT_OPTION_FIELDS:
-        value = form.get(key)
-        if isinstance(value, str):
-            fields[key] = value
-    sources: list[ImageSource] = []
-    mask_sources: list[ImageSource] = []
-    for key, value in form.multi_items():
-        if key in IMAGE_REFERENCE_FIELDS:
-            sources.extend(_sources_from_value(value))
-        elif key in MASK_REFERENCE_FIELDS:
-            mask_sources.extend(_sources_from_value(value))
-    _validate_edit_reference_counts(sources, mask_sources)
-    return _payload_from_fields(fields), sources, mask_sources
+    keep_uploads_open = False
+    try:
+        if any(key not in IMAGE_EDIT_REQUEST_FIELDS for key, _value in form.multi_items()):
+            raise HTTPException(status_code=400, detail={"error": "parameter is not supported by the image edit endpoint"})
+        fields: dict[str, Any] = {}
+        for key in IMAGE_EDIT_OPTION_FIELDS:
+            value = form.get(key)
+            if isinstance(value, str):
+                fields[key] = value
+        sources: list[ImageSource] = []
+        mask_sources: list[ImageSource] = []
+        for key, value in form.multi_items():
+            if key in IMAGE_REFERENCE_FIELDS:
+                sources.extend(_sources_from_value(
+                    value,
+                    max_sources=MAX_IMAGE_EDIT_INPUTS - len(sources),
+                ))
+            elif key in MASK_REFERENCE_FIELDS:
+                mask_sources.extend(_sources_from_value(
+                    value,
+                    max_sources=1 - len(mask_sources),
+                    limit_error="mask must contain at most one image",
+                ))
+        _validate_edit_reference_counts(sources, mask_sources)
+        keep_uploads_open = True
+        return _payload_from_fields(fields), sources, mask_sources
+    finally:
+        if not keep_uploads_open:
+            await _close_form_uploads(form)
 
 
 def _extension_from_mime(mime_type: str) -> str:
@@ -334,6 +428,35 @@ def _extension_from_mime(mime_type: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", subtype.lower()) or "png"
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _estimate_percent_decoded_size(payload: str, max_bytes: int) -> int:
+    """在 unquote_to_bytes 前精确估算 data URL 的 UTF-8 字节数。"""
+    size = 0
+    index = 0
+    while index < len(payload):
+        char = payload[index]
+        if char == "%":
+            if (
+                index + 2 >= len(payload)
+                or payload[index + 1] not in _HEX_DIGITS
+                or payload[index + 2] not in _HEX_DIGITS
+            ):
+                raise ValueError("invalid percent escape")
+            size += 1
+            index += 3
+        else:
+            try:
+                size += len(char.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ValueError("invalid data URL text") from exc
+            index += 1
+        if size > max_bytes:
+            return size
+    return size
+
+
 def _decode_data_url(url: str) -> ImageInput:
     """解码 data URL：把内联图片转成标准图片输入元组。"""
     header, separator, payload = url.partition(",")
@@ -342,10 +465,25 @@ def _decode_data_url(url: str) -> ImageInput:
     mime_type = header.split(";", 1)[0].removeprefix("data:") or "image/png"
     if not mime_type.startswith("image/"):
         raise HTTPException(status_code=400, detail={"error": "image_url must point to an image"})
-    try:
-        data = base64.b64decode(payload, validate=True) if ";base64" in header else unquote_to_bytes(payload)
-    except (binascii.Error, ValueError) as exc:
-        raise HTTPException(status_code=400, detail={"error": "invalid data image URL"}) from exc
+    if ";base64" in header:
+        try:
+            data = _decode_bounded_base64(payload, max_bytes=MAX_IMAGE_REFERENCE_BYTES)
+        except (TypeError, ValueError):
+            data = None
+    else:
+        try:
+            estimated_size = _estimate_percent_decoded_size(payload, MAX_IMAGE_REFERENCE_BYTES)
+        except ValueError:
+            data = None
+        else:
+            if estimated_size > MAX_IMAGE_REFERENCE_BYTES:
+                raise HTTPException(status_code=400, detail={"error": "image URL exceeds 50MB limit"})
+            try:
+                data = unquote_to_bytes(payload)
+            except (TypeError, ValueError, UnicodeError):
+                data = None
+    if data is None:
+        raise HTTPException(status_code=400, detail={"error": "invalid data image URL"})
     if not data:
         raise HTTPException(status_code=400, detail={"error": "image URL is empty"})
     if len(data) > MAX_IMAGE_REFERENCE_BYTES:
@@ -385,6 +523,25 @@ async def _run_remote_image_io(url: str) -> ImageInput:
     )
 
 
+async def _read_upload_image_bounded(source: UploadFile) -> bytes:
+    """Read an upload without materializing bytes beyond the image budget."""
+    payload = bytearray()
+    while len(payload) <= MAX_IMAGE_REFERENCE_BYTES:
+        remaining = MAX_IMAGE_REFERENCE_BYTES + 1 - len(payload)
+        chunk = await source.read(min(_UPLOAD_READ_CHUNK_BYTES, remaining))
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise HTTPException(status_code=400, detail={"error": "image data is invalid"})
+        part = bytes(chunk)
+        if len(part) > remaining:
+            raise HTTPException(status_code=400, detail={"error": "image file exceeds 50MB limit"})
+        if not part:
+            break
+        payload.extend(part)
+        if len(payload) > MAX_IMAGE_REFERENCE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image file exceeds 50MB limit"})
+    return bytes(payload)
+
+
 async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
     """读取图片来源：上传文件或 data URL 解码后统一返回图片元组。"""
     images: list[ImageInput] = []
@@ -394,9 +551,9 @@ async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:
             continue
         if _is_upload(source):
             try:
-                image_data = await source.read()
+                image_data = await _read_upload_image_bounded(source)
             finally:
-                await source.close()
+                await _close_upload(source)
             if not image_data:
                 raise HTTPException(status_code=400, detail={"error": "image file is empty"})
             if len(image_data) > MAX_IMAGE_REFERENCE_BYTES:

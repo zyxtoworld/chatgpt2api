@@ -10,7 +10,7 @@ import time
 
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -23,9 +23,14 @@ from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
+from services.image_payload import ImagePayloadError, inspect_image_payload, validate_image_payload
+from services.model_contract import parse_model_text
 from services.protocol.error_response import PublicSafeErrorMarker, exception_log_message
 from services.proxy_service import proxy_settings
-from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
+from services.remote_response import close_response, parse_json_response, read_bounded_text
+from services.secure_file import atomic_write_stream
+from utils.helper import UpstreamHTTPError, iter_sse_payloads, new_uuid, split_image_model
+from utils.bounded_base64 import decode_bounded_base64
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
 from utils.turnstile import solve_turnstile_token
@@ -87,6 +92,66 @@ class SearchTimeoutError(RuntimeError):
     pass
 
 
+def _solve_turnstile_challenge(info: object, source_p: str) -> str:
+    if info is None:
+        return ""
+    if not isinstance(info, dict):
+        raise RuntimeError("turnstile challenge is invalid")
+    if info.get("required") is not True:
+        return ""
+    dx = info.get("dx")
+    if not isinstance(dx, str) or not dx or len(dx) > MAX_TURNSTILE_DX_CHARS:
+        raise RuntimeError("turnstile challenge is invalid")
+    token = solve_turnstile_token(dx, source_p)
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("turnstile challenge is invalid")
+    return token
+
+
+def _build_proof_of_work_token(
+    info: object,
+    user_agent: str,
+    *,
+    script_sources: list[str] | None = None,
+    data_build: str = "",
+) -> str:
+    if info is None:
+        return ""
+    if not isinstance(info, dict):
+        raise RuntimeError("chat requirements proof-of-work is invalid")
+    required = info.get("required")
+    if required is not True:
+        return ""
+    seed = info.get("seed", "")
+    difficulty = info.get("difficulty", "")
+    if (
+        not isinstance(seed, str)
+        or not seed
+        or len(seed) > 256
+        or not isinstance(difficulty, str)
+        or not difficulty
+        or len(difficulty) > 256
+        or len(difficulty) % 2
+        or re.fullmatch(r"[0-9a-fA-F]+", difficulty) is None
+    ):
+        raise RuntimeError("chat requirements proof-of-work is invalid")
+    return build_proof_token(
+        seed,
+        difficulty,
+        user_agent,
+        script_sources=script_sources,
+        data_build=data_build,
+    )
+
+
+def _arkose_required(info: object) -> bool:
+    if info is None:
+        return False
+    if not isinstance(info, dict):
+        raise RuntimeError("chat requirements arkose is invalid")
+    return info.get("required") is True
+
+
 @dataclass
 class ChatRequirements:
     """保存一次对话请求所需的 sentinel token。"""
@@ -108,6 +173,13 @@ _ACCOUNT_INFO_EXECUTOR = ThreadPoolExecutor(
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 CODEX_RESPONSE_MAX_EVENT_BYTES = 64 * 1024 * 1024
+CODEX_RESPONSE_MAX_BODY_BYTES = 128 * 1024 * 1024
+CODEX_HTTP_ERROR_MAX_BODY_BYTES = 1 * 1024 * 1024
+_MAX_MODEL_CREATED_DIGITS = 19
+_MAX_MODEL_CREATED = (1 << 63) - 1
+_MAX_BACKEND_JSON_BYTES = 16 * 1024 * 1024
+_MAX_BOOTSTRAP_TEXT_BYTES = 4 * 1024 * 1024
+MAX_TURNSTILE_DX_CHARS = 2 * 1024 * 1024
 SEARCH_MODEL = "gpt-5-5"
 # Keep the complete search workflow below the reverse-proxy read timeout. The
 # value is a wall-clock budget shared by prepare, bootstrap, streaming, and
@@ -116,8 +188,13 @@ SEARCH_TIMEOUT_SECS = 90.0
 SEARCH_POLL_INTERVAL_SECS = 3.0
 SEARCH_DONE_STATUS = {"finished_successfully", "finished_partial_completion"}
 SEARCH_CONVERSATION_ID_RE = re.compile(r'"conversation_id"\s*:\s*"([^"]+)"')
+_SAFE_CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 SEARCH_URL_RE = re.compile(r"https?://[^\s\"'<>）)\]}]+")
 EDITABLE_FILE_MODEL = "gpt-5-5-thinking"
+_MAX_CHAT_IMAGE_BYTES = 50 * 1024 * 1024
+_MAX_EDITABLE_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_EDITABLE_ARTIFACT_BYTES = 100 * 1024 * 1024
+_MAX_UPSTREAM_IMAGE_BYTES = 50 * 1024 * 1024
 EDITABLE_FILE_THINKING_EFFORT = "extended"
 EDITABLE_FILE_TIMEOUT_SECS = 1200.0
 EDITABLE_FILE_POLL_INTERVAL_SECS = 5.0
@@ -173,6 +250,68 @@ def _is_content_policy_error(error_msg: str) -> bool:
     return any(keyword in msg_lower for keyword in _CONTENT_POLICY_KEYWORDS)
 
 
+def _parse_model_created(value: object) -> int:
+    """Convert an upstream model timestamp without letting malformed data fail the catalog."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value if 0 <= value <= _MAX_MODEL_CREATED else 0
+    if not isinstance(value, str):
+        return 0
+    text = value.strip()
+    if (
+        not text
+        or len(text) > _MAX_MODEL_CREATED_DIGITS
+        or not text.isascii()
+        or not text.isdecimal()
+    ):
+        return 0
+    try:
+        parsed = int(text)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return parsed if parsed <= _MAX_MODEL_CREATED else 0
+
+
+def _safe_upstream_text(value: object, *, max_length: int = 256) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if text and len(text) <= max_length else None
+
+
+def _safe_codex_log_timeout(value: object) -> int | float | None:
+    if type(value) not in (int, float):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value if value >= 0 else None
+
+
+def _safe_codex_log_status(value: object) -> int | None:
+    return value if type(value) is int and 100 <= value <= 599 else None
+
+
+def _safe_conversation_id(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip()
+    return candidate if _SAFE_CONVERSATION_ID.fullmatch(candidate) else ""
+
+
+def _safe_conversation_timestamp(value: object) -> float:
+    if type(value) in (int, float):
+        candidate = float(value)
+    elif isinstance(value, str):
+        try:
+            candidate = float(value.strip())
+        except (TypeError, ValueError):
+            return 0.0
+    else:
+        return 0.0
+    return candidate if math.isfinite(candidate) else 0.0
+
+
 @dataclass
 class EditableFileArtifact:
     attachment_id: str = ""
@@ -223,6 +362,10 @@ class OpenAIBackendAPI:
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
+        self._account_info_state_lock = threading.Lock()
+        self._account_info_pending = 0
+        self._account_info_close_requested = False
+        self._account_info_session_closed = False
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
             impersonate=self.fp["impersonate"],
@@ -257,16 +400,75 @@ class OpenAIBackendAPI:
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
 
-    def close(self) -> None:
-        if getattr(self, "_closed", False):
-            return
-        self._closed = True
-        session = getattr(self, "session", None)
+    def _account_info_lock(self) -> threading.Lock:
+        lock = getattr(self, "_account_info_state_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._account_info_state_lock = lock
+        return lock
+
+    def _close_account_info_session_if_ready(self) -> None:
+        session = None
+        with self._account_info_lock():
+            if (
+                not getattr(self, "_account_info_close_requested", False)
+                or getattr(self, "_account_info_pending", 0) > 0
+                or getattr(self, "_account_info_session_closed", False)
+            ):
+                return
+            self._account_info_session_closed = True
+            session = getattr(self, "session", None)
         if session:
             try:
                 session.close()
             except Exception:
-                pass
+                with self._account_info_lock():
+                    self._account_info_session_closed = False
+
+    def _account_info_future_done(self, _future: Any) -> None:
+        with self._account_info_lock():
+            self._account_info_pending = max(0, getattr(self, "_account_info_pending", 0) - 1)
+        self._close_account_info_session_if_ready()
+
+    def _submit_account_info_future(self, function: Callable[..., Any], deadline: float | None) -> Any:
+        kwargs = {} if deadline is None else {"deadline": deadline}
+        # Register ownership before submit: an external close() can race with
+        # submit() returning, and must not close the shared session while the
+        # just-submitted request is still being admitted.
+        submit_error: BaseException | None = None
+        with self._account_info_lock():
+            if (
+                getattr(self, "_account_info_close_requested", False)
+                or getattr(self, "_account_info_session_closed", False)
+            ):
+                raise RuntimeError("backend session is closed")
+            self._account_info_pending = getattr(self, "_account_info_pending", 0) + 1
+        try:
+            future = _ACCOUNT_INFO_EXECUTOR.submit(function, **kwargs)
+        except BaseException as exc:
+            with self._account_info_lock():
+                self._account_info_pending = max(0, self._account_info_pending - 1)
+            submit_error = exc
+        if submit_error is not None:
+            self._close_account_info_session_if_ready()
+            raise submit_error
+        add_done_callback = getattr(future, "add_done_callback", None)
+        if callable(add_done_callback):
+            try:
+                add_done_callback(self._account_info_future_done)
+            except BaseException:
+                self._account_info_future_done(future)
+                raise
+        return future
+
+    def close(self) -> None:
+        if getattr(self, "_closed", False):
+            self._close_account_info_session_if_ready()
+            return
+        self._closed = True
+        with self._account_info_lock():
+            self._account_info_close_requested = True
+        self._close_account_info_session_if_ready()
 
     def __del__(self):
         self.close()
@@ -281,8 +483,8 @@ class OpenAIBackendAPI:
     def _build_fp(self) -> Dict[str, str]:
         account = self.account
         raw_fp = account.get("fp")
-        fp = {str(k).lower(): str(v) for k, v in raw_fp.items()} if isinstance(raw_fp, dict) else {}
-        for key in (
+        fp: Dict[str, str] = {}
+        fp_keys = (
                 "user-agent",
                 "impersonate",
                 "oai-device-id",
@@ -290,8 +492,17 @@ class OpenAIBackendAPI:
                 "sec-ch-ua",
                 "sec-ch-ua-mobile",
                 "sec-ch-ua-platform",
-        ):
-            value = str(account.get(key) or "").strip()
+        )
+        if isinstance(raw_fp, dict):
+            for key in fp_keys:
+                value = raw_fp.get(key)
+                if isinstance(value, str) and value.strip():
+                    fp[key] = value.strip()
+        for key in fp_keys:
+            value = account.get(key)
+            if not isinstance(value, str):
+                continue
+            value = value.strip()
             if value:
                 fp[key] = value
         fp.setdefault(
@@ -317,10 +528,40 @@ class OpenAIBackendAPI:
         return headers
 
     @staticmethod
+    def _sanitize_limits_progress(value: object) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        sanitized: list[dict[str, Any]] = []
+        for item in value[:100]:
+            if not isinstance(item, dict):
+                continue
+            entry: dict[str, Any] = {}
+            feature_name = item.get("feature_name")
+            if isinstance(feature_name, str) and feature_name.strip() and len(feature_name.strip()) <= 256:
+                entry["feature_name"] = feature_name.strip()
+            remaining = item.get("remaining")
+            if type(remaining) is int and remaining >= 0:
+                entry["remaining"] = remaining
+            reset_after = item.get("reset_after")
+            if isinstance(reset_after, str) and len(reset_after.strip()) <= 256:
+                entry["reset_after"] = reset_after.strip()
+            if entry:
+                sanitized.append(entry)
+        return sanitized
+
+    @staticmethod
     def _extract_quota_and_restore_at(limits_progress: list[Any]) -> tuple[int, str | None]:
         for item in limits_progress:
             if isinstance(item, dict) and item.get("feature_name") == "image_gen":
-                return int(item.get("remaining") or 0), str(item.get("reset_after") or "") or None
+                remaining = item.get("remaining")
+                quota = remaining if type(remaining) is int and 0 <= remaining <= 1_000_000_000 else 0
+                reset_after = item.get("reset_after")
+                restore_at = (
+                    reset_after.strip()
+                    if isinstance(reset_after, str) and reset_after.strip() and len(reset_after) <= 256
+                    else None
+                )
+                return quota, restore_at
         return 0, None
 
     def _raise_on_error(self, response: Any, path: str) -> None:
@@ -328,14 +569,42 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
-    def _get_me(self) -> Dict[str, Any]:
-        path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
-        if response.status_code != 200:
-            self._raise_on_error(response, path)
-        return response.json()
+    def _ensure_status(self, response: Any, path: str) -> None:
+        """Validate status without reading an unbounded error body."""
+        if not 200 <= response.status_code < 300:
+            try:
+                self._raise_on_error(response, path)
+            finally:
+                close_response(response)
 
-    def _get_conversation_init(self) -> Dict[str, Any]:
+    def _read_json_response(self, response: Any, operation: str) -> Any:
+        """先按状态映射错误，再有界读取成功 JSON，并始终关闭响应。"""
+        try:
+            status_code = response.status_code
+            if not 200 <= status_code < 300:
+                self._raise_on_error(response, operation)
+            payload = parse_json_response(
+                response,
+                operation,
+                max_bytes=_MAX_BACKEND_JSON_BYTES,
+                require_ok=False,
+                close=False,
+            )
+            return payload
+        finally:
+            close_response(response)
+
+    def _get_me(self, *, deadline: float | None = None) -> Dict[str, Any]:
+        path = "/backend-api/me"
+        response = self.session.get(
+            self.base_url + path,
+            headers=self._headers(path),
+            timeout=self._search_remaining(deadline, 20.0),
+            stream=True,
+        )
+        return self._read_json_response(response, path)
+
+    def _get_conversation_init(self, *, deadline: float | None = None) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
         response = self.session.post(
             self.base_url + path,
@@ -346,69 +615,90 @@ class OpenAIBackendAPI:
                 "conversation_id": None,
                 "timezone_offset_min": -480,
             },
-            timeout=20,
+            timeout=self._search_remaining(deadline, 20.0),
+            stream=True,
         )
-        if response.status_code != 200:
-            self._raise_on_error(response, path)
-        return response.json()
+        return self._read_json_response(response, path)
 
-    def _get_default_account(self) -> Dict[str, Any]:
+    def _get_default_account(self, *, deadline: float | None = None) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
         response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
-        if response.status_code != 200:
-            self._raise_on_error(response, path)
-        payload = response.json()
+                                    timeout=self._search_remaining(deadline, 20.0), stream=True)
+        payload = self._read_json_response(response, path)
         default_account = ((payload.get("accounts") or {}).get("default") or {}).get("account") or {}
+        default_entitlement = (payload.get("accounts") or {}).get("default", {}).get("entitlement") or {}
+        plan_type_text = _safe_upstream_text(default_account.get("plan_type"), max_length=64)
+        account_user_role_text = _safe_upstream_text(default_account.get("account_user_role"), max_length=64)
+        account_id_text = _safe_upstream_text(default_account.get("account_id"))
+        subscription_plan_text = _safe_upstream_text(default_entitlement.get("subscription_plan"), max_length=64)
         logger.debug({
             "event": "backend_user_info_account_payload",
-            "plan_type": default_account.get("plan_type"),
-            "account_user_role": default_account.get("account_user_role"),
-            "account_id": default_account.get("account_id"),
-            "is_deactivated": default_account.get("is_deactivated"),
-            "has_active_subscription": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("has_active_subscription"),
-            "subscription_plan": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("subscription_plan"),
+            "plan_type_len": len(plan_type_text or ""),
+            "account_user_role_len": len(account_user_role_text or ""),
+            "account_id_present": bool(account_id_text),
+            "is_deactivated": default_account.get("is_deactivated") if type(default_account.get("is_deactivated")) is bool else None,
+            "has_active_subscription": default_entitlement.get("has_active_subscription") if type(default_entitlement.get("has_active_subscription")) is bool else None,
+            "subscription_plan_len": len(subscription_plan_text or ""),
         })
         return default_account
 
-    def get_user_info(self) -> Dict[str, Any]:
+    def get_user_info(self, *, deadline: float | None = None) -> Dict[str, Any]:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
-        futures = [
-            _ACCOUNT_INFO_EXECUTOR.submit(self._get_me),
-            _ACCOUNT_INFO_EXECUTOR.submit(self._get_conversation_init),
-            _ACCOUNT_INFO_EXECUTOR.submit(self._get_default_account),
-        ]
+        futures = []
         try:
-            me_payload, init_payload, default_account = (future.result() for future in futures)
+            # Register each future before submitting the next one.  A close or
+            # executor failure during a later admission must still cancel the
+            # siblings already using the shared session.
+            for function in (self._get_me, self._get_conversation_init, self._get_default_account):
+                futures.append(self._submit_account_info_future(function, deadline))
+            if deadline is None:
+                results = [future.result() for future in futures]
+            else:
+                results = []
+                for future in futures:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("account info deadline exceeded")
+                    try:
+                        results.append(future.result(timeout=remaining))
+                    except FutureTimeoutError as exc:
+                        raise TimeoutError("account info deadline exceeded") from exc
+            me_payload, init_payload, default_account = results
         except BaseException:
             for future in futures:
                 future.cancel()
+            if deadline is None:
+                for future in futures:
+                    try:
+                        future.result()
+                    except BaseException:
+                        pass
             raise
 
-        plan_type = str(default_account.get("plan_type") or "free")
+        raw_plan_type = default_account.get("plan_type")
+        plan_type = raw_plan_type.strip() if isinstance(raw_plan_type, str) and raw_plan_type.strip() else "free"
 
-        limits_progress = init_payload.get("limits_progress")
-        limits_progress = limits_progress if isinstance(limits_progress, list) else []
+        limits_progress = self._sanitize_limits_progress(init_payload.get("limits_progress"))
         quota, restore_at = self._extract_quota_and_restore_at(limits_progress)
         result = {
-            "email": me_payload.get("email"),
-            "user_id": me_payload.get("id"),
+            "email": _safe_upstream_text(me_payload.get("email")),
+            "user_id": _safe_upstream_text(me_payload.get("id")),
             "type": plan_type,
             "quota": quota,
             "limits_progress": limits_progress,
-            "default_model_slug": init_payload.get("default_model_slug"),
+            "default_model_slug": _safe_upstream_text(init_payload.get("default_model_slug")),
             "restore_at": restore_at,
             "status": "限流" if quota == 0 else "正常",
         }
         logger.debug({
             "event": "backend_user_info_result",
-            "user_id": result.get("user_id"),
-            "type": result.get("type"),
+            "user_id_present": bool(result.get("user_id")),
+            "type_len": len(result.get("type")) if isinstance(result.get("type"), str) else 0,
             "quota": result.get("quota"),
-            "default_model_slug": result.get("default_model_slug"),
-            "restore_at": result.get("restore_at"),
+            "default_model_slug_present": bool(result.get("default_model_slug")),
+            "restore_at_present": bool(result.get("restore_at")),
             "status": result.get("status"),
         })
         return result
@@ -431,31 +721,28 @@ class OpenAIBackendAPI:
 
     def _build_requirements(self, data: Dict[str, Any], source_p: str = "") -> ChatRequirements:
         """把 sentinel 响应整理成后续对话需要的 token 集合。"""
-        if (data.get("arkose") or {}).get("required"):
+        if _arkose_required(data.get("arkose")):
             raise RuntimeError("chat requirements requires arkose token, which is not implemented")
 
-        proof_token = ""
-        proof_info = data.get("proofofwork") or {}
-        if proof_info.get("required"):
-            proof_token = build_proof_token(
-                proof_info.get("seed", ""),
-                proof_info.get("difficulty", ""),
-                self.user_agent,
-                script_sources=self.pow_script_sources,
-                data_build=self.pow_data_build,
-            )
+        proof_token = _build_proof_of_work_token(
+            data.get("proofofwork"),
+            self.user_agent,
+            script_sources=self.pow_script_sources,
+            data_build=self.pow_data_build,
+        )
 
-        turnstile_token = ""
-        turnstile_info = data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], source_p) or ""
+        turnstile_token = _solve_turnstile_challenge(data.get("turnstile"), source_p)
 
+        token = _safe_upstream_text(data.get("token"), max_length=4096) or ""
+        if not token:
+            raise RuntimeError("missing chat requirements token")
+        so_token = _safe_upstream_text(data.get("so_token"), max_length=4096) or ""
         return ChatRequirements(
-            token=data.get("token", ""),
+            token=token,
             proof_token=proof_token,
             turnstile_token=turnstile_token,
-            so_token=data.get("so_token", ""),
-            raw_finalize=data,
+            so_token=so_token,
+            raw_finalize=None,
         )
 
     def _conversation_headers(self, path: str, requirements: ChatRequirements) -> Dict[str, str]:
@@ -495,10 +782,13 @@ class OpenAIBackendAPI:
                     continue
                 part_type = str(part.get("type") or "")
                 if part_type == "text":
-                    text_parts.append(str(part.get("text") or ""))
+                    text = part.get("text")
+                    if isinstance(text, str):
+                        text_parts.append(text)
                 elif part_type == "image":
                     data = part.get("data")
-                    mime = str(part.get("mime") or "image/png")
+                    mime_value = part.get("mime")
+                    mime = mime_value if isinstance(mime_value, str) and mime_value else "image/png"
                     if isinstance(data, (bytes, bytearray)):
                         image_inputs.append((bytes(data), mime))
             if not image_inputs:
@@ -682,19 +972,24 @@ class OpenAIBackendAPI:
 
     @staticmethod
     def _codex_event_summary(event: Dict[str, Any]) -> Dict[str, Any]:
-        summary: Dict[str, Any] = {
-            "type": str(event.get("type") or ""),
-            "field_count": len(event),
-        }
-        for key in ("id", "status", "sequence_number", "response_id", "item_id", "output_index", "content_index"):
+        summary: Dict[str, Any] = {"field_count": len(event)}
+        for key in ("id", "status", "response_id", "item_id"):
             value = event.get(key)
-            if isinstance(value, (str, int, float, bool)) or value is None:
+            if isinstance(value, str):
+                summary[f"{key}_len"] = len(value)
+        for key in ("sequence_number", "output_index", "content_index"):
+            value = event.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 summary[key] = value
         for key in ("response", "item", "output"):
             value = event.get(key)
             if isinstance(value, dict):
-                summary[f"{key}_type"] = value.get("type")
-                summary[f"{key}_status"] = value.get("status")
+                nested_type = value.get("type")
+                nested_status = value.get("status")
+                if isinstance(nested_type, str):
+                    summary[f"{key}_type_len"] = len(nested_type)
+                if isinstance(nested_status, str):
+                    summary[f"{key}_status_len"] = len(nested_status)
             elif isinstance(value, list):
                 summary[f"{key}_len"] = len(value)
         error = event.get("error")
@@ -725,20 +1020,15 @@ class OpenAIBackendAPI:
         }
         response_headers = dict(headers.items()) if hasattr(headers, "items") else dict(headers or {})
         tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
-        tool_types = [
-            str(tool.get("type") or "")
-            for tool in tools
-            if isinstance(tool, dict) and str(tool.get("type") or "")
-        ]
         input_value = payload.get("input")
         input_count = len(input_value) if isinstance(input_value, list) else int(input_value is not None)
+        model_value = payload.get("model")
         logger.warning({
             "event": "codex_responses_http_error",
             "path": path,
             "status_code": status_code,
             "request": {
-                "model": payload.get("model"),
-                "tool_types": tool_types,
+                "model_len": len(model_value) if isinstance(model_value, str) else 0,
                 "tool_count": len(tools),
                 "input_count": input_count,
                 "header_names": sorted(str(key) for key in safe_request_headers),
@@ -750,21 +1040,38 @@ class OpenAIBackendAPI:
         })
 
     @staticmethod
+    def _read_bounded_codex_body(raw: Any, max_bytes: int) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = raw.read(min(64 * 1024, max_bytes - total + 1))
+            if not chunk:
+                break
+            if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                raise RuntimeError("codex response body is invalid")
+            part = bytes(chunk)
+            total += len(part)
+            if total > max_bytes:
+                raise RuntimeError("codex response body exceeds the maximum size")
+            chunks.append(part)
+        return b"".join(chunks)
+
+    @staticmethod
     def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
-        content_type = str(raw.headers.get("content-type") or "").lower()
-        status_code = getattr(raw, "status", None)
+        raw_content_type = raw.headers.get("content-type")
+        content_type = raw_content_type.lower() if isinstance(raw_content_type, str) else ""
+        status_code = _safe_codex_log_status(getattr(raw, "status", None))
         parse_error_count = 0
         response_bytes = 0
         event_count = 0
-        event_types: Dict[str, int] = {}
+        event_type_count = 0
         image_result_lengths: list[int] = []
         event_summaries: list[Dict[str, Any]] = []
 
         def record(event: Dict[str, Any]) -> Dict[str, Any]:
-            nonlocal event_count
+            nonlocal event_count, event_type_count
             event_count += 1
-            event_type = str(event.get("type") or "<missing>")
-            event_types[event_type] = event_types.get(event_type, 0) + 1
+            event_type_count += 1
             image_result_lengths.extend(OpenAIBackendAPI._codex_event_image_result_lengths(event))
             if len(event_summaries) < 30:
                 event_summaries.append(OpenAIBackendAPI._codex_event_summary(event))
@@ -791,7 +1098,7 @@ class OpenAIBackendAPI:
 
         try:
             if "application/json" in content_type:
-                body = raw.read()
+                body = OpenAIBackendAPI._read_bounded_codex_body(raw, CODEX_RESPONSE_MAX_BODY_BYTES)
                 response_bytes = len(body)
                 text = body.decode("utf-8", "replace")
                 event = decode_event([text])
@@ -804,6 +1111,8 @@ class OpenAIBackendAPI:
             for raw_line in raw:
                 encoded_line = raw_line.encode("utf-8") if isinstance(raw_line, str) else bytes(raw_line)
                 response_bytes += len(encoded_line)
+                if response_bytes > CODEX_RESPONSE_MAX_BODY_BYTES:
+                    raise RuntimeError("codex response body exceeds the maximum size")
                 line = encoded_line.decode("utf-8", "replace").rstrip("\r\n")
                 if not line:
                     event = decode_event(parts)
@@ -826,10 +1135,11 @@ class OpenAIBackendAPI:
             logger.info({
                 "event": "codex_responses_response_debug",
                 "status_code": status_code,
-                "content_type": content_type,
+                "content_type_present": raw_content_type is not None,
+                "content_type_len": len(content_type),
                 "response_bytes": response_bytes,
                 "event_count": event_count,
-                "event_types": event_types,
+                "event_type_count": event_type_count,
                 "image_result_lengths": image_result_lengths[:10],
                 "parse_error_count": parse_error_count,
                 "event_summaries": event_summaries,
@@ -853,21 +1163,17 @@ class OpenAIBackendAPI:
             method="POST",
         )
         tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
-        tool_types = [
-            str(tool.get("type") or "")
-            for tool in tools
-            if isinstance(tool, dict) and str(tool.get("type") or "")
-        ]
         input_value = payload.get("input")
+        model_value = payload.get("model")
+        stream_value = payload.get("stream")
         logger.info({
             "event": "codex_responses_request_debug",
             "path": path,
             "transport": "urllib.request",
-            "timeout_secs": timeout,
+            "timeout_secs": _safe_codex_log_timeout(timeout),
             "request": {
-                "model": payload.get("model"),
-                "stream": payload.get("stream"),
-                "tool_types": tool_types,
+                "model_len": len(model_value) if isinstance(model_value, str) else 0,
+                "stream": stream_value if type(stream_value) is bool else None,
                 "tool_count": len(tools),
                 "input_count": len(input_value) if isinstance(input_value, list) else int(input_value is not None),
             },
@@ -876,12 +1182,13 @@ class OpenAIBackendAPI:
             with urllib.request.urlopen(request, timeout=timeout) as raw:
                 yield from self._iter_codex_response_events(raw)
         except urllib.error.HTTPError as error:
-            body_text = error.read().decode("utf-8", "replace")
-            body: Any = body_text
             try:
-                body = json.loads(body_text)
+                self._read_bounded_codex_body(error, CODEX_HTTP_ERROR_MAX_BODY_BYTES)
             except Exception:
                 pass
+            finally:
+                close_response(error)
+            body: Any = {"error": "upstream_error"}
             self._log_codex_response_failure(path, error.code, error.headers, payload, body)
             retry_after_header = error.headers.get("Retry-After") if error.headers else None
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
@@ -942,24 +1249,20 @@ class OpenAIBackendAPI:
             headers=self._image_headers(path, requirements),
             json=payload,
             timeout=60,
+            stream=True,
         )
-        ensure_ok(response, path)
-        return response.json().get("conduit_token", "")
+        data = self._read_json_response(response, path)
+        return _safe_upstream_text(data.get("conduit_token"), max_length=4096) if isinstance(data, dict) else ""
 
     def _decode_image_base64(self, image: str) -> bytes:
-        """把 base64 图片字符串或本地路径解码成二进制。"""
-        if (
-                image
-                and len(image) < 512
-                and not image.startswith("data:")
-                and "\n" not in image
-                and "\r" not in image
-        ):
-            file_path = Path(os.path.expanduser(image))
-            if file_path.exists() and file_path.is_file():
-                return file_path.read_bytes()
+        """把受控大小的 base64 图片字符串解码成二进制。"""
+        if not isinstance(image, str):
+            raise ValueError("image payload is invalid")
         payload = image.split(",", 1)[1] if image.startswith("data:") and "," in image else image
-        return base64.b64decode(payload)
+        data = decode_bounded_base64(payload, max_bytes=_MAX_CHAT_IMAGE_BYTES)
+        if data is None:
+            raise ValueError("image payload is invalid or too large")
+        return data
 
     def _upload_image(self, image: str, file_name: str = "image.png") -> Dict[str, Any]:
         """上传一张 base64 图片，返回底层文件元数据。"""
@@ -984,9 +1287,9 @@ class OpenAIBackendAPI:
             json={"file_name": file_name, "file_size": len(data), "use_case": "multimodal", "width": width,
                   "height": height},
             timeout=60,
+            stream=True,
         )
-        ensure_ok(response, path)
-        upload_meta = response.json()
+        upload_meta = self._read_json_response(response, path)
         response = self.session.put(
             upload_meta["upload_url"],
             headers={
@@ -1001,16 +1304,21 @@ class OpenAIBackendAPI:
             },
             data=data,
             timeout=120,
+            stream=True,
         )
-        ensure_ok(response, "image_upload")
+        try:
+            self._ensure_status(response, "image_upload")
+        finally:
+            close_response(response)
         path = f"/backend-api/files/{upload_meta['file_id']}/uploaded"
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Content-Type": "application/json", "Accept": "application/json"}),
             data="{}",
             timeout=60,
+            stream=True,
         )
-        ensure_ok(response, path)
+        self._read_json_response(response, path)
         return {
             "file_id": upload_meta["file_id"],
             "file_name": file_name,
@@ -1093,16 +1401,15 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
+        self._ensure_status(response, path)
         return response
 
     def _get_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """获取完整 conversation 详情。"""
         path = f"/backend-api/conversation/{conversation_id}"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
-        ensure_ok(response, path)
-        return response.json()
+                                    timeout=60, stream=True)
+        return self._read_json_response(response, path)
 
     def delete_conversation(self, conversation_id: str) -> Dict[str, Any]:
         """删除本地对话记录。"""
@@ -1118,9 +1425,9 @@ class OpenAIBackendAPI:
             headers=headers,
             json={"is_visible": False},
             timeout=60,
+            stream=True,
         )
-        ensure_ok(response, path)
-        return response.json()
+        return self._read_json_response(response, path)
 
     def _list_recent_conversations(self, limit: int = 5, timeout_secs: float = 10.0) -> list[Dict[str, Any]]:
         """列出最近的对话列表，按更新时间倒序。
@@ -1134,9 +1441,9 @@ class OpenAIBackendAPI:
                 self.base_url + path,
                 headers=self._headers(path, {"Accept": "application/json"}),
                 timeout=timeout_secs,
+                stream=True,
             )
-            ensure_ok(response, path)
-            data = response.json()
+            data = self._read_json_response(response, path)
             return data.get("items") or data.get("conversations") or []
         except Exception as exc:
             logger.debug({"event": "list_conversations_failed", "error": exception_log_message(exc)})
@@ -1165,16 +1472,21 @@ class OpenAIBackendAPI:
         best_match = ""
         best_score = 0.0
         for item in items:
+            if not isinstance(item, dict):
+                continue
             # item 可能是完整的 conversation 对象或摘要
-            conv_id = str(item.get("id") or item.get("conversation_id") or "")
+            conv_id = _safe_conversation_id(item.get("id")) or _safe_conversation_id(item.get("conversation_id"))
             if not conv_id:
                 continue
             # 检查时间范围：对话的 updated_at 应该在请求开始时间之后（或附近）
-            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
+            updated_at = _safe_conversation_timestamp(item.get("update_time"))
+            if not updated_at:
+                updated_at = _safe_conversation_timestamp(item.get("updated_at"))
             if updated_at and started_at and (updated_at < started_at - 30 or updated_at > started_at + 600):
                 continue
             # 匹配 prompt 关键词
-            title = str(item.get("title") or "").lower()
+            title_value = item.get("title")
+            title = title_value.strip().lower() if isinstance(title_value, str) else ""
             # 计算匹配分数
             score = 0.0
             if prompt_lower and title:
@@ -1199,8 +1511,12 @@ class OpenAIBackendAPI:
             return best_match
         # 如果没有标题匹配，返回最新的对话（时间最近的）
         for item in items:
-            conv_id = str(item.get("id") or item.get("conversation_id") or "")
-            updated_at = float(item.get("update_time") or item.get("updated_at") or 0)
+            if not isinstance(item, dict):
+                continue
+            conv_id = _safe_conversation_id(item.get("id")) or _safe_conversation_id(item.get("conversation_id"))
+            updated_at = _safe_conversation_timestamp(item.get("update_time"))
+            if not updated_at:
+                updated_at = _safe_conversation_timestamp(item.get("updated_at"))
             if conv_id and updated_at and started_at and updated_at >= started_at - 30:
                 logger.info({
                     "event": "conversation_latest_match",
@@ -1282,8 +1598,11 @@ class OpenAIBackendAPI:
         self.client_build_number = EDITABLE_FILE_CLIENT_BUILD_NUMBER
         self.session.headers["OAI-Client-Version"] = EDITABLE_FILE_CLIENT_VERSION
         self.session.headers["OAI-Client-Build-Number"] = EDITABLE_FILE_CLIENT_BUILD_NUMBER
-        output_path = Path(output_dir).expanduser().resolve()
-        output_path.mkdir(parents=True, exist_ok=True)
+        # Keep the caller's lexical output boundary.  Resolving here would
+        # turn a swapped symlink/junction into a new trusted root; the secure
+        # atomic writer validates and creates this directory without following
+        # links.
+        output_path = Path(os.path.abspath(os.fspath(Path(output_dir).expanduser())))
         uploaded = [self._upload_editable_base64_image(item, index) for index, item in enumerate(base64_images, start=1)]
         conduit_token = self._prepare_editable_conversation(prompt, [item["mime_type"] for item in uploaded])
         conversation_id = self._run_editable_conversation(prompt, uploaded, conduit_token)
@@ -1327,13 +1646,15 @@ class OpenAIBackendAPI:
                 "library_persistence_mode": "opportunistic",
             },
             timeout=60,
+            stream=True,
         )
-        ensure_ok(response, path)
-        payload = response.json()
-        upload_url = str(payload.get("upload_url") or "")
-        file_id = str(payload.get("file_id") or "")
+        payload = self._read_json_response(response, path)
+        if not isinstance(payload, dict):
+            raise RuntimeError("invalid upload response")
+        upload_url = _safe_upstream_text(payload.get("upload_url"), max_length=4096) or ""
+        file_id = _safe_upstream_text(payload.get("file_id"), max_length=256) or ""
         if not upload_url or not file_id:
-            raise RuntimeError(f"invalid upload response: {payload}")
+            raise RuntimeError("invalid upload response")
         response = self.session.put(
             upload_url,
             headers={
@@ -1348,19 +1669,24 @@ class OpenAIBackendAPI:
             },
             data=data,
             timeout=120,
+            stream=True,
         )
-        ensure_ok(response, "image_upload")
+        try:
+            self._ensure_status(response, "image_upload")
+        finally:
+            close_response(response)
         path = f"/backend-api/files/{file_id}/uploaded"
         response = self.session.post(
             self.base_url + path,
             headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json"}),
             data="{}",
             timeout=60,
+            stream=True,
         )
-        ensure_ok(response, path)
+        self._read_json_response(response, path)
         return {
             "file_id": file_id,
-            "library_file_id": str(payload.get("library_file_id") or ""),
+            "library_file_id": _safe_upstream_text(payload.get("library_file_id"), max_length=256) or "",
             "file_name": file_name,
             "file_size": len(data),
             "mime_type": mime_type,
@@ -1369,20 +1695,32 @@ class OpenAIBackendAPI:
         }
 
     def _decode_editable_base64_image(self, base64_image: str, index: int) -> tuple[bytes, str, str, int, int]:
-        raw = str(base64_image or "").strip()
+        if not isinstance(base64_image, str):
+            raise ValueError("image payload is invalid")
+        raw = base64_image.strip()
         if not raw:
-            raise ValueError("base64 image is empty")
+            raise ValueError("image payload is empty")
         mime_type = ""
         payload = raw
         match = re.match(r"^data:([^;]+);base64,(.*)$", raw, re.IGNORECASE | re.DOTALL)
         if match:
             mime_type = str(match.group(1) or "").strip().lower()
             payload = str(match.group(2) or "").strip()
-        data = base64.b64decode(payload)
-        image = Image.open(BytesIO(data))
-        image.load()
-        width, height = image.size
-        mime_type = Image.MIME.get(image.format, mime_type or "image/png")
+        if len(payload) > ((_MAX_EDITABLE_IMAGE_BYTES + 2) // 3) * 4:
+            raise ValueError("image payload is too large")
+        try:
+            data = decode_bounded_base64(payload, max_bytes=_MAX_EDITABLE_IMAGE_BYTES)
+            if data is None:
+                raise ImagePayloadError("image payload is invalid or too large")
+            info = (
+                validate_image_payload(data, mime_type)
+                if mime_type
+                else inspect_image_payload(data)
+            )
+        except (ImagePayloadError, ValueError, TypeError, base64.binascii.Error) as exc:
+            raise ValueError(f"image payload is invalid: {exc}") from exc
+        width, height = info.width, info.height
+        mime_type = info.mime_type
         extension = mimetypes.guess_extension(mime_type) or ".png"
         return data, f"image_{index}{extension}", mime_type, width, height
 
@@ -1411,9 +1749,10 @@ class OpenAIBackendAPI:
             headers=self._headers(path, {"Accept": "*/*", "Content-Type": "application/json", "X-Conduit-Token": "no-token"}),
             json=payload,
             timeout=60,
+            stream=True,
         )
-        ensure_ok(response, path)
-        conduit_token = str(response.json().get("conduit_token") or "")
+        response_data = self._read_json_response(response, path)
+        conduit_token = _safe_upstream_text(response_data.get("conduit_token"), max_length=4096) if isinstance(response_data, dict) else ""
         if not conduit_token:
             raise RuntimeError("missing conduit_token")
         return conduit_token
@@ -1486,7 +1825,7 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
+        self._ensure_status(response, path)
         conversation_id = ""
         try:
             for payload in iter_sse_payloads(response):
@@ -1510,14 +1849,27 @@ class OpenAIBackendAPI:
             timeout_secs: float,
             poll_interval_secs: float,
     ) -> list[EditableFileArtifact]:
-        deadline = time.time() + timeout_secs
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout_secs
+        try:
+            poll_interval = max(0.0, float(poll_interval_secs))
+        except (TypeError, ValueError):
+            poll_interval = 0.0
+
+        def sleep_until_deadline() -> bool:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(poll_interval, remaining))
+            return True
+
+        while time.monotonic() < deadline:
             try:
                 conversation = self._get_editable_conversation_detail(conversation_id)
             except UpstreamHTTPError as exc:
                 if exc.status_code in {404, 409, 423, 429, 500, 502, 503, 504}:
-                    time.sleep(poll_interval_secs)
-                    continue
+                    if sleep_until_deadline():
+                        continue
+                    break
                 raise
             targeted = self._pick_editable_target_artifacts(
                 self._extract_editable_artifacts(conversation, export_file_re),
@@ -1527,14 +1879,14 @@ class OpenAIBackendAPI:
             )
             if targeted:
                 return targeted
-            time.sleep(poll_interval_secs)
+            if not sleep_until_deadline():
+                break
         raise RuntimeError(f"timed out waiting for {primary_label}/zip outputs")
 
     def _get_editable_conversation_detail(self, conversation_id: str) -> Dict[str, Any]:
         path = f"/backend-api/conversation/{conversation_id}"
-        response = self.session.get(self.base_url + path, headers=self._editable_conversation_document_headers(path, conversation_id), timeout=60)
-        ensure_ok(response, path)
-        return response.json()
+        response = self.session.get(self.base_url + path, headers=self._editable_conversation_document_headers(path, conversation_id), timeout=60, stream=True)
+        return self._read_json_response(response, path)
 
     def _editable_browser_headers(self, path: str, conversation_id: str) -> Dict[str, str]:
         headers = self._headers(path, {"Accept": "*/*"})
@@ -1548,13 +1900,25 @@ class OpenAIBackendAPI:
 
     def _extract_editable_artifacts(self, conversation: Dict[str, Any], export_file_re: re.Pattern[str]) -> list[EditableFileArtifact]:
         artifacts: dict[str, EditableFileArtifact] = {}
-        for node in sorted((conversation.get("mapping") or {}).values(), key=lambda item: float(((item or {}).get("message") or {}).get("create_time") or 0.0)):
-            message = (node or {}).get("message") or {}
-            message_id = str(message.get("id") or "")
-            author_role = str(((message.get("author") or {}).get("role") or "")).strip()
+        mapping = conversation.get("mapping") if isinstance(conversation, dict) else None
+        if not isinstance(mapping, dict):
+            return []
+
+        def node_timestamp(node: Any) -> float:
+            if not isinstance(node, dict) or not isinstance(node.get("message"), dict):
+                return 0.0
+            return _safe_conversation_timestamp(node["message"].get("create_time"))
+
+        for node in sorted(mapping.values(), key=node_timestamp):
+            if not isinstance(node, dict) or not isinstance(node.get("message"), dict):
+                continue
+            message = node["message"]
+            message_id = self._clean_editable_text(message.get("id"))
+            author = message.get("author")
+            author_role = self._clean_editable_text(author.get("role") if isinstance(author, dict) else "").strip().lower()
             if author_role not in {"assistant", "tool"}:
                 continue
-            create_time = float(message.get("create_time") or 0.0)
+            create_time = _safe_conversation_timestamp(message.get("create_time"))
             message_text = self._editable_message_text(message)
             for artifact in self._extract_editable_message_artifacts(message, message_id, author_role, create_time, export_file_re):
                 key = artifact.attachment_id or artifact.file_id or artifact.name or artifact.sandbox_path
@@ -1574,7 +1938,11 @@ class OpenAIBackendAPI:
             export_file_re: re.Pattern[str],
     ) -> list[EditableFileArtifact]:
         artifacts: list[EditableFileArtifact] = []
-        for item in (message.get("metadata") or {}).get("attachments") or []:
+        metadata = message.get("metadata")
+        attachments = metadata.get("attachments") if isinstance(metadata, dict) else []
+        if not isinstance(attachments, list):
+            attachments = []
+        for item in attachments:
             artifact = self._editable_artifact_from_dict(item, message_id, author_role, create_time, export_file_re)
             if artifact:
                 artifacts.append(artifact)
@@ -1592,13 +1960,31 @@ class OpenAIBackendAPI:
             create_time: float,
             export_file_re: re.Pattern[str],
     ) -> EditableFileArtifact | None:
+        if not isinstance(payload, dict):
+            return None
         if not ({"id", "file_id", "asset_pointer", "name", "file_name", "filename", "mime_type", "mimeType"} & set(payload.keys())):
             return None
-        attachment_id = self._match_editable_file_id(str(payload.get("id") or ""))
-        file_id = self._match_editable_file_id(str(payload.get("file_id") or ""))
-        name = self._sanitize_editable_filename(str(payload.get("name") or payload.get("file_name") or payload.get("filename") or payload.get("title") or "").strip())
-        mime_type = self._clean_editable_mime_type(payload.get("mime_type") or payload.get("mimeType") or "")
-        for asset_id in EDITABLE_ASSET_POINTER_RE.findall(str(payload.get("asset_pointer") or "")):
+        attachment_id = self._match_editable_file_id(self._clean_editable_text(payload.get("id")))
+        file_id = self._match_editable_file_id(self._clean_editable_text(payload.get("file_id")))
+        raw_name = next(
+            (
+                payload.get(key)
+                for key in ("name", "file_name", "filename", "title")
+                if isinstance(payload.get(key), str) and payload.get(key).strip()
+            ),
+            "",
+        )
+        name = self._sanitize_editable_filename(self._clean_editable_text(raw_name))
+        raw_mime_type = next(
+            (
+                payload.get(key)
+                for key in ("mime_type", "mimeType")
+                if isinstance(payload.get(key), str)
+            ),
+            "",
+        )
+        mime_type = self._clean_editable_mime_type(raw_mime_type)
+        for asset_id in EDITABLE_ASSET_POINTER_RE.findall(self._clean_editable_text(payload.get("asset_pointer"))):
             attachment_id = attachment_id or asset_id
             file_id = file_id or asset_id
         if not attachment_id or not file_id:
@@ -1641,65 +2027,95 @@ class OpenAIBackendAPI:
         download_url = self._resolve_editable_download_url(conversation_id, artifact)
         if not download_url:
             raise RuntimeError(f"download url not found for artifact: {artifact}")
-        response = self.session.get(download_url, timeout=300)
-        ensure_ok(response, "artifact_download")
-        content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
-        file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
-        target_path = self._unique_editable_path(output_dir / file_name)
-        target_path.write_bytes(response.content)
-        return target_path
+        response = self.session.get(download_url, timeout=300, stream=True)
+        try:
+            self._ensure_status(response, "artifact_download")
+            content_type = self._clean_editable_mime_type(response.headers.get("Content-Type") or artifact.mime_type)
+            file_name = self._resolve_editable_output_name(artifact, response.url, response.headers.get("Content-Disposition"), content_type, primary_mime_types, primary_mime_keywords, primary_default_extension)
+            target_path = self._unique_editable_path(output_dir / file_name)
+            declared_length = response.headers.get("Content-Length") or response.headers.get("content-length")
+            if declared_length is not None:
+                if not isinstance(declared_length, str) or not declared_length.isascii() or not declared_length.isdecimal() or len(declared_length) > 20:
+                    raise ValueError("artifact download size is invalid")
+                if int(declared_length) > _MAX_EDITABLE_ARTIFACT_BYTES:
+                    raise ValueError("artifact download is too large")
+            def chunks():
+                total = 0
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    if not isinstance(chunk, bytes):
+                        raise ValueError("artifact download body is invalid")
+                    total += len(chunk)
+                    if total > _MAX_EDITABLE_ARTIFACT_BYTES:
+                        raise ValueError("artifact download is too large")
+                    yield chunk
+
+            atomic_write_stream(target_path, output_dir, chunks())
+            return target_path
+        finally:
+            response.close()
 
     def _resolve_editable_download_url(self, conversation_id: str, artifact: EditableFileArtifact) -> str:
         ids: list[str] = []
         for item in (artifact.attachment_id, artifact.file_id):
             if item and item not in ids:
                 ids.append(item)
+
+        def probe(path: str, *, route: str, params: dict[str, str] | None = None) -> str:
+            response = self.session.get(
+                self.base_url + path,
+                headers=self._editable_download_headers(path, conversation_id, route),
+                **({"params": params} if params is not None else {}),
+                timeout=60,
+                stream=True,
+            )
+            try:
+                if 200 <= response.status_code < 300:
+                    return self._download_url_from_response(response)
+                return ""
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+
         if artifact.sandbox_path and artifact.message_id:
             path = f"/backend-api/conversation/{conversation_id}/interpreter/download"
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/interpreter/download"),
+            url = probe(
+                path,
+                route="/backend-api/conversation/{conversation_id}/interpreter/download",
                 params={"message_id": artifact.message_id, "sandbox_path": artifact.sandbox_path},
-                timeout=60,
             )
-            if 200 <= response.status_code < 300:
-                url = self._download_url_from_response(response)
-                if url:
-                    return url
+            if url:
+                return url
         for attachment_id in ids:
             path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._editable_download_headers(path, conversation_id, "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"),
-                timeout=60,
+            url = probe(
+                path,
+                route="/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download",
             )
-            if 200 <= response.status_code < 300:
-                url = self._download_url_from_response(response)
-                if url:
-                    return url
+            if url:
+                return url
         for file_id in ids:
             path = f"/backend-api/files/download/{file_id}"
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
+            url = probe(
+                path,
+                route="/backend-api/files/download/{file_id}",
                 params={"post_id": "", "inline": "false"},
-                timeout=60,
             )
-            if 200 <= response.status_code < 300:
-                url = self._download_url_from_response(response)
-                if url:
-                    return url
+            if url:
+                return url
         for file_id in ids:
             path = f"/backend-api/files/{file_id}/download"
-            response = self.session.get(
-                self.base_url + path,
-                headers=self._editable_download_headers(path, conversation_id, "/backend-api/files/download/{file_id}"),
-                timeout=60,
+            url = probe(
+                path,
+                route="/backend-api/files/download/{file_id}",
             )
-            if 200 <= response.status_code < 300:
-                url = self._download_url_from_response(response)
-                if url:
-                    return url
+            if url:
+                return url
         return ""
 
     def _editable_download_headers(self, path: str, conversation_id: str, route: str) -> Dict[str, str]:
@@ -1708,12 +2124,36 @@ class OpenAIBackendAPI:
         return headers
 
     @staticmethod
+    def _validated_download_url(value: object) -> str:
+        if not isinstance(value, str):
+            return ""
+        url = value.strip()
+        if len(url) > 4096 or any(ord(char) < 32 or ord(char) == 127 for char in url):
+            return ""
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            return ""
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+            return ""
+        return url
+
+    @staticmethod
     def _download_url_from_response(response: Any) -> str:
         try:
-            payload = response.json()
+            payload = parse_json_response(
+                response,
+                "editable download url",
+                max_bytes=_MAX_BACKEND_JSON_BYTES,
+                require_ok=False,
+                close=False,
+            )
         except Exception:
             payload = {}
-        return str(payload.get("download_url") or payload.get("url") or "")
+        if not isinstance(payload, dict):
+            return ""
+        value = payload.get("download_url") or payload.get("url")
+        return OpenAIBackendAPI._validated_download_url(value)
 
     def _resolve_editable_output_name(
             self,
@@ -1770,8 +2210,12 @@ class OpenAIBackendAPI:
 
     @staticmethod
     def _clean_editable_mime_type(value: Any) -> str:
-        text = str(value or "").strip().lower()
+        text = value.strip().lower() if isinstance(value, str) else ""
         return text.split(";", 1)[0] if "/" in text else ""
+
+    @staticmethod
+    def _clean_editable_text(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ""
 
     def _looks_like_editable_primary(
             self,
@@ -1851,7 +2295,10 @@ class OpenAIBackendAPI:
                 if isinstance(part, str):
                     parts.append(part)
                 elif isinstance(part, dict):
-                    parts.extend(str(part.get(key) or "") for key in ("text", "asset_pointer", "model_set_context") if part.get(key))
+                    for key in ("text", "asset_pointer", "model_set_context"):
+                        value = part.get(key)
+                        if isinstance(value, str) and value:
+                            parts.append(value)
         if isinstance(message.get("content"), str):
             parts.append(str(message["content"]))
         return "\n".join(part for part in parts if part).strip()
@@ -1953,9 +2400,10 @@ class OpenAIBackendAPI:
                 "client_contextual_info": {"app_name": "chatgpt.com"},
             },
             timeout=self._search_remaining(deadline, timeout_secs),
+            stream=True,
         )
-        ensure_ok(response, path)
-        token = str(response.json().get("conduit_token") or "")
+        data = self._read_json_response(response, path)
+        token = _safe_upstream_text(data.get("conduit_token"), max_length=4096) if isinstance(data, dict) else ""
         if not token:
             raise RuntimeError("missing conduit_token")
         return token
@@ -2011,7 +2459,7 @@ class OpenAIBackendAPI:
             timeout=self._search_remaining(deadline, timeout_secs),
             stream=True,
         )
-        ensure_ok(response, path)
+        self._ensure_status(response, path)
         conversation_id = ""
         try:
             payloads = self._iter_search_sse_until(response, deadline)
@@ -2119,9 +2567,9 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=headers,
             timeout=self._search_remaining(deadline, timeout_secs),
+            stream=True,
         )
-        ensure_ok(response, path)
-        return response.json()
+        return self._read_json_response(response, path)
 
     def _extract_search_result(self, conversation_id: str, conversation: Dict[str, Any]) -> Dict[str, Any]:
         messages = []
@@ -2129,7 +2577,7 @@ class OpenAIBackendAPI:
             message = (node or {}).get("message") or {}
             if ((message.get("author") or {}).get("role") or "") == "assistant":
                 messages.append(message)
-        message = max(messages, key=lambda item: float(item.get("create_time") or 0.0)) if messages else {}
+        message = max(messages, key=lambda item: self._safe_search_timestamp(item.get("create_time"))) if messages else {}
         metadata = message.get("metadata") if isinstance(message.get("metadata"), dict) else {}
         finish_details = metadata.get("finish_details") if isinstance(metadata.get("finish_details"), dict) else {}
         answer = self._search_message_text(message)
@@ -2138,14 +2586,27 @@ class OpenAIBackendAPI:
             url = self._clean_search_url(url)
             if url and all(item["url"] != url for item in sources):
                 sources.append({"title": "", "url": url, "snippet": "", "source_type": ""})
+        raw_status = finish_details.get("type") or metadata.get("status") or self._find_search_value(message, "status")
+        status = raw_status.strip() if isinstance(raw_status, str) else ""
+        assistant_message_id = message.get("id")
         return {
             "conversation_id": conversation_id,
-            "status": str(finish_details.get("type") or metadata.get("status") or self._find_search_value(message, "status") or "").strip(),
+            "status": status,
             "answer": answer,
             "sources": sources,
-            "assistant_message_id": str(message.get("id") or ""),
-            "create_time": float(message.get("create_time") or 0.0),
+            "assistant_message_id": assistant_message_id.strip() if isinstance(assistant_message_id, str) else "",
+            "create_time": self._safe_search_timestamp(message.get("create_time")),
         }
+
+    @staticmethod
+    def _safe_search_timestamp(value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.0
+        try:
+            timestamp = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return timestamp if math.isfinite(timestamp) and timestamp >= 0 else 0.0
 
     def _extract_search_sources(self, payload: Any) -> list[Dict[str, str]]:
         sources: list[Dict[str, str]] = []
@@ -2153,11 +2614,35 @@ class OpenAIBackendAPI:
             metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
             url = self._clean_search_url(obj.get("url") or obj.get("link") or obj.get("source_url") or metadata.get("url"))
             if url and all(item["url"] != url for item in sources):
+                title = next(
+                    (
+                        value.strip()
+                        for value in (obj.get("title"), obj.get("name"), obj.get("source"))
+                        if isinstance(value, str) and value.strip()
+                    ),
+                    "",
+                )
+                snippet = next(
+                    (
+                        value.strip()
+                        for value in (obj.get("snippet"), obj.get("text"), obj.get("description"))
+                        if isinstance(value, str) and value.strip()
+                    ),
+                    "",
+                )
+                source_type = next(
+                    (
+                        value.strip()
+                        for value in (obj.get("type"), obj.get("source_type"))
+                        if isinstance(value, str) and value.strip()
+                    ),
+                    "",
+                )
                 sources.append({
-                    "title": str(obj.get("title") or obj.get("name") or obj.get("source") or "").strip(),
+                    "title": title,
                     "url": url,
-                    "snippet": str(obj.get("snippet") or obj.get("text") or obj.get("description") or "").strip(),
-                    "source_type": str(obj.get("type") or obj.get("source_type") or "").strip(),
+                    "snippet": snippet,
+                    "source_type": source_type,
                 })
         return sources
 
@@ -2171,10 +2656,13 @@ class OpenAIBackendAPI:
                 if isinstance(part, str):
                     parts.append(part)
                 elif isinstance(part, dict):
-                    parts.extend(str(part.get(key) or "") for key in ("text", "summary", "content") if part.get(key))
+                    for key in ("text", "summary", "content"):
+                        value = part.get(key)
+                        if isinstance(value, str) and value.strip():
+                            parts.append(value.strip())
         elif isinstance(content, str):
             parts.append(content)
-        return "\n".join(part.strip() for part in parts if str(part).strip()).strip()
+        return "\n".join(part.strip() for part in parts if isinstance(part, str) and part.strip()).strip()
 
     def _find_search_value(self, payload: Any, key: str) -> str:
         if isinstance(payload, str):
@@ -2322,7 +2810,7 @@ class OpenAIBackendAPI:
           (capped at 16s, +jitter) honoring Retry-After when present.
         - All sleeps stay within timeout_secs; on exhaustion raises ImagePollTimeoutError.
         """
-        start = time.time()
+        start = time.monotonic()
         attempt = 0
         interval = float(config.image_poll_interval_secs)
         initial_wait = float(config.image_poll_initial_wait_secs)
@@ -2345,7 +2833,7 @@ class OpenAIBackendAPI:
         })
 
         def _remaining() -> float:
-            return timeout_secs - (time.time() - start)
+            return timeout_secs - (time.monotonic() - start)
 
         if has_initial_ids and config.image_settle_enabled:
             settle_for = min(config.image_settle_secs, max(0.0, _remaining()))
@@ -2472,7 +2960,7 @@ class OpenAIBackendAPI:
                     continue
                 return file_ids, sediment_ids
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
-                          "elapsed_secs": round(time.time() - start, 1)})
+                          "elapsed_secs": round(time.monotonic() - start, 1)})
             wait = min(interval, max(0.0, _remaining()))
             if wait > 0:
                 time.sleep(wait)
@@ -2494,19 +2982,21 @@ class OpenAIBackendAPI:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
-        ensure_ok(response, path)
-        data = response.json()
-        return data.get("download_url") or data.get("url") or ""
+                                    timeout=60, stream=True)
+        data = self._read_json_response(response, path)
+        if not isinstance(data, dict):
+            return ""
+        return self._validated_download_url(data.get("download_url") or data.get("url"))
 
     def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
-                                    timeout=60)
-        ensure_ok(response, path)
-        data = response.json()
-        return data.get("download_url") or data.get("url") or ""
+                                    timeout=60, stream=True)
+        data = self._read_json_response(response, path)
+        if not isinstance(data, dict):
+            return ""
+        return self._validated_download_url(data.get("download_url") or data.get("url"))
 
     def _query_backend_tasks(
         self,
@@ -2529,9 +3019,9 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(path, {"Accept": "application/json"}),
             timeout=timeout_secs,
+            stream=True,
         )
-        ensure_ok(response, path)
-        data = response.json()
+        data = self._read_json_response(response, path)
         tasks = data.get("tasks", [])
         if not isinstance(tasks, list):
             return []
@@ -2723,10 +3213,32 @@ class OpenAIBackendAPI:
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images = []
         for url in urls:
-            response = self.session.get(url, timeout=120)
-            ensure_ok(response, "image_download")
-            if response.content not in images:
-                images.append(response.content)
+            response = self.session.get(url, timeout=120, stream=True)
+            try:
+                self._ensure_status(response, "image_download")
+                declared_length = response.headers.get("Content-Length") or response.headers.get("content-length")
+                if declared_length is not None:
+                    if not isinstance(declared_length, str) or not declared_length.isascii() or not declared_length.isdecimal() or len(declared_length) > 20:
+                        raise ValueError("image download size is invalid")
+                    if int(declared_length) > _MAX_UPSTREAM_IMAGE_BYTES:
+                        raise ValueError("image download is too large")
+                def chunks():
+                    total = 0
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        if not isinstance(chunk, bytes):
+                            raise ValueError("image download body is invalid")
+                        total += len(chunk)
+                        if total > _MAX_UPSTREAM_IMAGE_BYTES:
+                            raise ValueError("image download is too large")
+                        yield chunk
+
+                image = b"".join(chunks())
+                if image not in images:
+                    images.append(image)
+            finally:
+                response.close()
         return images
 
     def stream_conversation(
@@ -2755,7 +3267,7 @@ class OpenAIBackendAPI:
             timeout=300,
             stream=True,
         )
-        ensure_ok(response, path)
+        self._ensure_status(response, path)
         try:
             yield from iter_sse_payloads(response)
         finally:
@@ -2799,21 +3311,32 @@ class OpenAIBackendAPI:
         底层连接以解除阻塞，并抛出明确错误，让任务快速失败而非长时间挂起。
         """
         deadline = time.monotonic() + hard_cap_secs
+        timeout_event = threading.Event()
+
+        def expire() -> None:
+            timeout_event.set()
+            try:
+                response.close()
+            except Exception:
+                pass
+
         # 看门狗：SSE 读取可能阻塞在底层 curl 调用中，超时后关闭连接以强制解除阻塞
-        watchdog = threading.Timer(hard_cap_secs, response.close)
+        watchdog = threading.Timer(hard_cap_secs, expire)
         watchdog.daemon = True
         watchdog.start()
         timeout_message = f"图片生成流已超过硬上限 {int(hard_cap_secs)} 秒，已强制中断（上游可能未生成图片）"
         try:
             for payload in iter_sse_payloads(response):
-                if time.monotonic() >= deadline:
+                if timeout_event.is_set() or time.monotonic() >= deadline:
                     raise ImageStreamHardTimeoutError(timeout_message)
                 yield payload
+            if timeout_event.is_set() or time.monotonic() >= deadline:
+                raise ImageStreamHardTimeoutError(timeout_message)
         except ImageStreamHardTimeoutError:
             raise
         except Exception as exc:
             # 看门狗关闭连接后，底层读取会抛出 curl 错误，这里统一转成明确的硬上限错误
-            if time.monotonic() >= deadline:
+            if timeout_event.is_set() or time.monotonic() >= deadline:
                 raise ImageStreamHardTimeoutError(timeout_message) from exc
             raise
         finally:
@@ -2829,9 +3352,20 @@ class OpenAIBackendAPI:
             self.base_url + "/",
             headers=self._bootstrap_headers(),
             timeout=self._search_remaining(deadline, timeout_secs),
+            stream=True,
         )
-        ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        try:
+            self._ensure_status(response, "bootstrap")
+            text = read_bounded_text(
+                response,
+                "bootstrap",
+                max_bytes=_MAX_BOOTSTRAP_TEXT_BYTES,
+                require_ok=False,
+                close=False,
+            )
+            self.pow_script_sources, self.pow_data_build = parse_pow_resources(text)
+        finally:
+            close_response(response)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
 
@@ -2851,54 +3385,60 @@ class OpenAIBackendAPI:
             headers=self._headers(prepare_path, {"Content-Type": "application/json"}),
             json={"p": p_token},
             timeout=self._search_remaining(deadline, timeout_secs),
+            stream=True,
         )
-        ensure_ok(response, "chat_requirements_prepare")
-        prepare_data = response.json()
+        prepare_data = self._read_json_response(response, "chat_requirements_prepare")
+        if not isinstance(prepare_data, dict):
+            raise RuntimeError("chat requirements response is invalid")
 
-        if (prepare_data.get("arkose") or {}).get("required"):
+        if _arkose_required(prepare_data.get("arkose")):
             raise RuntimeError("chat requirements requires arkose token, which is not implemented")
 
-        proof_token = ""
-        proof_info = prepare_data.get("proofofwork") or {}
-        if proof_info.get("required"):
-            proof_token = build_proof_token(
-                proof_info.get("seed", ""),
-                proof_info.get("difficulty", ""),
-                self.user_agent,
-                script_sources=self.pow_script_sources,
-                data_build=self.pow_data_build,
-            )
+        prepare_token = _safe_upstream_text(prepare_data.get("prepare_token"), max_length=4096) or ""
+        if not prepare_token:
+            raise RuntimeError("chat requirements prepare token is invalid")
 
-        turnstile_token = ""
-        turnstile_info = prepare_data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+        proof_token = _build_proof_of_work_token(
+            prepare_data.get("proofofwork"),
+            self.user_agent,
+            script_sources=self.pow_script_sources,
+            data_build=self.pow_data_build,
+        )
+
+        turnstile_token = _solve_turnstile_challenge(prepare_data.get("turnstile"), p_token)
 
         finalize_path = base + "/finalize"
         response = self.session.post(
             self.base_url + finalize_path,
             headers=self._headers(finalize_path, {"Content-Type": "application/json"}),
             json={
-                "prepare_token": prepare_data.get("prepare_token", ""),
+                "prepare_token": prepare_token,
                 "proof_token": proof_token,
                 "turnstile_token": turnstile_token,
             },
             timeout=self._search_remaining(deadline, timeout_secs),
+            stream=True,
         )
-        ensure_ok(response, "chat_requirements_finalize")
-        data = response.json()
+        data = self._read_json_response(response, "chat_requirements_finalize")
+        if not isinstance(data, dict):
+            raise RuntimeError("chat requirements response is invalid")
 
-        token = data.get("token", "")
+        if _arkose_required(data.get("arkose")):
+            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
+
+        token = _safe_upstream_text(data.get("token"), max_length=4096) or ""
         if not token:
             message = "missing auth chat requirements token" if self.access_token else "missing chat requirements token"
-            raise RuntimeError(f"{message}: {data}")
+            raise RuntimeError(message)
+
+        so_token = _safe_upstream_text(data.get("so_token"), max_length=4096) or ""
 
         return ChatRequirements(
             token=token,
             proof_token=proof_token,
             turnstile_token=turnstile_token,
-            so_token=data.get("so_token", ""),
-            raw_finalize=data,
+            so_token=so_token,
+            raw_finalize=None,
         )
 
     def _chat_target(self) -> tuple[str, str]:
@@ -2970,22 +3510,26 @@ class OpenAIBackendAPI:
             self.base_url + path,
             headers=self._headers(route),
             timeout=self._search_remaining(deadline, timeout_secs),
+            stream=True,
         )
-        ensure_ok(response, context)
+        payload = self._read_json_response(response, context)
         data = []
         seen = set()
-        for item in response.json().get("models", []):
+        if not isinstance(payload, dict):
+            return {"object": "list", "data": data}
+        for item in payload.get("models", []):
             if not isinstance(item, dict):
                 continue
-            slug = str(item.get("slug", "")).strip()
+            slug = parse_model_text(item.get("slug"))
             if not slug or slug in seen:
                 continue
             seen.add(slug)
+            owned_by = parse_model_text(item.get("owned_by"), default="chatgpt")
             model_item = {
                 "id": slug,
                 "object": "model",
-                "created": int(item.get("created") or 0),
-                "owned_by": str(item.get("owned_by") or "chatgpt"),
+                "created": _parse_model_created(item.get("created")),
+                "owned_by": owned_by,
                 "permission": [],
                 "root": slug,
                 "parent": None,

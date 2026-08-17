@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from services.config import config
 from services.log_service import run_ai_in_threadpool
 from services.protocol import openai_v1_chat_complete, openai_v1_response
+import services.protocol.chat_completion_cache as cache_module
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
 from utils.helper import extract_image_from_message_content
@@ -112,6 +113,85 @@ class ChatCompletionCacheTests(unittest.TestCase):
             first["choices"][0]["message"]["content"],
             second["choices"][0]["message"]["content"],
         )
+
+    def test_route_account_rotation_does_not_reuse_old_completion(self) -> None:
+        class Backend:
+            def __init__(self, answer: str) -> None:
+                self.answer = answer
+
+        backends = [Backend("answer-a"), Backend("answer-b")]
+
+        def fake_collect_text(backend, _request):
+            return backend.answer
+
+        body = {
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "same prompt"}],
+        }
+        selected_tokens = iter(("account-a", "account-b"))
+        with (
+            mock.patch.object(
+                openai_v1_chat_complete.account_service,
+                "get_text_access_token",
+                side_effect=lambda **_kwargs: next(selected_tokens),
+            ),
+            mock.patch.object(
+                openai_v1_chat_complete,
+                "text_backend",
+                side_effect=lambda _model, **_kwargs: backends.pop(0),
+            ),
+            mock.patch.object(openai_v1_chat_complete, "collect_text", side_effect=fake_collect_text),
+        ):
+            first = openai_v1_chat_complete.handle(body, cache_scope="user-key")
+            second = openai_v1_chat_complete.handle(body, cache_scope="user-key")
+
+        self.assertEqual(first["choices"][0]["message"]["content"], "answer-a")
+        self.assertEqual(second["choices"][0]["message"]["content"], "answer-b")
+
+    def test_response_cache_binds_to_selected_account(self) -> None:
+        class Backend:
+            def __init__(self, answer: str) -> None:
+                self.answer = answer
+
+        selected_tokens = iter(("account-a", "account-b"))
+
+        def fake_stream_text_deltas(backend, _request):
+            yield backend.answer
+
+        body = {"model": "gpt-test", "input": "same prompt"}
+        with (
+            mock.patch.object(
+                openai_v1_response.account_service,
+                "get_text_access_token",
+                side_effect=lambda **_kwargs: next(selected_tokens),
+            ),
+            mock.patch.object(
+                openai_v1_response,
+                "text_backend",
+                side_effect=lambda _model, **kwargs: Backend(kwargs["access_token"]),
+            ),
+            mock.patch.object(openai_v1_response, "stream_text_deltas", side_effect=fake_stream_text_deltas),
+        ):
+            first = openai_v1_response.handle(body, cache_scope="user-key")
+            second = openai_v1_response.handle(body, cache_scope="user-key")
+
+        self.assertEqual(first["output"][0]["content"][0]["text"], "account-a")
+        self.assertEqual(second["output"][0]["content"][0]["text"], "account-b")
+
+    def test_cached_non_stream_completion_gets_a_fresh_response_id(self) -> None:
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "fresh response identity"}],
+        }
+
+        with (
+            mock.patch("services.protocol.openai_v1_chat_complete.text_backend", return_value=object()),
+            mock.patch("services.protocol.openai_v1_chat_complete.collect_text", return_value="ok"),
+        ):
+            first = openai_v1_chat_complete.handle(body)
+            second = openai_v1_chat_complete.handle(body)
+
+        self.assertNotEqual(first["id"], second["id"])
 
     def test_cache_key_distinguishes_thinking_effort_inputs(self) -> None:
         messages = [{"role": "user", "content": "same prompt"}]
@@ -299,9 +379,28 @@ class ChatCompletionCacheTests(unittest.TestCase):
             second = list(openai_v1_chat_complete.handle(body))
 
         self.assertEqual(calls, 1)
-        self.assertEqual(first, second)
+        self.assertNotEqual(first[0]["id"], second[0]["id"])
         content = "".join(str(chunk["choices"][0]["delta"].get("content") or "") for chunk in second)
         self.assertEqual(content, "streamed answer")
+
+    def test_cached_response_events_get_fresh_response_and_item_ids(self) -> None:
+        body = {"model": "auto", "input": "fresh response event identity"}
+
+        with (
+            mock.patch("services.protocol.openai_v1_response.text_backend", return_value=object()),
+            mock.patch(
+                "services.protocol.openai_v1_response.stream_text_deltas",
+                return_value=iter(["ok"]),
+            ),
+        ):
+            first = list(openai_v1_response.response_events(body))
+            second = list(openai_v1_response.response_events(body))
+
+        first_response = first[-1]["response"]
+        second_response = second[-1]["response"]
+        self.assertNotEqual(first_response["id"], second_response["id"])
+        self.assertNotEqual(first[1]["item"]["id"], second[1]["item"]["id"])
+        self.assertEqual(first[-1]["response"]["output"][0]["content"], second[-1]["response"]["output"][0]["content"])
 
     def test_stream_cache_followers_do_not_starve_the_owner_ai_worker(self) -> None:
         owner_can_finish = threading.Event()
@@ -378,6 +477,254 @@ class ChatCompletionCacheTests(unittest.TestCase):
             list(chat_completion_cache.get_or_compute_stream("same-stream", unexpected_late_compute)),
             [{"type": "owner.started"}, {"type": "owner.completed"}],
         )
+
+    def test_stream_cache_closes_owner_source_when_consumer_stops_early(self) -> None:
+        class CloseTrackingIterator:
+            def __init__(self) -> None:
+                self.closed = False
+                self.index = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.index == 0:
+                    self.index += 1
+                    return {"type": "owner.started"}
+                raise AssertionError("consumer should stop before source completes")
+
+            def close(self) -> None:
+                self.closed = True
+
+        source = CloseTrackingIterator()
+        owner = chat_completion_cache.get_or_compute_stream(
+            "early-stop-stream",
+            lambda: source,
+        )
+
+        self.assertEqual(next(owner), {"type": "owner.started"})
+        owner.close()
+
+        self.assertTrue(source.closed)
+
+    def test_clear_invalidates_inflight_response_before_owner_publishes(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        def compute_old() -> dict[str, object]:
+            started.set()
+            self.assertTrue(release.wait(timeout=2))
+            return {"value": "old"}
+
+        def run_owner() -> None:
+            try:
+                results.append(chat_completion_cache.get_or_compute_response("clear-response", compute_old))
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=run_owner)
+        thread.start()
+        self.assertTrue(started.wait(timeout=2))
+        chat_completion_cache.clear()
+        release.set()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [{"value": "old"}])
+
+        calls = 0
+
+        def compute_new() -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return {"value": "new"}
+
+        self.assertEqual(
+            chat_completion_cache.get_or_compute_response("clear-response", compute_new),
+            {"value": "new"},
+        )
+        self.assertEqual(calls, 1)
+
+    def test_clear_invalidates_inflight_stream_before_owner_publishes(self) -> None:
+        release = threading.Event()
+
+        def compute_old():
+            yield {"value": "old-started"}
+            self.assertTrue(release.wait(timeout=2))
+            yield {"value": "old-finished"}
+
+        owner = chat_completion_cache.get_or_compute_stream("clear-stream", compute_old)
+        self.assertEqual(next(owner), {"value": "old-started"})
+        chat_completion_cache.clear()
+        release.set()
+        self.assertEqual(list(owner), [{"value": "old-finished"}])
+
+        calls = 0
+
+        def compute_new():
+            nonlocal calls
+            calls += 1
+            yield {"value": "new"}
+
+        self.assertEqual(
+            list(chat_completion_cache.get_or_compute_stream("clear-stream", compute_new)),
+            [{"value": "new"}],
+        )
+        self.assertEqual(calls, 1)
+
+    def test_clear_wakes_response_waiter_without_touching_new_generation(self) -> None:
+        owner_started = threading.Event()
+        release_owner = threading.Event()
+        waiter_entered = threading.Event()
+        follower_errors: list[BaseException] = []
+        original_condition = threading.Condition
+
+        class TrackingCondition(original_condition):
+            def wait(self, *args, **kwargs):
+                waiter_entered.set()
+                return super().wait(*args, **kwargs)
+
+        def owner_compute() -> dict[str, object]:
+            owner_started.set()
+            self.assertTrue(release_owner.wait(timeout=2))
+            return {"value": "old"}
+
+        owner_thread = threading.Thread(
+            target=lambda: chat_completion_cache.get_or_compute_response("clear-waiter", owner_compute),
+        )
+        owner_thread.start()
+        self.assertTrue(owner_started.wait(timeout=2))
+
+        def follower() -> None:
+            try:
+                chat_completion_cache.get_or_compute_response("clear-waiter", lambda: {"value": "unexpected"})
+            except BaseException as exc:
+                follower_errors.append(exc)
+
+        with mock.patch.object(cache_module.threading, "Condition", TrackingCondition):
+            follower_thread = threading.Thread(target=follower)
+            follower_thread.start()
+            self.assertTrue(waiter_entered.wait(timeout=2))
+            chat_completion_cache.clear()
+            follower_thread.join(timeout=2)
+
+        release_owner.set()
+        owner_thread.join(timeout=2)
+        self.assertFalse(owner_thread.is_alive())
+        self.assertFalse(follower_thread.is_alive())
+        self.assertEqual(len(follower_errors), 1)
+        self.assertEqual(str(follower_errors[0]), "cache fill invalidated")
+
+    def test_old_response_error_cannot_remove_new_generation_owner(self) -> None:
+        old_started = threading.Event()
+        release_old = threading.Event()
+        new_started = threading.Event()
+        release_new = threading.Event()
+        third_started = threading.Event()
+        old_errors: list[BaseException] = []
+        new_results: list[dict[str, object]] = []
+        third_results: list[dict[str, object]] = []
+
+        def old_compute() -> dict[str, object]:
+            old_started.set()
+            self.assertTrue(release_old.wait(timeout=2))
+            raise RuntimeError("old failure")
+
+        old_thread = threading.Thread(
+            target=lambda: self._capture_error(
+                old_errors,
+                lambda: chat_completion_cache.get_or_compute_response("clear-aba", old_compute),
+            ),
+        )
+        old_thread.start()
+        self.assertTrue(old_started.wait(timeout=2))
+        chat_completion_cache.clear()
+
+        def new_compute() -> dict[str, object]:
+            new_started.set()
+            self.assertTrue(release_new.wait(timeout=2))
+            return {"value": "new"}
+
+        new_thread = threading.Thread(
+            target=lambda: new_results.append(
+                chat_completion_cache.get_or_compute_response("clear-aba", new_compute),
+            ),
+        )
+        new_thread.start()
+        self.assertTrue(new_started.wait(timeout=2))
+        release_old.set()
+        old_thread.join(timeout=2)
+        self.assertFalse(old_thread.is_alive())
+
+        def third_compute() -> dict[str, object]:
+            third_started.set()
+            return {"value": "third"}
+
+        third_thread = threading.Thread(
+            target=lambda: third_results.append(
+                chat_completion_cache.get_or_compute_response("clear-aba", third_compute),
+            ),
+        )
+        third_thread.start()
+        self.assertFalse(third_started.wait(timeout=0.2))
+        release_new.set()
+        new_thread.join(timeout=2)
+        third_thread.join(timeout=2)
+        self.assertFalse(new_thread.is_alive())
+        self.assertFalse(third_thread.is_alive())
+        self.assertEqual(old_errors[0].args, ("old failure",))
+        self.assertEqual(new_results, [{"value": "new"}])
+        self.assertEqual(third_results, [{"value": "new"}])
+
+    @staticmethod
+    def _capture_error(target: list[BaseException], callback) -> None:
+        try:
+            callback()
+        except BaseException as exc:
+            target.append(exc)
+
+    def test_stream_cache_clears_inflight_when_compute_acquisition_fails(self) -> None:
+        attempts = 0
+
+        def compute():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("compute acquisition failed")
+            return iter([{"type": "recovered"}])
+
+        first = chat_completion_cache.get_or_compute_stream("acquisition-failure", compute)
+        with self.assertRaises(RuntimeError):
+            next(first)
+
+        self.assertEqual(list(chat_completion_cache.get_or_compute_stream("acquisition-failure", compute)), [{"type": "recovered"}])
+        self.assertEqual(attempts, 2)
+
+    def test_stream_cache_clears_inflight_when_iterator_acquisition_fails(self) -> None:
+        attempts = 0
+
+        class BrokenIterable:
+            def __iter__(self):
+                raise RuntimeError("iterator acquisition failed")
+
+        def compute():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return BrokenIterable()
+            return iter([{"type": "recovered"}])
+
+        first = chat_completion_cache.get_or_compute_stream("iterator-acquisition-failure", compute)
+        with self.assertRaises(RuntimeError):
+            next(first)
+
+        self.assertEqual(
+            list(chat_completion_cache.get_or_compute_stream("iterator-acquisition-failure", compute)),
+            [{"type": "recovered"}],
+        )
+        self.assertEqual(attempts, 2)
 
     def test_adjacent_duplicate_messages_are_removed_before_upstream_call(self) -> None:
         captured_messages = []
@@ -463,7 +810,11 @@ class ChatCompletionCacheTests(unittest.TestCase):
             second = list(openai_v1_response.handle(body))
 
         self.assertEqual(calls, 1)
-        self.assertEqual(first, second)
+        self.assertNotEqual(first[0]["response"]["id"], second[0]["response"]["id"])
+        self.assertEqual(
+            first[-1]["response"]["output"][0]["content"],
+            second[-1]["response"]["output"][0]["content"],
+        )
 
     def test_output_sanitizer_removes_chatgpt_annotation_markup(self) -> None:
         text = (
@@ -900,6 +1251,19 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertEqual(len(images), 3)
         self.assertEqual([image[1] for image in images], ["image/png", "image/png", "image/png"])
         self.assertTrue(all(image[0] == PNG_1X1 for image in images))
+
+    def test_image_extractor_rejects_non_string_source_data_without_stringifying(self) -> None:
+        class ExplodingValue:
+            def __str__(self):
+                raise AssertionError("source data must not be stringified")
+
+        self.assertEqual(
+            extract_image_from_message_content([
+                {"type": "input_image", "source": {"type": "base64", "data": ExplodingValue()}},
+                {"type": "image_url", "image_url": {"url": ExplodingValue()}},
+            ]),
+            [],
+        )
 
 
 if __name__ == "__main__":

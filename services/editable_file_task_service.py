@@ -3,16 +3,19 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import secrets
+import shutil
 import stat
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from services.account_service import account_service
 from services.config import DATA_DIR
@@ -27,10 +30,19 @@ from services.secure_file import (
     has_link as _has_symlink,
     normalize_windows_handle_path as _normalize_windows_handle_path,
     open_no_follow_file as _open_no_follow_file,
+    read_checked_file_bytes,
     validate_windows_handle_path as _validate_windows_handle_path,
 )
-from services.storage.base import StorageConflictError, StorageDataError, make_storage_snapshot
+from services.storage.base import (
+    StorageConflictError,
+    StorageDataError,
+    canonical_path_write_lock,
+    make_storage_snapshot,
+)
 from services.task_executor import reserve_background_task
+from services.task_contract import canonical_task_timestamp
+
+_EDITABLE_TASK_LOGGER = logging.getLogger(__name__)
 from utils.helper import new_uuid
 
 TASK_STATUS_QUEUED = "queued"
@@ -41,6 +53,16 @@ UNFINISHED_STATUSES = {TASK_STATUS_QUEUED, TASK_STATUS_RUNNING}
 EDITABLE_FILE_PLAN_TYPES = ("Plus", "Team", "Pro", "Enterprise")
 EDITABLE_FILE_ROOT = DATA_DIR / "files"
 EDITABLE_FILE_TASKS_PATH = DATA_DIR / "editable_file_tasks.json"
+_PERSISTED_EDITABLE_ERRORS = frozenset({
+    "editable file task failed",
+    "PSD 任务需要至少一张图片",
+    "服务已重启，未完成的任务已中断",
+})
+_MAX_CLIENT_TASK_ID_LENGTH = 256
+
+
+def _persisted_editable_error(value: object) -> str:
+    return value if isinstance(value, str) and value in _PERSISTED_EDITABLE_ERRORS else "editable file task failed"
 
 
 def _now_iso() -> str:
@@ -61,6 +83,40 @@ def _task_key(owner_id: str, task_id: str) -> str:
 
 def _owner_storage_segment(owner_id: str) -> str:
     return hashlib.sha256(owner_id.encode("utf-8")).hexdigest()
+
+
+def _validate_persisted_file_url(value: str, owner_id: str, kind: str, task_id: str) -> bool:
+    if len(value) > 4096 or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return False
+    if parsed.netloc and not parsed.scheme:
+        return False
+    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+        return False
+    if parsed.scheme and not parsed.netloc:
+        return False
+    path = parsed.path
+    marker = "/files/"
+    if marker not in path:
+        return False
+    parts = path.split(marker, 1)[1].split("/")
+    if any(not part or part in {".", ".."} for part in parts):
+        return False
+    if len(parts) == 3:
+        expected = (kind, task_id)
+        if tuple(parts[:2]) != expected:
+            return False
+    elif len(parts) >= 5:
+        if parts[1] != _owner_storage_segment(owner_id) or parts[2] != kind or parts[3] != task_id:
+            return False
+    else:
+        return False
+    return all("\\" not in part and ":" not in part for part in parts)
 
 
 def _new_download_capability() -> str:
@@ -119,12 +175,14 @@ def _open_verified_file(path: Path, output_dir: Path) -> BinaryIO:
 
 
 def _validate_task_id(task_id: str) -> None:
+    if not task_id or len(task_id) > _MAX_CLIENT_TASK_ID_LENGTH:
+        raise PublicSafeValueError("client_task_id length exceeded")
     if (
-        not task_id
-        or task_id in {".", ".."}
+        task_id in {".", ".."}
         or "/" in task_id
         or "\\" in task_id
         or ":" in task_id
+        or "," in task_id
         or any(ord(character) < 32 or ord(character) == 127 for character in task_id)
     ):
         raise PublicSafeValueError("client_task_id must be a safe path segment")
@@ -197,17 +255,14 @@ def _file_url(
 
 
 def _editable_access_token() -> str:
-    accounts = [
-        item for item in account_service.list_accounts()
-        if _clean(item.get("access_token"))
-           and item.get("status") not in {"禁用", "异常"}
-           and account_service._account_matches_any_plan_type(item, EDITABLE_FILE_PLAN_TYPES)
-    ]
-    if not accounts:
-        raise RuntimeError("no available plus/team/pro account")
-    accounts.sort(key=lambda item: _clean(item.get("last_used_at")))
-    token = _clean(accounts[0].get("access_token"))
-    return account_service.refresh_access_token(token, event="editable_file_task") or token
+    try:
+        return account_service.get_text_access_token(plan_types=EDITABLE_FILE_PLAN_TYPES)
+    except Exception as exc:
+        from services.model_service import ModelUnavailableError
+
+        if isinstance(exc, ModelUnavailableError):
+            raise RuntimeError("no available plus/team/pro account") from exc
+        raise
 
 
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
@@ -230,7 +285,9 @@ class EditableFileTaskService:
     def __init__(self, path: Path = EDITABLE_FILE_TASKS_PATH) -> None:
         self.path = path
         self._lock = threading.RLock()
+        self._path_lock = canonical_path_write_lock(path)
         self._tasks: dict[str, dict[str, Any]] = {}
+        self._snapshot_tasks: dict[str, dict[str, Any]] = {}
         self._snapshot_revision = make_storage_snapshot([]).revision
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
@@ -265,7 +322,11 @@ class EditableFileTaskService:
             if key in self._tasks:
                 return _public_task(self._tasks[key])
             reservation = reserve_background_task()
-            download_capability = _new_download_capability()
+            try:
+                download_capability = _new_download_capability()
+            except BaseException:
+                reservation.cancel()
+                raise
             ts = time.time()
             self._tasks[key] = {
                 "id": task_id,
@@ -281,6 +342,20 @@ class EditableFileTaskService:
             task = dict(self._tasks[key])
             try:
                 self._save_locked()
+            except StorageConflictError:
+                self._tasks.pop(key, None)
+                try:
+                    with self._path_lock:
+                        latest_tasks = self._load_locked()
+                        self._tasks = latest_tasks
+                    existing = latest_tasks.get(key)
+                except Exception:
+                    reservation.cancel()
+                    raise
+                reservation.cancel()
+                if existing is not None:
+                    return _public_task(existing)
+                raise
             except Exception:
                 self._tasks.pop(key, None)
                 reservation.cancel()
@@ -298,7 +373,10 @@ class EditableFileTaskService:
                 )
             except Exception:
                 self._tasks.pop(key, None)
-                self._save_locked()
+                try:
+                    self._save_locked()
+                except Exception:
+                    _EDITABLE_TASK_LOGGER.error("editable task submission rollback persistence failed")
                 raise
         return _public_task(task)
 
@@ -314,18 +392,28 @@ class EditableFileTaskService:
     ) -> None:
         started = time.time()
         token = ""
-        self._update_task(key, status=TASK_STATUS_RUNNING, error="", started_ts=started)
+        expected_account = None
         backend = None
+        output_dir: Path | None = None
+        output_dir_was_present = False
         try:
+            self._update_task(key, status=TASK_STATUS_RUNNING, error="", started_ts=started)
             if kind == "psd" and not base64_images:
                 raise PublicSafeError("PSD 任务需要至少一张图片")
             token = _editable_access_token()
+            get_account_lease = getattr(account_service, "_get_account_lease", None)
+            if callable(get_account_lease):
+                _, expected_account = get_account_lease(token)
             backend = OpenAIBackendAPI(token)
             owner = _owner_id(identity)
             task_id = key.rsplit(":", 1)[-1]
             output_dir = _editable_output_dir(owner, kind, task_id)
+            output_dir_was_present = output_dir.exists()
             result = backend.export_psd_zip(base64_images, prompt, output_dir) if kind == "psd" else backend.export_ppt_zip(base64_images, prompt, output_dir)
-            account_service.mark_text_used(token)
+            if expected_account is None:
+                account_service.mark_text_used(token)
+            else:
+                account_service.mark_text_used(token, expected_account=expected_account)
             primary_relative_path = _output_relative_path(result.primary_path, owner, kind, task_id)
             zip_relative_path = _output_relative_path(result.zip_path, owner, kind, task_id)
             capability_hashes = {
@@ -372,9 +460,32 @@ class EditableFileTaskService:
                 ended_ts=time.time(),
             )
             self._log_call(identity, kind, started, request_text(prompt))
+        except StorageConflictError:
+            return
         except Exception as exc:
-            error = public_exception_message(exc, "editable file task failed")
-            self._update_task(key, status=TASK_STATUS_ERROR, error=error, ended_ts=time.time())
+            error = _persisted_editable_error(public_exception_message(exc, "editable file task failed"))
+            try:
+                self._update_task(key, status=TASK_STATUS_ERROR, error=error, ended_ts=time.time())
+            except Exception:
+                with self._lock:
+                    task = self._tasks.get(key)
+                    if task is not None:
+                        task.update({
+                            "status": TASK_STATUS_ERROR,
+                            "error": error,
+                            "ended_ts": time.time(),
+                            "updated_at": _now_iso(),
+                            "updated_ts": time.time(),
+                        })
+                _EDITABLE_TASK_LOGGER.error("editable task terminal state persistence failed")
+            if output_dir is not None and not output_dir_was_present:
+                try:
+                    root = authorized_root(EDITABLE_FILE_ROOT)
+                    relative_parts = output_dir.relative_to(root).parts
+                    if relative_parts and not _has_symlink(root, relative_parts) and not output_dir.is_symlink():
+                        shutil.rmtree(output_dir)
+                except Exception:
+                    _EDITABLE_TASK_LOGGER.error("editable task artifact cleanup failed")
             self._log_call(identity, kind, started, request_text(prompt), status="failed", error=error)
         finally:
             if backend is not None:
@@ -490,7 +601,7 @@ class EditableFileTaskService:
         if not self.path.exists():
             return []
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(read_checked_file_bytes(self.path, self.path.parent).decode("utf-8"))
             raw_items = raw.get("tasks") if isinstance(raw, dict) else raw
             return make_storage_snapshot(raw_items).records
         except StorageDataError:
@@ -548,24 +659,62 @@ class EditableFileTaskService:
             else:
                 raise StorageDataError()
 
+            model_value = item.get("model")
+            if model_value is not None and not isinstance(model_value, str):
+                raise StorageDataError()
+
             created_at_value = item.get("created_at")
             updated_at_value = item.get("updated_at")
-            if created_at_value is not None and not isinstance(created_at_value, str):
+            created_at = canonical_task_timestamp(created_at_value, "")
+            updated_at = canonical_task_timestamp(updated_at_value, "")
+            if not created_at or not updated_at:
                 raise StorageDataError()
-            if updated_at_value is not None and not isinstance(updated_at_value, str):
-                raise StorageDataError()
-            created_at = _clean(created_at_value, _now_iso())
-            updated_at = _clean(updated_at_value, created_at)
             task = {
                 "id": task_id,
                 "owner_id": owner,
                 "status": status,
                 "kind": kind,
+                "model": model_value or EDITABLE_FILE_MODEL,
                 "created_at": created_at,
                 "updated_at": updated_at,
                 "created_ts": self._timestamp_value(item.get("created_ts")),
                 "updated_ts": self._timestamp_value(item.get("updated_ts")),
             }
+            raw_result = item.get("result")
+            if raw_result is not None:
+                if not isinstance(raw_result, dict) or set(raw_result) - {"conversation_id", "primary_url", "zip_url"}:
+                    raise StorageDataError()
+                result: dict[str, str] = {}
+                for field in ("conversation_id", "primary_url", "zip_url"):
+                    field_value = raw_result.get(field)
+                    if field_value is not None and not isinstance(field_value, str):
+                        raise StorageDataError()
+                    if isinstance(field_value, str):
+                        if field in {"primary_url", "zip_url"} and not _validate_persisted_file_url(
+                            field_value,
+                            owner,
+                            kind,
+                            task_id,
+                        ):
+                            raise StorageDataError()
+                        result[field] = field_value
+                if result:
+                    task["result"] = result
+            raw_error = item.get("error")
+            if raw_error is not None and not isinstance(raw_error, str):
+                raise StorageDataError()
+            if isinstance(raw_error, str) and raw_error and raw_error not in _PERSISTED_EDITABLE_ERRORS:
+                raise StorageDataError()
+            if isinstance(raw_error, str) and raw_error:
+                task["error"] = raw_error
+            else:
+                task["error"] = ""
+            started_ts = self._timestamp_value(item.get("started_ts"))
+            ended_ts = self._timestamp_value(item.get("ended_ts"))
+            if started_ts:
+                task["started_ts"] = started_ts
+            if ended_ts:
+                task["ended_ts"] = ended_ts
             raw_capability_hashes = item.get("download_capability_hashes")
             if raw_capability_hashes is not None:
                 if not isinstance(raw_capability_hashes, dict):
@@ -583,24 +732,50 @@ class EditableFileTaskService:
                     capability_hashes[normalized_path] = digest
                 if capability_hashes:
                     task["download_capability_hashes"] = capability_hashes
-            for field in ("result", "error", "started_ts", "ended_ts"):
-                if item.get(field):
-                    task[field] = item[field]
             key = _task_key(owner, task_id)
             if key in tasks:
                 raise StorageDataError()
             tasks[key] = task
+        self._snapshot_tasks = deepcopy(tasks)
         return tasks
 
     def _save_locked(self) -> None:
-        items = sorted(self._tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        current_revision = make_storage_snapshot(self._read_items_locked()).revision
-        if current_revision != self._snapshot_revision:
-            raise StorageConflictError()
-        next_snapshot = make_storage_snapshot(items)
-        payload = (json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        atomic_write_bytes(self.path, self.path.parent, payload)
-        self._snapshot_revision = next_snapshot.revision
+        with self._path_lock:
+            local_tasks = deepcopy(self._tasks)
+            baseline_tasks = deepcopy(self._snapshot_tasks)
+            baseline_revision = self._snapshot_revision
+            current_tasks = self._load_locked()
+            current_revision = self._snapshot_revision
+            if current_revision != baseline_revision:
+                merged_tasks = deepcopy(current_tasks)
+                dirty_keys = {
+                    key
+                    for key in set(local_tasks) | set(baseline_tasks)
+                    if local_tasks.get(key) != baseline_tasks.get(key)
+                }
+                for key in dirty_keys:
+                    baseline = baseline_tasks.get(key)
+                    current = current_tasks.get(key)
+                    local = local_tasks.get(key)
+                    if current != baseline and current != local:
+                        self._tasks = local_tasks
+                        self._snapshot_tasks = baseline_tasks
+                        self._snapshot_revision = baseline_revision
+                        raise StorageConflictError()
+                    if local is None:
+                        merged_tasks.pop(key, None)
+                    else:
+                        merged_tasks[key] = local
+            else:
+                merged_tasks = local_tasks
+
+            items = sorted(merged_tasks.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+            next_snapshot = make_storage_snapshot(items)
+            payload = (json.dumps({"tasks": items}, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            atomic_write_bytes(self.path, self.path.parent, payload)
+            self._tasks = merged_tasks
+            self._snapshot_tasks = deepcopy(merged_tasks)
+            self._snapshot_revision = next_snapshot.revision
 
     def _recover_unfinished_locked(self) -> bool:
         changed = False
@@ -642,7 +817,7 @@ class EditableFileTaskService:
         try:
             log_service.add(LOG_TYPE_CALL, f"{kind.upper()}生成任务{'失败' if status == 'failed' else '完成'}", detail)
         except Exception:
-            pass
+            _EDITABLE_TASK_LOGGER.error("editable task log persistence failed")
 
 
 editable_file_task_service = EditableFileTaskService()

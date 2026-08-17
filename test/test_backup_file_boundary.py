@@ -36,6 +36,21 @@ class BackupFileBoundaryTests(unittest.TestCase):
         if os.name == "nt" and callable(is_junction) and is_junction():
             directory.unlink()
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX dir-fd atomic writer")
+    def test_atomic_writer_does_not_remove_preexisting_temp_on_name_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "config.json"
+            stale_temp = root / ".config.json.collision.tmp"
+            stale_temp.write_bytes(b"stale-sentinel")
+
+            with mock.patch.object(secure_file.secrets, "token_hex", return_value="collision"):
+                with self.assertRaises(FileExistsError):
+                    secure_file.atomic_write_bytes(target, root, b"new-secret")
+
+            self.assertEqual(stale_temp.read_bytes(), b"stale-sentinel")
+            self.assertFalse(target.exists())
+
     def test_image_backup_rejects_a_rebound_authorized_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir) / "images"

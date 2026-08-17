@@ -24,3 +24,17 @@ test("third-party navigation only appends baseUrl", () => {
   assert.equal(parsed.searchParams.get("baseUrl"), "https://api.example.test");
   assert.equal(parsed.searchParams.get("apiKey"), null);
 });
+
+test("malformed third-party URL values fail closed without coercion", () => {
+  let coerced = false;
+  const value = {
+    trim() {
+      coerced = true;
+      return "https://canvas.example.test";
+    },
+  };
+
+  assert.doesNotThrow(() => buildThirdPartyHref(value, "https://api.example.test"));
+  assert.equal(buildThirdPartyHref(value, "https://api.example.test"), "");
+  assert.equal(coerced, false);
+});

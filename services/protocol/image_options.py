@@ -8,7 +8,7 @@ from services.protocol.error_response import PublicSafeValueError
 IMAGE_QUALITY_VALUES = frozenset({"auto", "low", "medium", "high"})
 IMAGE_EDIT_SIZE_VALUES = frozenset({"auto", "1024x1024", "1536x1024", "1024x1536"})
 IMAGE_OUTPUT_FORMAT_VALUES = frozenset({"png", "jpeg", "webp"})
-_IMAGE_SIZE_PATTERN = re.compile(r"([1-9]\d{0,3})x([1-9]\d{0,3})")
+_IMAGE_SIZE_PATTERN = re.compile(r"([1-9][0-9]{0,3})x([1-9][0-9]{0,3})")
 _MAX_IMAGE_LONG_EDGE = 3840
 _MAX_IMAGE_SHORT_EDGE = 2160
 _MAX_IMAGE_PIXELS = _MAX_IMAGE_LONG_EDGE * _MAX_IMAGE_SHORT_EDGE

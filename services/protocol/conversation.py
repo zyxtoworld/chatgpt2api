@@ -6,11 +6,12 @@ import json
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
 import tiktoken
+from fastapi import HTTPException
 from PIL import Image
 
 from services.account_service import account_service
@@ -25,7 +26,7 @@ from utils.helper import (
     is_supported_image_model,
     split_image_model,
 )
-from utils.image_tokens import count_image_content_tokens
+from utils.image_tokens import _decode_bounded_base64, count_image_content_tokens
 from utils.log import logger
 
 
@@ -34,6 +35,7 @@ _IMAGE_GENERATION_EXECUTOR = ThreadPoolExecutor(
     max_workers=_IMAGE_GENERATION_THREAD_CAPACITY,
     thread_name_prefix="image-generation",
 )
+_IMAGE_GENERATION_SLOTS = threading.BoundedSemaphore(_IMAGE_GENERATION_THREAD_CAPACITY)
 _IMAGE_CLEANUP_WORKERS = 4
 _IMAGE_CLEANUP_CAPACITY = 16
 _IMAGE_CLEANUP_EXECUTOR = ThreadPoolExecutor(
@@ -41,9 +43,14 @@ _IMAGE_CLEANUP_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="image-conversation-cleanup",
 )
 _IMAGE_CLEANUP_SLOTS = threading.BoundedSemaphore(_IMAGE_CLEANUP_CAPACITY)
+_IMAGE_CLEANUP_FUTURES: set[Future[None]] = set()
+_IMAGE_CLEANUP_FUTURES_LOCK = threading.Lock()
 
 
 PUBLIC_IMAGE_POLICY_MESSAGE = "Image generation was rejected by upstream policy."
+PUBLIC_IMAGE_RESULT_MESSAGE = "Image generation failed. Please try again later."
+PUBLIC_IMAGE_PROGRESS_MESSAGE = "Image generation is in progress."
+_MAX_CODEX_IMAGE_BYTES = 50 * 1024 * 1024
 
 
 class ImageGenerationError(Exception, PublicSafeErrorMarker):
@@ -90,6 +97,7 @@ def public_image_error_message(error: object) -> str:
                 "instead of an image. Please try again later."
             ),
             "insufficient_quota": "no available image quota",
+            "image_generation_queue_full": "Image generation is temporarily busy. Please try again later.",
         }
         if error.code in messages:
             return messages[error.code]
@@ -186,15 +194,33 @@ def save_image_bytes(image_data: bytes, base_url: str | None = None) -> str:
 def message_text(content: Any) -> str:
     if isinstance(content, str):
         return content
+    if content is None:
+        return ""
     if isinstance(content, list):
         parts = []
         for item in content:
             if isinstance(item, str):
                 parts.append(item)
             elif isinstance(item, dict) and str(item.get("type") or "") in {"text", "input_text", "output_text"}:
-                parts.append(str(item.get("text") or ""))
+                text = item.get("text")
+                if not isinstance(text, str):
+                    raise HTTPException(
+                        status_code=400,
+                        detail={"error": "message text block must contain a string"},
+                    )
+                parts.append(text)
+            elif isinstance(item, dict):
+                continue
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "message content parts must be objects or strings"},
+                )
         return "".join(parts)
-    return ""
+    raise HTTPException(
+        status_code=400,
+        detail={"error": "message content must be a string or array"},
+    )
 
 
 def normalize_messages(messages: object, system: Any = None) -> list[dict[str, Any]]:
@@ -320,6 +346,13 @@ def _convert_image_output(
     return output.getvalue()
 
 
+def _decode_image_result_b64(value: object) -> bytes:
+    decoded = _decode_bounded_base64(value, max_bytes=_MAX_CODEX_IMAGE_BYTES)
+    if decoded is None:
+        raise ImageGenerationError("upstream image result is invalid")
+    return decoded
+
+
 def format_image_result(
     items: list[dict[str, Any]],
     prompt: str,
@@ -336,16 +369,25 @@ def format_image_result(
 ) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     for item in items:
-        b64_json = str(item.get("b64_json") or "").strip()
+        b64_value = item.get("b64_json")
+        if not isinstance(b64_value, str):
+            continue
+        b64_json = b64_value.strip()
         if not b64_json:
             continue
-        revised_prompt = str(item.get("revised_prompt") or prompt).strip() or prompt
-        image_data = _convert_image_output(
-            base64.b64decode(b64_json),
-            output_format,
-            output_compression,
-            background,
-        )
+        revised_value = item.get("revised_prompt")
+        revised_prompt = revised_value.strip() if isinstance(revised_value, str) else prompt
+        revised_prompt = revised_prompt or prompt
+        decoded = _decode_image_result_b64(b64_json)
+        try:
+            image_data = _convert_image_output(
+                decoded,
+                output_format,
+                output_compression,
+                background,
+            )
+        except (ValueError, TypeError, OSError) as exc:
+            raise ImageGenerationError("upstream image result is invalid") from exc
         converted_b64 = base64.b64encode(image_data).decode("ascii")
         if response_format == "b64_json":
             data.append({
@@ -415,6 +457,12 @@ class ImageOutput:
     data: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
     conversation_id: str = ""
+    public_safe_text: bool = False
+
+    def public_message(self) -> str:
+        if self.public_safe_text and isinstance(self.text, str) and self.text.strip():
+            return self.text.strip()
+        return PUBLIC_IMAGE_RESULT_MESSAGE
 
     def to_chunk(self) -> dict[str, Any]:
         chunk: dict[str, Any] = {
@@ -427,14 +475,12 @@ class ImageOutput:
             "upstream_event_type": self.upstream_event_type,
             "data": [],
         }
-        if self.account_email:
-            chunk["_account_email"] = self.account_email
         if self.conversation_id:
             chunk["_conversation_id"] = self.conversation_id
         if self.kind == "message":
             chunk.update({
                 "object": "image.generation.message",
-                "message": self.text,
+                "message": self.public_message(),
             })
             chunk.pop("progress_text", None)
             chunk.pop("upstream_event_type", None)
@@ -449,16 +495,29 @@ class ImageOutput:
 
 
 def assistant_message_text(message: dict[str, Any]) -> str:
-    content = message.get("content") or {}
-    parts = content.get("parts") or []
-    if isinstance(parts, list) and parts:
-        text = "".join(part for part in parts if isinstance(part, str))
+    raw_content = message.get("content")
+    if raw_content is None:
+        content: dict[str, Any] = {}
+    elif isinstance(raw_content, dict):
+        content = raw_content
+    else:
+        raise RuntimeError("upstream returned malformed assistant content")
+
+    if "parts" in content:
+        parts = content.get("parts")
+        if not isinstance(parts, list) or any(not isinstance(part, str) for part in parts):
+            raise RuntimeError("upstream returned malformed assistant content")
+        text = "".join(parts)
         if text:
             return text
+
     # Fallback: content_type "code" stores text in the "text" field instead of "parts"
-    text_field = str(content.get("text") or "")
-    if text_field:
-        return text_field
+    if "text" in content:
+        text_field = content.get("text")
+        if not isinstance(text_field, str):
+            raise RuntimeError("upstream returned malformed assistant content")
+        if text_field:
+            return text_field
     return ""
 
 
@@ -603,7 +662,10 @@ def apply_text_patch(event: dict[str, Any], current_text: str = "", history_text
 
 def apply_patch_op(operation: dict[str, Any], current_text: str, history_text: str = "") -> str:
     op = operation.get("o")
-    value = str(operation.get("v") or "")
+    raw_value = operation.get("v")
+    if not isinstance(raw_value, str):
+        raise RuntimeError("upstream returned malformed text patch")
+    value = raw_value
     if op == "append":
         return current_text + value
     if op == "replace":
@@ -623,6 +685,21 @@ FILE_ID_RE = re.compile(r"\b(file[-_](?!service\b)[A-Za-z0-9_-]+)\b")
 # 用于过滤非图片文件 ID（如 file_upload_business_upsell）
 REAL_IMAGE_FILE_ID_RE = re.compile(r"\bfile_00000000[a-f0-9]{24}\b")
 SEDIMENT_ID_RE = re.compile(r"sediment://([A-Za-z0-9_-]+)")
+
+_SAFE_CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
+
+
+def _safe_conversation_id(value: object, fallback: str = "") -> str:
+    if not isinstance(value, str):
+        return fallback
+    candidate = value.strip()
+    return candidate if _SAFE_CONVERSATION_ID.fullmatch(candidate) else fallback
+
+
+def _safe_conversation_delta(value: object) -> str:
+    if not isinstance(value, str):
+        raise RuntimeError("invalid conversation delta")
+    return value
 
 
 def extract_conversation_ids(payload: str) -> tuple[str, list[str], list[str]]:
@@ -673,8 +750,9 @@ def _is_user_message_event(event: dict[str, Any]) -> bool:
 
 def update_conversation_state(state: ConversationState, payload: str, event: dict[str, Any] | None = None) -> None:
     conversation_id, file_ids, sediment_ids = extract_conversation_ids(payload)
-    if conversation_id and not state.conversation_id:
-        state.conversation_id = conversation_id
+    safe_payload_conversation_id = _safe_conversation_id(conversation_id)
+    if safe_payload_conversation_id and not state.conversation_id:
+        state.conversation_id = safe_payload_conversation_id
     # Accept file_id / sediment_id when any of:
     #   1) event is a complete image_gen tool message
     #   2) prior server_ste_metadata already flipped tool_invoked True (in an image_gen turn),
@@ -694,10 +772,16 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
         add_unique(state.sediment_ids, sediment_ids)
     if not isinstance(event, dict):
         return
-    state.conversation_id = str(event.get("conversation_id") or state.conversation_id)
+    state.conversation_id = _safe_conversation_id(
+        event.get("conversation_id"),
+        state.conversation_id,
+    )
     value = event.get("v")
     if isinstance(value, dict):
-        state.conversation_id = str(value.get("conversation_id") or state.conversation_id)
+        state.conversation_id = _safe_conversation_id(
+            value.get("conversation_id"),
+            state.conversation_id,
+        )
     if event.get("type") == "moderation":
         moderation = event.get("moderation_response")
         if isinstance(moderation, dict) and moderation.get("blocked") is True:
@@ -707,7 +791,9 @@ def update_conversation_state(state: ConversationState, payload: str, event: dic
         if isinstance(metadata, dict):
             if isinstance(metadata.get("tool_invoked"), bool):
                 state.tool_invoked = metadata["tool_invoked"]
-            state.turn_use_case = str(metadata.get("turn_use_case") or state.turn_use_case)
+            turn_use_case = metadata.get("turn_use_case")
+            if isinstance(turn_use_case, str):
+                state.turn_use_case = turn_use_case
 
 
 def conversation_base_event(event_type: str, state: ConversationState, **extra: Any) -> dict[str, Any]:
@@ -788,17 +874,25 @@ def conversation_events(
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
 
-def text_backend(model: str = "auto") -> OpenAIBackendAPI:
-    return OpenAIBackendAPI(access_token=account_service.get_text_access_token(model=model))
+def text_backend(model: str = "auto", *, access_token: str | None = None) -> OpenAIBackendAPI:
+    token = access_token if access_token is not None else account_service.get_text_access_token(model=model)
+    return OpenAIBackendAPI(access_token=token)
 
 
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     try:
-        yield from _stream_text_deltas(backend, request)
+        yield from stream_text_deltas_without_closing(backend, request)
     finally:
         close = getattr(backend, "close", None)
         if callable(close):
             close()
+
+
+def stream_text_deltas_without_closing(
+    backend: OpenAIBackendAPI,
+    request: ConversationRequest,
+) -> Iterator[str]:
+    yield from _stream_text_deltas(backend, request)
 
 
 def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
@@ -811,7 +905,11 @@ def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest)
         if token:
             attempted_tokens.add(token)
         active_backend = None
+        expected_account = None
         try:
+            get_account_lease = getattr(account_service, "_get_account_lease", None)
+            if callable(get_account_lease):
+                _, expected_account = get_account_lease(token)
             active_backend = OpenAIBackendAPI(access_token=token)
             for event in conversation_events(
                 active_backend,
@@ -822,22 +920,46 @@ def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest)
             ):
                 if event.get("type") != "conversation.delta":
                     continue
-                delta = str(event.get("delta") or "")
+                delta = _safe_conversation_delta(event.get("delta"))
                 if delta:
                     emitted = True
                     yield delta
             if not emitted:
                 raise RuntimeError("upstream completed without visible assistant output")
-            account_service.mark_text_used(token)
+            if expected_account is None:
+                account_service.mark_text_used(token)
+            else:
+                account_service.mark_text_used(token, expected_account=expected_account)
             return
         except Exception as exc:
             error_message = str(exc)
             if token and not emitted and is_token_invalid_error(error_message):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="text_stream")
+                refreshed_token = account_service.refresh_access_token(
+                    token,
+                    force=True,
+                    event="text_stream",
+                    expected_account=expected_account,
+                )
                 if refreshed_token and refreshed_token != token and refreshed_token not in attempted_tokens:
-                    token = refreshed_token
+                    if request.model == "auto":
+                        token = refreshed_token
+                    else:
+                        from services.model_service import model_catalog_service
+
+                        refreshed_route = model_catalog_service.route_for_model(request.model)
+                        if refreshed_token in refreshed_route.access_tokens:
+                            token = refreshed_token
+                        else:
+                            token = account_service.get_text_access_token(
+                                excluded_tokens=set(attempted_tokens),
+                                model=request.model,
+                            )
                 else:
-                    account_service.remove_invalid_token(token, "text_stream")
+                    account_service.remove_invalid_token(
+                        token,
+                        "text_stream",
+                        expected_account=expected_account,
+                    )
                     token = account_service.get_text_access_token(
                         excluded_tokens=set(attempted_tokens),
                         model=request.model,
@@ -942,13 +1064,56 @@ def _remove_image_conversation_later(
             _IMAGE_CLEANUP_SLOTS.release()
 
     try:
-        _IMAGE_CLEANUP_EXECUTOR.submit(_run)
+        with _IMAGE_CLEANUP_FUTURES_LOCK:
+            future = _IMAGE_CLEANUP_EXECUTOR.submit(_run)
+            _IMAGE_CLEANUP_FUTURES.add(future)
+        future.add_done_callback(_discard_image_cleanup_future)
     except Exception as exc:
         _IMAGE_CLEANUP_SLOTS.release()
         logger.warning({
             "event": "image_conversation_remove_submit_failed",
             "error_type": type(exc).__name__,
         })
+
+
+def _acquire_image_generation_slots(count: int) -> None:
+    acquired = 0
+    try:
+        while acquired < count:
+            if not _IMAGE_GENERATION_SLOTS.acquire(blocking=False):
+                raise ImageGenerationError(
+                    "image generation queue is full",
+                    status_code=503,
+                    code="image_generation_queue_full",
+                )
+            acquired += 1
+    except BaseException:
+        for _ in range(acquired):
+            _IMAGE_GENERATION_SLOTS.release()
+        raise
+
+
+def _release_image_generation_slot(_future: Future[Any]) -> None:
+    _IMAGE_GENERATION_SLOTS.release()
+
+
+def _discard_image_cleanup_future(future: Future[None]) -> None:
+    with _IMAGE_CLEANUP_FUTURES_LOCK:
+        _IMAGE_CLEANUP_FUTURES.discard(future)
+
+
+def wait_for_image_cleanup_tasks() -> None:
+    """Drain accepted conversation deletions before application shutdown."""
+    while True:
+        with _IMAGE_CLEANUP_FUTURES_LOCK:
+            futures = tuple(_IMAGE_CLEANUP_FUTURES)
+        if not futures:
+            return
+        for future in futures:
+            try:
+                future.result()
+            except BaseException:
+                pass
 
 
 def stream_image_outputs(
@@ -973,44 +1138,56 @@ def stream_image_outputs(
                 model=request.model,
                 index=index,
                 total=total,
-                text=str(event.get("delta") or ""),
+                text=_safe_conversation_delta(event.get("delta")),
                 upstream_event_type="conversation.delta",
-                conversation_id=str(event.get("conversation_id") or ""),
+                conversation_id=_safe_conversation_id(event.get("conversation_id")),
             )
             continue
         if event.get("type") == "conversation.event":
             raw = event.get("raw")
-            raw_type = str(raw.get("type") or "") if isinstance(raw, dict) else ""
+            raw_type = raw.get("type") if isinstance(raw, dict) else ""
+            if not isinstance(raw_type, str):
+                raw_type = ""
             yield ImageOutput(
                 kind="progress",
                 model=request.model,
                 index=index,
                 total=total,
                 upstream_event_type=raw_type,
-                conversation_id=str(event.get("conversation_id") or ""),
+                conversation_id=_safe_conversation_id(event.get("conversation_id")),
             )
 
-    conversation_id = str(last.get("conversation_id") or "")
-    file_ids = [str(item) for item in last.get("file_ids") or []]
-    sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
-    message = str(last.get("text") or "").strip()
+    conversation_id = _safe_conversation_id(last.get("conversation_id"))
+    raw_file_ids = last.get("file_ids")
+    file_ids = [item.strip() for item in raw_file_ids if isinstance(item, str) and item.strip()] \
+        if isinstance(raw_file_ids, list) else []
+    raw_sediment_ids = last.get("sediment_ids")
+    sediment_ids = [item.strip() for item in raw_sediment_ids if isinstance(item, str) and item.strip()] \
+        if isinstance(raw_sediment_ids, list) else []
+    raw_message = last.get("text")
+    message = raw_message.strip() if isinstance(raw_message, str) else ""
+    tool_invoked = last.get("tool_invoked") if isinstance(last.get("tool_invoked"), bool) else False
+    turn_use_case = last.get("turn_use_case")
+    if not isinstance(turn_use_case, str) or turn_use_case != "image gen":
+        turn_use_case = ""
+    blocked = last.get("blocked") is True
     logger.info({
         "event": "image_stream_resolve_start",
         "conversation_id": conversation_id,
-        "file_ids": file_ids,
-        "sediment_ids": sediment_ids,
-        "tool_invoked": last.get("tool_invoked"),
-        "turn_use_case": last.get("turn_use_case"),
+        "file_count": len(file_ids),
+        "sediment_count": len(sediment_ids),
+        "tool_invoked": tool_invoked,
+        "turn_use_case": turn_use_case,
     })
     if request.progress_callback:
         request.progress_callback("image_stream_resolve_start")
-    if message and not file_ids and not sediment_ids and last.get("blocked"):
+    if message and not file_ids and not sediment_ids and blocked:
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
         error_text = detailed_error or message or "Image generation was rejected by upstream policy."
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=error_text, conversation_id=conversation_id)
         return
-    should_poll_for_image = bool(request.images) or last.get("turn_use_case") == "image gen"
+    should_poll_for_image = bool(request.images) or turn_use_case == "image gen"
     if message and not file_ids and not sediment_ids and not should_poll_for_image:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
         return
@@ -1362,7 +1539,8 @@ def stream_image_outputs(
         yield ImageOutput(kind="message", model=request.model, index=index, total=total,
                           text="Image generation completed upstream but the result could not be retrieved. "
                                "The image may still be processing. Please try again in a moment.",
-                          conversation_id=conversation_id)
+                          conversation_id=conversation_id,
+                          public_safe_text=True)
     elif message:
         yield ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
     else:
@@ -1372,7 +1550,8 @@ def stream_image_outputs(
         yield ImageOutput(kind="message", model=request.model, index=index, total=total,
                           text="Image generation started upstream but the response was incomplete. "
                                "Please try again.",
-                          conversation_id=conversation_id)
+                          conversation_id=conversation_id,
+                          public_safe_text=True)
 
 
 def _codex_response_images(value: Any) -> list[str]:
@@ -1461,22 +1640,44 @@ def _generate_single_image(
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
             )
+            leased_token = token
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
+        account_email = ""
         emitted_for_token = False
         returned_message = False
         returned_result = False
-        account = account_service.get_account(token) or {}
-        account_email = str(account.get("email") or "").strip()
-        logger.debug({
-            "event": "image_account_lookup",
-            "account_found": bool(account),
-            "index": index,
-        })
+        mark_result_attempted = False
+        expected_account = None
+
+        def mark_result(success: bool) -> None:
+            nonlocal mark_result_attempted
+            if mark_result_attempted:
+                return
+            mark_result_attempted = True
+            if expected_account is None:
+                account_service.mark_image_result(leased_token, success)
+            else:
+                account_service.mark_image_result(
+                    leased_token,
+                    success,
+                    expected_account=expected_account,
+                )
+
         backend = None
         try:
-            backend = OpenAIBackendAPI(access_token=token)
+            get_account_lease = getattr(account_service, "_get_account_lease", None)
+            if callable(get_account_lease):
+                _, expected_account = get_account_lease(leased_token)
+            account = account_service.get_account(leased_token) or {}
+            account_email = str(account.get("email") or "").strip()
+            logger.debug({
+                "event": "image_account_lookup",
+                "account_found": bool(account),
+                "index": index,
+            })
+            backend = OpenAIBackendAPI(access_token=leased_token)
             if request.progress_callback:
                 backend.progress_callback = request.progress_callback
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
@@ -1507,10 +1708,9 @@ def _generate_single_image(
             finally:
                 _remove_image_conversation_later(backend, last_conversation_id, success=returned_result)
             if returned_message:
-                account_service.mark_image_result(token, False)
+                mark_result(False)
                 return outputs
             if not returned_result:
-                account_service.mark_image_result(token, False)
                 if emitted_for_token:
                     conv_id = outputs[-1].conversation_id if outputs else ""
                     raise ImageGenerationError(
@@ -1521,16 +1721,17 @@ def _generate_single_image(
                         account_email=account_email,
                         conversation_id=conv_id,
                     )
+                mark_result(False)
                 return outputs
-            account_service.mark_image_result(token, True)
+            mark_result(True)
             return outputs
         except ImagePollTimeoutError as exc:
-            account_service.mark_image_result(token, False)
+            mark_result(False)
             if account_email:
                 setattr(exc, "account_email", account_email)
             # resume-poll 必须继续使用生成该 conversation 的登录会话。
             # token 只在当前进程的异常链路中传播，由任务服务保存在内存，不能写入任务文件。
-            exc.access_token = token
+            exc.access_token = leased_token
             # 轮询超时：换账号重试
             if not emitted_for_token:
                 poll_timeout_retry_count += 1
@@ -1550,7 +1751,7 @@ def _generate_single_image(
                 raise
             raise
         except ImageContentPolicyError as exc:
-            account_service.mark_image_result(token, False)
+            mark_result(False)
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "error": exception_log_message(exc),
@@ -1565,7 +1766,7 @@ def _generate_single_image(
                 conversation_id=getattr(exc, "conversation_id", ""),
             ) from exc
         except ImageGenerationError as exc:
-            account_service.mark_image_result(token, False)
+            mark_result(False)
             if account_email and not getattr(exc, "account_email", ""):
                 exc.account_email = account_email
             error_text = str(exc)
@@ -1601,7 +1802,7 @@ def _generate_single_image(
             })
             raise
         except Exception as exc:
-            account_service.mark_image_result(token, False)
+            mark_result(False)
             last_error = str(exc)
             logger.warning({
                 "event": "image_stream_fail",
@@ -1609,11 +1810,19 @@ def _generate_single_image(
                 "index": index,
             })
             if not emitted_for_token and is_token_invalid_error(last_error):
-                refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
-                if refreshed_token and refreshed_token != token:
-                    token = refreshed_token
+                refreshed_token = account_service.refresh_access_token(
+                    leased_token,
+                    force=True,
+                    event="image_stream",
+                    expected_account=expected_account,
+                )
+                if refreshed_token and refreshed_token != leased_token:
                     continue
-                account_service.remove_invalid_token(token, "image_stream")
+                account_service.remove_invalid_token(
+                    leased_token,
+                    "image_stream",
+                    expected_account=expected_account,
+                )
                 continue
             # TLS/SSL 连接错误：自动重试
             if not emitted_for_token and is_tls_connection_error(last_error):
@@ -1643,8 +1852,11 @@ def _generate_single_image(
                     continue
             raise ImageGenerationError(image_stream_error_message(last_error), account_email=account_email, conversation_id="") from exc
         finally:
-            if backend is not None:
-                backend.close()
+            try:
+                if backend is not None:
+                    backend.close()
+            finally:
+                account_service.release_image_slot(leased_token)
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
@@ -1677,13 +1889,22 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         "n": request.n,
         "model": request.model,
     })
+    _acquire_image_generation_slots(request.n)
     # 每张图片一个线程，同时启动
     futures = {}
     results: dict[int, list[ImageOutput]] = {}
     errors: dict[int, Exception] = {}
-    for index in range(1, request.n + 1):
-        future = _IMAGE_GENERATION_EXECUTOR.submit(_generate_single_image, request, index, request.n)
-        futures[future] = index
+    try:
+        for index in range(1, request.n + 1):
+            future = _IMAGE_GENERATION_EXECUTOR.submit(_generate_single_image, request, index, request.n)
+            futures[future] = index
+            future.add_done_callback(_release_image_generation_slot)
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        for _ in range(request.n - len(futures)):
+            _IMAGE_GENERATION_SLOTS.release()
+        raise
 
     # 按完成顺序收集结果
     for future in as_completed(futures):
@@ -1749,9 +1970,13 @@ def stream_image_events(
         for item in output.data:
             if not isinstance(item, dict):
                 continue
-            b64_json = str(item.get("b64_json") or "").strip()
+            raw_b64_json = item.get("b64_json")
+            if not isinstance(raw_b64_json, str):
+                raise ImageGenerationError("Image stream result is invalid")
+            b64_json = raw_b64_json.strip()
             if not b64_json:
                 continue
+            _decode_image_result_b64(b64_json)
             emitted = True
             yield {
                 "type": event_type,
@@ -1772,23 +1997,18 @@ def collect_image_outputs(outputs: Iterable[ImageOutput]) -> dict[str, Any]:
     data: list[dict[str, Any]] = []
     message = ""
     progress_parts: list[str] = []
-    account_email = ""
     for output in outputs:
         created = created or output.created
-        if output.account_email and not account_email:
-            account_email = output.account_email
         if output.kind == "progress" and output.text:
             progress_parts.append(output.text)
         elif output.kind == "message":
-            message = output.text
+            message = output.public_message()
         elif output.kind == "result":
             data.extend(output.data)
 
     result: dict[str, Any] = {"created": created or int(time.time()), "data": data}
     if not data:
-        text = message or "".join(progress_parts).strip()
+        text = message or (PUBLIC_IMAGE_RESULT_MESSAGE if progress_parts else "")
         if text:
             result["message"] = text
-    if account_email:
-        result["_account_email"] = account_email
     return result

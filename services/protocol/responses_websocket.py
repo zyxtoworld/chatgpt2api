@@ -84,6 +84,12 @@ class ResponsesWebSocketRequestError(ValueError):
         return self.message
 
 
+def _validation_error_message(exc: HTTPException) -> str:
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    message = detail.get("error")
+    return message.strip() if isinstance(message, str) and message.strip() else "invalid Responses WebSocket request"
+
+
 def _transcript_items(input_value: object) -> list[dict[str, Any]]:
     if isinstance(input_value, str):
         return messages_from_input(input_value)
@@ -199,9 +205,10 @@ class ResponsesWebSocketSession:
         try:
             validate_response_core_parameters(body)
         except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) else {}
-            message = str(detail.get("error") or "invalid Responses WebSocket request")
-            raise ResponsesWebSocketRequestError("invalid_request_error", message) from exc
+            raise ResponsesWebSocketRequestError(
+                "invalid_request_error",
+                _validation_error_message(exc),
+            ) from exc
         if body.get("background") is not None:
             raise ResponsesWebSocketRequestError(
                 "invalid_request_error",
@@ -245,9 +252,10 @@ class ResponsesWebSocketSession:
         try:
             validation_payload = codex_response_payload(validation_body, websocket=True)
         except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) else {}
-            message = str(detail.get("error") or "invalid Responses WebSocket request")
-            raise ResponsesWebSocketRequestError("invalid_request_error", message) from exc
+            raise ResponsesWebSocketRequestError(
+                "invalid_request_error",
+                _validation_error_message(exc),
+            ) from exc
 
         replay_body = copy.deepcopy(incremental_body)
         replay_body.pop("previous_response_id", None)
@@ -379,6 +387,10 @@ class CodexResponsesWebSocketTransport:
             access_token = account_service.get_text_access_token(model=model, source_type="codex")
         except ModelUnavailableError as exc:
             raise CodexResponsesWebSocketUnavailable("native codex websocket is unavailable") from exc
+        expected_account = None
+        get_account_lease = getattr(account_service, "_get_account_lease", None)
+        if callable(get_account_lease):
+            _, expected_account = get_account_lease(access_token)
         account = account_service.get_account(access_token)
         account = account if isinstance(account, dict) else {}
         account_id = str(account.get("account_id") or account.get("chatgpt_account_id") or "").strip()
@@ -419,7 +431,10 @@ class CodexResponsesWebSocketTransport:
                     raise CodexResponsesWebSocketProtocolError("invalid codex websocket event") from exc
                 if not isinstance(event, dict) or not isinstance(event.get("type"), str):
                     raise CodexResponsesWebSocketProtocolError("invalid codex websocket event")
-                public_event = project_public_codex_response_event(event)
+                try:
+                    public_event = project_public_codex_response_event(event)
+                except RuntimeError as exc:
+                    raise CodexResponsesWebSocketProtocolError("invalid codex websocket event") from exc
                 if public_event is None:
                     continue
                 event = public_event
@@ -451,11 +466,23 @@ class CodexResponsesWebSocketTransport:
                         raise CodexResponsesWebSocketProtocolError("invalid codex websocket terminal event") from exc
                     event = {**event, "response": terminal_response}
                     event = _reconcile_completed_output(event, completed_items)
-                yield event
-                if event_type in _CODEX_WEBSOCKET_SUCCESS_TERMINALS:
                     terminal = True
-                    account_service.mark_text_used(access_token)
+                    try:
+                        if expected_account is None:
+                            account_service.mark_text_used(access_token)
+                        else:
+                            account_service.mark_text_used(
+                                access_token,
+                                expected_account=expected_account,
+                            )
+                    except Exception as exc:
+                        logger.warning({
+                            "event": "codex_responses_websocket_usage_mark_failed",
+                            "error_type": type(exc).__name__,
+                        })
+                    yield event
                     return
+                yield event
                 if event_type in _CODEX_WEBSOCKET_FAILURE_TERMINALS:
                     terminal = True
                     self.close()

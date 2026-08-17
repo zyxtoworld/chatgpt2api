@@ -18,10 +18,13 @@ test("image-manager downloads use a shared lifecycle owner and cancel it on unmo
   assert.match(pageSource, /createLifecycleActionOwner/);
   assert.match(pageSource, /downloadOwnerRef/);
   assert.match(pageSource, /downloadOwner\.cancel\(\)/);
-  assert.match(pageSource, /downloadImages\(paths, isDownloadActive\)/);
-  assert.match(pageSource, /downloadSingleImage\(item\.rel, isDownloadActive\)/);
-  assert.match(apiSource, /downloadImages\(paths: string\[], isActive\?: \(\) => boolean\)/);
-  assert.match(apiSource, /downloadSingleImage\(path: string, isActive\?: \(\) => boolean\)/);
+  assert.match(pageSource, /downloadImages\(paths, isDownloadActive, controller\.signal\)/);
+  assert.match(pageSource, /downloadSingleImage\(item\.rel, isDownloadActive, controller\.signal\)/);
+  assert.match(apiSource, /downloadImages\(paths: string\[], isActive\?: \(\) => boolean, signal\?: AbortSignal\)/);
+  assert.match(apiSource, /downloadSingleImage\(path: string, isActive\?: \(\) => boolean, signal\?: AbortSignal\)/);
+  assert.match(apiSource, /signal\?: AbortSignal/);
+  assert.match(pageSource, /downloadAbortRegistryRef/);
+  assert.match(pageSource, /downloadAbortRegistry\.cancel\(\)/);
   assert.match(apiSource, /if \(isActive && !isActive\(\)\) return false;/);
 });
 

@@ -6,6 +6,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 _DNS_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _has_valid_percent_escapes(value: str) -> bool:
+    for index, character in enumerate(value):
+        if character != "%":
+            continue
+        if index + 2 >= len(value) or value[index + 1] not in _HEX_DIGITS or value[index + 2] not in _HEX_DIGITS:
+            return False
+    return True
 
 
 def _canonical_public_hostname(hostname: str) -> str:
@@ -49,6 +59,11 @@ def normalize_public_http_url(value: object) -> str:
         hostname = _canonical_public_hostname(parsed.hostname or "")
         if not hostname:
             return ""
+        if not all(
+            _has_valid_percent_escapes(part)
+            for part in (parsed.path, parsed.query, parsed.fragment)
+        ):
+            return ""
         authority = f"[{hostname}]" if ":" in hostname else hostname
         if port is not None:
             authority = f"{authority}:{port}"
@@ -75,7 +90,7 @@ def redact_url_credentials(value: object) -> str:
             return ""
         has_userinfo = "@" in parsed.netloc or parsed.username is not None or parsed.password is not None
         if not has_userinfo:
-            return raw_text
+            return urlunsplit(parsed._replace(query="", fragment=""))
         hostname = parsed.hostname or ""
         if not hostname:
             return ""
@@ -84,6 +99,6 @@ def redact_url_credentials(value: object) -> str:
         host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
         if parsed.port is not None:
             host = f"{host}:{parsed.port}"
-        return urlunsplit((parsed.scheme, f"[REDACTED]@{host}", parsed.path, parsed.query, parsed.fragment))
+        return urlunsplit((parsed.scheme, f"[REDACTED]@{host}", parsed.path, "", ""))
     except (TypeError, ValueError):
         return ""

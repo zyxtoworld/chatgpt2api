@@ -6,7 +6,7 @@ import { flushSync } from "react-dom"
 
 import { toggleDocumentTheme } from "@/lib/theme-toggle-state"
 import { cn } from "@/lib/utils"
-import { observeViewTransition } from "@/lib/view-transition-lifecycle"
+import { startObservedViewTransition } from "@/lib/view-transition-lifecycle"
 
 export type TransitionVariant =
   | "circle"
@@ -212,26 +212,29 @@ export const AnimatedThemeToggler = ({
       root.style.removeProperty("--magicui-theme-vt-clip-from")
     }
 
-    const transition = document.startViewTransition(() => {
-      flushSync(applyTheme)
-    })
-    observeViewTransition(transition, {
-      onReady: () => {
-        document.documentElement.animate(
-          {
-            clipPath,
-          },
-          {
-            duration,
-            // Star: linear avoids easing overshoot that fights polygon interpolation at t→1; VT group duration is synced above.
-            easing: shape === "star" ? "linear" : "ease-in-out",
-            fill: "forwards",
-            pseudoElement: "::view-transition-new(root)",
-          }
-        )
+    startObservedViewTransition(
+      () => document.startViewTransition(() => {
+        flushSync(applyTheme)
+      }),
+      applyTheme,
+      {
+        onReady: () => {
+          document.documentElement.animate(
+            {
+              clipPath,
+            },
+            {
+              duration,
+              // Star: linear avoids easing overshoot that fights polygon interpolation at t→1; VT group duration is synced above.
+              easing: shape === "star" ? "linear" : "ease-in-out",
+              fill: "forwards",
+              pseudoElement: "::view-transition-new(root)",
+            }
+          )
+        },
+        onSettled: cleanup,
       },
-      onSettled: cleanup,
-    })
+    )
   }, [shape, fromCenter, duration])
 
   return (

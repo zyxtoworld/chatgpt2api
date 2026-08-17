@@ -58,8 +58,9 @@ export function CPAPoolsCard() {
         ) : (
           <div className="space-y-3">
             {pools.map((pool) => {
-              const isBusy = hasMutation || loadingFilesId === pool.id;
               const importJob = pool.import_job ?? null;
+              const importRunning = importJob?.status === "pending" || importJob?.status === "running";
+              const isBusy = hasMutation || importRunning || loadingFilesId === pool.id;
               const progress = importJob?.total
                 ? Math.round((importJob.completed / importJob.total) * 100)
                 : 0;

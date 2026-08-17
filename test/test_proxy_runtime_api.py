@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI
@@ -9,6 +11,7 @@ from fastapi.testclient import TestClient
 
 import api.system as system_module
 from services.config import DEFAULT_PROXY_RUNTIME
+from services.storage.json_storage import JSONStorageBackend
 
 
 AUTH_HEADERS = {"Authorization": "Bearer chatgpt2api"}
@@ -164,7 +167,64 @@ class ProxyRuntimeApiTests(unittest.TestCase):
 
         self.assertEqual(post_response.status_code, 200, post_response.text)
         self.assertTrue(post_response.json()["runtime"]["enabled"])
+        self.assertEqual(post_response.json()["status"]["cached_clearance_hosts"], [])
+        for sentinel in (
+            "internal-target.sentinel.example",
+            "proxy-runtime.sentinel.example",
+            "opaque-cookie-sentinel",
+            "opaque-user-agent-sentinel",
+            "opaque-error-sentinel",
+            "proxy-runtime-future-sentinel",
+        ):
+            self.assertNotIn(sentinel, post_response.text)
         self.assertEqual(self.fake_config.data["proxy_runtime"], runtime)
+
+    def test_proxy_runtime_endpoint_drops_operational_status_details(self) -> None:
+        response = self.client.get("/api/proxy/runtime", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        status = response.json()["status"]
+        self.assertEqual(status["cached_clearance_hosts"], [])
+        for sentinel in (
+            "internal-target.sentinel.example",
+            "proxy-runtime.sentinel.example",
+            "opaque-cookie-sentinel",
+            "opaque-user-agent-sentinel",
+            "opaque-error-sentinel",
+            "proxy-runtime-future-sentinel",
+        ):
+            self.assertNotIn(sentinel, response.text)
+
+    def test_storage_info_does_not_expose_real_backend_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            canary = "storage-path-canary"
+            root = Path(temp_dir) / canary
+            backend = JSONStorageBackend(root / "accounts.json", root / "auth_keys.json")
+            with mock.patch.object(self.fake_config, "get_storage_backend", return_value=backend):
+                response = self.client.get("/api/storage/info", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        serialized = response.text
+        self.assertNotIn(canary, serialized)
+        self.assertNotIn("file_path", response.json()["backend"])
+        self.assertNotIn("auth_keys_file_path", response.json()["health"])
+
+    def test_storage_info_projects_real_backend_failure_to_fixed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "storage-failure-canary"
+            accounts_path = root / "accounts.json"
+            accounts_path.parent.mkdir(parents=True)
+            accounts_path.write_text("not-json", encoding="utf-8")
+            backend = JSONStorageBackend(accounts_path, root / "auth_keys.json")
+            with mock.patch.object(self.fake_config, "get_storage_backend", return_value=backend):
+                response = self.client.get("/api/storage/info", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {
+            "backend": {"type": "json"},
+            "health": {"status": "unhealthy", "error": "存储后端健康检查失败"},
+        })
+        self.assertNotIn("storage-failure-canary", response.text)
 
     def test_clearance_test_endpoint_runs_clearance_refresh_without_returning_cookie_values(self) -> None:
         response = self.client.post(
@@ -178,7 +238,45 @@ class ProxyRuntimeApiTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["has_cookies"])
         self.assertNotIn("cf_clearance", response.text)
+        for sentinel in (
+            "internal-target.sentinel.example",
+            "proxy-runtime.sentinel.example",
+            "opaque-cookie-sentinel",
+            "opaque-user-agent-sentinel",
+            "opaque-error-sentinel",
+            "proxy-runtime-future-sentinel",
+        ):
+            self.assertNotIn(sentinel, response.text)
         self.assertEqual(self.test_clearance_calls, ["https://chatgpt.com/backend-api/models"])
+
+    def test_clearance_test_projects_malformed_status_values_without_500(self) -> None:
+        canary = "proxy-clearance-malformed-canary"
+        malformed = {
+            "ok": True,
+            "status": {canary: "status"},
+            "latency_ms": [canary],
+            "has_cookies": {canary: True},
+            "error": {canary: "error"},
+            "runtime": {
+                "proxy_source": [canary],
+                "egress_mode": {canary: "egress"},
+                "clearance_mode": [canary],
+            },
+        }
+        with mock.patch.object(system_module, "test_clearance", return_value=malformed):
+            response = self.client.post(
+                "/api/proxy/clearance/test",
+                headers=AUTH_HEADERS,
+                json={"target_url": "https://chatgpt.com/backend-api/models"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()["result"]
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["latency_ms"], 0)
+        self.assertFalse(result["has_cookies"])
+        self.assertEqual(result["runtime"]["proxy_source"], "unknown")
+        self.assertNotIn(canary, response.text)
 
     def test_health_json_includes_proxy_runtime_status(self) -> None:
         response = self.client.get("/health?format=json")
@@ -234,6 +332,20 @@ class ProxyRuntimeApiTests(unittest.TestCase):
             "future_field",
         ):
             self.assertNotIn(sentinel, html_response.text)
+
+    def test_health_stays_available_when_proxy_runtime_probe_fails(self) -> None:
+        with mock.patch.object(
+            self.fake_proxy_settings,
+            "get_runtime_status",
+            side_effect=RuntimeError("runtime probe failed"),
+        ):
+            response = self.client.get("/health?format=json")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["proxy_runtime"],
+            {"enabled": False, "clearance_enabled": False},
+        )
 
 
 if __name__ == "__main__":

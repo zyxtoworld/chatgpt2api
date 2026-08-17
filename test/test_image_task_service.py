@@ -9,10 +9,15 @@ from pathlib import Path
 from unittest import mock
 
 import services.protocol.conversation as conversation_module
+import services.image_task_service as service_module
+import services.secure_file as secure_file
+from services.account_service import AccountService
 from services.image_task_service import ImageTaskService
 from services.openai_backend_api import ImagePollTimeoutError
-from services.protocol.conversation import ConversationRequest, ImageOutput
+from services.protocol.conversation import ConversationRequest, ImageGenerationError, ImageOutput
 from services.protocol.error_response import PublicSafeValueError
+from services.storage.json_storage import JSONStorageBackend
+from services.storage.base import StorageDataError
 from test.fixtures.image_inputs import image_fixture_bytes
 
 
@@ -48,6 +53,125 @@ class ImageTaskServiceTests(unittest.TestCase):
             edit_handler=handler or (lambda _payload: {"data": [{"url": "http://example.test/edit.png"}]}),
             retention_days_getter=lambda: 30,
         )
+
+    def test_client_task_id_is_bounded_before_reservation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+
+            class NoopReservation:
+                def submit(self, *_args, **_kwargs):
+                    return None
+
+                def cancel(self):
+                    return None
+
+            with mock.patch.object(
+                service_module,
+                "reserve_background_task",
+                return_value=NoopReservation(),
+            ) as reserve:
+                with self.assertRaises(ValueError):
+                    service.submit_generation(
+                        OWNER,
+                        client_task_id="x" * 257,
+                        prompt="cat",
+                        model="gpt-image-2",
+                        size=None,
+                    )
+
+                reserve.assert_not_called()
+
+            with mock.patch.object(
+                service_module,
+                "reserve_background_task",
+                return_value=NoopReservation(),
+            ) as reserve:
+                with self.assertRaises(ValueError):
+                    service.submit_generation(
+                        OWNER,
+                        client_task_id="task,one",
+                        prompt="cat",
+                        model="gpt-image-2",
+                        size=None,
+                    )
+
+            reserve.assert_not_called()
+
+    def test_snapshot_read_does_not_follow_path_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            replacement = Path(tmp_dir) / "replacement.json"
+            displaced = Path(tmp_dir) / "displaced.json"
+            original_snapshot = {"tasks": [{
+                "id": "original-task",
+                "owner_id": "owner-1",
+                "status": "success",
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "size": "1024x1024",
+                "quality": "auto",
+                "created_at": "2026-08-13 12:00:00",
+                "updated_at": "2026-08-13 12:00:00",
+                "created_ts": 1,
+                "updated_ts": 2,
+            }]}
+            replacement_snapshot = {"tasks": [{
+                **original_snapshot["tasks"][0],
+                "id": "replaced-task",
+            }]}
+            path.write_text(json.dumps(original_snapshot), encoding="utf-8")
+            replacement.write_text(json.dumps(replacement_snapshot), encoding="utf-8")
+            original_read_text = Path.read_text
+
+            def replace_before_read(path_obj, *args, **kwargs):
+                if path_obj == path:
+                    path.write_bytes(replacement.read_bytes())
+                return original_read_text(path_obj, *args, **kwargs)
+
+            with mock.patch.object(Path, "read_text", autospec=True, side_effect=replace_before_read):
+                service = self.make_service(path)
+
+            self.assertIn("owner-1:original-task", service._tasks)
+            self.assertNotIn("owner-1:replaced-task", service._tasks)
+
+    def test_snapshot_read_uses_fixed_handle_after_path_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            replacement = Path(tmp_dir) / "replacement.json"
+            displaced = Path(tmp_dir) / "displaced.json"
+            original_snapshot = {"tasks": [{
+                "id": "original-task",
+                "owner_id": "owner-1",
+                "status": "success",
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "size": "1024x1024",
+                "quality": "auto",
+                "created_at": "2026-08-13 12:00:00",
+                "updated_at": "2026-08-13 12:00:00",
+                "created_ts": 1,
+                "updated_ts": 2,
+            }]}
+            replacement_snapshot = {"tasks": [{
+                **original_snapshot["tasks"][0],
+                "id": "replaced-task",
+            }]}
+            path.write_text(json.dumps(original_snapshot), encoding="utf-8")
+            replacement.write_text(json.dumps(replacement_snapshot), encoding="utf-8")
+            original_open = secure_file.open_no_follow_file
+
+            def replace_after_open(path_obj, *args, **kwargs):
+                opened = original_open(path_obj, *args, **kwargs)
+                if path_obj == path:
+                    path.replace(displaced)
+                    replacement.replace(path)
+                return opened
+
+            with mock.patch.object(secure_file, "open_no_follow_file", side_effect=replace_after_open):
+                service = self.make_service(path)
+
+            self.assertIn("owner-1:original-task", service._tasks)
+            self.assertNotIn("owner-1:replaced-task", service._tasks)
 
     def test_invalid_image_options_are_rejected_before_task_persistence_or_start(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -122,6 +246,132 @@ class ImageTaskServiceTests(unittest.TestCase):
             task = wait_for_task(service, OWNER, "task-1", "success")
             self.assertEqual(task["data"][0]["url"], "http://example.test/image.png")
             self.assertEqual(calls, 1)
+
+    def test_submit_failure_preserves_primary_error_when_rollback_save_fails(self):
+        import services.task_executor as task_executor_module
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            with (
+                mock.patch.object(
+                    task_executor_module._EXECUTOR,
+                    "submit",
+                    side_effect=RuntimeError("executor submit failed"),
+                ),
+                mock.patch.object(
+                    service,
+                    "_save_locked",
+                    side_effect=[None, StorageDataError()],
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "executor submit failed"):
+                    service.submit_generation(
+                        OWNER,
+                        client_task_id="submit-rollback-failure",
+                        prompt="cat",
+                        model="gpt-image-2",
+                        size=None,
+                    )
+
+    def test_terminal_error_write_failure_does_not_leave_task_running(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            key = "owner-1:terminal-write-failure"
+            service._tasks[key] = {
+                "id": "terminal-write-failure",
+                "owner_id": "owner-1",
+                "status": service_module.TASK_STATUS_QUEUED,
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "created_at": "2026-08-16 12:00:00",
+                "updated_at": "2026-08-16 12:00:00",
+                "created_ts": 1,
+                "updated_ts": 1,
+            }
+            with (
+                mock.patch.object(service, "_save_locked", side_effect=[None, StorageDataError()]),
+                mock.patch.object(service_module, "_IMAGE_TASK_LOGGER") as fallback_logger,
+                mock.patch.object(service, "_log_call"),
+            ):
+                service._run_task(
+                    key,
+                    "generate",
+                    {"prompt": "cat"},
+                    OWNER,
+                    "gpt-image-2",
+                )
+
+            task = service.list_tasks(OWNER, ["terminal-write-failure"])["items"][0]
+            self.assertEqual(task["status"], service_module.TASK_STATUS_ERROR)
+            self.assertEqual(task["error"], "image task failed")
+            fallback_logger.error.assert_called_once_with("image task terminal state persistence failed")
+
+    def test_initial_running_state_write_failure_does_not_leave_task_queued(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            key = "owner-1:initial-write-failure"
+            service._tasks[key] = {
+                "id": "initial-write-failure",
+                "owner_id": "owner-1",
+                "status": service_module.TASK_STATUS_QUEUED,
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "created_at": "2026-08-16 12:00:00",
+                "updated_at": "2026-08-16 12:00:00",
+                "created_ts": 1,
+                "updated_ts": 1,
+            }
+            with mock.patch.object(service, "_update_task", side_effect=StorageDataError()):
+                service._run_task(
+                    key,
+                    "generate",
+                    {"prompt": "cat"},
+                    OWNER,
+                    "gpt-image-2",
+                )
+
+            task = service.list_tasks(OWNER, ["initial-write-failure"])["items"][0]
+            self.assertEqual(task["status"], service_module.TASK_STATUS_ERROR)
+            self.assertEqual(task["error"], "image task failed")
+
+    def test_resume_terminal_error_write_failure_does_not_leave_task_running(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json")
+            key = "owner-1:resume-terminal-write-failure"
+            service._tasks[key] = {
+                "id": "resume-terminal-write-failure",
+                "owner_id": "owner-1",
+                "status": service_module.TASK_STATUS_RUNNING,
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "conversation_id": "conversation-1",
+                "created_at": "2026-08-16 12:00:00",
+                "updated_at": "2026-08-16 12:00:00",
+                "created_ts": 1,
+                "updated_ts": 1,
+            }
+            service._resume_credentials[key] = "token-resume"
+            with (
+                mock.patch.object(service, "_save_locked", side_effect=StorageDataError()),
+                mock.patch.object(service_module.account_service, "refresh_access_token", return_value="token-resume"),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", side_effect=RuntimeError("backend failed")),
+                mock.patch.object(service_module, "_IMAGE_TASK_LOGGER") as fallback_logger,
+                mock.patch.object(service, "_log_call"),
+            ):
+                service._run_resume_poll(
+                    key,
+                    "conversation-1",
+                    30,
+                    "token-resume",
+                    OWNER,
+                    "generate",
+                    "gpt-image-2",
+                )
+
+            task = service.list_tasks(OWNER, ["resume-terminal-write-failure"])["items"][0]
+            self.assertEqual(task["status"], service_module.TASK_STATUS_ERROR)
+            self.assertEqual(task["error"], "image task failed")
+            fallback_logger.error.assert_called_once_with("image task terminal state persistence failed")
 
     def test_different_owner_cannot_query_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -198,6 +448,297 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertEqual([item["status"] for item in result["items"]], ["error", "error"])
             self.assertTrue(all("已中断" in item.get("error", "") for item in result["items"]))
+
+    def test_corrupt_task_scalar_container_fails_closed_without_public_stringification(self):
+        canary = "image-task-scalar-container-canary"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {
+                "tasks": [{
+                    "id": "corrupt-scalar",
+                    "owner_id": "owner-1",
+                    "status": "success",
+                    "mode": "generate",
+                    "model": {"secret": canary},
+                    "size": "",
+                    "quality": "auto",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                }]
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(StorageDataError):
+                ImageTaskService(path)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_corrupt_task_timestamp_text_fails_closed_without_public_leak(self):
+        canary = "image-timestamp-canary owner@example.com"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {
+                "tasks": [{
+                    "id": "corrupt-timestamp",
+                    "owner_id": "owner-1",
+                    "status": "success",
+                    "mode": "generate",
+                    "created_at": canary,
+                    "updated_at": canary,
+                    "created_ts": 1,
+                    "updated_ts": 2,
+                }],
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(StorageDataError):
+                ImageTaskService(path)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_missing_or_empty_task_timestamps_fail_closed_without_rewriting_snapshot(self):
+        for field_name, field_value in (
+            ("created_at", None),
+            ("created_at", ""),
+            ("updated_at", None),
+            ("updated_at", ""),
+        ):
+            with self.subTest(field_name=field_name, field_value=field_value):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    path = Path(tmp_dir) / "image_tasks.json"
+                    task = {
+                        "id": "missing-timestamp",
+                        "owner_id": "owner-1",
+                        "status": "success",
+                        "mode": "generate",
+                        "model": "gpt-image-2",
+                        "created_at": "2026-08-13 12:00:00",
+                        "updated_at": "2026-08-13 12:00:00",
+                        "created_ts": 1,
+                        "updated_ts": 2,
+                    }
+                    task[field_name] = field_value
+                    snapshot = {"tasks": [task]}
+                    path.write_text(json.dumps(snapshot), encoding="utf-8")
+                    original = path.read_bytes()
+
+                    with self.assertRaises(StorageDataError):
+                        ImageTaskService(path)
+
+                    self.assertEqual(path.read_bytes(), original)
+
+    def test_corrupt_task_data_usage_fields_fail_closed_without_rewriting_snapshot(self):
+        canary = "image-task-data-usage-canary"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {
+                "tasks": [{
+                    "id": "corrupt-data-usage",
+                    "owner_id": "owner-1",
+                    "status": "success",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "size": "",
+                    "quality": "auto",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                    "data": [{"url": "/images/x", "internal": canary}],
+                    "usage": {"input_tokens": 1, "internal": canary},
+                }],
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(StorageDataError):
+                ImageTaskService(path)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_corrupt_task_image_url_scheme_fails_closed_without_rewriting_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {
+                "tasks": [{
+                    "id": "corrupt-image-url",
+                    "owner_id": "owner-1",
+                    "status": "success",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "size": "",
+                    "quality": "auto",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                    "created_ts": 1,
+                    "updated_ts": 2,
+                    "data": [{"url": "javascript:alert('image-url-canary')"}],
+                }],
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(StorageDataError):
+                ImageTaskService(path)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_corrupt_task_numeric_fields_fail_closed_without_rewriting_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {
+                "tasks": [{
+                    "id": "corrupt-numeric",
+                    "owner_id": "owner-1",
+                    "status": "success",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "size": "",
+                    "quality": "auto",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                    "created_ts": float("nan"),
+                    "updated_ts": 1,
+                    "started_ts": 1,
+                    "duration_ms": {"secret": "duration-canary"},
+                }],
+            }
+            path.write_text(json.dumps(snapshot, allow_nan=True), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(StorageDataError):
+                ImageTaskService(path)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_corrupt_task_progress_fails_closed_without_rewriting_snapshot(self):
+        canary = "image-progress-container-canary"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {
+                "tasks": [{
+                    "id": "corrupt-progress",
+                    "owner_id": "owner-1",
+                    "status": "running",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "size": "",
+                    "quality": "auto",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                    "created_ts": 1,
+                    "updated_ts": 2,
+                    "started_ts": 2,
+                    "progress": {"secret": canary},
+                }],
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(StorageDataError):
+                ImageTaskService(path)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_corrupt_task_conversation_id_fails_closed_without_rewriting_snapshot(self):
+        canary = "image-conversation-canary owner@example.com"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {
+                "tasks": [{
+                    "id": "corrupt-conversation",
+                    "owner_id": "owner-1",
+                    "status": "error",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                    "created_ts": 1,
+                    "updated_ts": 2,
+                    "conversation_id": canary,
+                }],
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(StorageDataError):
+                ImageTaskService(path)
+
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_recovered_unfinished_tasks_round_trip_across_two_restarts(self):
+        recovery_error = "服务已重启，未完成的图片任务已中断"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {"tasks": [
+                {
+                    "id": "queued-restart",
+                    "owner_id": "owner-1",
+                    "status": "queued",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                    "created_ts": 1,
+                    "updated_ts": 2,
+                },
+                {
+                    "id": "running-restart",
+                    "owner_id": "owner-1",
+                    "status": "running",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                    "created_ts": 1,
+                    "updated_ts": 2,
+                    "started_ts": 2,
+                },
+            ]}
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+
+            first = ImageTaskService(path)
+            first_items = first.list_tasks(OWNER, ["queued-restart", "running-restart"])["items"]
+            self.assertEqual([item["status"] for item in first_items], ["error", "error"])
+            self.assertTrue(all(item["error"] == recovery_error for item in first_items))
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(all(
+                item.get("error") == recovery_error
+                and item.get("error_code") == "image_task_interrupted_on_restart"
+                for item in persisted["tasks"]
+            ))
+
+            second = ImageTaskService(path)
+            second_items = second.list_tasks(OWNER, ["queued-restart", "running-restart"])["items"]
+            self.assertEqual([item["status"] for item in second_items], ["error", "error"])
+            self.assertTrue(all(item["error"] == recovery_error for item in second_items))
+
+    def test_corrupt_task_error_text_fails_closed_without_rewriting_snapshot(self):
+        canary = "image-error-canary owner@example.com token"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            snapshot = {
+                "tasks": [{
+                    "id": "corrupt-error",
+                    "owner_id": "owner-1",
+                    "status": "error",
+                    "mode": "generate",
+                    "model": "gpt-image-2",
+                    "size": "",
+                    "quality": "auto",
+                    "created_at": "2026-08-13 12:00:00",
+                    "updated_at": "2026-08-13 12:00:00",
+                    "error": canary,
+                }],
+            }
+            path.write_text(json.dumps(snapshot), encoding="utf-8")
+            original = path.read_bytes()
+
+            with self.assertRaises(StorageDataError):
+                ImageTaskService(path)
+
+            self.assertEqual(path.read_bytes(), original)
 
     def test_resume_poll_uses_the_generation_account_token(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -645,6 +1186,497 @@ class ImageTaskServiceTests(unittest.TestCase):
         self.assertEqual(FakeBackend.instances[0].access_token, "token-generated")
         self.assertTrue(FakeBackend.instances[0].closed)
 
+    def test_generation_without_image_result_marks_failure_once(self):
+        class FakeBackend:
+            def __init__(self, *, access_token):
+                self.access_token = access_token
+
+            def close(self):
+                pass
+
+        def progress_only_stream(_backend, _request, *_args):
+            yield ImageOutput(
+                kind="progress",
+                model="gpt-image-2",
+                index=1,
+                total=1,
+                conversation_id="conversation-1",
+            )
+
+        with (
+            mock.patch.object(conversation_module.account_service, "get_available_access_token", return_value="token-generated"),
+            mock.patch.object(conversation_module.account_service, "get_account", return_value={"email": "owner@example.test"}),
+            mock.patch.object(conversation_module.account_service, "mark_image_result") as mark_result,
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", progress_only_stream),
+            mock.patch.object(conversation_module, "_remove_image_conversation_later"),
+        ):
+            with self.assertRaisesRegex(ImageGenerationError, "without generating images"):
+                conversation_module._generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        mark_result.assert_called_once_with("token-generated", False)
+        release_slot.assert_called_once_with("token-generated")
+
+    def test_generation_releases_image_slot_on_success_error_and_timeout(self):
+        class FakeBackend:
+            def __init__(self, *, access_token):
+                self.access_token = access_token
+
+            def close(self):
+                pass
+
+        def success_stream(_backend, _request, *_args):
+            yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1)
+
+        def error_stream(_backend, _request, *_args):
+            raise RuntimeError("upstream failed")
+
+        def timeout_stream(_backend, _request, *_args):
+            yield ImageOutput(
+                kind="progress",
+                model="gpt-image-2",
+                index=1,
+                total=1,
+                conversation_id="conversation-1",
+            )
+            raise ImagePollTimeoutError.from_timeout(30, "conversation-1")
+
+        with (
+            mock.patch.object(conversation_module.account_service, "get_available_access_token", return_value="token-generated"),
+            mock.patch.object(conversation_module.account_service, "get_account", return_value={"email": "owner@example.test"}),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "_remove_image_conversation_later"),
+        ):
+            for stream, expected_exception in (
+                (success_stream, None),
+                (error_stream, ImageGenerationError),
+                (timeout_stream, ImagePollTimeoutError),
+            ):
+                with self.subTest(stream=stream.__name__):
+                    with mock.patch.object(conversation_module, "stream_image_outputs", stream):
+                        if expected_exception is None:
+                            outputs = conversation_module._generate_single_image(
+                                ConversationRequest(model="gpt-image-2", prompt="cat"),
+                                1,
+                                1,
+                            )
+                            self.assertEqual(len(outputs), 1)
+                        else:
+                            with self.assertRaises(expected_exception):
+                                conversation_module._generate_single_image(
+                                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                                    1,
+                                    1,
+                                )
+
+        self.assertEqual(release_slot.call_count, 3)
+        self.assertEqual(release_slot.call_args_list, [mock.call("token-generated")] * 3)
+
+    def test_generator_owned_release_happens_exactly_once_after_marking_result(self):
+        class FakeBackend:
+            def __init__(self, *, access_token):
+                self.access_token = access_token
+
+            def close(self):
+                pass
+
+        def result_stream(_backend, _request, *_args):
+            yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{
+                "access_token": "token-generated",
+                "status": "正常",
+                "quota": 3,
+            }])
+            service._image_inflight["token-generated"] = 2
+            with (
+                mock.patch.object(service, "get_available_access_token", return_value="token-generated"),
+                mock.patch.object(conversation_module, "account_service", service),
+                mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+                mock.patch.object(conversation_module, "stream_image_outputs", result_stream),
+                mock.patch.object(conversation_module, "_remove_image_conversation_later"),
+            ):
+                outputs = conversation_module._generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+            self.assertEqual(len(outputs), 1)
+            self.assertEqual(service._image_inflight.get("token-generated"), 1)
+
+    def test_late_image_result_cannot_mutate_replaced_same_token_account(self):
+        class FakeBackend:
+            def __init__(self, *, access_token):
+                self.access_token = access_token
+
+            def close(self):
+                pass
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_result_stream(_backend, _request, *_args):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("image stream did not receive release")
+            yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{
+                "access_token": "token-replaced",
+                "status": "正常",
+                "quota": 3,
+                "success": 0,
+            }])
+            service._image_inflight["token-replaced"] = 1
+            errors: list[BaseException] = []
+            outputs: list[ImageOutput] = []
+
+            def run_generation() -> None:
+                try:
+                    outputs.extend(
+                        conversation_module._generate_single_image(
+                            ConversationRequest(model="gpt-image-2", prompt="cat"),
+                            1,
+                            1,
+                        )
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                mock.patch.object(service, "get_available_access_token", return_value="token-replaced"),
+                mock.patch.object(conversation_module, "account_service", service),
+                mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+                mock.patch.object(conversation_module, "stream_image_outputs", blocked_result_stream),
+                mock.patch.object(conversation_module, "_remove_image_conversation_later"),
+            ):
+                worker = threading.Thread(target=run_generation)
+                worker.start()
+                self.assertTrue(entered.wait(5))
+
+                service.update_account(
+                    "token-replaced",
+                    {"status": "正常", "quota": 9, "success": 40},
+                )
+                release.set()
+                worker.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(outputs), 1)
+            current = service.get_account("token-replaced")
+            self.assertIsNotNone(current)
+            self.assertEqual(current["quota"], 9)
+            self.assertEqual(current["success"], 40)
+            self.assertNotIn("token-replaced", service._image_inflight)
+
+    def test_late_image_failure_cannot_disable_replaced_same_token_account(self):
+        class FakeBackend:
+            def __init__(self, *, access_token):
+                self.access_token = access_token
+
+            def close(self):
+                pass
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_invalid_stream(_backend, _request, *_args):
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("image stream did not receive release")
+            raise RuntimeError("token_invalidated")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([{
+                "access_token": "token-replaced",
+                "status": "正常",
+                "quota": 3,
+                "fail": 0,
+            }])
+            service._image_inflight["token-replaced"] = 1
+            errors: list[BaseException] = []
+
+            def run_generation() -> None:
+                try:
+                    conversation_module._generate_single_image(
+                        ConversationRequest(model="gpt-image-2", prompt="cat"),
+                        1,
+                        1,
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with (
+                mock.patch.object(service, "get_available_access_token", side_effect=[
+                    "token-replaced",
+                    RuntimeError("no available image quota"),
+                ]),
+                mock.patch.object(service, "refresh_access_token", return_value=""),
+                mock.patch.object(conversation_module, "account_service", service),
+                mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+                mock.patch.object(conversation_module, "stream_image_outputs", blocked_invalid_stream),
+                mock.patch.object(conversation_module, "_remove_image_conversation_later"),
+            ):
+                worker = threading.Thread(target=run_generation)
+                worker.start()
+                self.assertTrue(entered.wait(5))
+
+                service.update_account(
+                    "token-replaced",
+                    {"status": "正常", "quota": 9, "fail": 40},
+                )
+                release.set()
+                worker.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], ImageGenerationError)
+            current = service.get_account("token-replaced")
+            self.assertIsNotNone(current)
+            self.assertEqual(current["status"], "正常")
+            self.assertEqual(current["quota"], 9)
+            self.assertEqual(current["fail"], 40)
+            self.assertNotIn("token-replaced", service._image_inflight)
+
+    def test_generation_releases_the_token_acquired_before_refresh_retry(self):
+        class FakeBackend:
+            def __init__(self, *, access_token):
+                self.access_token = access_token
+
+            def close(self):
+                pass
+
+        stream_calls = 0
+
+        def retrying_stream(_backend, _request, *_args):
+            nonlocal stream_calls
+            stream_calls += 1
+            if stream_calls == 1:
+                raise RuntimeError("token_invalidated")
+            yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1)
+
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                side_effect=["token-one", "token-two"],
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                return_value={"email": "owner@example.test"},
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "refresh_access_token",
+                return_value="token-two",
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", retrying_stream),
+            mock.patch.object(conversation_module, "_remove_image_conversation_later"),
+        ):
+            outputs = conversation_module._generate_single_image(
+                ConversationRequest(model="gpt-image-2", prompt="cat"),
+                1,
+                1,
+            )
+
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(
+            release_slot.call_args_list,
+            [mock.call("token-one"), mock.call("token-two")],
+        )
+
+    def test_generation_does_not_release_when_token_acquisition_fails(self):
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                side_effect=RuntimeError("no available image quota"),
+            ),
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+        ):
+            with self.assertRaises(ImageGenerationError):
+                conversation_module._generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        release_slot.assert_not_called()
+
+    def test_generation_releases_when_backend_constructor_fails(self):
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                return_value="token-generated",
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                return_value={"email": "owner@example.test"},
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+            mock.patch.object(
+                conversation_module,
+                "OpenAIBackendAPI",
+                side_effect=RuntimeError("backend constructor failed"),
+            ),
+        ):
+            with self.assertRaises(ImageGenerationError):
+                conversation_module._generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        release_slot.assert_called_once_with("token-generated")
+
+    def test_generation_releases_when_account_lookup_fails(self):
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                return_value="token-generated",
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                side_effect=RuntimeError("account lookup failed"),
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+        ):
+            with self.assertRaises(ImageGenerationError):
+                conversation_module._generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        release_slot.assert_called_once_with("token-generated")
+
+    def test_generation_releases_when_account_lease_capture_fails(self):
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                return_value="token-generated",
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "_get_account_lease",
+                side_effect=RuntimeError("account lease capture failed"),
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+        ):
+            with self.assertRaises(ImageGenerationError):
+                conversation_module._generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        release_slot.assert_called_once_with("token-generated")
+
+    def test_generation_releases_once_when_backend_close_fails(self):
+        class ClosingBackend:
+            def __init__(self, *, access_token):
+                self.access_token = access_token
+
+            def close(self):
+                raise RuntimeError("backend close failed")
+
+        def result_stream(_backend, _request, *_args):
+            yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1)
+
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                return_value="token-generated",
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                return_value={"email": "owner@example.test"},
+            ),
+            mock.patch.object(conversation_module.account_service, "mark_image_result"),
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", ClosingBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", result_stream),
+            mock.patch.object(conversation_module, "_remove_image_conversation_later"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "backend close failed"):
+                conversation_module._generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        release_slot.assert_called_once_with("token-generated")
+
+    def test_generation_does_not_mark_the_same_lease_twice_when_accounting_fails(self):
+        class FakeBackend:
+            def __init__(self, *, access_token):
+                self.access_token = access_token
+
+            def close(self):
+                pass
+
+        def result_stream(_backend, _request, *_args):
+            yield ImageOutput(kind="result", model="gpt-image-2", index=1, total=1)
+
+        with (
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_available_access_token",
+                return_value="token-generated",
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "get_account",
+                return_value={"email": "owner@example.test"},
+            ),
+            mock.patch.object(
+                conversation_module.account_service,
+                "mark_image_result",
+                side_effect=RuntimeError("account snapshot write failed"),
+            ) as mark_result,
+            mock.patch.object(conversation_module.account_service, "release_image_slot") as release_slot,
+            mock.patch.object(conversation_module, "OpenAIBackendAPI", FakeBackend),
+            mock.patch.object(conversation_module, "stream_image_outputs", result_stream),
+            mock.patch.object(conversation_module, "_remove_image_conversation_later"),
+        ):
+            with self.assertRaises(Exception):
+                conversation_module._generate_single_image(
+                    ConversationRequest(model="gpt-image-2", prompt="cat"),
+                    1,
+                    1,
+                )
+
+        mark_result.assert_called_once_with("token-generated", True)
+        release_slot.assert_called_once_with("token-generated")
+
     def test_resume_credentials_are_isolated_by_owner(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             def timeout_handler(_payload):
@@ -690,6 +1722,58 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(service._resume_credentials, {})
             self.assertNotIn("token-ordinary", path.read_text(encoding="utf-8"))
 
+            reloaded = self.make_service(path)
+            reloaded_task = reloaded.list_tasks(OWNER, ["ordinary-failure"])["items"][0]
+            self.assertEqual(reloaded_task["status"], "error")
+            self.assertEqual(reloaded_task["error"], "image task failed")
+
+    def test_self_produced_resume_failure_snapshot_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+
+            def timeout_handler(_payload):
+                error = ImagePollTimeoutError.from_timeout(30, "conversation-round-trip")
+                error.access_token = "token-round-trip"
+                raise error
+
+            service = self.make_service(path, timeout_handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="resume-round-trip",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            wait_for_task(service, OWNER, "resume-round-trip", "error")
+
+            class FakeBackend:
+                def __init__(self, *, access_token):
+                    self.access_token = access_token
+
+                def _poll_image_results(self, _conversation_id, _timeout_secs):
+                    raise RuntimeError("opaque upstream resume failure")
+
+                def close(self):
+                    pass
+
+            with (
+                mock.patch(
+                    "services.image_task_service.account_service.refresh_access_token",
+                    return_value="token-round-trip",
+                ),
+                mock.patch("services.openai_backend_api.OpenAIBackendAPI", FakeBackend),
+                mock.patch("services.image_task_service.reserve_background_task", return_value=InlineReservation()),
+            ):
+                service.resume_poll(OWNER, "resume-round-trip", 30)
+                resumed = wait_for_task(service, OWNER, "resume-round-trip", "error")
+
+            self.assertEqual(resumed["error"], "image task failed")
+            reloaded = self.make_service(path)
+            reloaded_task = reloaded.list_tasks(OWNER, ["resume-round-trip"])["items"][0]
+            self.assertEqual(reloaded_task["status"], "error")
+            self.assertEqual(reloaded_task["error"], "image task failed")
+
     def test_untrusted_result_message_is_not_exposed_or_logged(self):
         secret = "opaque-result-token owner@example.com upstream fragment"
 
@@ -712,7 +1796,122 @@ class ImageTaskServiceTests(unittest.TestCase):
 
             self.assertNotIn(secret, json.dumps(task, ensure_ascii=False))
             self.assertNotIn(secret, path.read_text(encoding="utf-8"))
-            self.assertNotIn(secret, repr(add.call_args_list))
+        self.assertNotIn(secret, repr(add.call_args_list))
+
+    def test_successful_image_task_reports_log_persistence_failure_without_losing_result(self):
+        def handler(_payload):
+            return {"data": [{"url": "https://example.test/image.png"}]}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            with (
+                mock.patch.object(service_module.log_service, "add", side_effect=OSError("log unavailable")),
+                mock.patch.object(service_module._IMAGE_TASK_LOGGER, "error") as fallback_logger,
+            ):
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="log-failure-success",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+                task = wait_for_task(service, OWNER, "log-failure-success", "success")
+
+        self.assertEqual(task["status"], "success")
+        fallback_logger.assert_called_once_with("image task log persistence failed")
+
+    def test_public_task_projects_image_data_and_usage_fields(self):
+        secret = "image-task-public-canary"
+
+        def handler(_payload):
+            return {
+                "data": [
+                    {
+                        "b64_json": "ZmFrZQ==",
+                        "url": "https://example.test/image.png",
+                        "revised_prompt": "a safe prompt",
+                        "internal_metadata": {"secret": secret},
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 3,
+                    "output_tokens": 7,
+                    "total_tokens": 10,
+                    "input_tokens_details": {
+                        "text_tokens": 3,
+                        "image_tokens": 0,
+                        "cached_tokens": 0,
+                        "secret": secret,
+                    },
+                    "output_tokens_details": {
+                        "text_tokens": 0,
+                        "image_tokens": 7,
+                        "reasoning_tokens": 0,
+                        "secret": secret,
+                    },
+                    "internal_metadata": {"secret": secret},
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="public-projection",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            task = wait_for_task(service, OWNER, "public-projection", "success")
+            persisted = path.read_text(encoding="utf-8")
+
+        serialized = json.dumps(task, ensure_ascii=False)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(secret, persisted)
+        self.assertEqual(task["data"], [{
+            "b64_json": "ZmFrZQ==",
+            "url": "https://example.test/image.png",
+            "revised_prompt": "a safe prompt",
+        }])
+        self.assertEqual(task["usage"], {
+            "input_tokens": 3,
+            "output_tokens": 7,
+            "total_tokens": 10,
+            "input_tokens_details": {
+                "text_tokens": 3,
+                "image_tokens": 0,
+                "cached_tokens": 0,
+            },
+            "output_tokens_details": {
+                "text_tokens": 0,
+                "image_tokens": 7,
+                "reasoning_tokens": 0,
+            },
+        })
+
+    def test_image_result_url_query_is_not_written_to_call_log(self):
+        canary = "signed-image-query-canary"
+
+        def handler(_payload):
+            return {"data": [{"url": f"https://cdn.example.test/image.png?sig={canary}"}]}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            with mock.patch.object(service_module.log_service, "add") as add:
+                service.submit_generation(
+                    OWNER,
+                    client_task_id="signed-image-url",
+                    prompt="cat",
+                    model="gpt-image-2",
+                    size=None,
+                    base_url="http://local.test",
+                )
+                wait_for_task(service, OWNER, "signed-image-url", "success")
+
+        self.assertNotIn(canary, repr(add.call_args_list))
 
     def test_resume_runtime_error_is_not_exposed_or_logged(self):
         secret = "opaque-resume-token owner@example.com upstream fragment"

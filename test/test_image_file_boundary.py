@@ -16,6 +16,7 @@ import services.image_service as image_module
 import services.image_storage_service as storage_module
 import services.config as config_module
 import services.secure_file as secure_file
+from services.log_service import LogService
 from services.image_storage_service import ImageStorageService
 
 
@@ -26,6 +27,127 @@ def _png_bytes(color: tuple[int, int, int]) -> bytes:
 
 
 class ImageFileBoundaryTests(unittest.TestCase):
+    def test_log_append_rejects_hardlinked_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            victim = root / "victim.jsonl"
+            log_path = root / "logs.jsonl"
+            victim.write_bytes(b"private-sentinel\n")
+            try:
+                log_path.hardlink_to(victim)
+            except OSError as exc:
+                self.skipTest(f"hard links unavailable: {exc}")
+
+            service = LogService(log_path)
+            with self.assertRaises(OSError):
+                service.add("account", "safe summary")
+
+            self.assertEqual(victim.read_bytes(), b"private-sentinel\n")
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows file handles")
+    def test_windows_atomic_write_does_not_delete_unowned_collision_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "image_index.json"
+            collision = root / ".image_index.json.fixed-token.tmp"
+            target.write_bytes(b"old")
+            collision.write_bytes(b"pre-existing")
+
+            with mock.patch.object(secure_file.secrets, "token_hex", return_value="fixed-token"):
+                with self.assertRaises(OSError):
+                    secure_file.atomic_write_bytes(target, root, b"new")
+
+            self.assertEqual(target.read_bytes(), b"old")
+            self.assertEqual(collision.read_bytes(), b"pre-existing")
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows file handles")
+    def test_windows_atomic_write_cleans_owned_temp_after_body_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            target = root / "image_index.json"
+
+            with mock.patch.object(secure_file.secrets, "token_hex", return_value="fixed-token"):
+                with self.assertRaises(OSError):
+                    secure_file.atomic_write_stream(target, root, [b"partial", "invalid"])
+
+            self.assertFalse((root / ".image_index.json.fixed-token.tmp").exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows file handles")
+    def test_windows_atomic_write_rejects_root_rebind_after_identity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "authorized"
+            root.mkdir()
+            target = root / "state.json"
+            target.write_bytes(b"authorized")
+            expected_identity = (root.stat().st_dev, root.stat().st_ino)
+            moved = Path(tmp_dir) / "moved-authorized"
+            rebound = False
+            original_open = secure_file._windows_open_directory_handle
+
+            def rebind_before_open(create_file, path, *args):
+                nonlocal rebound
+                if not rebound and Path(path) == root:
+                    rebound = True
+                    root.rename(moved)
+                    root.mkdir()
+                    (root / "state.json").write_bytes(b"foreign")
+                return original_open(create_file, path, *args)
+
+            with mock.patch.object(
+                secure_file,
+                "_windows_open_directory_handle",
+                side_effect=rebind_before_open,
+            ):
+                with self.assertRaises(OSError):
+                    secure_file.atomic_write_bytes(
+                        target,
+                        root,
+                        b"attacker",
+                        expected_root_identity=expected_identity,
+                    )
+
+            self.assertTrue(rebound)
+            self.assertEqual((root / "state.json").read_bytes(), b"foreign")
+            self.assertEqual((moved / "state.json").read_bytes(), b"authorized")
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows file handles")
+    def test_windows_append_rejects_root_rebind_after_identity_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "authorized"
+            root.mkdir()
+            target = root / "events.log"
+            target.write_bytes(b"authorized\n")
+            expected_identity = (root.stat().st_dev, root.stat().st_ino)
+            moved = Path(tmp_dir) / "moved-authorized"
+            rebound = False
+            original_open = secure_file._windows_open_directory_handle
+
+            def rebind_before_open(create_file, path, *args):
+                nonlocal rebound
+                if not rebound and Path(path) == root:
+                    rebound = True
+                    root.rename(moved)
+                    root.mkdir()
+                    (root / "events.log").write_bytes(b"foreign\n")
+                return original_open(create_file, path, *args)
+
+            with mock.patch.object(
+                secure_file,
+                "_windows_open_directory_handle",
+                side_effect=rebind_before_open,
+            ):
+                with self.assertRaises(OSError):
+                    secure_file.append_checked_file_bytes(
+                        target,
+                        root,
+                        b"attacker\n",
+                        expected_root_identity=expected_identity,
+                    )
+
+            self.assertTrue(rebound)
+            self.assertEqual((root / "events.log").read_bytes(), b"foreign\n")
+            self.assertEqual((moved / "events.log").read_bytes(), b"authorized\n")
+
     def test_posix_atomic_write_calls_replace_when_supports_dir_fd_omits_it(self) -> None:
         replace = mock.Mock()
 
@@ -155,6 +277,43 @@ class ImageFileBoundaryTests(unittest.TestCase):
                 self.assertEqual((foreign / relative_path).read_bytes(), b"private-file-secret")
             finally:
                 self._remove_directory_link(root)
+
+    def test_open_local_rejects_a_rebound_authorized_root_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            authorized_parent = Path(tmp_dir) / "authorized-parent"
+            foreign_parent = Path(tmp_dir) / "foreign-parent"
+            relative_path = "2026/08/08/image.png"
+            authorized_root = authorized_parent / "images"
+            foreign_root = foreign_parent / "images"
+            (authorized_root / relative_path).parent.mkdir(parents=True)
+            (foreign_root / relative_path).parent.mkdir(parents=True)
+            (authorized_root / relative_path).write_bytes(b"authorized-image")
+            (foreign_root / relative_path).write_bytes(b"foreign-image")
+            self._replace_directory_with_link(authorized_parent, foreign_parent)
+            try:
+                storage = ImageStorageService(Path(tmp_dir) / "index.json")
+                with mock.patch("services.image_storage_service.config") as config:
+                    config.images_dir = authorized_root
+                    with self.assertRaises(HTTPException) as error:
+                        storage.open_local(relative_path)
+                self.assertEqual(error.exception.status_code, 404)
+                self.assertEqual((foreign_root / relative_path).read_bytes(), b"foreign-image")
+            finally:
+                self._remove_directory_link(authorized_parent)
+
+    def test_authorized_root_rejects_a_rebound_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            authorized_parent = Path(tmp_dir) / "authorized-parent"
+            foreign_parent = Path(tmp_dir) / "foreign-parent"
+            root = authorized_parent / "images"
+            root.mkdir(parents=True)
+            foreign_parent.mkdir()
+            self._replace_directory_with_link(authorized_parent, foreign_parent)
+            try:
+                with self.assertRaises(OSError):
+                    secure_file.authorized_root(root)
+            finally:
+                self._remove_directory_link(authorized_parent)
 
     def test_list_items_rejects_a_rebound_authorized_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

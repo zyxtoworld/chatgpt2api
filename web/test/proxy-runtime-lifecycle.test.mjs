@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   createProxyRuntimeRequestGate,
   runCurrentProxyFollowup,
+  runProxyRuntimeSave,
 } from "../src/lib/proxy-runtime-request-gate.js";
 
 function deferred() {
@@ -28,6 +29,31 @@ test("ProxyRuntimeCard wires independent owners through mount cleanup and guarde
   assert.match(source, /requestGate\.acceptsProxy\(request\)/);
   assert.match(source, /requestGate\.acceptsClearance\(request, candidate\)/);
   assert.match(source, /invalidateClearance\(\)/);
+  assert.match(source, /const handleSave = async \(\) => \{[\s\S]*?runProxyRuntimeSave\(invalidateRuntimeTests, saveConfig\);/);
+  assert.match(source, /onClick=\{\(\) => void handleSave\(\)\}/);
+});
+
+test("production runtime save invalidates both in-flight test owners before the write settles", async () => {
+  const gate = createProxyRuntimeRequestGate();
+  gate.activate();
+  const proxy = gate.beginProxy();
+  const clearance = gate.beginClearance("https://example.test/a");
+  const save = deferred();
+
+  const saving = runProxyRuntimeSave(
+    () => {
+      gate.invalidateProxy();
+      gate.invalidateClearance();
+    },
+    () => save.promise,
+  );
+
+  assert.equal(gate.acceptsProxy(proxy), false);
+  assert.equal(gate.acceptsClearance(clearance, "https://example.test/a"), false);
+  save.resolve(true);
+  assert.equal(await saving, true);
+  assert.equal(gate.acceptsProxy(gate.beginProxy()), true);
+  assert.equal(gate.acceptsClearance(gate.beginClearance("https://example.test/b"), "https://example.test/b"), true);
 });
 
 test("proxy and clearance tests have independent latest owners", () => {

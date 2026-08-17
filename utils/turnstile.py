@@ -5,6 +5,9 @@ import time
 from typing import Any, Dict, Optional
 
 
+MAX_TURNSTILE_INSTRUCTIONS = 100_000
+
+
 class OrderedMap:
     def __init__(self) -> None:
         self.keys = []
@@ -50,6 +53,8 @@ def solve_turnstile_token(dx: str, p: str) -> Optional[str]:
     try:
         decoded = base64.b64decode(dx).decode()
         token_list = json.loads(_xor_string(decoded, p))
+        if not isinstance(token_list, list) or len(token_list) > MAX_TURNSTILE_INSTRUCTIONS:
+            return None
     except Exception:
         return None
 

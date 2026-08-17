@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from services.config import config
 from services.protocol.error_response import exception_log_message
 from services.proxy_service import proxy_settings
+from services.remote_response import parse_json_response
 from utils.log import logger
 
 DEFAULT_REVIEW_PROMPT = "判断用户请求是否允许。只回答 ALLOW 或 REJECT。"
@@ -24,7 +25,11 @@ _BASE64_DATA_URI = re.compile(r"data:[\w/.+;-]+;base64,[A-Za-z0-9+/=]+")
 # exceeds the cap after base64 stripping, keep equal head/tail halves so both
 # the system prompt and the most recent user message survive.
 _MAX_REVIEW_TEXT_LEN = 100_000
+_MAX_REVIEW_RESPONSE_BYTES = 1 * 1024 * 1024
 _TRUNCATION_MARKER = "\n…[truncated]…\n"
+_STRUCTURED_INPUT_TRUNCATION_MARKER = "\n…[structured input truncated]…"
+_MAX_STRUCTURED_INPUT_DEPTH = 64
+_MAX_STRUCTURED_INPUT_NODES = 10_000
 _CONTENT_REVIEW_THREAD_CAPACITY = 8
 _CONTENT_REVIEW_THREAD_STATE = threading.local()
 
@@ -37,14 +42,58 @@ async def check_request_async(text: str) -> None:
     await anyio.to_thread.run_sync(check_request, text, limiter=limiter)
 
 
+_TEXT_FIELDS = ("text", "input_text", "content", "input", "instructions", "system", "prompt")
+
+
 def _text(value: object) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "\n".join(_text(item) for item in value)
-    if isinstance(value, dict):
-        return "\n".join(_text(value.get(key)) for key in ("text", "input_text", "content", "input", "instructions", "system", "prompt"))
-    return ""
+    """Extract review text without recursively trusting client-controlled shape."""
+    parts: list[str] = []
+    stack: list[tuple[object, int]] = [(value, 0)]
+    node_count = 0
+    collected_chars = 0
+    truncated = False
+
+    while stack:
+        current, depth = stack.pop()
+        node_count += 1
+        if depth > _MAX_STRUCTURED_INPUT_DEPTH or node_count > _MAX_STRUCTURED_INPUT_NODES:
+            truncated = True
+            continue
+        if isinstance(current, str):
+            if current:
+                remaining = _MAX_REVIEW_TEXT_LEN - collected_chars
+                if remaining <= 0:
+                    truncated = True
+                    stack.clear()
+                    break
+                if len(current) > remaining:
+                    parts.append(current[:remaining])
+                    collected_chars += remaining
+                    truncated = True
+                    stack.clear()
+                    break
+                parts.append(current)
+                collected_chars += len(current)
+            continue
+        if isinstance(current, list):
+            child_count = min(len(current), _MAX_STRUCTURED_INPUT_NODES - node_count)
+            if child_count < len(current):
+                truncated = True
+            for index in range(child_count - 1, -1, -1):
+                stack.append((current[index], depth + 1))
+            continue
+        if isinstance(current, dict):
+            for key in reversed(_TEXT_FIELDS):
+                stack.append((current.get(key), depth + 1))
+
+    result = "\n".join(parts)
+    if len(result) > _MAX_REVIEW_TEXT_LEN:
+        truncated = True
+        result = result[:_MAX_REVIEW_TEXT_LEN]
+    if truncated:
+        marker = _STRUCTURED_INPUT_TRUNCATION_MARKER
+        result = result[: max(0, _MAX_REVIEW_TEXT_LEN - len(marker))] + marker
+    return result
 
 
 def request_text(*values: object) -> str:
@@ -63,7 +112,13 @@ def request_shape(*values: object) -> dict[str, int]:
         "literal_image_placeholders": 0,
     }
 
-    def walk(value: object, key: str = "") -> None:
+    stack: list[tuple[object, str, int]] = [(value, "", 0) for value in reversed(values)]
+    node_count = 0
+    while stack and node_count < _MAX_STRUCTURED_INPUT_NODES:
+        value, key, depth = stack.pop()
+        node_count += 1
+        if depth > _MAX_STRUCTURED_INPUT_DEPTH:
+            continue
         if isinstance(value, str):
             text = value.strip()
             lower = text.lower()
@@ -73,14 +128,16 @@ def request_shape(*values: object) -> dict[str, int]:
                 stats["data_url_images"] += 1
             elif key in {"image_url", "url"} and lower.startswith(("http://", "https://")):
                 stats["remote_image_urls"] += 1
-            return
+            continue
         if isinstance(value, list):
-            for item in value:
-                walk(item, key)
-            return
+            child_count = min(len(value), _MAX_STRUCTURED_INPUT_NODES - node_count)
+            for index in range(child_count - 1, -1, -1):
+                stack.append((value[index], key, depth + 1))
+            continue
         if not isinstance(value, dict):
-            return
-        item_type = str(value.get("type") or "").strip()
+            continue
+        item_type = value.get("type") if isinstance(value.get("type"), str) else ""
+        item_type = item_type.strip()
         if item_type == "message":
             stats["response_message_items"] += 1
         elif item_type == "input_image":
@@ -89,11 +146,9 @@ def request_shape(*values: object) -> dict[str, int]:
             stats["image_url_parts"] += 1
         elif item_type == "image":
             stats["image_parts"] += 1
-        for child_key, child in value.items():
-            walk(child, str(child_key))
-
-    for value in values:
-        walk(value)
+        children = [(child, child_key) for child_key, child in value.items() if isinstance(child_key, str)]
+        for child, child_key in reversed(children):
+            stack.append((child, child_key, depth + 1))
     return {key: value for key, value in stats.items() if value}
 
 
@@ -136,9 +191,9 @@ def _extract_review_decision(data: object) -> str | None:
     if not isinstance(message, dict):
         return None
     content = message.get("content")
-    if content is None:
+    if not isinstance(content, str):
         return None
-    return str(content).strip().lower()
+    return content.strip().lower()
 
 
 def _is_allow_decision(decision: str) -> bool:
@@ -158,7 +213,21 @@ def _resolve_fail_open(review: dict) -> bool:
         return value
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
+    return True
+
+
+def _resolve_enabled(review: dict) -> bool:
+    value = review.get("enabled")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _review_text_setting(review: dict, key: str) -> str:
+    value = review.get(key)
+    return value.strip() if isinstance(value, str) else ""
 
 
 def check_request(text: str) -> None:
@@ -170,11 +239,11 @@ def check_request(text: str) -> None:
         if word in text:
             raise HTTPException(status_code=400, detail={"error": CONTENT_FILTER_REJECTION_MESSAGE})
     review = config.ai_review
-    if not review.get("enabled"):
+    if not isinstance(review, dict) or not _resolve_enabled(review):
         return
-    base_url = str(review.get("base_url") or "").strip().rstrip("/")
-    api_key = str(review.get("api_key") or "").strip()
-    model = str(review.get("model") or "").strip()
+    base_url = _review_text_setting(review, "base_url").rstrip("/")
+    api_key = _review_text_setting(review, "api_key")
+    model = _review_text_setting(review, "model")
     if not base_url or not api_key or not model:
         raise HTTPException(status_code=400, detail={"error": "ai review config is incomplete"})
 
@@ -188,7 +257,7 @@ def check_request(text: str) -> None:
             "review_text_len": len(review_text),
             **sanitize_stats,
         })
-    prompt = str(review.get("prompt") or DEFAULT_REVIEW_PROMPT).strip()
+    prompt = _review_text_setting(review, "prompt") or DEFAULT_REVIEW_PROMPT
     content = f"{prompt}\n\n用户请求:\n{review_text}\n\n只回答 ALLOW 或 REJECT。"
 
     # fail_open=True (default): on upstream failure or ambiguous reply, let the
@@ -209,7 +278,8 @@ def check_request(text: str) -> None:
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0},
             timeout=60,
-            **proxy_settings.build_session_kwargs(),
+            stream=True,
+            **proxy_settings.build_session_kwargs(require_tls_verification=True),
         )
     except Exception as exc:
         _on_failure({
@@ -222,8 +292,20 @@ def check_request(text: str) -> None:
         return
 
     try:
+        if not 200 <= response.status_code < 300:
+            _on_failure({
+                "event": "ai_review_response_http_error",
+                "status_code": response.status_code,
+            })
+            return
         try:
-            data = response.json()
+            data = parse_json_response(
+                response,
+                "ai review response",
+                max_bytes=_MAX_REVIEW_RESPONSE_BYTES,
+                require_ok=False,
+                close=False,
+            )
         except Exception as exc:
             _on_failure({
                 "event": "ai_review_response_not_json",
@@ -249,7 +331,7 @@ def check_request(text: str) -> None:
         # Ambiguous decisions (e.g. "MAYBE", empty content) fall back to fail-open policy.
         _on_failure({
             "event": "ai_review_ambiguous_decision",
-            "decision": decision[:100],
+            "decision_len": len(decision),
             "review_text_len": len(review_text),
         })
         return

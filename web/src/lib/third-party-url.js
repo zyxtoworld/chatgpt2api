@@ -1,5 +1,11 @@
 export function buildThirdPartyHref(appUrl, baseUrl) {
+  if (typeof appUrl !== "string" || typeof baseUrl !== "string") {
+    return "";
+  }
   const url = appUrl.trim();
+  if (!url || !baseUrl.trim()) {
+    return "";
+  }
   try {
     const target = new URL(url);
     target.searchParams.set("baseUrl", baseUrl);

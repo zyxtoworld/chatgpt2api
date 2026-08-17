@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from functools import partial
 
@@ -8,7 +9,13 @@ import anyio
 from fastapi import APIRouter, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ConfigDict, Field
 
-from api.image_inputs import parse_image_edit_request, read_image_sources, validate_image_api_options
+from api.image_inputs import (
+    MAX_IMAGE_EDIT_INPUTS,
+    close_image_sources,
+    parse_image_edit_request,
+    read_image_sources,
+    validate_image_api_options,
+)
 from api.support import require_identity_async, resolve_image_base_url
 from services.content_filter import (
     CONTENT_FILTER_REJECTION_MESSAGE,
@@ -87,6 +94,7 @@ def _close_response_iterators(*iterators: object) -> None:
 def _responses_websocket_turn_events(
         native_transport: CodexResponsesWebSocketTransport,
         turn: PreparedResponsesWebSocketTurn,
+        cache_scope: str = "",
 ):
     warmup = turn.incremental_body.get("generate") is False
     try:
@@ -99,7 +107,13 @@ def _responses_websocket_turn_events(
         # implementation is a safe fallback for this connection.
         pass
     native_transport.close()
-    yield from openai_v1_response.response_events(turn.replay_body)
+    if cache_scope:
+        yield from openai_v1_response.response_events(
+            turn.replay_body,
+            cache_scope=cache_scope,
+        )
+    else:
+        yield from openai_v1_response.response_events(turn.replay_body)
 
 
 async def _close_expired_responses_websocket(websocket: WebSocket) -> None:
@@ -156,9 +170,9 @@ class ResponseCreateRequest(BaseModel):
 
 
 class AnthropicMessageRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", strict=True)
     model: str | None = None
-    messages: list[dict[str, object]] | None = None
+    messages: object | None = None
     system: object | None = None
     stream: bool | None = None
 
@@ -169,8 +183,8 @@ class SearchRequest(BaseModel):
 
 class EditableFileTaskRequest(BaseModel):
     prompt: str = ""
-    base64_images: list[str] = Field(default_factory=list)
-    client_task_id: str | None = None
+    base64_images: list[str] = Field(default_factory=list, max_length=MAX_IMAGE_EDIT_INPUTS)
+    client_task_id: str | None = Field(default=None, max_length=256, pattern=r"^[^,]+$")
 
 
 async def filter_or_log(call: LoggedCall, text: str) -> None:
@@ -207,25 +221,28 @@ def create_router() -> APIRouter:
 
     @router.post("/v1/images/edits")
     async def edit_images(
-            request: Request,
-            authorization: str | None = Header(default=None),
+        request: Request,
+        authorization: str | None = Header(default=None),
     ):
         identity = await require_identity_async(authorization)
         payload, image_sources, mask_sources = await parse_image_edit_request(request)
-        if "client_task_id" in payload:
-            raise HTTPException(
-                status_code=400,
-                detail={"error": "client_task_id is only supported by /api/image-tasks/edits"},
-            )
-        prompt = str(payload["prompt"])
-        model = str(payload["model"])
-        call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
-        await filter_or_log(call, prompt)
-        payload["images"] = await read_image_sources(image_sources)
-        if mask_sources:
-            payload["mask"] = await read_image_sources(mask_sources)
-        payload["base_url"] = resolve_image_base_url(request)
-        return await call.run(openai_v1_image_edit.handle, payload, sse="images")
+        try:
+            if "client_task_id" in payload:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "client_task_id is only supported by /api/image-tasks/edits"},
+                )
+            prompt = str(payload["prompt"])
+            model = str(payload["model"])
+            call = LoggedCall(identity, "/v1/images/edits", model, "图生图", request_text=prompt)
+            await filter_or_log(call, prompt)
+            payload["images"] = await read_image_sources(image_sources)
+            if mask_sources:
+                payload["mask"] = await read_image_sources(mask_sources)
+            payload["base_url"] = resolve_image_base_url(request)
+            return await call.run(openai_v1_image_edit.handle, payload, sse="images")
+        finally:
+            await close_image_sources([*image_sources, *mask_sources])
 
     @router.post("/v1/chat/completions")
     async def create_chat_completion(body: ChatCompletionRequest, authorization: str | None = Header(default=None)):
@@ -242,7 +259,11 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("messages")),
         )
         await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_chat_complete.handle, payload)
+        return await call.run(
+            openai_v1_chat_complete.handle,
+            payload,
+            cache_scope=str(identity.get("id") or ""),
+        )
 
     @router.post("/v1/responses")
     async def create_response(body: ResponseCreateRequest, authorization: str | None = Header(default=None)):
@@ -259,7 +280,12 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("input")),
         )
         await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_response.handle, payload, sse="responses")
+        return await call.run(
+            openai_v1_response.handle,
+            payload,
+            sse="responses",
+            cache_scope=str(identity.get("id") or ""),
+        )
 
     @router.websocket("/v1/responses")
     async def create_response_websocket(websocket: WebSocket):
@@ -302,6 +328,16 @@ def create_router() -> APIRouter:
                 except TimeoutError:
                     await _close_expired_responses_websocket(websocket)
                     return
+                except (json.JSONDecodeError, UnicodeDecodeError, TypeError, KeyError):
+                    await websocket.send_json({
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "invalid_json",
+                            "message": "Request body is not valid JSON.",
+                        },
+                    })
+                    continue
                 try:
                     identity = await require_identity_async(authorization)
                 except HTTPException:
@@ -345,8 +381,13 @@ def create_router() -> APIRouter:
                         })
                         continue
                     raise
-                raw_events = _responses_websocket_turn_events(native_transport, turn)
+                raw_events = _responses_websocket_turn_events(
+                    native_transport,
+                    turn,
+                    cache_scope=str(identity.get("id") or ""),
+                )
                 events = call.stream(raw_events)
+                turn_terminal = False
                 try:
                     async for event in iterate_ws_ai_chunks(events):
                         await websocket.send_json(event)
@@ -354,6 +395,24 @@ def create_router() -> APIRouter:
                             session.commit(turn.replay_body, event.get("response"))
                         elif event.get("type") in {"response.failed", "error"}:
                             session.fail(turn)
+                        if event.get("type") in {
+                                "response.completed",
+                                "response.incomplete",
+                                "response.failed",
+                                "error",
+                        }:
+                            turn_terminal = True
+                            break
+                    if not turn_terminal:
+                        session.fail(turn)
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": {
+                                "type": "server_error",
+                                "code": "upstream_error",
+                                "message": PUBLIC_SERVER_ERROR_MESSAGE,
+                            },
+                        })
                 finally:
                     await run_ws_ai_in_threadpool(_close_response_iterators, events, raw_events)
         except WebSocketDisconnect:

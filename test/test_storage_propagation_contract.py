@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import hashlib
 import json
-import html
 from unittest import mock
 from typing import Any
 
@@ -173,6 +173,69 @@ def test_public_health_does_not_run_storage_io_on_event_loop() -> None:
     assert response.json()["storage"]["health"] == {"status": "healthy"}
 
 
+def test_public_health_degrades_when_account_stats_fails_without_exposing_error() -> None:
+    secret = "health-account-stats-secret"
+    storage = LeakyStorageBackend()
+    app = FastAPI()
+    app.include_router(create_router("test"))
+
+    with (
+        mock.patch.object(system_module.config, "get_storage_backend", return_value=storage),
+        mock.patch.object(account_module.account_service, "get_stats", side_effect=RuntimeError(secret)),
+        mock.patch.object(system_module.proxy_settings, "get_runtime_status", return_value={}),
+    ):
+        response = TestClient(app, raise_server_exceptions=False).get("/health?format=json")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "degraded"
+    assert payload["healthy"] is False
+    assert payload["accounts"] == {
+        "total": 0,
+        "cumulative_total": 0,
+        "active": 0,
+        "limited": 0,
+        "abnormal": 0,
+        "disabled": 0,
+        "total_quota": 0,
+        "total_success": 0,
+        "total_fail": 0,
+        "by_type": {},
+    }
+    assert secret not in response.text
+
+
+@pytest.mark.parametrize("failure_stage", ("backend", "health", "info"))
+def test_public_health_degrades_when_storage_probe_raises_without_exposing_error(failure_stage: str) -> None:
+    secret = f"health-storage-{failure_stage}-secret"
+    storage = LeakyStorageBackend()
+    app = FastAPI()
+    app.include_router(create_router("test"))
+    backend_patch = mock.patch.object(system_module.config, "get_storage_backend", return_value=storage)
+    if failure_stage == "backend":
+        backend_patch = mock.patch.object(system_module.config, "get_storage_backend", side_effect=RuntimeError(secret))
+    health_patch = mock.patch.object(storage, "health_check", side_effect=RuntimeError(secret)) if failure_stage == "health" else mock.patch.object(storage, "health_check", wraps=storage.health_check)
+    info_patch = mock.patch.object(storage, "get_backend_info", side_effect=RuntimeError(secret)) if failure_stage == "info" else mock.patch.object(storage, "get_backend_info", wraps=storage.get_backend_info)
+
+    with (
+        backend_patch,
+        health_patch,
+        info_patch,
+        mock.patch.object(system_module.proxy_settings, "get_runtime_status", return_value={}),
+    ):
+        response = TestClient(app, raise_server_exceptions=False).get("/health?format=json")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["status"] == "degraded"
+    assert payload["healthy"] is False
+    assert payload["storage"] == {
+        "backend": "unknown",
+        "health": {"status": "unhealthy", "error": "存储后端健康检查失败"},
+    }
+    assert secret not in response.text
+
+
 def test_health_html_escapes_persisted_account_type() -> None:
     malicious_type = '<img src=x onerror="storage-html-sentinel">'
     storage = LeakyStorageBackend(account_type=malicious_type)
@@ -189,7 +252,26 @@ def test_health_html_escapes_persisted_account_type() -> None:
     assert response.status_code == 200, response.text
     assert "<img" not in response.text
     assert 'onerror="storage-html-sentinel"' not in response.text
-    assert html.escape(malicious_type, quote=True) in response.text
+    assert "other" in response.text
+    assert malicious_type not in response.text
+
+
+def test_health_json_does_not_expose_unknown_persisted_account_type() -> None:
+    malicious_type = "health-json-storage-canary owner@example.com"
+    storage = LeakyStorageBackend(account_type=malicious_type)
+    service = AccountService(storage)
+    app = FastAPI()
+    app.include_router(create_router("test"))
+
+    with (
+        mock.patch.object(system_module.config, "get_storage_backend", return_value=storage),
+        mock.patch.object(account_module, "account_service", service),
+    ):
+        response = TestClient(app).get("/health?format=json")
+
+    assert response.status_code == 200, response.text
+    assert malicious_type not in response.text
+    assert response.json()["accounts"]["by_type"] == {"other": 1}
 
 
 def test_accounts_delete_does_not_overwrite_corrupt_snapshot(tmp_path) -> None:
@@ -273,7 +355,7 @@ def _new_auth_service_with_corrupt_snapshot(tmp_path):
     return service, auth_keys_path, raw_key
 
 
-@pytest.mark.parametrize("operation", ("create", "update", "delete"))
+@pytest.mark.parametrize("operation", ("create", "update", "rotate", "delete"))
 def test_auth_key_mutation_paths_do_not_overwrite_corrupt_snapshot(tmp_path, operation: str) -> None:
     service, auth_keys_path, _ = _new_auth_service_with_corrupt_snapshot(tmp_path)
 
@@ -286,6 +368,50 @@ def test_auth_key_mutation_paths_do_not_overwrite_corrupt_snapshot(tmp_path, ope
             service.delete_key("base-key", role="user")
 
     assert auth_keys_path.read_text(encoding="utf-8") == "{broken"
+
+
+@pytest.mark.parametrize("operation", ("create", "update", "delete"))
+def test_auth_key_mutation_save_failure_restores_memory_and_disk(
+    tmp_path,
+    operation: str,
+) -> None:
+    accounts_path = tmp_path / "accounts.json"
+    auth_keys_path = tmp_path / "auth_keys.json"
+    raw_key = "auth-transaction-base-key"
+    auth_keys_path.write_text(
+        json.dumps({
+            "items": [{
+                "id": "base-key",
+                "role": "user",
+                "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
+                "name": "base",
+                "enabled": True,
+                "created_at": "2024-01-01T00:00:00+00:00",
+            }],
+        }),
+        encoding="utf-8",
+    )
+    accounts_path.write_text("[]", encoding="utf-8")
+    storage = JSONStorageBackend(accounts_path, auth_keys_path)
+    service = AuthService(storage)
+    before_items = deepcopy(service._items)
+    before_revision = service._auth_keys_snapshot.revision
+    before_file = auth_keys_path.read_bytes()
+
+    with mock.patch.object(storage, "save_auth_keys", side_effect=OSError("disk unavailable")):
+        with pytest.raises(OSError, match="disk unavailable"):
+            if operation == "create":
+                service.create_key(role="user", name="new")
+            elif operation == "update":
+                service.update_key("base-key", {"enabled": False}, role="user")
+            elif operation == "rotate":
+                service.update_key("base-key", {"key": "sk-rotated-key"}, role="user")
+            else:
+                service.delete_key("base-key", role="user")
+
+    assert service._items == before_items
+    assert service._auth_keys_snapshot.revision == before_revision
+    assert auth_keys_path.read_bytes() == before_file
 
 
 def test_authenticate_fails_closed_on_corrupt_auth_snapshot(tmp_path) -> None:
@@ -347,6 +473,67 @@ def test_auth_service_honors_explicit_boolean_enabled(tmp_path, enabled: bool, e
     assert (identity is not None) is expected_authenticated
     if not expected_authenticated:
         assert auth_keys_path.read_text(encoding="utf-8") == before
+
+
+def test_auth_service_reload_of_legacy_missing_created_at_is_deterministic(tmp_path) -> None:
+    accounts_path = tmp_path / "accounts.json"
+    auth_keys_path = tmp_path / "auth_keys.json"
+    raw_key = "auth-legacy-created-at-key"
+    auth_keys_path.write_text(
+        json.dumps({
+            "items": [{
+                "id": "legacy-created-at-key",
+                "role": "user",
+                "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
+                "name": "legacy-created-at",
+                "enabled": True,
+            }],
+        }),
+        encoding="utf-8",
+    )
+    accounts_path.write_text("[]", encoding="utf-8")
+
+    service = AuthService(JSONStorageBackend(accounts_path, auth_keys_path))
+    first = service.list_keys(role="user")
+    second = service.list_keys(role="user")
+
+    assert second == first
+    persisted = json.loads(auth_keys_path.read_text(encoding="utf-8"))
+    assert isinstance(persisted, dict)
+    assert isinstance(persisted.get("items"), list)
+    assert persisted["items"][0]["created_at"] == first[0]["created_at"]
+    reloaded = AuthService(JSONStorageBackend(accounts_path, auth_keys_path))
+    assert reloaded.list_keys(role="user") == first
+
+
+def test_auth_service_legacy_created_at_migration_failure_preserves_snapshot(tmp_path) -> None:
+    accounts_path = tmp_path / "accounts.json"
+    auth_keys_path = tmp_path / "auth_keys.json"
+    raw_key = "auth-legacy-created-at-write-failure"
+    auth_keys_path.write_text(
+        json.dumps({
+            "items": [{
+                "id": "legacy-created-at-write-failure",
+                "role": "user",
+                "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
+                "name": "legacy-created-at",
+                "enabled": True,
+            }],
+        }),
+        encoding="utf-8",
+    )
+    accounts_path.write_text("[]", encoding="utf-8")
+    before = auth_keys_path.read_bytes()
+
+    service = AuthService(JSONStorageBackend(accounts_path, auth_keys_path))
+    with mock.patch.object(
+        JSONStorageBackend,
+        "save_auth_keys_if_revision",
+        side_effect=OSError("migration write failed"),
+    ), pytest.raises(OSError, match="migration write failed"):
+        service.list_keys(role="user")
+
+    assert auth_keys_path.read_bytes() == before
 
 
 @pytest.mark.parametrize(
@@ -524,6 +711,42 @@ def test_authenticate_skips_only_audit_cas_conflict_without_overwrite(tmp_path) 
     persisted = backend.load_auth_keys()
     assert {item["id"] for item in persisted} == {"base-key", "unrelated-key"}
     assert all("last_used_at" not in item for item in persisted if item["id"] == "base-key")
+
+
+def test_authenticate_rechecks_key_after_cas_conflict_revoke(tmp_path) -> None:
+    accounts_path = tmp_path / "accounts.json"
+    auth_keys_path = tmp_path / "auth_keys.json"
+    raw_key = "auth-revoked-during-audit-key"
+    auth_keys_path.write_text(
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "id": "base-key",
+                        "role": "user",
+                        "key_hash": hashlib.sha256(raw_key.encode("utf-8")).hexdigest(),
+                        "name": "base",
+                        "enabled": True,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    accounts_path.write_text("[]", encoding="utf-8")
+    backend = JSONStorageBackend(accounts_path, auth_keys_path)
+    service = AuthService(backend)
+
+    def revoke_then_conflict(expected, auth_keys):
+        current = backend.load_auth_keys()
+        backend.save_auth_keys([{**current[0], "enabled": False}])
+        raise StorageConflictError()
+
+    with mock.patch.object(backend, "save_auth_keys_if_revision", side_effect=revoke_then_conflict):
+        identity = service.authenticate(raw_key)
+
+    assert identity is None
+    assert backend.load_auth_keys()[0]["enabled"] is False
 
 
 def test_authenticate_does_not_swallow_corruption_during_audit_write(tmp_path) -> None:

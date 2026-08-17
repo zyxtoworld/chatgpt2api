@@ -6,14 +6,42 @@ import { toast } from "sonner";
 import webConfig from "@/constants/common-env";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { parseChangelog, type ReleaseInfo } from "@/lib/release";
+import { fetchReleaseText } from "@/lib/version-release-fetch";
 
 const latestVersionUrl =
   "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/VERSION";
 const latestChangelogUrl =
   "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/CHANGELOG.md";
+const VERSION_MAX_BYTES = 16 * 1024;
+const CHANGELOG_MAX_BYTES = 2 * 1024 * 1024;
 
 function readLocalReleases(): ReleaseInfo[] {
-  return JSON.parse(process.env.NEXT_PUBLIC_APP_RELEASES || "[]");
+  try {
+    const parsed: unknown = JSON.parse(process.env.NEXT_PUBLIC_APP_RELEASES || "[]");
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((release) => {
+      if (!release || typeof release !== "object" || Array.isArray(release)) {
+        return false;
+      }
+      const items = release.items;
+      return (
+        typeof release.version === "string"
+        && typeof release.date === "string"
+        && Array.isArray(items)
+        && items.every(
+          (item) => item
+            && typeof item === "object"
+            && !Array.isArray(item)
+            && typeof item.type === "string"
+            && typeof item.content === "string",
+        )
+      );
+    }) as ReleaseInfo[];
+  } catch {
+    return [];
+  }
 }
 
 function toVersionParts(version: string) {
@@ -40,32 +68,35 @@ export function useVersionCheck() {
   const [checking, setChecking] = useState(false);
   const [open, setOpen] = useState(false);
   const releaseCheckOwnerRef = useRef(createLatestActionOwner());
+  const releaseAbortControllerRef = useRef<AbortController | null>(null);
   const hasNewVersion = isNewerVersion(latestVersion, currentVersion);
 
   useEffect(() => {
     const releaseCheckOwner = releaseCheckOwnerRef.current;
     releaseCheckOwner.activate();
-    return () => releaseCheckOwner.cancel();
+    return () => {
+      releaseCheckOwner.cancel();
+      releaseAbortControllerRef.current?.abort();
+      releaseAbortControllerRef.current = null;
+    };
   }, []);
 
   const checkLatestRelease = useCallback(
     async (showMessage = false) => {
       const releaseCheckOwner = releaseCheckOwnerRef.current;
       const requestOwner = releaseCheckOwner.begin();
+      releaseAbortControllerRef.current?.abort();
+      const abortController = new AbortController();
+      releaseAbortControllerRef.current = abortController;
       setChecking(true);
       try {
         const [versionResponse, changelogResponse] = await Promise.all([
-          fetch(latestVersionUrl),
-          fetch(latestChangelogUrl),
-        ]);
-        if (!versionResponse.ok || !changelogResponse.ok) throw new Error();
-        const [version, changelog] = await Promise.all([
-          versionResponse.text(),
-          changelogResponse.text(),
+          fetchReleaseText(latestVersionUrl, { maxBytes: VERSION_MAX_BYTES, signal: abortController.signal }),
+          fetchReleaseText(latestChangelogUrl, { maxBytes: CHANGELOG_MAX_BYTES, signal: abortController.signal }),
         ]);
         if (releaseCheckOwner.accepts(requestOwner)) {
-          setLatestVersion(version.trim() || currentVersion);
-          if (changelog.trim()) setReleases(parseChangelog(changelog));
+          setLatestVersion(versionResponse.trim() || currentVersion);
+          if (changelogResponse.trim()) setReleases(parseChangelog(changelogResponse));
           if (showMessage) toast.success("已获取最新版本信息");
         }
       } catch {
@@ -77,6 +108,9 @@ export function useVersionCheck() {
       } finally {
         if (releaseCheckOwner.accepts(requestOwner)) {
           setChecking(false);
+          if (releaseAbortControllerRef.current === abortController) {
+            releaseAbortControllerRef.current = null;
+          }
         }
       }
     },

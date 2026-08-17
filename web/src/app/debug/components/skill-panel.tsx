@@ -7,6 +7,8 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import webConfig from "@/constants/common-env";
 import { fetchSettingsConfig } from "@/lib/api";
+import { downloadTextFile } from "@/lib/download-text.js";
+import { normalizeSkillBaseUrl } from "@/lib/skill-base-url.js";
 
 const API_KEY_PLACEHOLDER = "<YOUR_API_KEY>";
 
@@ -22,7 +24,7 @@ export function SkillPanel() {
     let cancelled = false;
     void fetchSettingsConfig()
       .then((data) => {
-        if (!cancelled) setConfiguredBaseUrl(String(data.config.base_url || "").replace(/\/$/, ""));
+        if (!cancelled) setConfiguredBaseUrl(normalizeSkillBaseUrl(data.config?.base_url));
       })
       .catch(() => undefined);
     return () => {
@@ -144,12 +146,7 @@ ${skillEn}
   };
 
   const downloadSkill = (text: string) => {
-    const url = URL.createObjectURL(new Blob([text], { type: "text/markdown;charset=utf-8" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "SKILL.md";
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadTextFile(text, "SKILL.md");
   };
 
   const versions = [

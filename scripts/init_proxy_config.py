@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import copy
+import errno
 import json
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
+
+from services.secure_file import atomic_write_bytes
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -120,8 +122,20 @@ def _looks_like_repository_default(runtime: Any) -> bool:
     return candidate == DEFAULT_PROXY_RUNTIME
 
 
-def _mask_url(value: str) -> str:
-    return re.sub(r"(https?://)([^\s/@:]+):([^\s/@]+)@", r"\1[REDACTED]@", value or "", flags=re.I)
+def _mask_url(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return "[configured]" if value.strip() else ""
+    return "[invalid]"
+
+
+def _safe_mode(value: object, allowed: set[str]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str) and value in allowed:
+        return value
+    return "[invalid]"
 
 
 def main() -> int:
@@ -156,28 +170,40 @@ def main() -> int:
     if changed:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-        tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
         try:
-            tmp_path.write_text(payload, encoding="utf-8")
-            tmp_path.replace(config_path)
+            parent_stat = config_path.parent.stat()
+            atomic_write_bytes(
+                config_path,
+                config_path.parent,
+                payload.encode("utf-8"),
+                mode=0o600,
+                expected_root_identity=(parent_stat.st_dev, parent_stat.st_ino),
+            )
         except OSError as exc:
             # Docker bind-mounted single files can reject atomic rename with EBUSY.
             # Fall back to in-place write so the init job works with both file and
             # directory mounts.
-            if getattr(exc, "errno", None) != 16:
+            if getattr(exc, "errno", None) != errno.EBUSY:
                 raise
-            config_path.write_text(payload, encoding="utf-8")
-            tmp_path.unlink(missing_ok=True)
+            previous_payload = config_path.read_bytes()
+            try:
+                config_path.write_text(payload, encoding="utf-8")
+            except BaseException as write_error:
+                try:
+                    config_path.write_bytes(previous_payload)
+                except BaseException as rollback_error:
+                    raise OSError("config bind mount rollback failed") from rollback_error
+                raise write_error
 
     runtime = data.get("proxy_runtime") if isinstance(data.get("proxy_runtime"), dict) else {}
     clearance = runtime.get("clearance") if isinstance(runtime.get("clearance"), dict) else {}
     print(
         "Proxy runtime summary: "
         f"enabled={bool(runtime.get('enabled'))}, "
-        f"egress_mode={runtime.get('egress_mode')}, "
-        f"proxy_url={_mask_url(str(runtime.get('proxy_url') or ''))}, "
-        f"clearance_mode={clearance.get('mode')}, "
-        f"flaresolverr_url={_mask_url(str(clearance.get('flaresolverr_url') or ''))}"
+        f"egress_mode={_safe_mode(runtime.get('egress_mode'), {'direct', 'single_proxy'})}, "
+        f"proxy_url={_mask_url(runtime.get('proxy_url'))}, "
+        f"clearance_mode={_safe_mode(clearance.get('mode'), {'none', 'manual', 'flaresolverr'})}, "
+        f"flaresolverr_url={_mask_url(clearance.get('flaresolverr_url'))}"
     )
     return 0
 

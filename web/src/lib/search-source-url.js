@@ -65,9 +65,9 @@ export function normalizeSearchSources(values) {
     if (!url || seen.has(url)) continue;
     seen.add(url);
     output.push({
-      title: String(source.title || "").trim(),
+      title: typeof source.title === "string" ? source.title.trim() : "",
       url,
-      snippet: String(source.snippet || "").trim(),
+      snippet: typeof source.snippet === "string" ? source.snippet.trim() : "",
     });
   }
   return output;

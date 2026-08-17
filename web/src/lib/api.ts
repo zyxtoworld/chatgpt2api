@@ -1,5 +1,6 @@
 import { httpRequest, request } from "@/lib/request";
 import { encodeApiPath } from "@/lib/api-path";
+import { downloadBlobFile } from "@/lib/download-text.js";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
@@ -599,35 +600,21 @@ export async function deleteManagedImages(body: { paths?: string[]; start_date?:
   return httpRequest<{ removed: number }>("/api/images/delete", { method: "POST", body });
 }
 
-export async function downloadImages(paths: string[], isActive?: () => boolean): Promise<boolean> {
+export async function downloadImages(paths: string[], isActive?: () => boolean, signal?: AbortSignal): Promise<boolean> {
   if (isActive && !isActive()) return false;
-  const response = await request.post("/api/images/download", { paths }, { responseType: "blob" });
+  const response = await request.post("/api/images/download", { paths }, { responseType: "blob", signal });
   if (isActive && !isActive()) return false;
   const blob = response.data as Blob;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "images.zip";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  downloadBlobFile(blob, "images.zip");
   return true;
 }
 
-export async function downloadSingleImage(path: string, isActive?: () => boolean): Promise<boolean> {
+export async function downloadSingleImage(path: string, isActive?: () => boolean, signal?: AbortSignal): Promise<boolean> {
   if (isActive && !isActive()) return false;
-  const response = await request.get(`/api/images/download/${encodeApiPath(path)}`, { responseType: "blob" });
+  const response = await request.get(`/api/images/download/${encodeApiPath(path)}`, { responseType: "blob", signal });
   if (isActive && !isActive()) return false;
   const blob = response.data as Blob;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = path.split("/").pop() || "image.png";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  downloadBlobFile(blob, path.split("/").pop() || "image.png");
   return true;
 }
 

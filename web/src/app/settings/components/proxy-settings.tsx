@@ -21,6 +21,7 @@ import {
 } from "@/lib/api";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { proxySettingsWriteGate } from "@/lib/proxy-settings-write-gate";
 import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
 
 export function ProxySettingsCard() {
@@ -80,8 +81,14 @@ export function ProxySettingsCard() {
     testOwnerRef.current.invalidate();
     setIsTesting(false);
     setTestResult(null);
+    const writeOwner = proxySettingsWriteGate.begin();
+    if (!writeOwner.accepted) {
+      toast.error("代理配置操作正在进行，请稍候");
+      return;
+    }
     const mutationOwner = requestGateRef.current.beginMutation();
     if (!mutationOwner.accepted) {
+      proxySettingsWriteGate.finish(writeOwner);
       toast.error("代理配置操作正在进行，请稍候");
       return;
     }
@@ -109,6 +116,7 @@ export function ProxySettingsCard() {
         setIsSaving(false);
       }
       requestGateRef.current.finishMutation(mutationOwner);
+      proxySettingsWriteGate.finish(writeOwner);
     }
   };
 

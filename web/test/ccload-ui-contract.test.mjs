@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { createMutationRequestGate } from "../src/lib/mutation-request-gate.js";
 
 const componentSource = readFileSync(
   fileURLToPath(new URL("../src/app/settings/components/ccload-connections.tsx", import.meta.url)),
@@ -24,15 +25,60 @@ test("ccLoad uses stable connection and channel wording without a pinned preview
   assert.doesNotMatch(serviceSource, /ccLoad[^\n]*preview/i);
 });
 
-test("ccLoad loads one model catalog per account type without a global overwrite", () => {
+test("ccLoad loads bounded catalogs for the visible channels without a global overwrite", () => {
   assert.match(componentSource, /normalizeCCLoadChannels\(data\.channels\)/);
   assert.match(componentSource, /await fetchCCLoadChannels\(server\.id\)/);
   assert.match(componentSource, /fetchCCLoadChannelModels\(serverId, channelIds\)/);
-  assert.match(componentSource, /getUnloadedCCLoadChannelIds\(channels\)\.slice\(0, 50\)/);
-  assert.doesNotMatch(componentSource, /getUnloadedCCLoadChannelIds\(channelPageResult\.items\)/);
+  assert.match(componentSource, /getUnloadedCCLoadChannelIds\(channelPageResult\.items\)\.slice\(0, 50\)/);
+  assert.doesNotMatch(componentSource, /getUnloadedCCLoadChannelIds\(channels\)\.slice\(0, 50\)/);
   assert.match(componentSource, /mergeCCLoadChannelModels\(current, data\.channels\)/);
   assert.doesNotMatch(componentSource, /fetchModels/);
   assert.doesNotMatch(componentSource, /replaceCCLoadChannelModels/);
+});
+
+test("ccLoad exposes a bounded user-triggered retry after model loading fails", () => {
+  assert.match(componentSource, /const \[modelRetryGeneration, setModelRetryGeneration\] = useState\(0\)/);
+  assert.match(componentSource, /const retryChannelModels = \(\) =>/);
+  assert.match(componentSource, /setModelRetryGeneration\(\(current\) => current \+ 1\)/);
+  assert.match(componentSource, /读取失败，重试/);
+  assert.match(
+    componentSource,
+    /\}, \[browserOpen, browserServer, unloadedPageModelKey, modelRetryGeneration\]\);/,
+  );
+  assert.match(componentSource, /getCCLoadModelErrorIds\(data\.channels, channelIds\)/);
+  assert.match(componentSource, /failedIds\.has\(id\)/);
+});
+
+test("ccLoad invalidates an old model query when the next page has no unloaded channels", () => {
+  const effectStart = componentSource.indexOf(
+    "useEffect(() => {",
+    componentSource.indexOf("const unloadedPageModelKey ="),
+  );
+  const effectEnd = componentSource.indexOf(
+    "  }, [browserOpen, browserServer, unloadedPageModelKey, modelRetryGeneration]);",
+    effectStart,
+  );
+  assert.ok(effectStart >= 0 && effectEnd > effectStart);
+  const effectBody = componentSource.slice(effectStart, effectEnd);
+  const invalidateIndex = effectBody.indexOf('gate.invalidateQueries("channel-models")');
+  const guardIndex = effectBody.indexOf("if (!browserOpen || !browserServer || !unloadedPageModelKey) return;");
+  assert.ok(invalidateIndex >= 0, "model effect must invalidate the previous page owner");
+  assert.ok(guardIndex >= 0, "model effect guard must remain explicit");
+  assert.ok(invalidateIndex < guardIndex, "invalidation must happen before the empty-page early return");
+});
+
+test("closing ccLoad browser invalidates an in-flight channel query", () => {
+  const closeStart = componentSource.indexOf("const closeBrowser = () => {");
+  const closeEnd = componentSource.indexOf("const selectableFilteredChannelIds", closeStart);
+  assert.ok(closeStart >= 0 && closeEnd > closeStart);
+  const closeBody = componentSource.slice(closeStart, closeEnd);
+  assert.match(closeBody, /invalidateQueries\("channels"\)/);
+  assert.match(closeBody, /setLoadingChannelsId\(null\)/);
+
+  const gate = createMutationRequestGate();
+  const channelQuery = gate.beginQuery("channels");
+  gate.invalidateQueries("channels");
+  assert.equal(gate.acceptsQuery(channelQuery), false);
 });
 
 test("ccLoad card and dialogs keep the CPA visual structure", () => {

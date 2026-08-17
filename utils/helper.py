@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from services.image_payload import ImagePayloadError, validate_image_payload
 from services.protocol.error_response import PUBLIC_SERVER_ERROR_MESSAGE
 from services.remote_image import download_remote_image
+from utils.bounded_base64 import decode_bounded_base64
 from utils.log import logger
 
 BASE_IMAGE_MODELS = {"gpt-image-2", "codex-gpt-image-2"}
@@ -28,6 +29,8 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 SUPPORTED_JSON_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
+MAX_SSE_LINE_BYTES = 16 * 1024 * 1024
+SSE_READ_CHUNK_BYTES = 64 * 1024
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 
 
@@ -57,10 +60,9 @@ def _decode_json_image_string(value: str, index: int, filename: str | None = Non
         resolved_mime = "image/jpeg"
     if resolved_mime not in SUPPORTED_JSON_IMAGE_MIME_TYPES:
         raise HTTPException(status_code=400, detail={"error": "unsupported image mime type"})
-    try:
-        image_data = base64.b64decode(encoded, validate=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"}) from exc
+    image_data = decode_bounded_base64(encoded, max_bytes=MAX_JSON_IMAGE_BYTES)
+    if image_data is None:
+        raise HTTPException(status_code=400, detail={"error": "invalid base64 image data"})
     if not image_data:
         raise HTTPException(status_code=400, detail={"error": "image file is empty"})
     if len(image_data) > MAX_JSON_IMAGE_BYTES:
@@ -233,7 +235,12 @@ def sse_json_stream(items) -> Iterator[str]:
 def responses_sse_stream(items) -> Iterator[str]:
     try:
         for item in items:
-            event_type = str(item.get("type") or "error") if isinstance(item, dict) else "error"
+            if not isinstance(item, dict):
+                raise RuntimeError("invalid responses SSE event")
+            event_value = item.get("type")
+            if not isinstance(event_value, str) or not event_value.strip():
+                raise RuntimeError("invalid responses SSE event")
+            event_type = event_value.strip()
             yield f"event: {event_type}\n"
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
     except Exception as exc:
@@ -254,7 +261,12 @@ def responses_sse_stream(items) -> Iterator[str]:
 def anthropic_sse_stream(items) -> Iterator[str]:
     try:
         for item in items:
-            event = str(item.get("type") or "message_delta") if isinstance(item, dict) else "message_delta"
+            if not isinstance(item, dict):
+                raise RuntimeError("invalid anthropic SSE event")
+            event_value = item.get("type")
+            if not isinstance(event_value, str) or not event_value.strip():
+                raise RuntimeError("invalid anthropic SSE event")
+            event = event_value.strip()
             yield f"event: {event}\n"
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
     except Exception as exc:
@@ -274,14 +286,59 @@ def anthropic_sse_stream(items) -> Iterator[str]:
 
 
 def iter_sse_payloads(response: requests.Response) -> Iterator[str]:
-    for raw_line in response.iter_lines():
-        if not raw_line:
-            continue
-        line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
+    def parse_line(raw_line: object) -> str | None:
+        if isinstance(raw_line, bytes):
+            if len(raw_line) > MAX_SSE_LINE_BYTES:
+                raise RuntimeError("SSE line is too large")
+            line = raw_line.decode("utf-8", errors="ignore")
+        elif isinstance(raw_line, str):
+            if len(raw_line.encode("utf-8")) > MAX_SSE_LINE_BYTES:
+                raise RuntimeError("SSE line is too large")
+            line = raw_line
+        else:
+            raise RuntimeError("invalid SSE line")
+        line = line.rstrip("\r")
         if not line.startswith("data:"):
-            continue
+            return None
         payload = line[5:].strip()
-        if payload:
+        return payload or None
+
+    iter_content = getattr(response, "iter_content", None)
+    if callable(iter_content):
+        pending = bytearray()
+        for raw_chunk in iter_content(chunk_size=SSE_READ_CHUNK_BYTES):
+            if not isinstance(raw_chunk, (bytes, bytearray, memoryview)):
+                raise RuntimeError("invalid SSE chunk")
+            raw_chunk_size = raw_chunk.nbytes if isinstance(raw_chunk, memoryview) else len(raw_chunk)
+            if raw_chunk_size > MAX_SSE_LINE_BYTES:
+                raise RuntimeError("SSE chunk is too large")
+            chunk = bytes(raw_chunk)
+            if len(chunk) > MAX_SSE_LINE_BYTES:
+                raise RuntimeError("SSE chunk is too large")
+            if len(pending) + len(chunk) > MAX_SSE_LINE_BYTES and b"\n" not in chunk:
+                raise RuntimeError("SSE line is too large")
+            pending.extend(chunk)
+            while True:
+                try:
+                    newline = pending.index(0x0A)
+                except ValueError:
+                    if len(pending) > MAX_SSE_LINE_BYTES:
+                        raise RuntimeError("SSE line is too large")
+                    break
+                raw_line = bytes(pending[:newline])
+                del pending[:newline + 1]
+                payload = parse_line(raw_line)
+                if payload is not None:
+                    yield payload
+        if pending:
+            payload = parse_line(bytes(pending))
+            if payload is not None:
+                yield payload
+        return
+
+    for raw_line in response.iter_lines():
+        payload = parse_line(raw_line)
+        if payload is not None:
             yield payload
 
 
@@ -369,8 +426,10 @@ def extract_prompt_from_message_content(content: object) -> str:
 
 def _message_image_url(value: object) -> str:
     if isinstance(value, dict):
-        return str(value.get("url") or value.get("image_url") or "").strip()
-    return str(value or "").strip()
+        candidate = value.get("url") or value.get("image_url")
+    else:
+        candidate = value
+    return candidate.strip() if isinstance(candidate, str) else ""
 
 
 def _decode_message_image_url(value: object) -> tuple[bytes, str] | None:
@@ -401,9 +460,12 @@ def _decode_message_image_object(item: dict[str, object]) -> tuple[bytes, str] |
         )
         return image_data, mime
     source = item.get("source")
-    if isinstance(source, dict) and str(source.get("type") or "") == "base64":
-        encoded = str(source.get("data") or "")
-        mime = str(source.get("media_type") or source.get("mime_type") or "image/png")
+    if isinstance(source, dict) and source.get("type") == "base64":
+        encoded = source.get("data")
+        if not isinstance(encoded, str) or not encoded.strip():
+            return None
+        raw_mime = source.get("media_type") or source.get("mime_type")
+        mime = raw_mime.strip() if isinstance(raw_mime, str) and raw_mime.strip() else "image/png"
         image_data, _, resolved_mime = _decode_json_image_string(encoded, 1, mime_type=mime)
         return image_data, resolved_mime
     return None
@@ -480,7 +542,10 @@ def build_chat_image_markdown_content(image_result: dict[str, object]) -> str:
     for index, item in enumerate(image_items, start=1):
         if not isinstance(item, dict):
             continue
-        b64_json = str(item.get("b64_json") or "").strip()
+        b64_value = item.get("b64_json")
+        if not isinstance(b64_value, str):
+            continue
+        b64_json = b64_value.strip()
         if b64_json:
             markdown_images.append(f"![image_{index}](data:image/png;base64,{b64_json})")
     return "\n\n".join(markdown_images) if markdown_images else "Image generation completed."

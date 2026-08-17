@@ -21,6 +21,7 @@ import { loadManagedImagesWithTags } from "@/lib/image-manager-load";
 import { createRequestGate } from "@/lib/query-request-gate";
 import { createReplaceableTimeout } from "@/lib/replaceable-timeout";
 import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
+import { createDownloadAbortRegistry } from "@/lib/download-lifecycle";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 
 const LONG_PRESS_MS = 800;
@@ -45,12 +46,20 @@ async function copyImageUrl(url: string) {
 const imageQueryKey = (startDate: string, endDate: string) => JSON.stringify([startDate, endDate]);
 
 function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressTimerRef = useRef(createReplaceableTimeout());
   const activeRef = useRef(false);
+
+  useEffect(() => {
+    const longPressTimer = longPressTimerRef.current;
+    return () => {
+      activeRef.current = false;
+      longPressTimer.cancel();
+    };
+  }, []);
 
   const start = useCallback((e: React.MouseEvent | React.TouchEvent) => {
     activeRef.current = true;
-    timerRef.current = setTimeout(() => {
+    longPressTimerRef.current.schedule(() => {
       if (activeRef.current) {
         onLongPress();
       }
@@ -59,10 +68,7 @@ function useLongPress(onLongPress: () => void, ms = LONG_PRESS_MS) {
 
   const stop = useCallback(() => {
     activeRef.current = false;
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    longPressTimerRef.current.cancel();
   }, []);
 
   return {
@@ -140,18 +146,22 @@ function ImageManagerContent() {
   const [isMutating, setIsMutating] = useState(false);
   const imageMutationGateRef = useRef(createMutationRequestGate());
   const downloadOwnerRef = useRef(createLifecycleActionOwner());
+  const downloadAbortRegistryRef = useRef(createDownloadAbortRegistry());
   const deleteDialogCleanupTimerRef = useRef(createReplaceableTimeout());
   const tagPressTimerRef = useRef(createReplaceableTimeout());
 
   useEffect(() => {
     const mutationGate = imageMutationGateRef.current;
     const downloadOwner = downloadOwnerRef.current;
+    const downloadAbortRegistry = downloadAbortRegistryRef.current;
     const cleanupTimer = deleteDialogCleanupTimerRef.current;
     const tagPressTimer = tagPressTimerRef.current;
     downloadOwner.activate();
+    downloadAbortRegistry.activate();
     return () => {
       mutationGate.cancel();
       downloadOwner.cancel();
+      downloadAbortRegistry.cancel();
       cleanupTimer.cancel();
       tagPressTimer.cancel();
     };
@@ -435,9 +445,10 @@ function ImageManagerContent() {
     const downloadOwner = downloadOwnerRef.current;
     const downloadAction = downloadOwner.begin();
     const isDownloadActive = () => downloadOwner.accepts(downloadAction);
+    const controller = downloadAbortRegistryRef.current.begin();
     setIsDownloading(true);
     try {
-      const started = await downloadImages(paths, isDownloadActive);
+      const started = await downloadImages(paths, isDownloadActive, controller.signal);
       if (isDownloadActive() && started) {
         toast.success(`已下载 ${paths.length} 张图片`);
       }
@@ -446,6 +457,7 @@ function ImageManagerContent() {
         toast.error(error instanceof Error ? error.message : "下载失败");
       }
     } finally {
+      downloadAbortRegistryRef.current.finish(controller);
       if (isDownloadActive()) {
         setIsDownloading(false);
       }
@@ -456,8 +468,9 @@ function ImageManagerContent() {
     const downloadOwner = downloadOwnerRef.current;
     const downloadAction = downloadOwner.begin();
     const isDownloadActive = () => downloadOwner.accepts(downloadAction);
+    const controller = downloadAbortRegistryRef.current.begin();
     try {
-      const started = await downloadSingleImage(item.rel, isDownloadActive);
+      const started = await downloadSingleImage(item.rel, isDownloadActive, controller.signal);
       if (isDownloadActive() && started) {
         toast.success("图片下载已开始");
       }
@@ -465,6 +478,9 @@ function ImageManagerContent() {
       if (isDownloadActive()) {
         toast.error("下载图片失败");
       }
+    }
+    finally {
+      downloadAbortRegistryRef.current.finish(controller);
     }
   };
 

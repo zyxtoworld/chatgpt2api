@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.image_tasks as image_tasks_module
+import api.image_inputs as image_inputs_module
 from api.errors import install_exception_handlers
 from services.image_task_service import ImageTaskNotFoundError, ImageTaskResumeConflictError
 from services.task_executor import BackgroundTaskQueueFullError
@@ -97,6 +98,26 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(payload["status"], "success")
         self.assertEqual(len(self.fake_service.generation_calls), 1)
 
+    def test_generation_rejects_oversized_client_task_id_before_service(self):
+        response = self.client.post(
+            "/api/image-tasks/generations",
+            headers=AUTH_HEADERS,
+            json={"client_task_id": "x" * 257, "prompt": "cat", "model": "gpt-image-2"},
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.fake_service.generation_calls, [])
+
+    def test_generation_rejects_comma_client_task_id_before_service(self):
+        response = self.client.post(
+            "/api/image-tasks/generations",
+            headers=AUTH_HEADERS,
+            json={"client_task_id": "task,one", "prompt": "cat", "model": "gpt-image-2"},
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.fake_service.generation_calls, [])
+
     def test_generation_uses_relative_image_url_for_untrusted_host(self):
         with mock.patch("api.support.config", SimpleNamespace(base_url="", auth_key="chatgpt2api")):
             response = self.client.post(
@@ -125,6 +146,55 @@ class ImageTasksApiTests(unittest.TestCase):
         self.assertEqual(len(self.fake_service.edit_calls), 1)
         images = self.fake_service.edit_calls[0][1]["images"]
         self.assertEqual(len(images), 2)
+
+    def test_edit_rejects_oversized_client_task_id_before_review_or_image_read(self):
+        with mock.patch.object(image_tasks_module, "filter_or_log", new=mock.AsyncMock()) as filter_or_log, \
+             mock.patch.object(image_tasks_module, "read_image_sources", new=mock.AsyncMock()) as read_images:
+            response = self.client.post(
+                "/api/image-tasks/edits",
+                headers=AUTH_HEADERS,
+                data={"client_task_id": "x" * 257, "prompt": "edit", "model": "gpt-image-2"},
+                files=[("image", ("one.png", PNG_BYTES, "image/png"))],
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        filter_or_log.assert_not_awaited()
+        read_images.assert_not_awaited()
+        self.assertEqual(self.fake_service.edit_calls, [])
+
+    def test_edit_rejects_comma_client_task_id_before_review_or_image_read(self):
+        with mock.patch.object(image_tasks_module, "filter_or_log", new=mock.AsyncMock()) as filter_or_log, \
+             mock.patch.object(image_tasks_module, "read_image_sources", new=mock.AsyncMock()) as read_images:
+            response = self.client.post(
+                "/api/image-tasks/edits",
+                headers=AUTH_HEADERS,
+                data={"client_task_id": "task,one", "prompt": "edit", "model": "gpt-image-2"},
+                files=[("image", ("one.png", PNG_BYTES, "image/png"))],
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        filter_or_log.assert_not_awaited()
+        read_images.assert_not_awaited()
+        self.assertEqual(self.fake_service.edit_calls, [])
+
+    def test_json_edit_rejects_oversized_client_task_id_before_decoding_image_url(self):
+        with mock.patch.object(image_tasks_module, "filter_or_log", new=mock.AsyncMock()) as filter_or_log, \
+             mock.patch.object(image_inputs_module, "_decode_data_url", wraps=image_inputs_module._decode_data_url) as decode_data_url:
+            response = self.client.post(
+                "/api/image-tasks/edits",
+                headers=AUTH_HEADERS,
+                json={
+                    "client_task_id": "x" * 257,
+                    "prompt": "edit",
+                    "model": "gpt-image-2",
+                    "image_url": DATA_IMAGE_URL,
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        filter_or_log.assert_not_awaited()
+        decode_data_url.assert_not_called()
+        self.assertEqual(self.fake_service.edit_calls, [])
 
     def test_create_edit_task_accepts_image_url(self):
         """测试图片编辑任务接口支持表单 image_url 引用。"""
@@ -174,6 +244,16 @@ class ImageTasksApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 409, response.text)
+
+    def test_resume_poll_rejects_string_timeout_before_service_call(self):
+        response = self.client.post(
+            "/api/image-tasks/task-1/resume-poll",
+            headers=AUTH_HEADERS,
+            json={"extra_timeout_secs": "30"},
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(self.fake_service.resume_calls, [])
 
     def test_generation_does_not_echo_untrusted_value_error(self):
         secret = "opaque-image-task-secret owner@example.com"

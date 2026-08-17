@@ -46,6 +46,10 @@ class InflightCall:
     error: BaseException | None = None
 
 
+class _CacheInvalidatedError(RuntimeError):
+    pass
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, bytes):
         return {"__bytes_sha256__": hashlib.sha256(value).hexdigest(), "length": len(value)}
@@ -66,14 +70,30 @@ def canonical_body(body: dict[str, Any], messages: list[dict[str, Any]], *, stre
     return payload
 
 
-def cache_key(body: dict[str, Any], messages: list[dict[str, Any]], *, stream: bool) -> str:
+def cache_key(
+    body: dict[str, Any],
+    messages: list[dict[str, Any]],
+    *,
+    stream: bool,
+    cache_scope: str = "",
+) -> str:
     encoded = json.dumps(
         _json_safe(canonical_body(body, messages, stream=stream)),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    if cache_scope:
+        encoded = encoded + b"\x00" + cache_scope.encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def resolve_access_token_cache_scope(cache_scope: str, access_token: str) -> str:
+    """Bind a request cache to the selected account generation."""
+    if not cache_scope:
+        return ""
+    token_digest = hashlib.sha256(str(access_token or "<anonymous>").encode("utf-8")).hexdigest()
+    return f"{cache_scope}\x00account:{token_digest}"
 
 
 def _message_signature(message: dict[str, Any]) -> str:
@@ -103,11 +123,21 @@ class ChatCompletionCache:
         self._lock = threading.RLock()
         self._entries: dict[str, CacheEntry] = {}
         self._inflight: dict[str, InflightCall] = {}
+        self._generation = 0
 
     def clear(self) -> None:
         with self._lock:
+            self._generation += 1
             self._entries.clear()
+            inflight_calls = list(self._inflight.values())
             self._inflight.clear()
+        for inflight in inflight_calls:
+            with inflight.condition:
+                if inflight.done:
+                    continue
+                inflight.error = _CacheInvalidatedError("cache fill invalidated")
+                inflight.done = True
+                inflight.condition.notify_all()
 
     def _settings(self) -> dict[str, object]:
         return config.get_chat_completion_cache_settings()
@@ -124,7 +154,27 @@ class ChatCompletionCache:
     def _copy(value: Any) -> Any:
         return copy.deepcopy(value)
 
-    def get_or_compute_response(self, key: str, compute: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    @staticmethod
+    def _finish_inflight(
+        inflight: InflightCall,
+        *,
+        value: Any = None,
+        error: BaseException | None = None,
+    ) -> None:
+        with inflight.condition:
+            if inflight.done:
+                return
+            inflight.value = value
+            inflight.error = error
+            inflight.done = True
+            inflight.condition.notify_all()
+
+    def get_or_compute_response(
+        self,
+        key: str,
+        compute: Callable[[], dict[str, Any]],
+        replay: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         settings = self._settings()
         if not settings.get("enabled") or int(settings.get("ttl_seconds") or 0) <= 0:
             return compute()
@@ -135,7 +185,8 @@ class ChatCompletionCache:
             self._prune_locked(now, max_entries)
             entry = self._entries.get(key)
             if entry and entry.expires_at > now:
-                return self._copy(entry.value)
+                value = self._copy(entry.value)
+                return replay(value) if replay is not None else value
             inflight = self._inflight.get(key) if settings.get("dedupe_inflight") else None
             if inflight is None:
                 inflight = InflightCall()
@@ -144,6 +195,7 @@ class ChatCompletionCache:
                 owner = True
             else:
                 owner = False
+            generation = self._generation
 
         if not owner:
             with inflight.condition:
@@ -151,31 +203,34 @@ class ChatCompletionCache:
                     inflight.condition.wait()
                 if inflight.error:
                     raise inflight.error
-                return self._copy(inflight.value)
+                value = self._copy(inflight.value)
+                return replay(value) if replay is not None else value
 
         try:
             value = compute()
         except BaseException as exc:
             with self._lock:
-                self._inflight.pop(key, None)
-            with inflight.condition:
-                inflight.error = exc
-                inflight.done = True
-                inflight.condition.notify_all()
+                if self._inflight.get(key) is inflight:
+                    self._inflight.pop(key, None)
+            self._finish_inflight(inflight, error=exc)
             raise
 
-        expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(value))
-            self._prune_locked(time.time(), max_entries)
-            self._inflight.pop(key, None)
-        with inflight.condition:
-            inflight.value = self._copy(value)
-            inflight.done = True
-            inflight.condition.notify_all()
+            if self._generation == generation:
+                expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
+                self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(value))
+                self._prune_locked(time.time(), max_entries)
+            if self._inflight.get(key) is inflight:
+                self._inflight.pop(key, None)
+        self._finish_inflight(inflight, value=self._copy(value))
         return value
 
-    def get_or_compute_stream(self, key: str, compute: Callable[[], Iterable[dict[str, Any]]]) -> Iterator[dict[str, Any]]:
+    def get_or_compute_stream(
+        self,
+        key: str,
+        compute: Callable[[], Iterable[dict[str, Any]]],
+        replay: Callable[[list[dict[str, Any]]], Iterable[dict[str, Any]]] | None = None,
+    ) -> Iterator[dict[str, Any]]:
         settings = self._settings()
         if (
             not settings.get("enabled")
@@ -191,7 +246,8 @@ class ChatCompletionCache:
             self._prune_locked(now, max_entries)
             entry = self._entries.get(key)
             if entry and entry.expires_at > now:
-                yield from self._copy(entry.value)
+                value = self._copy(entry.value)
+                yield from (replay(value) if replay is not None else value)
                 return
             inflight = self._inflight.get(key) if settings.get("dedupe_inflight") else None
             if inflight is None:
@@ -201,6 +257,7 @@ class ChatCompletionCache:
                 owner = True
             else:
                 owner = False
+            generation = self._generation
 
         if not owner:
             # A streaming owner must reacquire the bounded AI worker for every
@@ -213,28 +270,35 @@ class ChatCompletionCache:
             return
 
         chunks: list[dict[str, Any]] = []
+        source = None
         try:
-            for chunk in compute():
+            source = iter(compute())
+            for chunk in source:
                 chunks.append(self._copy(chunk))
                 yield chunk
         except BaseException as exc:
             with self._lock:
-                self._inflight.pop(key, None)
-            with inflight.condition:
-                inflight.error = exc
-                inflight.done = True
-                inflight.condition.notify_all()
+                if self._inflight.get(key) is inflight:
+                    self._inflight.pop(key, None)
+            self._finish_inflight(inflight, error=exc)
             raise
+        finally:
+            if source is not None:
+                close = getattr(source, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
-        expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
         with self._lock:
-            self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(chunks))
-            self._prune_locked(time.time(), max_entries)
-            self._inflight.pop(key, None)
-        with inflight.condition:
-            inflight.value = self._copy(chunks)
-            inflight.done = True
-            inflight.condition.notify_all()
+            if self._generation == generation:
+                expires_at = time.time() + int(settings.get("ttl_seconds") or 0)
+                self._entries[key] = CacheEntry(expires_at=expires_at, value=self._copy(chunks))
+                self._prune_locked(time.time(), max_entries)
+            if self._inflight.get(key) is inflight:
+                self._inflight.pop(key, None)
+        self._finish_inflight(inflight, value=self._copy(chunks))
 
 
 chat_completion_cache = ChatCompletionCache()

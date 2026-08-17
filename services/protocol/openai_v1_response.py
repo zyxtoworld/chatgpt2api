@@ -12,7 +12,12 @@ from fastapi import HTTPException
 from services.account_service import account_service
 from services.model_service import ModelUnavailableError, model_catalog_service
 from services.openai_backend_api import CODEX_RESPONSES_MODEL, OpenAIBackendAPI
-from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
+from services.protocol.chat_completion_cache import (
+    cache_key,
+    chat_completion_cache,
+    normalize_text_messages,
+    resolve_access_token_cache_scope,
+)
 from services.protocol.conversation import (
     ConversationRequest,
     ImageOutput,
@@ -22,7 +27,7 @@ from services.protocol.conversation import (
     encode_images,
     normalize_messages,
     stream_image_outputs_with_pool,
-    stream_text_deltas,
+    stream_text_deltas_without_closing as stream_text_deltas,
     text_backend,
 )
 from services.protocol.reasoning_effort import conversation_effort_from_body
@@ -75,6 +80,7 @@ SUPPORTED_FUNCTION_CALL_FIELDS = {
     "id",
     "call_id",
     "name",
+    "description",
     "namespace",
     "arguments",
     "encrypted_function_args",
@@ -151,6 +157,209 @@ CODEX_INTERNAL_RESPONSE_EVENT_FIELDS = frozenset({
 })
 CODEX_INTERNAL_RESPONSE_ITEM_FIELDS = frozenset({
     "internal_chat_message_metadata_passthrough",
+})
+_PUBLIC_CODEX_EVENT_FIELDS = frozenset({
+    "type",
+    "sequence_number",
+    "response",
+    "item",
+    "output_index",
+    "content_index",
+    "item_id",
+    "delta",
+    "text",
+    "arguments",
+    "part",
+    "code",
+    "message",
+    "param",
+    "error",
+})
+_PUBLIC_CODEX_RESPONSE_FIELDS = frozenset({
+    "id",
+    "object",
+    "created_at",
+    "status",
+    "error",
+    "incomplete_details",
+    "model",
+    "output",
+    "parallel_tool_calls",
+    "usage",
+})
+_PUBLIC_CODEX_ITEM_FIELDS = frozenset().union(
+    SUPPORTED_RESPONSE_MESSAGE_FIELDS,
+    SUPPORTED_FUNCTION_CALL_OUTPUT_FIELDS,
+    SUPPORTED_CUSTOM_TOOL_CALL_FIELDS,
+    SUPPORTED_FUNCTION_CALL_FIELDS,
+    SUPPORTED_REASONING_FIELDS,
+    SUPPORTED_COMPACTION_FIELDS,
+    SUPPORTED_IMAGE_GENERATION_CALL_FIELDS,
+    SUPPORTED_WEB_SEARCH_CALL_FIELDS,
+    SUPPORTED_TOOL_SEARCH_CALL_FIELDS,
+    SUPPORTED_TOOL_SEARCH_OUTPUT_FIELDS,
+    SUPPORTED_MCP_TOOL_CALL_OUTPUT_FIELDS,
+)
+_PUBLIC_CODEX_CONTENT_FIELDS = frozenset({
+    "type",
+    "text",
+    "annotations",
+    "logprobs",
+    "image_url",
+    "detail",
+    "audio_url",
+    "encrypted_content",
+})
+_PUBLIC_CODEX_LOGPROB_FIELDS = frozenset({"token", "logprob", "bytes", "top_logprobs"})
+_PUBLIC_CODEX_ERROR_FIELDS = frozenset({"type", "code", "message", "param"})
+_PUBLIC_CODEX_USAGE_FIELDS = frozenset({
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "input_tokens_details",
+    "output_tokens_details",
+})
+_PUBLIC_CODEX_USAGE_DETAIL_FIELDS = frozenset({
+    "cached_tokens",
+    "cache_write_tokens",
+    "text_tokens",
+    "image_tokens",
+    "reasoning_tokens",
+})
+_PUBLIC_CODEX_ANNOTATION_FIELDS = frozenset({
+    "type",
+    "url",
+    "title",
+    "start_index",
+    "end_index",
+})
+_PUBLIC_CODEX_INCOMPLETE_REASONS = frozenset({
+    "max_output_tokens",
+    "content_filter",
+})
+_PUBLIC_CODEX_ACTION_FIELDS = frozenset({
+    "type",
+    "query",
+    "queries",
+    "url",
+    "pattern",
+})
+_PUBLIC_CODEX_TOOL_DEFINITION_FIELDS = frozenset({
+    "type",
+    "name",
+    "description",
+    "parameters",
+    "strict",
+    "defer_loading",
+})
+_PUBLIC_CODEX_TOOL_SCHEMA_FIELDS = frozenset({
+    "type",
+    "properties",
+    "required",
+    "items",
+    "additionalProperties",
+    "description",
+    "title",
+    "pattern",
+    "enum",
+    "const",
+    "oneOf",
+    "anyOf",
+    "allOf",
+    "minLength",
+    "maxLength",
+    "minimum",
+    "maximum",
+})
+_PUBLIC_CODEX_TOOL_SCHEMA_STRING_FIELDS = frozenset({
+    "description",
+    "title",
+    "pattern",
+})
+_PUBLIC_CODEX_TOOL_SCHEMA_NUMBER_FIELDS = frozenset({
+    "minLength",
+    "maxLength",
+    "minimum",
+    "maximum",
+})
+_PUBLIC_CODEX_SCALAR_FIELDS = frozenset({
+    "type",
+    "id",
+    "object",
+    "status",
+    "model",
+    "role",
+    "phase",
+    "item_id",
+    "call_id",
+    "name",
+    "namespace",
+    "delta",
+    "text",
+    "arguments",
+    "encrypted_content",
+    "result",
+    "revised_prompt",
+    "execution",
+    "detail",
+    "image_url",
+    "audio_url",
+    "code",
+    "message",
+    "param",
+    "url",
+    "title",
+    "query",
+    "pattern",
+    "sequence_number",
+    "output_index",
+    "content_index",
+    "created_at",
+    "start_index",
+    "end_index",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "text_tokens",
+    "image_tokens",
+    "reasoning_tokens",
+    "parallel_tool_calls",
+    "description",
+})
+_PUBLIC_CODEX_STRING_FIELDS = frozenset(_PUBLIC_CODEX_SCALAR_FIELDS - {
+    "sequence_number",
+    "output_index",
+    "content_index",
+    "created_at",
+    "start_index",
+    "end_index",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "text_tokens",
+    "image_tokens",
+    "reasoning_tokens",
+    "parallel_tool_calls",
+})
+_PUBLIC_CODEX_INTEGER_FIELDS = frozenset({
+    "sequence_number",
+    "output_index",
+    "content_index",
+    "created_at",
+    "start_index",
+    "end_index",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "text_tokens",
+    "image_tokens",
+    "reasoning_tokens",
 })
 CODEX_SUPPORTED_INCLUDE_VALUES = {
     CODEX_DEFAULT_INCLUDE,
@@ -391,6 +600,10 @@ def _codex_request_error(message: str) -> HTTPException:
     return HTTPException(status_code=400, detail={"error": message})
 
 
+def _is_supported_string_enum(value: object, supported: set[str] | frozenset[str]) -> bool:
+    return isinstance(value, str) and value in supported
+
+
 def _validate_response_content_part(part: dict[str, Any]) -> None:
     part_type = part.get("type")
     if part_type == "input_text":
@@ -416,7 +629,7 @@ def _validate_response_content_part(part: dict[str, Any]) -> None:
         if not isinstance(image_url, str) or not image_url.strip():
             raise _codex_request_error("message image_url must be a non-empty string")
         detail = part.get("detail")
-        if detail is not None and detail not in SUPPORTED_RESPONSE_IMAGE_DETAILS:
+        if detail is not None and not _is_supported_string_enum(detail, SUPPORTED_RESPONSE_IMAGE_DETAILS):
             raise _codex_request_error("message image detail is not supported")
         return
     if part_type == "input_audio":
@@ -439,7 +652,7 @@ def _validate_tool_call_output_body(output: object) -> None:
         if not isinstance(part, dict):
             raise _codex_request_error("tool call output must contain objects")
         part_type = part.get("type")
-        if part_type not in SUPPORTED_TOOL_CALL_OUTPUT_PART_TYPES:
+        if not _is_supported_string_enum(part_type, SUPPORTED_TOOL_CALL_OUTPUT_PART_TYPES):
             raise _codex_request_error("tool call output content type is not supported")
         if part_type == "encrypted_content":
             if set(part) != {"type", "encrypted_content"} or not isinstance(
@@ -468,7 +681,7 @@ def _validate_function_call_output(item: dict[str, Any]) -> None:
     _validate_output_item_identity(item, "function call output")
 
     status = item.get("status")
-    if status is not None and status not in SUPPORTED_FUNCTION_CALL_OUTPUT_STATUSES:
+    if status is not None and not _is_supported_string_enum(status, SUPPORTED_FUNCTION_CALL_OUTPUT_STATUSES):
         raise _codex_request_error("function call output status is not supported")
     _validate_tool_call_output_body(item.get("output"))
 
@@ -495,7 +708,7 @@ def _validate_tool_call_identity(item: dict[str, Any], item_name: str) -> None:
     ):
         raise _codex_request_error(f"{item_name} namespace must be a non-empty string")
     status = item.get("status")
-    if status is not None and status not in SUPPORTED_TOOL_CALL_STATUSES:
+    if status is not None and not _is_supported_string_enum(status, SUPPORTED_TOOL_CALL_STATUSES):
         raise _codex_request_error(f"{item_name} status is not supported")
 
 
@@ -534,7 +747,7 @@ def _validate_reasoning_history(item: dict[str, Any]) -> None:
         raise _codex_request_error("reasoning fields are not supported")
     _validate_optional_history_id(item, "reasoning")
     status = item.get("status")
-    if status is not None and status not in SUPPORTED_TOOL_CALL_STATUSES:
+    if status is not None and not _is_supported_string_enum(status, SUPPORTED_TOOL_CALL_STATUSES):
         raise _codex_request_error("reasoning status is not supported")
 
     summary = item.get("summary")
@@ -557,7 +770,7 @@ def _validate_reasoning_history(item: dict[str, Any]) -> None:
             if (
                 not isinstance(part, dict)
                 or set(part) != {"type", "text"}
-                or part.get("type") not in {"reasoning_text", "text"}
+                or not _is_supported_string_enum(part.get("type"), {"reasoning_text", "text"})
                 or not isinstance(part.get("text"), str)
             ):
                 raise _codex_request_error("reasoning content is invalid")
@@ -584,7 +797,7 @@ def _validate_image_generation_history(item: dict[str, Any]) -> None:
     if set(item) - SUPPORTED_IMAGE_GENERATION_CALL_FIELDS:
         raise _codex_request_error("image generation call fields are not supported")
     _validate_optional_history_id(item, "image generation call")
-    if item.get("status") not in SUPPORTED_IMAGE_GENERATION_CALL_STATUSES:
+    if not _is_supported_string_enum(item.get("status"), SUPPORTED_IMAGE_GENERATION_CALL_STATUSES):
         raise _codex_request_error("image generation call status is not supported")
     if not isinstance(item.get("result"), str):
         raise _codex_request_error("image generation call result must be a string")
@@ -602,7 +815,7 @@ def _validate_web_search_action(action: object) -> None:
         "open_page": {"type", "url"},
         "find_in_page": {"type", "url", "pattern"},
     }
-    allowed_fields = fields_by_type.get(action_type)
+    allowed_fields = fields_by_type.get(action_type) if isinstance(action_type, str) else None
     if allowed_fields is None or set(action) - allowed_fields:
         raise _codex_request_error("web search action is not supported by Codex Responses")
     query = action.get("query")
@@ -625,7 +838,7 @@ def _validate_web_search_history(item: dict[str, Any]) -> None:
         raise _codex_request_error("web search call fields are not supported")
     _validate_optional_history_id(item, "web search call")
     status = item.get("status")
-    if status is not None and status not in SUPPORTED_WEB_SEARCH_CALL_STATUSES:
+    if status is not None and not _is_supported_string_enum(status, SUPPORTED_WEB_SEARCH_CALL_STATUSES):
         raise _codex_request_error("web search call status is not supported")
     action = item.get("action")
     if action is not None:
@@ -644,9 +857,9 @@ def _validate_tool_search_common(item: dict[str, Any], item_name: str) -> None:
     _validate_optional_history_id(item, item_name)
     _validate_optional_call_id(item, item_name)
     status = item.get("status")
-    if status is not None and status not in SUPPORTED_TOOL_CALL_STATUSES:
+    if status is not None and not _is_supported_string_enum(status, SUPPORTED_TOOL_CALL_STATUSES):
         raise _codex_request_error(f"{item_name} status is not supported")
-    if item.get("execution") not in SUPPORTED_TOOL_SEARCH_EXECUTIONS:
+    if not _is_supported_string_enum(item.get("execution"), SUPPORTED_TOOL_SEARCH_EXECUTIONS):
         raise _codex_request_error(f"{item_name} execution is not supported")
 
 
@@ -829,11 +1042,11 @@ def validate_response_core_parameters(body: dict[str, Any]) -> None:
             raise _codex_request_error("message id must be a non-empty string")
         phase = item.get("phase")
         if phase is not None and (
-            role != "assistant" or phase not in SUPPORTED_RESPONSE_MESSAGE_PHASES
+            role != "assistant" or not _is_supported_string_enum(phase, SUPPORTED_RESPONSE_MESSAGE_PHASES)
         ):
             raise _codex_request_error("message phase is not supported")
         status = item.get("status")
-        if status is not None and status not in SUPPORTED_RESPONSE_MESSAGE_STATUSES:
+        if status is not None and not _is_supported_string_enum(status, SUPPORTED_RESPONSE_MESSAGE_STATUSES):
             raise _codex_request_error("message status is not supported")
         content = item.get("content")
         if isinstance(content, str):
@@ -941,7 +1154,10 @@ def _normalize_codex_tool(tool: object) -> dict[str, Any]:
     if not isinstance(tool, dict):
         raise _codex_request_error("tools must contain objects")
     normalized = copy.deepcopy(tool)
-    tool_type = str(normalized.get("type") or "").strip()
+    raw_type = normalized.get("type")
+    if not isinstance(raw_type, str) or raw_type != raw_type.strip():
+        raise _codex_request_error("tool type is not supported by Codex Responses")
+    tool_type = raw_type
     if tool_type in WEB_SEARCH_TOOL_TYPES:
         return _normalize_codex_web_search_tool(normalized, tool_type)
     if tool_type not in {"function", "image_generation", "web_search"}:
@@ -1198,7 +1414,10 @@ def codex_response_payload(body: dict[str, Any], *, websocket: bool = False) -> 
     if prompt_cache_key is not None and not isinstance(prompt_cache_key, str):
         raise _codex_request_error("prompt_cache_key must be a string")
     service_tier = body.get("service_tier")
-    if service_tier not in {None, "default", "priority", "flex"}:
+    if service_tier is not None and not _is_supported_string_enum(
+        service_tier,
+        {"default", "priority", "flex"},
+    ):
         raise _codex_request_error("service_tier is not supported by Codex Responses")
     include = _normalize_codex_include(body.get("include"))
     generate = body.get("generate")
@@ -1336,6 +1555,37 @@ def validated_codex_usage(usage: object) -> dict[str, Any] | None:
     return projected
 
 
+def _terminal_has_malformed_citation(response: dict[str, Any]) -> bool:
+    output = response.get("output")
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            annotations = part.get("annotations")
+            if not isinstance(annotations, list):
+                continue
+            for annotation in annotations:
+                if not isinstance(annotation, dict) or annotation.get("type") != "url_citation":
+                    continue
+                if (
+                    not isinstance(annotation.get("url"), str)
+                    or not isinstance(annotation.get("title"), str)
+                    or type(annotation.get("start_index")) is not int
+                    or annotation.get("start_index") < 0
+                    or type(annotation.get("end_index")) is not int
+                    or annotation.get("end_index") < 0
+                ):
+                    return True
+    return False
+
+
 def terminal_response_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
     event_type = event.get("type")
     expected_status = {
@@ -1380,12 +1630,22 @@ def terminal_response_from_event(event: dict[str, Any]) -> dict[str, Any] | None
             raise RuntimeError("codex returned a malformed terminal response")
         projected_incomplete_details = {} if reason is None else {"reason": reason}
 
-    normalized = copy.deepcopy(response)
+    validated_usage = (
+        validated_codex_usage(response.get("usage"))
+        if "usage" in response
+        else None
+    )
+    try:
+        normalized = _project_public_codex_value(response, field="response")
+    except RuntimeError:
+        if _terminal_has_malformed_citation(response):
+            raise RuntimeError("codex returned a malformed citation") from None
+        raise
     normalized["status"] = expected_status
     if projected_incomplete_details is not None:
         normalized["incomplete_details"] = projected_incomplete_details
     if "usage" in response:
-        normalized["usage"] = validated_codex_usage(response.get("usage"))
+        normalized["usage"] = validated_usage
     return normalized
 
 
@@ -1424,43 +1684,219 @@ def in_progress_response_from_event(event: dict[str, Any]) -> dict[str, Any] | N
     return _active_response_from_event(event, "response.in_progress")
 
 
+def _project_public_codex_value(value: Any, *, field: str | None = None) -> Any:
+    if field in {"error", "item", "response", "usage"}:
+        if value is not None and not isinstance(value, dict):
+            raise RuntimeError("codex returned malformed public response event")
+    if field == "output":
+        if value is None:
+            return None
+        if not isinstance(value, list) or any(not isinstance(child, dict) for child in value):
+            raise RuntimeError("codex returned malformed public response event")
+        return [_project_public_codex_value(child, field="item") for child in value]
+    if field == "tools":
+        if value is None:
+            return None
+        if not isinstance(value, list) or any(not isinstance(child, dict) for child in value):
+            raise RuntimeError("codex returned malformed public response event")
+        return [_project_public_codex_value(child, field="tool_definition") for child in value]
+    if field in {"content", "annotations"}:
+        if value is None:
+            return None
+        if not isinstance(value, list) or any(not isinstance(child, dict) for child in value):
+            raise RuntimeError("codex returned malformed public response event")
+        element_field = "part" if field == "content" else "annotation"
+        return [_project_public_codex_value(child, field=element_field) for child in value]
+    if field == "queries":
+        if value is None:
+            return None
+        if not isinstance(value, list) or any(not isinstance(query, str) for query in value):
+            raise RuntimeError("codex returned malformed public response event")
+        return list(value)
+    if field == "logprobs":
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise RuntimeError("codex returned malformed public response event")
+        return [_project_public_codex_logprob(item) for item in value]
+    if field == "incomplete_details":
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise RuntimeError("codex returned malformed public response event")
+        reason = value.get("reason")
+        if reason is None:
+            return {}
+        if not isinstance(reason, str) or reason not in _PUBLIC_CODEX_INCOMPLETE_REASONS:
+            raise RuntimeError("codex returned malformed public response event")
+        return {"reason": reason}
+    if field in _PUBLIC_CODEX_STRING_FIELDS:
+        if not isinstance(value, str):
+            raise RuntimeError("codex returned malformed public response event")
+        return value
+    if field in _PUBLIC_CODEX_INTEGER_FIELDS:
+        if type(value) is not int or value < 0:
+            raise RuntimeError("codex returned malformed public response event")
+        return value
+    if field == "parallel_tool_calls":
+        if type(value) is not bool:
+            raise RuntimeError("codex returned malformed public response event")
+        return value
+    if field in {"strict", "defer_loading"}:
+        if type(value) is not bool:
+            raise RuntimeError("codex returned malformed public response event")
+        return value
+    if field == "parameters":
+        return _project_public_codex_tool_schema(value)
+    if isinstance(value, dict):
+        if field == "error":
+            allowed = _PUBLIC_CODEX_ERROR_FIELDS
+        elif field == "usage":
+            allowed = _PUBLIC_CODEX_USAGE_FIELDS
+        elif field in {"item", "output"}:
+            allowed = _PUBLIC_CODEX_ITEM_FIELDS
+        elif field == "response":
+            allowed = _PUBLIC_CODEX_RESPONSE_FIELDS
+        elif field in {"input_tokens_details", "output_tokens_details"}:
+            allowed = _PUBLIC_CODEX_USAGE_DETAIL_FIELDS
+        elif field == "annotation":
+            allowed = _PUBLIC_CODEX_ANNOTATION_FIELDS
+        elif field == "action":
+            allowed = _PUBLIC_CODEX_ACTION_FIELDS
+        elif field == "tool_definition":
+            allowed = _PUBLIC_CODEX_TOOL_DEFINITION_FIELDS
+        elif field in {"part", "content"}:
+            allowed = _PUBLIC_CODEX_CONTENT_FIELDS
+        else:
+            allowed = _PUBLIC_CODEX_CONTENT_FIELDS
+        projected: dict[str, Any] = {}
+        for key, child in value.items():
+            if key not in allowed:
+                continue
+            projected[key] = _project_public_codex_value(child, field=key)
+        return projected
+    if isinstance(value, list):
+        return [_project_public_codex_value(child, field=field) for child in value]
+    return value
+
+
+def _project_public_codex_logprob(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("codex returned malformed public response event")
+    projected: dict[str, Any] = {}
+    for key, child in value.items():
+        if key not in _PUBLIC_CODEX_LOGPROB_FIELDS:
+            continue
+        if key == "token":
+            if not isinstance(child, str):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = child
+        elif key == "logprob":
+            if isinstance(child, bool) or not isinstance(child, (int, float)) or not math.isfinite(child):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = child
+        elif key == "bytes":
+            if not isinstance(child, list) or any(type(item) is not int or item < 0 for item in child):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = list(child)
+        elif key == "top_logprobs":
+            if not isinstance(child, list):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = [_project_public_codex_logprob(item) for item in child]
+    return projected
+
+
+def _project_public_codex_tool_schema(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("codex returned malformed public response event")
+
+    projected: dict[str, Any] = {}
+    for key, child in value.items():
+        if key not in _PUBLIC_CODEX_TOOL_SCHEMA_FIELDS:
+            continue
+        if key in _PUBLIC_CODEX_TOOL_SCHEMA_STRING_FIELDS:
+            if not isinstance(child, str):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = child
+        elif key == "type":
+            if isinstance(child, str):
+                projected[key] = child
+            elif isinstance(child, list) and all(isinstance(item, str) for item in child):
+                projected[key] = list(child)
+            else:
+                raise RuntimeError("codex returned malformed public response event")
+        elif key == "properties":
+            if not isinstance(child, dict):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = {
+                name: _project_public_codex_tool_schema(schema)
+                for name, schema in child.items()
+                if isinstance(name, str) and isinstance(schema, dict)
+            }
+        elif key == "required":
+            if not isinstance(child, list) or any(not isinstance(item, str) for item in child):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = list(child)
+        elif key in {"items", "additionalProperties"}:
+            if isinstance(child, bool) and key == "additionalProperties":
+                projected[key] = child
+            else:
+                projected[key] = _project_public_codex_tool_schema(child)
+        elif key in {"oneOf", "anyOf", "allOf"}:
+            if not isinstance(child, list) or any(not isinstance(item, dict) for item in child):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = [_project_public_codex_tool_schema(item) for item in child]
+        elif key == "enum":
+            if not isinstance(child, list) or any(isinstance(item, (dict, list)) for item in child):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = list(child)
+        elif key == "const":
+            if isinstance(child, (dict, list)):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = child
+        elif key in _PUBLIC_CODEX_TOOL_SCHEMA_NUMBER_FIELDS:
+            if isinstance(child, bool) or not isinstance(child, (int, float)) or not math.isfinite(child):
+                raise RuntimeError("codex returned malformed public response event")
+            projected[key] = child
+    return projected
+
+
 def _project_public_codex_response_item(item: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in item.items()
-        if key not in CODEX_INTERNAL_RESPONSE_ITEM_FIELDS
-    }
+    return _project_public_codex_value(item, field="item")
 
 
 def project_public_codex_response_event(event: dict[str, Any]) -> dict[str, Any] | None:
-    if event.get("type") in CODEX_INTERNAL_RESPONSE_EVENT_TYPES:
+    event_type = event.get("type")
+    if not isinstance(event_type, str) or not event_type.strip():
+        raise RuntimeError("codex returned malformed public response event")
+    if event_type in CODEX_INTERNAL_RESPONSE_EVENT_TYPES:
         return None
 
-    projected = {
-        key: value
-        for key, value in event.items()
-        if key not in CODEX_INTERNAL_RESPONSE_EVENT_FIELDS
-    }
-    item = projected.get("item")
-    if isinstance(item, dict):
-        projected["item"] = _project_public_codex_response_item(item)
-    response = projected.get("response")
-    if isinstance(response, dict):
-        public_response = {
-            key: value
-            for key, value in response.items()
-            if key != "headers"
+    try:
+        projected = {
+            key: _project_public_codex_value(value, field=key)
+            for key, value in event.items()
+            if key in _PUBLIC_CODEX_EVENT_FIELDS
         }
-        output = public_response.get("output")
-        if isinstance(output, list):
-            public_response["output"] = [
-                _project_public_codex_response_item(value)
-                if isinstance(value, dict)
-                else value
-                for value in output
-            ]
-        projected["response"] = public_response
-    return projected
+        item = projected.get("item")
+        if isinstance(item, dict):
+            projected["item"] = _project_public_codex_response_item(item)
+        response = projected.get("response")
+        if isinstance(response, dict):
+            public_response = _project_public_codex_value(response, field="response")
+            projected["response"] = public_response
+        return projected
+    except RuntimeError as exc:
+        if event_type in {"response.created", "response.in_progress"}:
+            raise RuntimeError(f"codex returned malformed {event_type}") from None
+        response = event.get("response")
+        if (
+            event_type in {"response.completed", "response.incomplete"}
+            and isinstance(response, dict)
+            and "usage" in response
+        ):
+            raise RuntimeError("codex returned malformed codex usage") from None
+        raise RuntimeError("codex returned malformed public response event") from None
 
 
 def stream_codex_response(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -1474,6 +1910,10 @@ def stream_codex_response(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
             detail={"error": "native tools require an active Codex OAuth account"},
         ) from exc
     resolve_codex_reasoning_effort(payload, access_token=access_token)
+    expected_account = None
+    get_account_lease = getattr(account_service, "_get_account_lease", None)
+    if callable(get_account_lease):
+        _, expected_account = get_account_lease(access_token)
     backend = OpenAIBackendAPI(access_token=access_token)
     try:
         for event in backend.iter_codex_response_events(payload):
@@ -1491,7 +1931,13 @@ def stream_codex_response(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 event = {**event, "response": terminal}
             yield event
             if terminal is not None:
-                account_service.mark_text_used(access_token)
+                if expected_account is None:
+                    account_service.mark_text_used(access_token)
+                else:
+                    account_service.mark_text_used(
+                        access_token,
+                        expected_account=expected_account,
+                    )
                 return
             if event.get("type") in {"response.failed", "error"}:
                 return
@@ -1652,14 +2098,21 @@ def text_output_item(
 def image_output_items(prompt: str, data: list[dict[str, Any]], item_id: str | None = None) -> list[dict[str, Any]]:
     output = []
     for item in data:
-        b64_json = str(item.get("b64_json") or "").strip()
+        b64_value = item.get("b64_json")
+        if not isinstance(b64_value, str):
+            continue
+        b64_json = b64_value.strip()
         if b64_json:
             output.append({
                 "id": item_id or f"ig_{len(output) + 1}",
                 "type": "image_generation_call",
                 "status": "completed",
                 "result": b64_json,
-                "revised_prompt": str(item.get("revised_prompt") or prompt).strip() or prompt,
+                "revised_prompt": (
+                    item["revised_prompt"].strip()
+                    if isinstance(item.get("revised_prompt"), str) and item["revised_prompt"].strip()
+                    else prompt
+                ),
             })
     return output
 
@@ -1717,46 +2170,90 @@ def text_response_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]
 
 
 def stream_text_response(backend, body: dict[str, Any], messages: list[dict[str, Any]] | None = None) -> Iterator[dict[str, Any]]:
-    model = str(body.get("model") or "auto").strip() or "auto"
-    messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
-    thinking_effort = thinking_effort_from_body(body)
+    try:
+        model = str(body.get("model") or "auto").strip() or "auto"
+        messages = messages if messages is not None else messages_from_input(body.get("input"), body.get("instructions"))
+        thinking_effort = thinking_effort_from_body(body)
+        response_id = f"resp_{uuid.uuid4().hex}"
+        item_id = f"msg_{uuid.uuid4().hex}"
+        created = int(time.time())
+        full_text = ""
+        yield response_created(response_id, model, created)
+        yield {
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": text_output_item("", item_id, "in_progress", content_added=False),
+        }
+        yield {
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": output_text_part(""),
+        }
+        request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
+        for delta in stream_text_deltas(backend, request):
+            full_text += delta
+            yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
+        yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
+        yield {
+            "type": "response.content_part.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": output_text_part(full_text),
+        }
+        item = text_output_item(full_text, item_id, "completed")
+        yield {"type": "response.output_item.done", "output_index": 0, "item": item}
+        usage = token_usage(
+            input_text_tokens=count_message_text_tokens(messages, model),
+            input_image_tokens=count_message_image_tokens(messages, model),
+            output_text_tokens=count_text_tokens(full_text, model),
+        )
+        yield response_completed(response_id, model, created, [item], usage)
+    finally:
+        close = getattr(backend, "close", None)
+        if callable(close):
+            close()
+
+
+def replay_text_response_events(events: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
     response_id = f"resp_{uuid.uuid4().hex}"
-    item_id = f"msg_{uuid.uuid4().hex}"
     created = int(time.time())
-    full_text = ""
-    yield response_created(response_id, model, created)
-    yield {
-        "type": "response.output_item.added",
-        "output_index": 0,
-        "item": text_output_item("", item_id, "in_progress", content_added=False),
-    }
-    yield {
-        "type": "response.content_part.added",
-        "item_id": item_id,
-        "output_index": 0,
-        "content_index": 0,
-        "part": output_text_part(""),
-    }
-    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
-    for delta in stream_text_deltas(backend, request):
-        full_text += delta
-        yield {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta}
-    yield {"type": "response.output_text.done", "item_id": item_id, "output_index": 0, "content_index": 0, "text": full_text}
-    yield {
-        "type": "response.content_part.done",
-        "item_id": item_id,
-        "output_index": 0,
-        "content_index": 0,
-        "part": output_text_part(full_text),
-    }
-    item = text_output_item(full_text, item_id, "completed")
-    yield {"type": "response.output_item.done", "output_index": 0, "item": item}
-    usage = token_usage(
-        input_text_tokens=count_message_text_tokens(messages, model),
-        input_image_tokens=count_message_image_tokens(messages, model),
-        output_text_tokens=count_text_tokens(full_text, model),
-    )
-    yield response_completed(response_id, model, created, [item], usage)
+    item_ids: dict[str, str] = {}
+
+    def remap_item(item: object) -> None:
+        if not isinstance(item, dict):
+            return
+        old_id = item.get("id")
+        if isinstance(old_id, str):
+            item_ids.setdefault(old_id, f"msg_{uuid.uuid4().hex}")
+            item["id"] = item_ids[old_id]
+
+    def remap_item_id(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        item_ids.setdefault(value, f"msg_{uuid.uuid4().hex}")
+        return item_ids[value]
+
+    for event in events:
+        if not isinstance(event, dict):
+            yield event
+            continue
+        event_type = event.get("type")
+        response = event.get("response")
+        if event_type in {"response.created", "response.completed"} and isinstance(response, dict):
+            response["id"] = response_id
+            response["created_at"] = created
+            output = response.get("output")
+            if isinstance(output, list):
+                for item in output:
+                    remap_item(item)
+        if "item_id" in event:
+            event["item_id"] = remap_item_id(event.get("item_id"))
+        if "item" in event:
+            remap_item(event.get("item"))
+        yield event
 
 
 def stream_image_response(
@@ -1774,7 +2271,7 @@ def stream_image_response(
     yield response_created(response_id, model, created)
     for output in image_outputs:
         if output.kind == "message":
-            text = output.text
+            text = output.public_message()
             item_id = f"msg_{uuid.uuid4().hex}"
             yield {
                 "type": "response.output_item.added",
@@ -1833,17 +2330,27 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return terminal
 
 
-def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+def response_events(body: dict[str, Any], *, cache_scope: str = "") -> Iterator[dict[str, Any]]:
     validate_response_core_parameters(body)
     if uses_native_codex_responses(body):
         yield from stream_codex_response(body)
         return
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
-        key = cache_key(body, messages, stream=bool(body.get("stream")))
+        selected_token = account_service.get_text_access_token(model=model) if cache_scope else None
+        effective_scope = resolve_access_token_cache_scope(cache_scope, selected_token or "")
+        compute = lambda: stream_text_response(
+            text_backend(model, access_token=selected_token)
+            if selected_token is not None
+            else text_backend(model),
+            body,
+            messages,
+        )
+        key = cache_key(body, messages, stream=bool(body.get("stream")), cache_scope=effective_scope)
         yield from chat_completion_cache.get_or_compute_stream(
             key,
-            lambda: stream_text_response(text_backend(model), body, messages),
+            compute,
+            replay=replay_text_response_events,
         )
         return
 
@@ -1895,10 +2402,14 @@ def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
     )
 
 
-def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
+def handle(body: dict[str, Any], *, cache_scope: str = "") -> dict[str, Any] | Iterator[dict[str, Any]]:
     validate_response_core_parameters(body)
     validate_tool_container(body)
-    events = response_events(body)
+    events = (
+        response_events(body, cache_scope=cache_scope)
+        if cache_scope
+        else response_events(body)
+    )
     if body.get("stream"):
         return events
     return collect_response(events)

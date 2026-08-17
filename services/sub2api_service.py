@@ -12,16 +12,24 @@ from threading import Lock
 from curl_cffi.requests import Session
 
 from services.account_service import account_service
-from services.config import DATA_DIR
+from services.config import DATA_DIR, parse_public_url
 from services.protocol.error_response import (
+    ImportJobActiveError,
     PublicSafeValueError,
     canonicalize_import_job_errors,
     exception_log_message,
     validate_import_job_errors,
 )
-from services.secure_file import atomic_write_bytes
-from services.storage.base import StorageConflictError, StorageDataError, make_storage_snapshot
-from services.task_executor import reserve_background_task
+from services.remote_response import parse_json_response
+from services.secure_file import atomic_write_bytes, read_checked_file_bytes
+from services.storage.base import (
+    StorageConflictError,
+    StorageDataError,
+    canonical_path_write_lock,
+    make_storage_snapshot,
+)
+from services.task_executor import reserve_background_task, run_with_timeout
+from utils.log import logger
 
 
 SUB2API_CONFIG_FILE = DATA_DIR / "sub2api_config.json"
@@ -29,6 +37,20 @@ SUB2API_CONFIG_FILE = DATA_DIR / "sub2api_config.json"
 # Cached JWT per server to avoid re-login on every list/import call.
 # Token lifetime on sub2api defaults to 24h; we refresh 5 min before expiry.
 _TOKEN_REFRESH_SKEW = 5 * 60
+SUB2API_REMOTE_BROWSE_TIMEOUT_SECS = 90.0
+SUB2API_IMPORT_TIMEOUT_SECS = 30 * 60.0
+SUB2API_MAX_REMOTE_ITEMS = 5000
+SUB2API_MAX_REMOTE_PAGES = 25
+_SUB2API_PUBLIC_TEXT_MAX_LENGTH = 256
+
+
+def _remaining_import_timeout(deadline: float | None, maximum: float) -> float:
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Sub2API import timed out")
+    return min(maximum, remaining)
 
 
 def _new_id() -> str:
@@ -43,10 +65,84 @@ def _clean(value: object) -> str:
     return str(value or "").strip()
 
 
+def _clean_remote_text(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _clean_public_text(value: object) -> str:
+    text = _clean_remote_text(value)
+    return text if len(text) <= _SUB2API_PUBLIC_TEXT_MAX_LENGTH else ""
+
+
+def _require_base_url(value: object) -> str:
+    normalized = parse_public_url(value)
+    if not normalized:
+        raise PublicSafeValueError(
+            "Sub2API base URL must use http or https without credentials, query, or fragment"
+        )
+    return normalized
+
+
+def _response_json(
+    response,
+    operation: str,
+    *,
+    invalidate_server_id: str = "",
+) -> object:
+    if invalidate_server_id and getattr(response, "status_code", None) in {401, 403}:
+        _invalidate_token_cache(invalidate_server_id)
+    return parse_json_response(response, operation)
+
+
+def _clean_remote_id(value: object) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        return text if len(text) <= _SUB2API_PUBLIC_TEXT_MAX_LENGTH else ""
+    if type(value) is int and value >= 0:
+        text = str(value)
+        return text if len(text) <= _SUB2API_PUBLIC_TEXT_MAX_LENGTH else ""
+    return ""
+
+
 def _parse_nonnegative_int(value: object) -> int:
     if type(value) is not int or value < 0:
         raise ValueError("invalid non-negative integer")
     return value
+
+
+def _remaining_timeout(deadline: float, maximum: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("sub2api remote browse timed out")
+    return min(maximum, remaining)
+
+
+def _validate_remote_page(data: list, total: int | None, current_count: int, page: int) -> None:
+    if page > SUB2API_MAX_REMOTE_PAGES:
+        raise ValueError("remote item limit exceeded")
+    received_count = current_count + len(data)
+    if total is not None and (total < received_count or (not data and received_count < total)):
+        raise ValueError("invalid sub2api pagination payload")
+    if (total is not None and total > SUB2API_MAX_REMOTE_ITEMS) or received_count > SUB2API_MAX_REMOTE_ITEMS:
+        raise ValueError("remote item limit exceeded")
+
+
+def _merge_declared_total(
+    total: int | None,
+    expected_total: int | None,
+    total_seen: bool,
+    page: int,
+) -> tuple[int | None, bool]:
+    """Keep one total snapshot for a single paginated read."""
+    if total_seen:
+        if total is None or total != expected_total:
+            raise ValueError("invalid sub2api pagination payload")
+        return expected_total, True
+    if total is not None:
+        if page != 1:
+            raise ValueError("invalid sub2api pagination payload")
+        return total, True
+    return None, False
 
 
 def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
@@ -81,7 +177,12 @@ def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
     if "errors" not in raw:
         raise StorageDataError()
     raw_errors = validate_import_job_errors(raw["errors"])
-    if counters["completed"] > counters["total"] or counters["failed"] > counters["completed"]:
+    if (
+        counters["completed"] > counters["total"]
+        or counters["failed"] > counters["completed"]
+        or counters["added"] + counters["skipped"] > counters["total"]
+        or counters["refreshed"] > counters["total"]
+    ):
         raise StorageDataError()
     return {
         "job_id": text_fields["job_id"],
@@ -126,6 +227,7 @@ class Sub2APIConfig:
     def __init__(self, store_file: Path):
         self._store_file = store_file
         self._lock = Lock()
+        self._path_write_lock = canonical_path_write_lock(store_file)
         self._servers: list[dict] = self._load(fail_unfinished=False)
         self._snapshot_revision = make_storage_snapshot(self._servers).revision
         recovered_servers: list[dict] = []
@@ -144,7 +246,7 @@ class Sub2APIConfig:
         if not self._store_file.exists():
             return []
         try:
-            raw = json.loads(self._store_file.read_text(encoding="utf-8"))
+            raw = json.loads(read_checked_file_bytes(self._store_file, self._store_file.parent).decode("utf-8"))
             if not isinstance(raw, list):
                 raise StorageDataError()
             servers: list[dict] = []
@@ -153,7 +255,7 @@ class Sub2APIConfig:
                 if not isinstance(item, dict):
                     raise StorageDataError()
                 server = _normalize_server(item, fail_unfinished=fail_unfinished)
-                if not server["base_url"] or server["id"] in seen_ids:
+                if not server["base_url"] or not parse_public_url(server["base_url"]) or server["id"] in seen_ids:
                     raise StorageDataError()
                 seen_ids.add(server["id"])
                 servers.append(server)
@@ -178,13 +280,28 @@ class Sub2APIConfig:
             raise
 
     def _save(self) -> None:
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        current_revision = make_storage_snapshot(self._load(fail_unfinished=False)).revision
-        if current_revision != self._snapshot_revision:
-            raise StorageConflictError()
-        payload = (json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        atomic_write_bytes(self._store_file, self._store_file.parent, payload)
-        self._snapshot_revision = make_storage_snapshot(self._servers).revision
+        parent = self._store_file.parent
+        try:
+            parent_stat = parent.stat()
+            expected_root_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        except FileNotFoundError:
+            expected_root_identity = None
+        with self._path_write_lock:
+            parent.mkdir(parents=True, exist_ok=True)
+            if expected_root_identity is None:
+                parent_stat = parent.stat()
+                expected_root_identity = (parent_stat.st_dev, parent_stat.st_ino)
+            current_revision = make_storage_snapshot(self._load(fail_unfinished=False)).revision
+            if current_revision != self._snapshot_revision:
+                raise StorageConflictError()
+            payload = (json.dumps(self._servers, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            atomic_write_bytes(
+                self._store_file,
+                parent,
+                payload,
+                expected_root_identity=expected_root_identity,
+            )
+            self._snapshot_revision = make_storage_snapshot(self._servers).revision
 
     def list_servers(self) -> list[dict]:
         with self._lock:
@@ -212,7 +329,7 @@ class Sub2APIConfig:
         server = _normalize_server({
             "id": _new_id(),
             "name": name,
-            "base_url": base_url,
+            "base_url": _require_base_url(base_url),
             "email": email,
             "password": password,
             "api_key": api_key,
@@ -221,7 +338,7 @@ class Sub2APIConfig:
         with self._lock:
             self._reload_locked()
             self._commit_locked([*self._servers, server])
-        _token_cache.pop(server["id"], None)
+        _invalidate_token_cache(server["id"])
         return dict(server)
 
     def update_server(self, server_id: str, updates: dict) -> dict | None:
@@ -231,6 +348,8 @@ class Sub2APIConfig:
                 if server["id"] != server_id:
                     continue
                 merged = {**server, **{k: v for k, v in updates.items() if v is not None}, "id": server_id}
+                if "base_url" in updates and updates["base_url"] is not None:
+                    merged["base_url"] = _require_base_url(updates["base_url"])
                 next_servers = list(self._servers)
                 next_servers[index] = _normalize_server(merged)
                 self._commit_locked(next_servers)
@@ -238,19 +357,25 @@ class Sub2APIConfig:
                 break
             else:
                 return None
-        _token_cache.pop(server_id, None)
+        _invalidate_token_cache(server_id)
         return result
 
     def delete_server(self, server_id: str) -> bool:
         with self._lock:
             self._reload_locked()
+            for server in self._servers:
+                if server["id"] == server_id:
+                    import_job = server.get("import_job")
+                    if isinstance(import_job, dict) and import_job.get("status") in {"pending", "running"}:
+                        raise ImportJobActiveError("import is already running")
+                    break
             before = len(self._servers)
             next_servers = [server for server in self._servers if server["id"] != server_id]
             removed = len(next_servers) < before
             if removed:
                 self._commit_locked(next_servers)
         if removed:
-            _token_cache.pop(server_id, None)
+            _invalidate_token_cache(server_id)
         return removed
 
     def set_import_job(self, server_id: str, import_job: dict | None) -> dict | None:
@@ -275,7 +400,7 @@ class Sub2APIConfig:
                     continue
                 current_job = server.get("import_job")
                 if isinstance(current_job, dict) and current_job.get("status") in {"pending", "running"}:
-                    raise PublicSafeValueError("import is already running")
+                    raise ImportJobActiveError("import is already running")
                 next_server = dict(server)
                 next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=False)
                 next_servers = list(self._servers)
@@ -294,12 +419,27 @@ class Sub2APIConfig:
         return None
 
 
-# Per-server cached access token: {server_id: (jwt, expires_at_epoch)}
-_token_cache: dict[str, tuple[str, float]] = {}
+# Per-server cached access token: {server_id: (jwt, expires_at_epoch, auth_generation)}
+_token_cache: dict[str, tuple[str, float, int]] = {}
+_token_cache_generations: dict[str, int] = {}
 _token_cache_lock = Lock()
 
 
-def _login(base_url: str, email: str, password: str) -> tuple[str, float]:
+def _invalidate_token_cache(server_id: str) -> None:
+    if not server_id:
+        return
+    with _token_cache_lock:
+        _token_cache.pop(server_id, None)
+        _token_cache_generations[server_id] = _token_cache_generations.get(server_id, 0) + 1
+
+
+def _login(
+    base_url: str,
+    email: str,
+    password: str,
+    *,
+    deadline: float | None = None,
+) -> tuple[str, float]:
     url = f"{base_url.rstrip('/')}/api/v1/auth/login"
     session = Session(verify=True)
     try:
@@ -307,28 +447,37 @@ def _login(base_url: str, email: str, password: str) -> tuple[str, float]:
             url,
             json={"email": email, "password": password},
             headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=30,
+            timeout=_remaining_timeout(deadline, 30.0) if deadline is not None else 30.0,
+            stream=True,
         )
-        if not response.ok:
-            raise RuntimeError(f"sub2api login failed: HTTP {response.status_code}")
-        payload = response.json()
+        payload = _response_json(response, "sub2api login failed")
     finally:
         session.close()
+
+    if deadline is not None and time.monotonic() >= deadline:
+        raise RuntimeError("sub2api browse timed out")
 
     body = _unwrap_envelope(payload)
     if not isinstance(body, dict):
         raise RuntimeError("sub2api login payload is invalid")
 
-    token = _clean(body.get("access_token"))
+    token = _clean_remote_text(body.get("access_token"))
     if not token:
         raise RuntimeError("sub2api login did not return access_token")
 
-    expires_in = int(body.get("expires_in") or 3600)
+    raw_expires_in = body.get("expires_in")
+    if raw_expires_in is None:
+        expires_in = 3600
+    else:
+        try:
+            expires_in = _parse_nonnegative_int(raw_expires_in)
+        except ValueError as exc:
+            raise RuntimeError("sub2api login payload is invalid") from exc
     expires_at = time.time() + max(60, expires_in) - _TOKEN_REFRESH_SKEW
     return token, expires_at
 
 
-def _auth_headers(server: dict) -> dict[str, str]:
+def _auth_headers(server: dict, *, deadline: float | None = None) -> dict[str, str]:
     api_key = _clean(server.get("api_key"))
     if api_key:
         return {"x-api-key": api_key, "Accept": "application/json"}
@@ -342,21 +491,29 @@ def _auth_headers(server: dict) -> dict[str, str]:
     base_url = _clean(server.get("base_url"))
 
     with _token_cache_lock:
+        generation = _token_cache_generations.get(server_id, 0)
         cached = _token_cache.get(server_id)
-        if cached and cached[1] > time.time():
+        if cached and cached[2] == generation and cached[1] > time.time():
             return {"Authorization": f"Bearer {cached[0]}", "Accept": "application/json"}
 
-    token, expires_at = _login(base_url, email, password)
+    token, expires_at = _login(base_url, email, password, deadline=deadline)
     with _token_cache_lock:
-        _token_cache[server_id] = (token, expires_at)
+        if _token_cache_generations.get(server_id, 0) == generation:
+            _token_cache[server_id] = (token, expires_at, generation)
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _password_auth_cache_id(server: dict) -> str:
+    if _clean(server.get("api_key")):
+        return ""
+    return _clean(server.get("id"))
 
 
 def _extract_access_token(credentials: object) -> str:
     if not isinstance(credentials, dict):
         return ""
     for key in ("access_token", "accessToken", "token"):
-        value = _clean(credentials.get(key))
+        value = _clean_remote_text(credentials.get(key))
         if value:
             return value
     return ""
@@ -370,20 +527,27 @@ def _unwrap_envelope(payload: object) -> object:
     return payload
 
 
-def _extract_paged_items(payload: object) -> tuple[list, int]:
+def _extract_paged_items(payload: object) -> tuple[list, int | None]:
     """Return (items, total) from a paginated sub2api response.
 
     Handles both the wrapped shape `{code,data:{items,total,...}}` and a few looser
     variants (`{data:[...]}`, `[...]`, `{items:[...],total:N}`)."""
     inner = _unwrap_envelope(payload)
     if isinstance(inner, list):
-        return inner, len(inner)
+        return inner, None
     if isinstance(inner, dict):
         for key in ("items", "data", "list"):
             value = inner.get(key)
             if isinstance(value, list):
-                return value, int(inner.get("total") or len(value))
-    return [], 0
+                raw_total = inner.get("total")
+                if raw_total is None:
+                    total = None
+                elif type(raw_total) is int and raw_total >= len(value):
+                    total = raw_total
+                else:
+                    raise ValueError("invalid sub2api pagination payload")
+                return value, total
+    raise ValueError("invalid sub2api pagination payload")
 
 
 def list_remote_accounts(server: dict) -> list[dict]:
@@ -392,14 +556,21 @@ def list_remote_accounts(server: dict) -> list[dict]:
     if not base_url:
         return []
 
-    headers = _auth_headers(server)
+    deadline = time.monotonic() + SUB2API_REMOTE_BROWSE_TIMEOUT_SECS
+    headers = _auth_headers(server, deadline=deadline)
+    invalidate_server_id = _password_auth_cache_id(server)
     group_id = _clean(server.get("group_id"))
 
     session = Session(verify=True)
     items: list[dict] = []
+    received_count = 0
+    expected_total: int | None = None
+    total_seen = False
     try:
         page = 1
         while True:
+            if page > SUB2API_MAX_REMOTE_PAGES:
+                raise ValueError("remote item limit exceeded")
             params: dict[str, object] = {
                 "platform": "openai",
                 "type": "oauth",
@@ -412,34 +583,43 @@ def list_remote_accounts(server: dict) -> list[dict]:
                 f"{base_url.rstrip('/')}/api/v1/admin/accounts",
                 headers=headers,
                 params=params,
-                timeout=30,
+                timeout=_remaining_timeout(deadline, 30.0),
+                stream=True,
             )
-            if not response.ok:
-                raise RuntimeError(f"sub2api list failed: HTTP {response.status_code}")
-            payload = response.json()
+            payload = _response_json(
+                response,
+                "sub2api list failed",
+                invalidate_server_id=invalidate_server_id,
+            )
 
             data, total = _extract_paged_items(payload)
+            expected_total, total_seen = _merge_declared_total(total, expected_total, total_seen, page)
+            _validate_remote_page(data, total, received_count, page)
             if not data:
                 break
+            received_count += len(data)
 
             for account in data:
                 if not isinstance(account, dict):
                     continue
                 credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
-                account_id = account.get("id")
-                if account_id is None:
+                account_id = _clean_remote_id(account.get("id"))
+                if not account_id:
                     continue
                 items.append({
-                    "id": str(account_id),
-                    "name": _clean(account.get("name")),
-                    "email": _clean(credentials.get("email")) or _clean(account.get("name")),
-                    "plan_type": _clean(credentials.get("plan_type")),
-                    "status": _clean(account.get("status")),
-                    "expires_at": _clean(credentials.get("expires_at")),
-                    "has_refresh_token": bool(_clean(credentials.get("refresh_token"))),
+                    "id": account_id,
+                    "name": _clean_public_text(account.get("name")),
+                    "email": _clean_public_text(credentials.get("email")) or _clean_public_text(account.get("name")),
+                    "plan_type": _clean_public_text(credentials.get("plan_type")),
+                    "status": _clean_public_text(account.get("status")),
+                    "expires_at": _clean_public_text(credentials.get("expires_at")),
+                    "has_refresh_token": bool(_clean_remote_text(credentials.get("refresh_token"))),
                 })
 
-            if page * 200 >= total or len(data) < 200:
+            if total is not None:
+                if received_count >= total:
+                    break
+            elif len(data) < 200:
                 break
             page += 1
     finally:
@@ -454,13 +634,20 @@ def list_remote_groups(server: dict) -> list[dict]:
     if not base_url:
         return []
 
-    headers = _auth_headers(server)
+    deadline = time.monotonic() + SUB2API_REMOTE_BROWSE_TIMEOUT_SECS
+    headers = _auth_headers(server, deadline=deadline)
+    invalidate_server_id = _password_auth_cache_id(server)
 
     session = Session(verify=True)
     items: list[dict] = []
+    received_count = 0
+    expected_total: int | None = None
+    total_seen = False
     try:
         page = 1
         while True:
+            if page > SUB2API_MAX_REMOTE_PAGES:
+                raise ValueError("remote item limit exceeded")
             response = session.get(
                 f"{base_url.rstrip('/')}/api/v1/admin/groups",
                 headers=headers,
@@ -468,33 +655,49 @@ def list_remote_groups(server: dict) -> list[dict]:
                     "page": page,
                     "page_size": 200,
                 },
-                timeout=30,
+                timeout=_remaining_timeout(deadline, 30.0),
+                stream=True,
             )
-            if not response.ok:
-                raise RuntimeError(f"sub2api groups failed: HTTP {response.status_code}")
-            payload = response.json()
+            payload = _response_json(
+                response,
+                "sub2api groups failed",
+                invalidate_server_id=invalidate_server_id,
+            )
 
             data, total = _extract_paged_items(payload)
+            expected_total, total_seen = _merge_declared_total(total, expected_total, total_seen, page)
+            _validate_remote_page(data, total, received_count, page)
             if not data:
                 break
+            received_count += len(data)
 
             for group in data:
                 if not isinstance(group, dict):
                     continue
-                group_id = group.get("id")
-                if group_id is None:
+                group_id = _clean_remote_id(group.get("id"))
+                if not group_id:
                     continue
+                try:
+                    account_count = _parse_nonnegative_int(group.get("account_count", 0))
+                    active_account_count = _parse_nonnegative_int(
+                        group.get("active_account_count", 0)
+                    )
+                except ValueError as exc:
+                    raise ValueError("invalid sub2api group payload") from exc
                 items.append({
-                    "id": str(group_id),
-                    "name": _clean(group.get("name")),
-                    "description": _clean(group.get("description")),
-                    "platform": _clean(group.get("platform")),
-                    "status": _clean(group.get("status")),
-                    "account_count": int(group.get("account_count") or 0),
-                    "active_account_count": int(group.get("active_account_count") or 0),
+                    "id": group_id,
+                    "name": _clean_public_text(group.get("name")),
+                    "description": _clean_public_text(group.get("description")),
+                    "platform": _clean_public_text(group.get("platform")),
+                    "status": _clean_public_text(group.get("status")),
+                    "account_count": account_count,
+                    "active_account_count": active_account_count,
                 })
 
-            if page * 200 >= total or len(data) < 200:
+            if total is not None:
+                if received_count >= total:
+                    break
+            elif len(data) < 200:
                 break
             page += 1
     finally:
@@ -503,25 +706,38 @@ def list_remote_groups(server: dict) -> list[dict]:
     return items
 
 
-def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> tuple[list[str], list[dict]]:
+def _fetch_access_tokens_for_accounts(
+        server: dict,
+        account_ids: list[str],
+        *,
+        deadline: float | None = None,
+) -> tuple[list[str], list[dict]]:
     """Return exported access tokens and per-account errors from sub2api."""
     base_url = _clean(server.get("base_url"))
-    headers = _auth_headers(server)
-    ids = [_clean(item) for item in account_ids if _clean(item)]
+    if not isinstance(account_ids, list) or any(not isinstance(item, str) for item in account_ids):
+        raise ValueError("invalid account ids")
+    ids = list(dict.fromkeys(item.strip() for item in account_ids if item.strip()))
     if not ids:
         return [], []
+    headers = _auth_headers(server, deadline=deadline)
+    invalidate_server_id = _password_auth_cache_id(server)
 
     session = Session(verify=True)
+    requested_ids = set(ids)
+    matched_ids: set[str] = set()
     try:
         response = session.get(
             f"{base_url.rstrip('/')}/api/v1/admin/accounts/data",
             headers=headers,
             params={"ids": ",".join(ids), "timezone": "Asia/Shanghai"},
-            timeout=30,
+            timeout=_remaining_import_timeout(deadline, 30.0),
+            stream=True,
         )
-        if not response.ok:
-            raise RuntimeError(f"HTTP {response.status_code}")
-        payload = response.json()
+        payload = _response_json(
+            response,
+            "sub2api account export failed",
+            invalidate_server_id=invalidate_server_id,
+        )
     finally:
         session.close()
 
@@ -535,16 +751,20 @@ def _fetch_access_tokens_for_accounts(server: dict, account_ids: list[str]) -> t
     for account in accounts:
         if not isinstance(account, dict):
             continue
+        account_id = _clean_remote_id(account.get("id"))
+        if not account_id or account_id not in requested_ids or account_id in matched_ids:
+            continue
+        matched_ids.add(account_id)
         credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
         token = _extract_access_token(credentials)
-        account_id = _clean(account.get("id")) or _clean(credentials.get("chatgpt_account_id")) or _clean(account.get("name"))
         if token:
             tokens.append(token)
         else:
-            errors.append({"name": account_id or _clean(account.get("name")) or "unknown", "error": "missing access_token"})
+            errors.append({"name": account_id, "error": "missing access_token"})
 
-    if len(accounts) < len(ids):
-        errors.append({"name": ",".join(ids), "error": f"exported {len(accounts)}/{len(ids)} accounts"})
+    missing_count = len(requested_ids - matched_ids)
+    if missing_count:
+        errors.append({"name": "Sub2API", "error": f"missing {missing_count} selected accounts"})
 
     return tokens, errors
 
@@ -554,9 +774,13 @@ class Sub2APIImportService:
         self._config = sub2api_config
 
     def start_import(self, server: dict, account_ids: list[str]) -> dict:
-        ids = [_clean(item) for item in account_ids if _clean(item)]
+        if not isinstance(account_ids, list) or any(not isinstance(item, str) for item in account_ids):
+            raise PublicSafeValueError("account ids are required")
+        ids = [item.strip() for item in account_ids if item.strip()]
         if not ids:
             raise PublicSafeValueError("account ids is required")
+        if len(ids) > SUB2API_MAX_REMOTE_ITEMS:
+            raise PublicSafeValueError("account ids limit exceeded")
 
         server_id = _clean(server.get("id"))
         reservation = reserve_background_task()
@@ -582,7 +806,7 @@ class Sub2APIImportService:
             reservation.cancel()
             raise PublicSafeValueError("server not found")
         try:
-            reservation.submit(self._run_import, server_id, server, ids)
+            reservation.submit(self._run_import, server_id, dict(saved), ids)
         except Exception:
             self._config.set_import_job(
                 server_id,
@@ -613,12 +837,35 @@ class Sub2APIImportService:
         self._update_job(server_id, errors=canonicalize_import_job_errors(errors))
 
     def _run_import(self, server_id: str, server: dict, account_ids: list[str]) -> None:
-        self._update_job(server_id, status="running")
+        try:
+            self._update_job(server_id, status="running")
+        except Exception:
+            try:
+                self._update_job(
+                    server_id,
+                    status="failed",
+                    completed=len(account_ids),
+                    failed=len(account_ids),
+                    errors=canonicalize_import_job_errors([
+                        {"name": "Sub2API", "error": "import failed"},
+                    ]),
+                )
+            except Exception:
+                logger.error({
+                    "event": "sub2api_import_initial_state_persist_failed",
+                    "stage": "running",
+                })
+            return
+        deadline = time.monotonic() + SUB2API_IMPORT_TIMEOUT_SECS
         current = self._config.get_import_job(server_id) or {}
         failed_count = int(current.get("failed") or 0)
 
         try:
-            tokens, errors = _fetch_access_tokens_for_accounts(server, account_ids)
+            tokens, errors = _fetch_access_tokens_for_accounts(
+                server,
+                account_ids,
+                deadline=deadline,
+            )
         except Exception as exc:
             message = exception_log_message(exc)
             for account_id in account_ids:
@@ -650,11 +897,27 @@ class Sub2APIImportService:
             return
 
         try:
+            _remaining_import_timeout(deadline, float("inf"))
+        except TimeoutError:
+            self._update_job(
+                server_id,
+                status="failed",
+                completed=total,
+                failed=total,
+                errors=canonicalize_import_job_errors(
+                    [*(current.get("errors") or []), {"name": "Sub2API", "error": "import failed"}],
+                ),
+            )
+            return
+
+        try:
             add_result = account_service.add_accounts(tokens, source_type="codex")
             if not isinstance(add_result, dict) or not add_result:
                 raise ValueError("invalid account import result")
             added = _parse_nonnegative_int(add_result["added"])
             skipped = _parse_nonnegative_int(add_result["skipped"])
+            if added + skipped > len(tokens):
+                raise ValueError("invalid account import count")
         except Exception:
             self._update_job(
                 server_id,
@@ -670,10 +933,52 @@ class Sub2APIImportService:
             )
             return
         try:
-            refresh_result = account_service.refresh_accounts(tokens)
+            _remaining_import_timeout(deadline, float("inf"))
+        except TimeoutError:
+            self._update_job(
+                server_id,
+                status="failed",
+                completed=total,
+                added=added,
+                skipped=skipped,
+                refreshed=0,
+                failed=total,
+                errors=canonicalize_import_job_errors(
+                    [*(current.get("errors") or []), {"name": "Sub2API", "error": "import failed"}],
+                ),
+            )
+            return
+        try:
+            refresh_result = run_with_timeout(
+                account_service.refresh_accounts,
+                tokens,
+                timeout=_remaining_import_timeout(deadline, float("inf")),
+                timeout_message="Sub2API account refresh timed out",
+                deadline=deadline,
+            )
+            _remaining_import_timeout(deadline, float("inf"))
             if not isinstance(refresh_result, dict) or not refresh_result:
                 raise ValueError("invalid account refresh result")
             refreshed = _parse_nonnegative_int(refresh_result["refreshed"])
+            if refreshed > len(tokens):
+                raise ValueError("invalid account refresh count")
+            refresh_errors = refresh_result.get("errors", [])
+            if not isinstance(refresh_errors, list):
+                raise ValueError("invalid account refresh errors")
+        except TimeoutError:
+            self._update_job(
+                server_id,
+                status="failed",
+                completed=total,
+                added=added,
+                skipped=skipped,
+                refreshed=0,
+                failed=total,
+                errors=canonicalize_import_job_errors(
+                    [*(current.get("errors") or []), {"name": "Sub2API", "error": "import failed"}],
+                ),
+            )
+            return
         except Exception:
             self._update_job(
                 server_id,
@@ -686,6 +991,18 @@ class Sub2APIImportService:
                 errors=canonicalize_import_job_errors(
                     [*(current.get("errors") or []), {"name": "Sub2API", "error": "import failed"}],
                 ),
+            )
+            return
+        if refresh_errors:
+            self._update_job(
+                server_id,
+                status="failed",
+                completed=total,
+                added=added,
+                skipped=skipped,
+                refreshed=refreshed,
+                failed=min(total, failed_count + len(refresh_errors)),
+                errors=canonicalize_import_job_errors([*(current.get("errors") or []), *refresh_errors]),
             )
             return
         current = self._config.get_import_job(server_id) or {}

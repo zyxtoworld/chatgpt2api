@@ -60,6 +60,7 @@ import {
 } from "@/lib/api";
 import { createCancelableProgress, createSerialPoller, isProgressTerminal } from "@/lib/serial-poll";
 import { writeClipboardText } from "@/lib/clipboard";
+import { downloadTextFile } from "@/lib/download-text.js";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { createMutationRequestGate } from "@/lib/mutation-request-gate";
 import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
@@ -139,13 +140,7 @@ function maskToken(token?: string) {
 
 function downloadTokens(accounts: Account[]) {
   const content = `${accounts.map((account) => account.access_token).join("\n")}\n`;
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `accounts-${Date.now()}.txt`;
-  link.click();
-  URL.revokeObjectURL(url);
+  downloadTextFile(content, `accounts-${Date.now()}.txt`, { mimeType: "text/plain;charset=utf-8" });
 }
 
 async function copyText(value: string, successMessage: string) {

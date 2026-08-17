@@ -217,6 +217,36 @@ class ImageEditsJsonApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertFalse(_FakeSession.instances)
 
+    def test_image_edit_rejects_dns_resolution_to_nat64_embedded_private_address(self):
+        response_body = _FakeResponse(
+            headers={"content-type": "image/png"},
+            chunks=[REMOTE_PNG],
+        )
+        _FakeSession.responses = [response_body]
+        with (
+            mock.patch.object(remote_image_module.requests, "Session", _FakeSession),
+            mock.patch.object(
+                remote_image_module.socket,
+                "getaddrinfo",
+                return_value=[(
+                    socket.AF_INET6,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("64:ff9b::c000:0204", 443, 0, 0),
+                )],
+            ),
+        ):
+            response = self.client.post(
+                "/v1/images/edits",
+                headers=AUTH_HEADERS,
+                json={"prompt": "拒绝 NAT64 私网地址", "images": [{"image_url": "https://nat64.example.test/image.png"}]},
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertFalse(_FakeSession.instances)
+        self.assertTrue(response_body.closed is False)
+
     def test_image_edit_does_not_follow_public_redirect_to_private_target(self):
         redirect_response = _FakeResponse(
             status_code=302,

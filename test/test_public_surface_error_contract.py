@@ -19,6 +19,19 @@ SECRET = "opaque-proxy-token user:password@proxy.example owner@example.com"
 
 
 class PublicSurfaceErrorContractTests(unittest.TestCase):
+    def test_clearance_test_does_not_project_container_user_agent(self) -> None:
+        canary = "clearance-user-agent-container-canary"
+        status = {"clearance_enabled": True, "clearance_mode": "flaresolverr"}
+        bundle = SimpleNamespace(cookies={}, user_agent={"secret": canary})
+        with (
+            mock.patch.object(proxy_module.proxy_settings, "get_runtime_status", return_value=status),
+            mock.patch.object(proxy_module.proxy_settings, "refresh_clearance", return_value=bundle),
+        ):
+            result = run_clearance_test()
+
+        self.assertEqual(result["user_agent"], "")
+        self.assertNotIn(canary, json.dumps(result, ensure_ascii=False))
+
     def test_proxy_test_does_not_return_raw_exception_text(self) -> None:
         class FailedSession:
             def __init__(self, *args, **kwargs):

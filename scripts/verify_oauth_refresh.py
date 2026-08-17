@@ -15,6 +15,7 @@ from __future__ import annotations
 import sys
 
 from services.account_service import account_service
+from utils.helper import anonymize_token
 
 
 def _fmt_remaining(seconds: int | None) -> str:
@@ -25,6 +26,18 @@ def _fmt_remaining(seconds: int | None) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60}m 后过期"
 
 
+def _has_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _safe_presence(value: object) -> str:
+    return "有" if _has_text(value) else "无"
+
+
+def _safe_timestamp(value: object) -> str:
+    return "已记录" if _has_text(value) else "无"
+
+
 def diagnose() -> list[str]:
     """只读：打印每个账号的刷新就绪状态，返回带 refresh_token 的 token 列表。"""
     tokens = account_service.list_tokens()
@@ -33,15 +46,15 @@ def diagnose() -> list[str]:
     for token in tokens:
         account = account_service.get_account(token) or {}
         remaining = account_service._token_expires_in(token)
-        has_rt = bool(str(account.get("refresh_token") or "").strip())
+        has_rt = _has_text(account.get("refresh_token"))
         if has_rt:
             refreshable.append(token)
         print(f"- email={account.get('email') or '(未知)'}")
-        print(f"    access_token[:20]   = {token[:20]}...")
+        print(f"    access_token        = {anonymize_token(token)}")
         print(f"    距过期              = {_fmt_remaining(remaining)}")
         print(f"    refresh_token       = {'有 ✅' if has_rt else '无 ❌（无法自动刷新）'}")
-        print(f"    last_token_refresh_at    = {account.get('last_token_refresh_at')}")
-        print(f"    last_token_refresh_error = {account.get('last_token_refresh_error')}")
+        print(f"    last_token_refresh_at    = {_safe_timestamp(account.get('last_token_refresh_at'))}")
+        print(f"    last_token_refresh_error = {_safe_presence(account.get('last_token_refresh_error'))}")
         print()
     return refreshable
 
@@ -58,17 +71,17 @@ def force_refresh(tokens: list[str]) -> None:
         before = account_service.get_account(token) or {}
         new_token = account_service.refresh_access_token(token, force=True, event="manual_verify")
         after = account_service.get_account(new_token) or {}
-        err = str(after.get("last_token_refresh_error") or "").strip()
-        rotated = new_token != token
-        success = bool(new_token) and not err
+        error_present = _has_text(after.get("last_token_refresh_error"))
+        rotated = isinstance(new_token, str) and new_token != token
+        success = _has_text(new_token) and not error_present
         if success:
             ok += 1
         print(f"- email={before.get('email') or '(未知)'}")
-        print(f"    旧 access_token[:20] = {token[:20]}...")
-        print(f"    新 access_token[:20] = {new_token[:20]}...")
+        print(f"    旧 access_token      = {anonymize_token(token)}")
+        print(f"    新 access_token      = {anonymize_token(new_token)}")
         print(f"    token 是否轮换       = {'是' if rotated else '否（exp 未到刷新窗口时可能返回原值）'}")
-        print(f"    last_token_refresh_at    = {after.get('last_token_refresh_at')}")
-        print(f"    last_token_refresh_error = {after.get('last_token_refresh_error') or '无'}")
+        print(f"    last_token_refresh_at    = {_safe_timestamp(after.get('last_token_refresh_at'))}")
+        print(f"    last_token_refresh_error = {_safe_presence(after.get('last_token_refresh_error'))}")
         print(f"    >>> 刷新结果         = {'成功 ✅' if success else '失败 ❌'}")
         print()
     print("=" * 60)
@@ -76,7 +89,7 @@ def force_refresh(tokens: list[str]) -> None:
     if ok == len(tokens):
         print("✅ 自动刷新机制对这些账号完全可用——refresh_token 与 client_id 匹配。")
     else:
-        print("❌ 有账号刷新失败，看上面的 last_token_refresh_error，或 docker logs 里的 [oauth-login]/refresh 日志。")
+        print("❌ 有账号刷新失败，请查看服务日志中的刷新错误记录。")
 
 
 def main() -> None:

@@ -34,10 +34,40 @@ from services.openai_oauth import (
 )
 from services.proxy_service import proxy_settings
 from services.protocol.error_response import PublicSafeError
+from services.remote_response import parse_json_response
 
 
 class OAuthLoginError(PublicSafeError):
     """OAuth 桥流程中的可预期错误，会被 API 层翻译成 400。"""
+
+
+class OAuthFinishResult(dict[str, str]):
+    """Token payload plus the private claim identity that owns persistence."""
+
+    def __init__(self, tokens: dict[str, str], claim_id: str) -> None:
+        super().__init__(tokens)
+        self.claim_id = claim_id
+
+
+def _strict_token_fields(value: object) -> dict[str, str] | None:
+    if not isinstance(value, dict):
+        return None
+    access_token = value.get("access_token")
+    refresh_token = value.get("refresh_token")
+    id_token = value.get("id_token")
+    if (
+        not isinstance(access_token, str)
+        or not access_token.strip()
+        or not isinstance(refresh_token, str)
+        or not refresh_token.strip()
+        or (id_token is not None and not isinstance(id_token, str))
+    ):
+        return None
+    return {
+        "access_token": access_token.strip(),
+        "refresh_token": refresh_token.strip(),
+        "id_token": (id_token or "").strip(),
+    }
 
 
 class OAuthLoginService:
@@ -45,6 +75,7 @@ class OAuthLoginService:
 
     _SESSION_TTL_SECONDS = 10 * 60  # 用户点开浏览器 + 拿 code 给的时间上限
     _MAX_SESSIONS = 64               # 防止异常累积；超过容量时清理最老的
+    _MAX_TOKEN_RESPONSE_BYTES = 1 * 1024 * 1024
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -103,13 +134,13 @@ class OAuthLoginService:
         authorize_url = f"{auth_base}/api/accounts/authorize?{urlencode(params)}"
 
         with self._lock:
-            self._purge_expired_locked()
             self._sessions[session_id] = {
                 "code_verifier": verifier,
                 "state": state,
                 "created_at": time.time(),
                 "redirect_uri": platform_oauth_redirect_uri,
             }
+            self._purge_expired_locked()
 
         return {
             "session_id": session_id,
@@ -141,13 +172,18 @@ class OAuthLoginService:
         # 用户可能直接粘了 code 字符串
         return raw, ""
 
-    def finish(self, session_id: str, callback: str) -> dict[str, str]:
+    def finish(
+        self,
+        session_id: str,
+        callback: str,
+        claim_id: str = "",
+    ) -> OAuthFinishResult:
         """用 session_id 配对的 code_verifier 把 callback 里的 code 换成 token 三件套。
 
         - 优先用 callback URL 自带 state 里的 session_id（更可靠），
           找不到才用前端传来的 session_id；
         - 失败时不立刻销毁 session（OAuth code 错配换 token 失败通常不会消耗 code），
-          只有成功兑换才 pop，便于用户用同一 verifier 重试。
+          成功兑换后也要等本地凭据持久化显式 commit，避免磁盘失败丢失重试资格。
         """
         body_sid = str(session_id or "").strip()
         code, state = self._extract_code_from_callback(callback)
@@ -180,20 +216,85 @@ class OAuthLoginService:
                 "state 不匹配。常见原因：你点过两次\"打开授权页面\"，但浏览器里登录的还是前一次的窗口。请点\"重新生成\"重来。"
             )
 
-        tokens = self._exchange_code(
-            code,
-            session["code_verifier"],
-            session.get("redirect_uri") or platform_oauth_redirect_uri,
-        )
-        # 仅在成功兑换之后才消耗 session
         with self._lock:
+            current = self._sessions.get(picked_sid)
+            if current is not session:
+                raise OAuthLoginError(
+                    "OAuth 会话已过期或不存在，请回到导入对话框点\"重新生成\"再走一次"
+                )
+            if current.get("_exchange_in_flight") is True:
+                raise OAuthLoginError("OAuth 换 token 正在进行，请稍后重试")
+            claim_id = claim_id or secrets.token_urlsafe(24)
+            current["_exchange_in_flight"] = True
+            current["_finish_claim_id"] = claim_id
+
+        try:
+            tokens = self._exchange_code(
+                code,
+                session["code_verifier"],
+                session.get("redirect_uri") or platform_oauth_redirect_uri,
+            )
+        except BaseException:
+            with self._lock:
+                current = self._sessions.get(picked_sid)
+                if current is session and current.get("_finish_claim_id") == claim_id:
+                    current.pop("_exchange_in_flight", None)
+                    current.pop("_finish_claim_id", None)
+            raise
+        return OAuthFinishResult(tokens, claim_id)
+
+    def _finish_session_id(self, session_id: str, callback: str) -> str:
+        """Resolve the same state-selected session used by ``finish``."""
+        _code, state = self._extract_code_from_callback(callback)
+        state_sid = state.split(".", 1)[0] if state else ""
+        body_sid = str(session_id or "").strip()
+        with self._lock:
+            for candidate in (state_sid, body_sid):
+                if candidate and candidate in self._sessions:
+                    return candidate
+        return ""
+
+    def commit_finish(
+        self,
+        session_id: str,
+        callback: str = "",
+        claim_id: str = "",
+    ) -> None:
+        """Consume a successfully exchanged session after local persistence."""
+        picked_sid = self._finish_session_id(session_id, callback)
+        if not picked_sid:
+            raise OAuthLoginError("OAuth 会话已过期或不存在，请重新开始登录")
+        with self._lock:
+            current = self._sessions.get(picked_sid)
+            if (
+                current is None
+                or current.get("_exchange_in_flight") is not True
+                or not claim_id
+                or current.get("_finish_claim_id") != claim_id
+            ):
+                raise OAuthLoginError("OAuth 会话已过期或不存在，请重新开始登录")
             self._sessions.pop(picked_sid, None)
-        return tokens
+
+    def abort_finish(
+        self,
+        session_id: str,
+        callback: str = "",
+        claim_id: str = "",
+    ) -> None:
+        """Release a failed local persistence claim while retaining the PKCE session."""
+        picked_sid = self._finish_session_id(session_id, callback)
+        if not picked_sid:
+            return
+        with self._lock:
+            current = self._sessions.get(picked_sid)
+            if current is not None and current.get("_finish_claim_id") == claim_id:
+                current.pop("_exchange_in_flight", None)
+                current.pop("_finish_claim_id", None)
 
     @staticmethod
     def _exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict[str, str]:
         """调用 /api/accounts/oauth/token 用 code+verifier 换 token 三件套。"""
-        kwargs = proxy_settings.build_session_kwargs(impersonate="chrome", verify=False)
+        kwargs = proxy_settings.build_session_kwargs(impersonate="chrome", verify=True)
         session = requests.Session(**kwargs)
         try:
             response = session.post(
@@ -214,7 +315,18 @@ class OAuthLoginService:
                     "redirect_uri": redirect_uri,
                 },
                 timeout=60,
+                stream=True,
             )
+            status_code = response.status_code
+            try:
+                data = parse_json_response(
+                    response,
+                    "oauth token response",
+                    max_bytes=OAuthLoginService._MAX_TOKEN_RESPONSE_BYTES,
+                    require_ok=False,
+                )
+            except Exception:
+                data = {}
         except Exception as exc:
             print(
                 f"[oauth-login] token exchange network error: {exc.__class__.__name__}",
@@ -224,37 +336,19 @@ class OAuthLoginService:
         finally:
             session.close()
 
-        try:
-            data = response.json() if response.text else {}
-        except Exception:
-            data = {}
-
-        if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
+        if status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
             # 只记录状态，不记录 callback/code 或上游响应体。
             print(
                 f"[oauth-login] /api/accounts/oauth/token rejected: "
-                f"status={response.status_code}",
+                f"status={status_code}",
                 flush=True,
             )
-            raise OAuthLoginError(f"OpenAI 拒绝换 token (HTTP {response.status_code})")
+            raise OAuthLoginError(f"OpenAI 拒绝换 token (HTTP {status_code})")
 
-        access_token = str(data.get("access_token") or "").strip()
-        refresh_token = str(data.get("refresh_token") or "").strip()
-        id_token = str(data.get("id_token") or "").strip()
-
-        if not access_token:
-            raise OAuthLoginError("OpenAI 返回的 access_token 为空")
-        if not refresh_token:
-            # scope 含 offline_access 时正常会下发 refresh_token；这里给出明确提示
-            raise OAuthLoginError(
-                "OpenAI 没有返回 refresh_token（可能 scope 未包含 offline_access 或 code 已使用过）"
-            )
-
-        return {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "id_token": id_token,
-        }
+        token_fields = _strict_token_fields(data)
+        if token_fields is None:
+            raise OAuthLoginError("OpenAI 返回的 token 格式无效")
+        return token_fields
 
 
 oauth_login_service = OAuthLoginService()

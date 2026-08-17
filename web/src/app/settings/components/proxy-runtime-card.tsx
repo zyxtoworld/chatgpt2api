@@ -18,7 +18,7 @@ import {
   type ProxyRuntimeEgressMode,
   type ProxyTestResult,
 } from "@/lib/api";
-import { createProxyRuntimeRequestGate, runCurrentProxyFollowup } from "@/lib/proxy-runtime-request-gate";
+import { createProxyRuntimeRequestGate, runCurrentProxyFollowup, runProxyRuntimeSave } from "@/lib/proxy-runtime-request-gate";
 
 import { useSettingsStore } from "../store";
 
@@ -81,6 +81,10 @@ export function ProxyRuntimeCard() {
   const updateStatusCodes = (value: string) => {
     invalidateRuntimeTests();
     setProxyRuntimeStatusCodesText(value);
+  };
+
+  const handleSave = async () => {
+    await runProxyRuntimeSave(invalidateRuntimeTests, saveConfig);
   };
 
   const handleTestRuntimeProxy = async () => {
@@ -428,7 +432,7 @@ export function ProxyRuntimeCard() {
           <Button
             type="button"
             className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
-            onClick={() => void saveConfig()}
+            onClick={() => void handleSave()}
             disabled={isSavingConfig}
           >
             {isSavingConfig ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}

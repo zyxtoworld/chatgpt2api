@@ -8,31 +8,42 @@ import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from typing import Callable, Iterator
 
 from curl_cffi.requests import Session
 
 from services.account_service import account_service
 from services.config import DATA_DIR, parse_public_url
+from services.model_contract import parse_model_text
 from services.openai_backend_api import OpenAIBackendAPI
+from services.remote_response import parse_json_response
 from services.protocol.error_response import (
+    ImportJobActiveError,
     PublicSafeValueError,
     canonicalize_import_job_errors,
     exception_log_message,
     validate_import_job_errors,
 )
-from services.secure_file import atomic_write_bytes
-from services.storage.base import StorageConflictError, StorageDataError
-from services.task_executor import reserve_background_task
+from services.secure_file import atomic_write_bytes, read_checked_file_bytes
+from services.storage.base import (
+    StorageConflictError,
+    StorageDataError,
+    canonical_path_write_lock,
+    canonical_scoped_path_write_lock,
+)
+from services.task_executor import reserve_background_task, run_with_timeout
 from utils.log import logger
 
 
 CCLOAD_CONFIG_FILE = DATA_DIR / "ccload_config.json"
 CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS = 90.0
+CCLOAD_IMPORT_TIMEOUT_SECS = 30 * 60.0
+CCLOAD_MAX_CHANNELS = 5000
+CCLOAD_MAX_CHANNEL_PAGES = 25
 CCLOAD_FETCH_WORKERS = 16
 CCLOAD_MODEL_CATALOG_WORKERS = 8
 CCLOAD_MODEL_BATCH_LIMIT = 50
@@ -40,10 +51,23 @@ _CCLOAD_FETCH_EXECUTOR = ThreadPoolExecutor(
     max_workers=CCLOAD_FETCH_WORKERS,
     thread_name_prefix="ccload-fetch",
 )
+_CCLOAD_MODEL_EXECUTOR = ThreadPoolExecutor(
+    max_workers=CCLOAD_MODEL_CATALOG_WORKERS,
+    thread_name_prefix="ccload-models",
+)
+_CCLOAD_MODEL_SLOTS = BoundedSemaphore(CCLOAD_MODEL_CATALOG_WORKERS)
 
 
 class CCLoadError(RuntimeError):
     pass
+
+
+class CCLoadSelectionError(CCLoadError, PublicSafeValueError):
+    """The channel-model request itself is invalid, not an upstream failure."""
+
+
+_MAX_CHANNEL_ID_LENGTH = 64
+_CCLOAD_PUBLIC_TEXT_MAX_LENGTH = 256
 
 
 def _remaining_timeout(deadline: float | None, maximum: float) -> float:
@@ -57,6 +81,46 @@ def _remaining_timeout(deadline: float | None, maximum: float) -> float:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _clean_text(value: object) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _clean_public_text(value: object) -> str:
+    text = _clean_text(value)
+    return text if len(text) <= _CCLOAD_PUBLIC_TEXT_MAX_LENGTH else ""
+
+
+def _clean_channel_id(value: object) -> str:
+    if type(value) is int:
+        text = str(value)
+        return text if value > 0 and len(text) <= _MAX_CHANNEL_ID_LENGTH else ""
+    if isinstance(value, str):
+        value = value.strip()
+        return (
+            value
+            if len(value) <= _MAX_CHANNEL_ID_LENGTH
+            and all("0" <= char <= "9" for char in value)
+            and value.lstrip("0")
+            else ""
+        )
+    return ""
+
+
+def _clean_channel_ids(values: object) -> list[str]:
+    if not isinstance(values, list) or not values:
+        return []
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        channel_id = _clean_channel_id(value)
+        if not channel_id:
+            return []
+        if channel_id not in seen:
+            seen.add(channel_id)
+            selected.append(channel_id)
+    return selected
 
 
 def _require_base_url(value: object) -> str:
@@ -106,7 +170,12 @@ def _normalize_import_job(raw: object, *, fail_unfinished: bool) -> dict | None:
     if "errors" not in raw:
         raise StorageDataError()
     errors = validate_import_job_errors(raw["errors"])
-    if counters["completed"] > counters["total"] or counters["failed"] > counters["completed"]:
+    if (
+        counters["completed"] > counters["total"]
+        or counters["failed"] > counters["completed"]
+        or counters["added"] + counters["skipped"] > counters["total"]
+        or counters["refreshed"] > counters["total"]
+    ):
         raise StorageDataError()
     return {
         "job_id": job_id.strip(),
@@ -138,7 +207,7 @@ def _normalize_server(raw: object, *, fail_unfinished: bool) -> dict:
 
 def _file_revision(path: Path) -> str | None:
     try:
-        payload = path.read_bytes()
+        payload = read_checked_file_bytes(path, path.parent)
     except FileNotFoundError:
         return None
     except Exception as exc:
@@ -152,25 +221,47 @@ class CCLoadConfig:
     def __init__(self, store_file: Path):
         self._store_file = Path(store_file)
         self._lock = Lock()
+        self._path_write_lock = canonical_path_write_lock(self._store_file)
         self._servers, self._snapshot_revision = self._load(fail_unfinished=False)
         recovered_servers: list[dict] = []
         recovered = False
+        active_server_ids: list[str] = []
         for server in self._servers:
             next_server = dict(server)
             import_job = server.get("import_job")
             if isinstance(import_job, dict) and import_job.get("status") in {"pending", "running"}:
+                active_server_ids.append(server["id"])
                 next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=True)
                 recovered = True
             recovered_servers.append(next_server)
         if recovered:
-            self._commit_locked(recovered_servers)
+            with ExitStack() as locks:
+                for server_id in sorted(active_server_ids):
+                    locks.enter_context(self.import_job_lock(server_id))
+                self._servers, self._snapshot_revision = self._load(fail_unfinished=False)
+                recovered_servers = []
+                recovered_after_lock = False
+                for server in self._servers:
+                    next_server = dict(server)
+                    import_job = server.get("import_job")
+                    if isinstance(import_job, dict) and import_job.get("status") in {"pending", "running"}:
+                        next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=True)
+                        recovered_after_lock = True
+                    recovered_servers.append(next_server)
+                if recovered_after_lock:
+                    self._commit_locked(recovered_servers)
+
+    def import_job_lock(self, server_id: str):
+        return canonical_scoped_path_write_lock(self._store_file, f"ccload-import:{server_id}")
 
     def _load(self, *, fail_unfinished: bool) -> tuple[list[dict], str | None]:
-        revision = _file_revision(self._store_file)
-        if revision is None:
+        try:
+            payload = read_checked_file_bytes(self._store_file, self._store_file.parent)
+        except FileNotFoundError:
             return [], None
         try:
-            raw = json.loads(self._store_file.read_text(encoding="utf-8"))
+            revision = hashlib.sha256(payload).hexdigest()
+            raw = json.loads(payload.decode("utf-8"))
             if not isinstance(raw, list):
                 raise StorageDataError()
             servers: list[dict] = []
@@ -191,13 +282,28 @@ class CCLoadConfig:
         self._servers, self._snapshot_revision = self._load(fail_unfinished=False)
 
     def _commit_locked(self, servers: list[dict]) -> None:
-        if _file_revision(self._store_file) != self._snapshot_revision:
-            raise StorageConflictError()
-        payload = (json.dumps(servers, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
-        self._store_file.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_bytes(self._store_file, self._store_file.parent, payload)
-        self._servers = servers
-        self._snapshot_revision = hashlib.sha256(payload).hexdigest()
+        parent = self._store_file.parent
+        try:
+            parent_stat = parent.stat()
+            expected_root_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        except FileNotFoundError:
+            expected_root_identity = None
+        with self._path_write_lock:
+            if _file_revision(self._store_file) != self._snapshot_revision:
+                raise StorageConflictError()
+            payload = (json.dumps(servers, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            parent.mkdir(parents=True, exist_ok=True)
+            if expected_root_identity is None:
+                parent_stat = parent.stat()
+                expected_root_identity = (parent_stat.st_dev, parent_stat.st_ino)
+            atomic_write_bytes(
+                self._store_file,
+                parent,
+                payload,
+                expected_root_identity=expected_root_identity,
+            )
+            self._servers = servers
+            self._snapshot_revision = hashlib.sha256(payload).hexdigest()
 
     def list_servers(self) -> list[dict]:
         with self._lock:
@@ -235,6 +341,37 @@ class CCLoadConfig:
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
+                active = isinstance(server.get("import_job"), dict) and server["import_job"].get("status") in {"pending", "running"}
+                break
+            else:
+                return None
+        if active:
+            with self.import_job_lock(server_id), self._lock:
+                self._reload_locked()
+                for index, server in enumerate(self._servers):
+                    if server["id"] != server_id:
+                        continue
+                    merged = dict(server)
+                    for name in ("name", "base_url", "password"):
+                        if name in updates and updates[name] is not None:
+                            merged[name] = (
+                                _require_base_url(updates[name])
+                                if name == "base_url"
+                                else _clean(updates[name])
+                            )
+                    if not merged["password"]:
+                        raise PublicSafeValueError("base URL and admin password are required")
+                    normalized = _normalize_server(merged, fail_unfinished=False)
+                    next_servers = list(self._servers)
+                    next_servers[index] = normalized
+                    self._commit_locked(next_servers)
+                    return dict(normalized)
+            return None
+        with self._lock:
+            self._reload_locked()
+            for index, server in enumerate(self._servers):
+                if server["id"] != server_id:
+                    continue
                 merged = dict(server)
                 for name in ("name", "base_url", "password"):
                     if name in updates and updates[name] is not None:
@@ -255,18 +392,66 @@ class CCLoadConfig:
     def delete_server(self, server_id: str) -> bool:
         with self._lock:
             self._reload_locked()
+            server = next((item for item in self._servers if item["id"] == server_id), None)
+            active = isinstance(server.get("import_job"), dict) and server["import_job"].get("status") in {"pending", "running"} if server else False
+        if active:
+            with self.import_job_lock(server_id), self._lock:
+                self._reload_locked()
+                for server in self._servers:
+                    if server["id"] == server_id:
+                        import_job = server.get("import_job")
+                        if isinstance(import_job, dict) and import_job.get("status") in {"pending", "running"}:
+                            raise ImportJobActiveError("import is already running")
+                        break
+                before = len(self._servers)
+                next_servers = [server for server in self._servers if server["id"] != server_id]
+                if len(next_servers) < before:
+                    self._commit_locked(next_servers)
+                    return True
+            return False
+        with self._lock:
+            self._reload_locked()
             next_servers = [server for server in self._servers if server["id"] != server_id]
             if len(next_servers) == len(self._servers):
                 return False
             self._commit_locked(next_servers)
             return True
 
-    def set_import_job(self, server_id: str, import_job: dict | None) -> dict | None:
+    def set_import_job(
+        self,
+        server_id: str,
+        import_job: dict | None,
+        *,
+        expected_job_id: str | None = None,
+    ) -> dict | None:
+        with self._lock:
+            self._reload_locked()
+            current = next((server for server in self._servers if server["id"] == server_id), None)
+            active = isinstance(current.get("import_job"), dict) and current["import_job"].get("status") in {"pending", "running"} if current else False
+        lock = self.import_job_lock(server_id) if active else None
+        if lock is not None:
+            with lock:
+                return self._set_import_job_locked(server_id, import_job, expected_job_id=expected_job_id)
+        return self._set_import_job_locked(server_id, import_job, expected_job_id=expected_job_id)
+
+    def _set_import_job_locked(
+        self,
+        server_id: str,
+        import_job: dict | None,
+        *,
+        expected_job_id: str | None,
+    ) -> dict | None:
         with self._lock:
             self._reload_locked()
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
+                current_job = server.get("import_job")
+                if expected_job_id is not None and (
+                    not isinstance(current_job, dict)
+                    or current_job.get("job_id") != expected_job_id
+                ):
+                    return None
                 next_server = dict(server)
                 next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=False)
                 next_servers = list(self._servers)
@@ -278,12 +463,23 @@ class CCLoadConfig:
     def begin_import_job(self, server_id: str, import_job: dict) -> dict | None:
         with self._lock:
             self._reload_locked()
+            current = next((server for server in self._servers if server["id"] == server_id), None)
+            active = isinstance(current.get("import_job"), dict) and current["import_job"].get("status") in {"pending", "running"} if current else False
+        lock = self.import_job_lock(server_id) if active else None
+        if lock is not None:
+            with lock:
+                return self._begin_import_job_locked(server_id, import_job)
+        return self._begin_import_job_locked(server_id, import_job)
+
+    def _begin_import_job_locked(self, server_id: str, import_job: dict) -> dict | None:
+        with self._lock:
+            self._reload_locked()
             for index, server in enumerate(self._servers):
                 if server["id"] != server_id:
                     continue
                 current_job = server.get("import_job")
                 if isinstance(current_job, dict) and current_job.get("status") in {"pending", "running"}:
-                    raise PublicSafeValueError("import is already running")
+                    raise ImportJobActiveError("import is already running")
                 next_server = dict(server)
                 next_server["import_job"] = _normalize_import_job(import_job, fail_unfinished=False)
                 next_servers = list(self._servers)
@@ -299,11 +495,11 @@ class CCLoadConfig:
 
 
 def _response_payload(response, operation: str) -> dict:
-    if not getattr(response, "ok", False):
-        raise CCLoadError(f"ccLoad {operation} failed")
     try:
-        payload = response.json()
+        payload = parse_json_response(response, f"ccLoad {operation}")
     except Exception as exc:
+        if isinstance(exc, CCLoadError):
+            raise
         raise CCLoadError(f"ccLoad {operation} failed") from exc
     if not isinstance(payload, dict) or payload.get("success") is not True or "data" not in payload:
         raise CCLoadError(f"ccLoad {operation} failed")
@@ -330,13 +526,14 @@ def _admin_session(
                 json={"mode": "admin", "password": password},
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
                 timeout=_remaining_timeout(deadline, 30.0),
+                stream=True,
             )
         except Exception as exc:
             raise CCLoadError("ccLoad login failed") from exc
         payload = _response_payload(response, "login")
         data = payload.get("data")
-        token = _clean(data.get("token")) if isinstance(data, dict) else ""
-        role = _clean(data.get("role")) if isinstance(data, dict) else ""
+        token = _clean_text(data.get("token")) if isinstance(data, dict) else ""
+        role = _clean_text(data.get("role")) if isinstance(data, dict) else ""
         if not token or role != "admin":
             raise CCLoadError("ccLoad login failed")
         yield session, base_url, {
@@ -346,11 +543,16 @@ def _admin_session(
     finally:
         if token:
             try:
-                session.post(
+                logout_timeout = _remaining_timeout(deadline, 10.0) if deadline is not None else 10.0
+                logout_response = session.post(
                     f"{base_url}/logout",
                     headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-                    timeout=10,
+                    timeout=logout_timeout,
+                    stream=True,
                 )
+                close = getattr(logout_response, "close", None)
+                if callable(close):
+                    close()
             except Exception:
                 pass
         session.close()
@@ -361,15 +563,22 @@ def list_remote_channels(server: dict) -> list[dict]:
     channels: list[dict] = []
     limit = 200
     offset = 0
+    page_count = 0
+    expected_count: int | None = None
+    count_seen = False
     deadline = time.monotonic() + CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS
     with _admin_session(server, deadline=deadline) as (session, base_url, headers):
         while True:
+            page_count += 1
+            if page_count > CCLOAD_MAX_CHANNEL_PAGES:
+                raise CCLoadError("ccLoad channel list limit exceeded")
             try:
                 response = session.get(
                     f"{base_url}/admin/channels",
                     headers=headers,
                     params={"auth_type": "codex_oauth", "limit": limit, "offset": offset},
                     timeout=_remaining_timeout(deadline, 30.0),
+                    stream=True,
                 )
             except Exception as exc:
                 raise CCLoadError("ccLoad channel list failed") from exc
@@ -377,42 +586,71 @@ def list_remote_channels(server: dict) -> list[dict]:
             data = payload.get("data")
             if not isinstance(data, list):
                 raise CCLoadError("ccLoad channel list failed")
+            count = payload.get("count")
+            if count_seen:
+                if type(count) is not int or count != expected_count:
+                    raise CCLoadError("ccLoad channel list failed")
+            elif count is not None:
+                if page_count != 1 or type(count) is not int:
+                    raise CCLoadError("ccLoad channel list failed")
+                expected_count = count
+                count_seen = True
+            if count is not None:
+                if type(count) is not int or count < offset:
+                    raise CCLoadError("ccLoad channel list failed")
+                if count > CCLOAD_MAX_CHANNELS:
+                    raise CCLoadError("ccLoad channel list limit exceeded")
+            next_offset = offset + len(data)
+            if next_offset > CCLOAD_MAX_CHANNELS:
+                raise CCLoadError("ccLoad channel list limit exceeded")
+            if count is not None and next_offset > count:
+                raise CCLoadError("ccLoad channel list failed")
             for item in data:
-                if not isinstance(item, dict) or _clean(item.get("auth_type")) != "codex_oauth":
+                if not isinstance(item, dict) or _clean_text(item.get("auth_type")) != "codex_oauth":
                     continue
-                channel_id = _clean(item.get("id"))
+                channel_id = _clean_channel_id(item.get("id"))
                 enabled = item.get("enabled")
-                if not channel_id.isdecimal() or int(channel_id) <= 0 or not isinstance(enabled, bool):
+                if not channel_id or not isinstance(enabled, bool):
                     raise CCLoadError("ccLoad channel list failed")
                 channels.append({
                     "id": channel_id,
-                    "name": _clean(item.get("name")),
+                    "name": _clean_public_text(item.get("name")),
                     "enabled": enabled,
-                    "plan_type": _clean(item.get("codex_plan_type")),
-                    "subscription_active_until": _clean(item.get("codex_subscription_active_until")),
+                    "plan_type": _clean_public_text(item.get("codex_plan_type")),
+                    "subscription_active_until": _clean_public_text(item.get("codex_subscription_active_until")),
                     "models": [],
                     "models_loaded": not enabled,
                 })
 
-            count = payload.get("count")
-            total = count if isinstance(count, int) and count >= 0 else offset + len(data)
-            offset += len(data)
-            if not data or offset >= total or len(data) < limit:
-                break
+            offset = next_offset
+            if count is None:
+                # Some ccLoad versions omit the total. A full page is not
+                # evidence of completion; continue until the first short
+                # or empty page.
+                if not data or len(data) < limit:
+                    break
+                if page_count >= CCLOAD_MAX_CHANNEL_PAGES:
+                    raise CCLoadError("ccLoad channel list limit exceeded")
+            elif type(count) is int and count >= offset:
+                if offset >= count:
+                    break
+                if not data:
+                    raise CCLoadError("ccLoad channel list failed")
+            else:
+                raise CCLoadError("ccLoad channel list failed")
     return channels
 
 
 def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dict]:
-    selected = list(dict.fromkeys(_clean(value) for value in channel_ids if _clean(value)))
-    if not selected or any(not value.isdecimal() or int(value) <= 0 for value in selected):
-        raise CCLoadError("ccLoad channel selection is invalid")
+    selected = _clean_channel_ids(channel_ids)
+    if not selected:
+        raise CCLoadSelectionError("ccLoad channel selection is invalid")
     if len(selected) > CCLOAD_MODEL_BATCH_LIMIT:
-        raise CCLoadError("ccLoad model batch supports at most 50 channels")
+        raise CCLoadSelectionError("ccLoad model batch supports at most 50 channels")
 
     deadline = time.monotonic() + CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS
     catalogs: list[dict] = []
     model_tokens: dict[int, str] = {}
-    seen_plan_types: set[str] = set()
     with _admin_session(server, deadline=deadline) as (session, base_url, headers):
         for channel_id in selected:
             try:
@@ -423,18 +661,15 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
                     channel_id,
                     deadline=deadline,
                 )
-                plan_type = _clean(credential.get("plan_type"))
-                plan_key = plan_type.casefold() if plan_type else f"channel:{channel_id}"
-                if plan_key in seen_plan_types:
-                    continue
-                seen_plan_types.add(plan_key)
+                plan_type = _clean_public_text(credential.get("plan_type"))
+                catalog_index = len(catalogs)
                 catalogs.append({
                     "id": channel_id,
                     "plan_type": plan_type,
                     "models": [],
-                    "models_loaded": True,
+                    "models_loaded": False,
                 })
-                model_tokens[len(catalogs) - 1] = credential["access_token"]
+                model_tokens[catalog_index] = credential["access_token"]
             except Exception as exc:
                 if time.monotonic() >= deadline:
                     raise CCLoadError("ccLoad channel model list timed out") from exc
@@ -442,7 +677,7 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
                     "id": channel_id,
                     "plan_type": "",
                     "models": [],
-                    "models_loaded": True,
+                    "models_loaded": False,
                 })
                 logger.warning({
                     "event": "ccload_channel_model_catalog_failed",
@@ -452,20 +687,17 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
     if not model_tokens:
         return catalogs
 
-    executor = ThreadPoolExecutor(
-        max_workers=min(CCLOAD_MODEL_CATALOG_WORKERS, len(model_tokens)),
-        thread_name_prefix="ccload-models",
-    )
-    futures = {
-        executor.submit(_channel_model_ids, access_token, deadline=deadline): catalog_index
-        for catalog_index, access_token in model_tokens.items()
-    }
+    futures = {}
     try:
+        for catalog_index, access_token in model_tokens.items():
+            futures[_submit_channel_model_ids(access_token, deadline=deadline)] = catalog_index
         for future in as_completed(futures, timeout=_remaining_timeout(deadline, CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS)):
             catalog_index = futures[future]
             try:
                 catalogs[catalog_index]["models"] = future.result()
+                catalogs[catalog_index]["models_loaded"] = True
             except Exception as exc:
+                catalogs[catalog_index]["models_loaded"] = False
                 if time.monotonic() >= deadline:
                     raise CCLoadError("ccLoad channel model list timed out") from exc
                 logger.warning({
@@ -474,9 +706,13 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
                     "error": exception_log_message(exc),
                 })
     except FuturesTimeoutError as exc:
+        for future in futures:
+            future.cancel()
         raise CCLoadError("ccLoad channel model list timed out") from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    except BaseException:
+        for future in futures:
+            future.cancel()
+        raise
     return catalogs
 
 
@@ -533,6 +769,7 @@ def _fetch_remote_credential(
         f"{base_url}/admin/channels/{channel_id}/editor",
         headers=headers,
         timeout=_remaining_timeout(deadline, 30.0),
+        stream=True,
     )
     payload = _response_payload(response, "credential fetch")
     data = payload.get("data")
@@ -541,8 +778,8 @@ def _fetch_remote_credential(
     credential = _normalized_codex_credential(raw_credential)
     if (
         not isinstance(channel, dict)
-        or _clean(channel.get("id")) != channel_id
-        or _clean(channel.get("auth_type")) != "codex_oauth"
+        or _clean_channel_id(channel.get("id")) != channel_id
+        or _clean_text(channel.get("auth_type")) != "codex_oauth"
         or credential is None
     ):
         raise CCLoadError("ccLoad credential fetch failed")
@@ -563,18 +800,43 @@ def _channel_model_ids(access_token: str, *, deadline: float | None = None) -> l
     return list(dict.fromkeys(
         model_id
         for item in data
-        if isinstance(item, dict) and (model_id := _clean(item.get("id")))
+        if isinstance(item, dict) and (model_id := parse_model_text(item.get("id")))
     ))
+
+
+def _submit_channel_model_ids(access_token: str, *, deadline: float):
+    remaining = _remaining_timeout(deadline, float("inf"))
+    if not _CCLOAD_MODEL_SLOTS.acquire(timeout=remaining):
+        raise CCLoadError("ccLoad channel model list timed out")
+    try:
+        future = _CCLOAD_MODEL_EXECUTOR.submit(
+            _channel_model_ids,
+            access_token,
+            deadline=deadline,
+        )
+    except BaseException:
+        _CCLOAD_MODEL_SLOTS.release()
+        raise
+    future.add_done_callback(lambda _future: _CCLOAD_MODEL_SLOTS.release())
+    return future
 
 
 def _fetch_remote_credential_for_import(
         base_url: str,
         headers: dict[str, str],
         channel_id: str,
+        *,
+        deadline: float | None = None,
 ) -> dict:
     session = Session(verify=True)
     try:
-        return _fetch_remote_credential(session, base_url, headers, channel_id)
+        return _fetch_remote_credential(
+            session,
+            base_url,
+            headers,
+            channel_id,
+            deadline=deadline,
+        )
     finally:
         session.close()
 
@@ -584,35 +846,51 @@ def fetch_remote_credentials(
         channel_ids: list[str],
         *,
         on_progress: Callable[[str, str | None], None] | None = None,
+        deadline: float | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    selected = list(dict.fromkeys(_clean(value) for value in channel_ids if _clean(value)))
-    if not selected or any(not value.isdecimal() or int(value) <= 0 for value in selected):
+    selected = _clean_channel_ids(channel_ids)
+    if not selected:
         raise CCLoadError("ccLoad channel selection is invalid")
 
     credentials: list[dict] = []
     errors: list[dict] = []
-    with _admin_session(server) as (_session, base_url, headers):
+    if deadline is None:
+        deadline = time.monotonic() + CCLOAD_IMPORT_TIMEOUT_SECS
+    with _admin_session(server, deadline=deadline) as (_session, base_url, headers):
         for offset in range(0, len(selected), CCLOAD_FETCH_WORKERS):
             batch = selected[offset:offset + CCLOAD_FETCH_WORKERS]
-            future_map = {
-                _CCLOAD_FETCH_EXECUTOR.submit(
-                    _fetch_remote_credential_for_import,
-                    base_url,
-                    headers,
-                    channel_id,
-                ): channel_id
-                for channel_id in batch
-            }
-            for future in as_completed(future_map):
-                channel_id = future_map[future]
-                error: str | None = None
-                try:
-                    credentials.append(future.result())
-                except Exception:
-                    error = "credential unavailable"
-                    errors.append({"name": channel_id, "error": error})
-                if on_progress is not None:
-                    on_progress(channel_id, error)
+            future_map = {}
+            try:
+                for channel_id in batch:
+                    future_map[_CCLOAD_FETCH_EXECUTOR.submit(
+                        _fetch_remote_credential_for_import,
+                        base_url,
+                        headers,
+                        channel_id,
+                        deadline=deadline,
+                    )] = channel_id
+                futures = as_completed(
+                    future_map,
+                    timeout=_remaining_timeout(deadline, CCLOAD_IMPORT_TIMEOUT_SECS),
+                )
+                for future in futures:
+                    channel_id = future_map[future]
+                    error: str | None = None
+                    try:
+                        credentials.append(future.result())
+                    except Exception:
+                        error = "credential unavailable"
+                        errors.append({"name": channel_id, "error": error})
+                    if on_progress is not None:
+                        on_progress(channel_id, error)
+            except FuturesTimeoutError as exc:
+                for future in future_map:
+                    future.cancel()
+                raise CCLoadError("ccLoad import timed out") from exc
+            except BaseException:
+                for future in future_map:
+                    future.cancel()
+                raise
     return credentials, errors
 
 
@@ -621,9 +899,11 @@ class CCLoadImportService:
         self._config = config
 
     def start_import(self, server: dict, channel_ids: list[str]) -> dict:
-        selected = list(dict.fromkeys(_clean(value) for value in channel_ids if _clean(value)))
-        if not selected or any(not value.isdecimal() or int(value) <= 0 for value in selected):
+        selected = _clean_channel_ids(channel_ids)
+        if not selected:
             raise PublicSafeValueError("channel ids are required")
+        if len(selected) > CCLOAD_MAX_CHANNELS:
+            raise PublicSafeValueError("channel ids limit exceeded")
         server_id = _clean(server.get("id"))
         reservation = reserve_background_task()
         now = _now_iso()
@@ -649,7 +929,7 @@ class CCLoadImportService:
             reservation.cancel()
             raise PublicSafeValueError("server not found")
         try:
-            reservation.submit(self._run_import, server_id, dict(server), selected)
+            reservation.submit(self._run_import, server_id, dict(saved), selected)
         except Exception:
             self._config.set_import_job(
                 server_id,
@@ -664,14 +944,63 @@ class CCLoadImportService:
             raise
         return dict(saved.get("import_job") or job)
 
-    def _update_job(self, server_id: str, **updates: object) -> None:
+    def _update_job(
+        self,
+        server_id: str,
+        *,
+        expected_job_id: str | None = None,
+        **updates: object,
+    ) -> bool:
         current = self._config.get_import_job(server_id)
         if current is None:
-            return
-        self._config.set_import_job(server_id, {**current, **updates, "updated_at": _now_iso()})
+            return False
+        if expected_job_id is not None and current.get("job_id") != expected_job_id:
+            return False
+        next_job = {**current, **updates, "updated_at": _now_iso()}
+        if expected_job_id is None:
+            saved = self._config.set_import_job(server_id, next_job)
+        else:
+            saved = self._config.set_import_job(
+                server_id,
+                next_job,
+                expected_job_id=expected_job_id,
+            )
+        return saved is not None
+
+    def _job_is_current(self, server_id: str, expected_job_id: str) -> bool:
+        current = self._config.get_import_job(server_id)
+        return current is not None and current.get("job_id") == expected_job_id
 
     def _run_import(self, server_id: str, server: dict, channel_ids: list[str]) -> None:
-        self._update_job(server_id, status="running")
+        initial_job = server.get("import_job")
+        expected_job_id = initial_job.get("job_id") if isinstance(initial_job, dict) else None
+        if expected_job_id is None:
+            current_job = self._config.get_import_job(server_id)
+            expected_job_id = current_job.get("job_id") if current_job else None
+        if not isinstance(expected_job_id, str) or not expected_job_id:
+            return
+        try:
+            if not self._update_job(server_id, expected_job_id=expected_job_id, status="running"):
+                return
+        except Exception:
+            try:
+                self._update_job(
+                    server_id,
+                    expected_job_id=expected_job_id,
+                    status="failed",
+                    completed=len(channel_ids),
+                    failed=len(channel_ids),
+                    errors=canonicalize_import_job_errors([
+                        {"name": "ccLoad", "error": "import failed"},
+                    ]),
+                )
+            except Exception:
+                logger.error({
+                    "event": "ccload_import_initial_state_persist_failed",
+                    "stage": "running",
+                })
+            return
+        deadline = time.monotonic() + CCLOAD_IMPORT_TIMEOUT_SECS
         completed_count = 0
         failed_count = 0
 
@@ -687,19 +1016,25 @@ class CCLoadImportService:
                     *(current.get("errors") or []),
                     {"name": channel_id, "error": error},
                 ])
-            self._update_job(server_id, **updates)
+            self._update_job(server_id, expected_job_id=expected_job_id, **updates)
 
         try:
             credentials, errors = fetch_remote_credentials(
                 server,
                 channel_ids,
                 on_progress=record_progress,
+                deadline=deadline,
             )
         except Exception:
             credentials = []
             errors = [{"name": channel_id, "error": "credential unavailable"} for channel_id in channel_ids]
 
-        failure_count = min(len(channel_ids), max(failed_count, len(errors)))
+        # Error details are a bounded diagnostic sample, not the result count.
+        # The selected set and the returned credential results are the stable
+        # accounting boundary; keep progress-derived failures as a lower-level
+        # signal for real-time fetch callbacks.
+        fetch_failure_count = max(0, len(channel_ids) - len(credentials))
+        failure_count = min(len(channel_ids), max(failed_count, fetch_failure_count))
         safe_errors = canonicalize_import_job_errors(errors)
         if not credentials:
             safe_errors = safe_errors or canonicalize_import_job_errors(
@@ -707,6 +1042,7 @@ class CCLoadImportService:
             )
             self._update_job(
                 server_id,
+                expected_job_id=expected_job_id,
                 status="failed",
                 completed=len(channel_ids),
                 failed=len(channel_ids),
@@ -715,43 +1051,136 @@ class CCLoadImportService:
             return
 
         try:
-            add_result = account_service.add_account_items(credentials)
-            if not isinstance(add_result, dict) or not add_result:
-                raise ValueError("invalid account import result")
-            added = _parse_nonnegative_int(add_result["added"])
-            skipped = _parse_nonnegative_int(add_result["skipped"])
-        except Exception:
+            _remaining_timeout(deadline, float("inf"))
+        except CCLoadError:
             self._update_job(
                 server_id,
+                expected_job_id=expected_job_id,
                 status="failed",
                 completed=len(channel_ids),
-                added=0,
-                skipped=0,
-                refreshed=0,
                 failed=len(channel_ids),
                 errors=canonicalize_import_job_errors(
-                    [*safe_errors, {"name": "ccLoad", "error": "account import failed"}],
+                    [*safe_errors, {"name": "ccLoad", "error": "import failed"}],
                 ),
             )
             return
-        self._update_job(server_id, added=added, skipped=skipped)
+
+        with self._config.import_job_lock(server_id):
+            if not self._job_is_current(server_id, expected_job_id):
+                return
+
+            try:
+                add_result = account_service.add_account_items(credentials)
+                if not isinstance(add_result, dict) or not add_result:
+                    raise ValueError("invalid account import result")
+                added = _parse_nonnegative_int(add_result["added"])
+                skipped = _parse_nonnegative_int(add_result["skipped"])
+                if added + skipped != len(credentials):
+                    raise ValueError("invalid account import count")
+            except Exception:
+                self._update_job(
+                    server_id,
+                    expected_job_id=expected_job_id,
+                    status="failed",
+                    completed=len(channel_ids),
+                    added=0,
+                    skipped=0,
+                    refreshed=0,
+                    failed=len(channel_ids),
+                    errors=canonicalize_import_job_errors(
+                        [*safe_errors, {"name": "ccLoad", "error": "account import failed"}],
+                    ),
+                )
+                return
+            if not self._update_job(
+                server_id,
+                expected_job_id=expected_job_id,
+                added=added,
+                skipped=skipped,
+            ):
+                return
+
+        if not self._job_is_current(server_id, expected_job_id):
+            return
+
+        try:
+            _remaining_timeout(deadline, float("inf"))
+        except CCLoadError:
+            self._update_job(
+                server_id,
+                expected_job_id=expected_job_id,
+                status="failed",
+                completed=len(channel_ids),
+                added=added,
+                skipped=skipped,
+                refreshed=0,
+                failed=len(channel_ids),
+                errors=canonicalize_import_job_errors(
+                    [*safe_errors, {"name": "ccLoad", "error": "import failed"}],
+                ),
+            )
+            return
+
+        refresh_active = True
+        refresh_state_lock = Lock()
 
         def record_refresh_progress(refreshed: int) -> None:
-            self._update_job(server_id, refreshed=refreshed)
+            with refresh_state_lock:
+                if refresh_active and time.monotonic() < deadline:
+                    self._update_job(
+                        server_id,
+                        expected_job_id=expected_job_id,
+                        refreshed=refreshed,
+                    )
 
         access_tokens = [credential["access_token"] for credential in credentials]
         try:
-            refresh_result = account_service.refresh_accounts(
+            refresh_result = run_with_timeout(
+                account_service.refresh_accounts,
                 access_tokens,
+                timeout=_remaining_timeout(deadline, float("inf")),
+                timeout_message="ccLoad account refresh timed out",
                 on_progress=record_refresh_progress,
+                deadline=deadline,
             )
+            _remaining_timeout(deadline, float("inf"))
             if not isinstance(refresh_result, dict) or not refresh_result:
                 raise ValueError("invalid account refresh result")
             refreshed = _parse_nonnegative_int(refresh_result["refreshed"])
-        except Exception:
+            if refreshed > len(access_tokens):
+                raise ValueError("invalid account refresh count")
+            refresh_errors = refresh_result.get("errors", [])
+            if not isinstance(refresh_errors, list):
+                raise ValueError("invalid account refresh errors")
+            # Error details are a bounded diagnostic sample.  The number of
+            # refresh failures comes from the selected token set and the
+            # trusted refreshed count, never from len(refresh_errors).
+            refresh_failure_count = len(access_tokens) - refreshed
+        except (TimeoutError, CCLoadError):
+            with refresh_state_lock:
+                refresh_active = False
             current = self._config.get_import_job(server_id) or {}
             self._update_job(
                 server_id,
+                expected_job_id=expected_job_id,
+                status="failed",
+                completed=len(channel_ids),
+                added=added,
+                skipped=skipped,
+                refreshed=int(current.get("refreshed") or 0),
+                failed=len(channel_ids),
+                errors=canonicalize_import_job_errors(
+                    [*safe_errors, {"name": "ccLoad", "error": "import failed"}],
+                ),
+            )
+            return
+        except Exception:
+            with refresh_state_lock:
+                refresh_active = False
+            current = self._config.get_import_job(server_id) or {}
+            self._update_job(
+                server_id,
+                expected_job_id=expected_job_id,
                 status="failed",
                 completed=len(channel_ids),
                 added=added,
@@ -764,8 +1193,25 @@ class CCLoadImportService:
             )
             return
 
+        with refresh_state_lock:
+            refresh_active = False
+        if refresh_failure_count > 0 or refresh_errors:
+            self._update_job(
+                server_id,
+                expected_job_id=expected_job_id,
+                status="failed",
+                completed=len(channel_ids),
+                added=added,
+                skipped=skipped,
+                refreshed=refreshed,
+                failed=min(len(channel_ids), failure_count + refresh_failure_count),
+                errors=canonicalize_import_job_errors([*safe_errors, *refresh_errors]),
+            )
+            return
+
         self._update_job(
             server_id,
+            expected_job_id=expected_job_id,
             status="completed",
             completed=len(channel_ids),
             added=added,

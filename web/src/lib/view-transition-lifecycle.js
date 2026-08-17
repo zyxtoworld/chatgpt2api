@@ -22,3 +22,16 @@ export function observeViewTransition(transition, { onReady, onSettled }) {
     settle();
   }
 }
+
+export function startObservedViewTransition(startTransition, applyTheme, { onReady, onSettled }) {
+  let transition;
+  try {
+    transition = startTransition();
+  } catch {
+    onSettled();
+    applyTheme();
+    return false;
+  }
+  observeViewTransition(transition, { onReady, onSettled });
+  return true;
+}

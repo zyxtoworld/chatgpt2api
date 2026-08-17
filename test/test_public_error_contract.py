@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
@@ -14,12 +16,15 @@ import api.accounts as accounts_module
 import services.account_service as account_service_module
 import services.cpa_service as cpa_service_module
 import services.content_filter as content_filter_module
+import services.log_service as log_service_module
 import services.protocol.conversation as conversation_module
+import services.protocol.openai_v1_response as openai_v1_response_module
 import services.sub2api_service as sub2api_service_module
 from api.errors import install_exception_handlers
-from services.log_service import LoggedCall
+from services.log_service import LogService, LoggedCall
 from services.openai_backend_api import ImagePollTimeoutError
-from services.protocol.error_response import PublicSafeError, public_exception_message
+from services.config import config
+from services.protocol.error_response import PublicSafeError, openai_error_payload, public_exception_message
 from utils.helper import UpstreamHTTPError, anthropic_sse_stream, responses_sse_stream, sse_json_stream
 
 
@@ -35,6 +40,409 @@ def _app_with_ai_router() -> FastAPI:
 
 
 class PublicErrorContractTests(unittest.TestCase):
+    def test_chat_cache_does_not_share_response_between_authenticated_identities(self) -> None:
+        old_settings = config.data.get("chat_completion_cache")
+        config.data["chat_completion_cache"] = {
+            "enabled": True,
+            "ttl_seconds": 60,
+            "max_entries": 32,
+            "dedupe_inflight": True,
+            "stream_cache": False,
+            "normalize_messages": True,
+            "drop_adjacent_duplicates": False,
+            "drop_assistant_history": False,
+        }
+        from services.protocol.chat_completion_cache import chat_completion_cache
+
+        chat_completion_cache.clear()
+        try:
+            app = _app_with_ai_router()
+            body = {
+                "model": "auto",
+                "messages": [{"role": "user", "content": "identity-sensitive cache probe"}],
+            }
+            with (
+                mock.patch.object(
+                    ai_module,
+                    "require_identity_async",
+                    new=mock.AsyncMock(side_effect=[{"id": "identity-a"}, {"id": "identity-b"}]),
+                ),
+                mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                mock.patch.object(ai_module.openai_v1_chat_complete, "text_backend", return_value=object()),
+                mock.patch.object(
+                    ai_module.openai_v1_chat_complete,
+                    "collect_text",
+                    side_effect=["response-for-a", "response-for-b"],
+                ) as collect_text,
+            ):
+                client = TestClient(app)
+                first = client.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer a"})
+                second = client.post("/v1/chat/completions", json=body, headers={"Authorization": "Bearer b"})
+
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(first.json()["choices"][0]["message"]["content"], "response-for-a")
+            self.assertEqual(second.json()["choices"][0]["message"]["content"], "response-for-b")
+            self.assertEqual(collect_text.call_count, 2)
+        finally:
+            chat_completion_cache.clear()
+            if old_settings is None:
+                config.data.pop("chat_completion_cache", None)
+            else:
+                config.data["chat_completion_cache"] = old_settings
+
+    def test_responses_cache_does_not_share_response_between_authenticated_identities(self) -> None:
+        old_settings = config.data.get("chat_completion_cache")
+        config.data["chat_completion_cache"] = {
+            "enabled": True,
+            "ttl_seconds": 60,
+            "max_entries": 32,
+            "dedupe_inflight": True,
+            "stream_cache": True,
+            "normalize_messages": True,
+            "drop_adjacent_duplicates": False,
+            "drop_assistant_history": False,
+        }
+        from services.protocol.chat_completion_cache import chat_completion_cache
+
+        chat_completion_cache.clear()
+        try:
+            app = _app_with_ai_router()
+            body = {"model": "auto", "input": "identity-sensitive responses cache probe"}
+            with (
+                mock.patch.object(
+                    ai_module,
+                    "require_identity_async",
+                    new=mock.AsyncMock(side_effect=[{"id": "identity-a"}, {"id": "identity-b"}]),
+                ),
+                mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                mock.patch.object(ai_module.openai_v1_response, "text_backend", return_value=object()),
+                mock.patch.object(
+                    ai_module.openai_v1_response,
+                    "stream_text_deltas",
+                    side_effect=[iter(["response-for-a"]), iter(["response-for-b"])],
+                ) as stream_text_deltas,
+            ):
+                client = TestClient(app)
+                first = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer a"})
+                second = client.post("/v1/responses", json=body, headers={"Authorization": "Bearer b"})
+
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            self.assertIn("response-for-a", first.text)
+            self.assertIn("response-for-b", second.text)
+            self.assertEqual(stream_text_deltas.call_count, 2)
+        finally:
+            chat_completion_cache.clear()
+            if old_settings is None:
+                config.data.pop("chat_completion_cache", None)
+            else:
+                config.data["chat_completion_cache"] = old_settings
+
+    def test_logged_call_does_not_turn_success_into_error_when_log_write_fails(self) -> None:
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/chat/completions",
+            "auto",
+            "chat",
+            request_text="private request token=opaque-request-secret",
+        )
+
+        with (
+            mock.patch.object(
+                log_service_module.log_service,
+                "add",
+                side_effect=OSError("log disk unavailable private-path"),
+            ),
+            mock.patch.object(log_service_module._LOGGER, "error") as fallback_logger,
+        ):
+            result = asyncio.run(call.run(lambda: {"id": "response-1", "object": "response"}))
+
+        self.assertEqual(result, {"id": "response-1", "object": "response"})
+        fallback_logger.assert_called_once_with(
+            "log persistence failed",
+            extra={"error_type": "OSError"},
+        )
+        self.assertNotIn("opaque-request-secret", repr(fallback_logger.call_args))
+        self.assertNotIn("private-path", repr(fallback_logger.call_args))
+
+    def test_logged_call_redacts_request_credentials_and_signed_url_text(self) -> None:
+        bearer = "upstream-bearer-secret"
+        cookie = "session-cookie-secret"
+        query_secret = "signed-query-secret"
+        image_data = "A" * 128
+        ansi = "\x1b[31m"
+        with TemporaryDirectory() as directory:
+            old_log_service = log_service_module.log_service
+            log_service_module.log_service = LogService(Path(directory) / "logs.jsonl")
+            try:
+                call = LoggedCall(
+                    {"id": "user-1", "name": "user", "role": "user"},
+                    "/v1/chat/completions",
+                    "auto",
+                    "chat",
+                    request_text=(
+                        f"{ansi}Authorization: Bearer {bearer}\r\n"
+                        f"cookie=session={cookie} "
+                        f"https://cdn.example.test/image.png?token={query_secret}#fragment "
+                        f"data:image/png;base64,{image_data} C:\\Users\\owner\\private.txt"
+                    ),
+                )
+                call.log("调用失败", status="failed", error="upstream error")
+                persisted = (Path(directory) / "logs.jsonl").read_text(encoding="utf-8")
+            finally:
+                log_service_module.log_service = old_log_service
+
+        self.assertNotIn(bearer, persisted)
+        self.assertNotIn(cookie, persisted)
+        self.assertNotIn(query_secret, persisted)
+        self.assertNotIn(image_data, persisted)
+        self.assertNotIn("C:\\Users\\owner", persisted)
+        self.assertNotIn("Authorization:", persisted)
+        self.assertNotIn("?token=", persisted)
+        self.assertNotIn("#fragment", persisted)
+        self.assertNotIn("\x1b", persisted)
+        self.assertEqual(len(persisted.splitlines()), 1)
+        self.assertIn("https://cdn.example.test/image.png", persisted)
+
+    def test_logged_stream_keeps_items_when_log_write_fails(self) -> None:
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/chat/completions",
+            "auto",
+            "chat",
+        )
+
+        with mock.patch.object(log_service_module.log_service, "add", side_effect=OSError("log disk unavailable")):
+            items = list(call.stream(iter([{"data": "first"}])))
+
+        self.assertEqual(items, [{"data": "first"}])
+
+    def test_logged_stream_preserves_upstream_exception_when_failure_log_fails(self) -> None:
+        class UpstreamFailure(RuntimeError):
+            pass
+
+        marker = UpstreamFailure("upstream detail")
+
+        def failing_stream():
+            yield {"data": "first"}
+            raise marker
+
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/chat/completions",
+            "auto",
+            "chat",
+        )
+
+        with (
+            mock.patch.object(
+                log_service_module.log_service,
+                "add",
+                side_effect=OSError("log disk unavailable secret-path"),
+            ),
+            mock.patch.object(log_service_module._LOGGER, "error") as fallback_logger,
+            self.assertRaises(UpstreamFailure) as raised,
+        ):
+            list(call.stream(failing_stream()))
+
+        self.assertIs(raised.exception, marker)
+        fallback_logger.assert_called_once_with(
+            "log persistence failed",
+            extra={"error_type": "OSError"},
+        )
+        self.assertNotIn("log disk unavailable", repr(fallback_logger.call_args))
+        self.assertNotIn("upstream detail", repr(fallback_logger.call_args))
+
+    @staticmethod
+    def _persist_logged_result_url(url: str) -> str:
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/chat/completions",
+            "auto",
+            "chat",
+        )
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "logs.jsonl"
+            service = LogService(path)
+            with mock.patch("services.log_service.log_service", service):
+                response = asyncio.run(call.run(lambda: {"data": [{"url": url}]}))
+            if response != {"data": [{"url": url}]}:
+                raise AssertionError("LoggedCall changed the handler result")
+            return path.read_text(encoding="utf-8")
+
+    def test_logged_call_drops_result_url_with_userinfo(self) -> None:
+        persisted = self._persist_logged_result_url(
+            "https://user:password@cdn.example.test/private.png"
+        )
+
+        self.assertNotIn("user:password", persisted)
+        self.assertNotIn("https://cdn.example.test/private.png", persisted)
+
+    def test_logged_call_strips_query_and_fragment_from_result_url(self) -> None:
+        secret = "signed-result-query-canary owner@example.com"
+        persisted = self._persist_logged_result_url(
+            f"https://cdn.example.test/signed.png?token={secret}#fragment"
+        )
+
+        self.assertNotIn(secret, persisted)
+        self.assertNotIn("token=", persisted)
+        self.assertNotIn("#fragment", persisted)
+        self.assertIn("https://cdn.example.test/signed.png", persisted)
+
+    def test_logged_call_preserves_safe_result_url(self) -> None:
+        persisted = self._persist_logged_result_url("https://cdn.example.test/safe.png")
+
+        self.assertIn("https://cdn.example.test/safe.png", persisted)
+
+    def test_conversation_text_container_fails_closed_instead_of_stringifying(self) -> None:
+        canary = "conversation-text-container-canary owner@example.test"
+        payload = json.dumps({
+            "message": {
+                "author": {"role": "assistant"},
+                "channel": "final",
+                "recipient": "all",
+                "content": {"content_type": "code", "text": {"secret": canary}},
+            }
+        })
+
+        with self.assertRaisesRegex(RuntimeError, "malformed"):
+            list(conversation_module.iter_conversation_payloads(iter([payload, "[DONE]"])) )
+
+    def test_conversation_text_patch_container_fails_closed_instead_of_stringifying(self) -> None:
+        canary = "conversation-text-patch-container-canary owner@example.test"
+        payload = json.dumps({
+            "p": "/message/content/parts/0",
+            "o": "append",
+            "v": {"secret": canary},
+        })
+
+        with self.assertRaisesRegex(RuntimeError, "malformed"):
+            list(conversation_module.iter_conversation_payloads(iter([payload, "[DONE]"])) )
+
+    def test_conversation_metadata_does_not_stringify_container_fields(self) -> None:
+        canary = "conversation-metadata-container-canary owner@example.com"
+        payload = json.dumps({
+            "type": "server_ste_metadata",
+            "metadata": {"turn_use_case": {"secret": canary}},
+        })
+
+        events = list(conversation_module.iter_conversation_payloads(iter([payload, "[DONE]"])) )
+        self.assertTrue(events)
+        self.assertEqual(events[0]["turn_use_case"], "")
+        self.assertNotIn(canary, events[0]["turn_use_case"])
+
+    def test_image_progress_does_not_stringify_container_event_type(self) -> None:
+        canary = "image-event-type-container-canary owner@example.com"
+
+        class Backend:
+            def stream_conversation(self, **kwargs):
+                yield json.dumps({"type": {"secret": canary}})
+                yield "[DONE]"
+
+            def resolve_conversation_image_urls(self, *args, **kwargs):
+                return []
+
+        request = conversation_module.ConversationRequest(
+            prompt="draw",
+            model="gpt-image-2",
+        )
+        progress = list(conversation_module.stream_image_outputs(Backend(), request))
+
+        serialized = json.dumps(progress, ensure_ascii=False, default=str)
+        self.assertNotIn(canary, serialized)
+        self.assertTrue(progress)
+        self.assertEqual(progress[0].upstream_event_type, "")
+
+    def test_client_error_payload_does_not_stringify_container_fields(self) -> None:
+        canary = "error-payload-container-canary owner@example.test"
+
+        payload = openai_error_payload(
+            {
+                "error": {
+                    "message": {"secret": canary},
+                    "type": {"secret": canary},
+                    "code": [canary],
+                    "param": {"secret": canary},
+                }
+            },
+            400,
+        )
+
+        serialized = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn(canary, serialized)
+        self.assertEqual(payload["error"]["message"], "request failed")
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertEqual(payload["error"]["code"], "bad_request")
+        self.assertIsNone(payload["error"]["param"])
+
+    def test_codex_response_event_projection_drops_unknown_nested_fields(self) -> None:
+        canary = "codex-event-unknown-field-canary owner@example.test"
+        event = {
+            "type": "response.completed",
+            "sequence_number": 4,
+            "future_event_field": canary,
+            "response": {
+                "id": "resp_public",
+                "object": "response",
+                "created_at": 1_765_000_000,
+                "status": "completed",
+                "model": "gpt-test",
+                "future_response_field": canary,
+                "output": [{
+                    "id": "msg_public",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "future_item_field": canary,
+                    "content": [],
+                }],
+            },
+        }
+
+        projected = openai_v1_response_module.project_public_codex_response_event(event)
+
+        self.assertIsNotNone(projected)
+        serialized = json.dumps(projected, ensure_ascii=False)
+        self.assertNotIn(canary, serialized)
+        self.assertNotIn("future_event_field", projected)
+        self.assertNotIn("future_response_field", projected["response"])
+        self.assertNotIn("future_item_field", projected["response"]["output"][0])
+
+    def test_codex_response_event_projection_preserves_search_citations(self) -> None:
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_search",
+                "status": "completed",
+                "output": [{
+                    "id": "msg_search",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "answer",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://example.test/source",
+                            "title": "Source",
+                            "start_index": 0,
+                            "end_index": 6,
+                            "future_annotation_field": "drop-me",
+                        }],
+                    }],
+                }],
+            },
+        }
+
+        projected = openai_v1_response_module.project_public_codex_response_event(event)
+        citation = projected["response"]["output"][0]["content"][0]["annotations"][0]
+        self.assertEqual(citation["url"], "https://example.test/source")
+        self.assertEqual(citation["title"], "Source")
+        self.assertEqual(citation["start_index"], 0)
+        self.assertEqual(citation["end_index"], 6)
+        self.assertNotIn("future_annotation_field", citation)
+
     def test_responses_sse_uses_typed_events_without_chat_done_sentinel(self) -> None:
         output = "".join(responses_sse_stream([
             {"type": "response.created", "response": {"id": "resp_1"}},
@@ -57,6 +465,95 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertIn("event: error\n", output)
         self.assertNotIn(secret, output)
         self.assertNotIn("[DONE]", output)
+
+    def test_public_sse_rejects_container_event_types_without_serializing_them(self) -> None:
+        canary = "sse-event-type-container-secret"
+        malformed = [{"type": {"secret": canary}, "payload": "ignored"}]
+
+        responses_output = "".join(responses_sse_stream(malformed))
+        anthropic_output = "".join(anthropic_sse_stream(malformed))
+
+        for output in (responses_output, anthropic_output):
+            self.assertIn("event: error\n", output)
+            self.assertNotIn(canary, output)
+
+    def test_logged_public_stream_drops_explicit_credential_fields(self) -> None:
+        canary = "stream-access-token-canary owner@example.com"
+        item = {
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed"},
+            "access_token": canary,
+            "refresh_token": canary,
+            "id_token": canary,
+            "password": canary,
+            "account_email": canary,
+        }
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/responses",
+            "auto",
+            "responses",
+        )
+
+        with mock.patch("services.log_service.log_service.add"):
+            projected = list(call.stream([item]))
+        output = "".join(responses_sse_stream(projected))
+
+        self.assertNotIn(canary, output)
+        for key in ("access_token", "refresh_token", "id_token", "password", "account_email"):
+            self.assertNotIn(key, output)
+
+    def test_logged_responses_stream_drops_unknown_success_fields(self) -> None:
+        canary = "responses-success-metadata-canary owner@example.com"
+        item = {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hello",
+            "metadata": {"private_debug": canary},
+            "nested": {"canary": canary},
+        }
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/responses",
+            "auto",
+            "Responses",
+        )
+
+        with mock.patch("services.log_service.log_service.add"):
+            projected = list(call.stream([item]))
+
+        self.assertEqual(projected[0]["delta"], "hello")
+        serialized = json.dumps(projected, ensure_ascii=False)
+        self.assertNotIn(canary, serialized)
+        self.assertNotIn("metadata", projected[0])
+        self.assertNotIn("nested", projected[0])
+
+    def test_logged_public_json_drops_explicit_credential_fields(self) -> None:
+        canary = "json-access-token-canary owner@example.com"
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/chat/completions",
+            "auto",
+            "chat",
+        )
+
+        with mock.patch("services.log_service.log_service.add"):
+            response = asyncio.run(call.run(lambda: {
+                "access_token": canary,
+                "refresh_token": canary,
+                "id_token": canary,
+                "password": canary,
+                "account_email": canary,
+                "answer": "ok",
+            }))
+
+        serialized = json.dumps(response, ensure_ascii=False)
+        self.assertNotIn(canary, serialized)
+        for key in ("access_token", "refresh_token", "id_token", "password", "account_email"):
+            self.assertNotIn(key, response)
+        self.assertEqual(response["answer"], "ok")
 
     def test_responses_upstream_failure_events_are_projected_before_sse_and_logging(self) -> None:
         secret = "opaque-terminal-secret owner@example.test"
@@ -396,6 +893,67 @@ class PublicErrorContractTests(unittest.TestCase):
                 self.assertNotIn(secret, response.body.decode("utf-8"))
                 self.assertNotIn(secret, json.dumps(add.call_args, ensure_ascii=False, default=str))
 
+    def test_model_unavailable_is_a_client_error_for_non_streaming_calls(self) -> None:
+        from services.model_service import ModelUnavailableError
+
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/chat/completions",
+            "missing-model",
+            "chat",
+        )
+        with mock.patch("services.log_service.log_service.add"):
+            response = asyncio.run(call.run(lambda: (_ for _ in ()).throw(ModelUnavailableError("missing-model"))))
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertNotIn("missing-model", response.body.decode("utf-8"))
+
+    def test_model_unavailable_is_a_client_error_when_stream_starts(self) -> None:
+        from services.model_service import ModelUnavailableError
+
+        def handler():
+            raise ModelUnavailableError("missing-model")
+            yield  # pragma: no cover
+
+        call = LoggedCall(
+            {"id": "user-1", "name": "user", "role": "user"},
+            "/v1/chat/completions",
+            "missing-model",
+            "chat",
+        )
+        with mock.patch("services.log_service.log_service.add"):
+            response = asyncio.run(call.run(handler))
+
+        payload = json.loads(response.body)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(payload["error"]["type"], "invalid_request_error")
+        self.assertNotIn("missing-model", response.body.decode("utf-8"))
+
+    def test_chat_route_projects_unavailable_model_as_invalid_request(self) -> None:
+        from services.model_service import ModelUnavailableError
+
+        with (
+            mock.patch.object(ai_module, "require_identity_async", return_value={"id": "user-1", "role": "user"}),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete,
+                "text_backend",
+                side_effect=ModelUnavailableError("private-model-name"),
+            ),
+            mock.patch("services.log_service.log_service.add"),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/chat/completions",
+                headers=AUTH_HEADERS,
+                json={"model": "private-model-name", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+        self.assertNotIn("private-model-name", response.text)
+
     def test_logged_call_first_iterator_failure_is_safe_for_both_protocols(self) -> None:
         secret = "opaque-first-item-secret owner@example.com upstream body"
 
@@ -646,6 +1204,35 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertNotIn("message_preview", logged)
         self.assertIn(f'"message_len": {len(message)}', logged)
 
+    def test_image_stream_resolve_log_does_not_stringify_upstream_metadata(self) -> None:
+        canary = "image-resolve-upstream-metadata-canary owner@example.test"
+        request = conversation_module.ConversationRequest(
+            model="gpt-image-2",
+            prompt="draw an apple",
+        )
+        event = {
+            "type": "conversation.done",
+            "conversation_id": {"secret": canary},
+            "file_ids": [],
+            "sediment_ids": [],
+            "text": "safe upstream message",
+            "blocked": True,
+            "tool_invoked": {"secret": canary},
+            "turn_use_case": [canary],
+        }
+
+        with (
+            mock.patch.object(conversation_module, "conversation_events", return_value=iter([event])),
+            mock.patch.object(conversation_module, "_get_detailed_error_from_tasks", return_value=""),
+            mock.patch.object(conversation_module.logger, "info") as info,
+        ):
+            outputs = list(conversation_module.stream_image_outputs(object(), request))
+
+        self.assertEqual(outputs[-1].kind, "message")
+        self.assertNotIn(canary, repr(outputs))
+        logged = json.dumps(info.call_args_list, ensure_ascii=False, default=str)
+        self.assertNotIn(canary, logged)
+
     def test_refresh_token_failure_does_not_include_upstream_body(self) -> None:
         class FailedResponse:
             status_code = 401
@@ -779,6 +1366,103 @@ class PublicErrorContractTests(unittest.TestCase):
         logged = json.dumps(warning.call_args_list, ensure_ascii=False, default=str)
         self.assertNotIn(secret, logged)
         self.assertNotIn("body_preview", logged)
+
+    def test_content_filter_preview_bounds_client_controlled_nested_json(self) -> None:
+        value: object = "leaf"
+        for _ in range(1100):
+            value = {"content": value}
+
+        preview = content_filter_module.request_text(value)
+        shape = content_filter_module.request_shape(value)
+
+        self.assertIn("structured input truncated", preview)
+        self.assertEqual(shape, {})
+        self.assertLessEqual(
+            len(preview),
+            content_filter_module._MAX_REVIEW_TEXT_LEN,
+        )
+
+        large_preview = content_filter_module.request_text(["x" * 10_000] * 20)
+        self.assertLessEqual(len(large_preview), content_filter_module._MAX_REVIEW_TEXT_LEN)
+
+    def test_responses_route_accepts_deep_input_without_preview_recursion_error(self) -> None:
+        value: object = "leaf"
+        for _ in range(1100):
+            value = {"content": value}
+        call = mock.Mock()
+        call.run = mock.AsyncMock(return_value={"id": "response-test"})
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "identity-test"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module, "LoggedCall", return_value=call),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json={"model": "auto", "input": value},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"id": "response-test"})
+        call.run.assert_awaited_once()
+
+    def test_content_filter_rejects_container_review_settings_without_stringifying_them(self) -> None:
+        secret = "malformed-review-setting-canary owner@example.com"
+        review_config = {
+            "enabled": True,
+            "base_url": {"secret": secret},
+            "api_key": [secret],
+            "model": {"name": secret},
+            "prompt": [secret],
+            "fail_open": {"value": secret},
+        }
+        with (
+            mock.patch.object(
+                content_filter_module,
+                "config",
+                mock.Mock(sensitive_words=[], ai_review=review_config),
+            ),
+            mock.patch.object(content_filter_module.requests, "post") as post,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                content_filter_module.check_request("hello")
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertNotIn(secret, json.dumps(raised.exception.detail, ensure_ascii=False, default=str))
+        post.assert_not_called()
+
+    def test_content_filter_does_not_log_ambiguous_upstream_decision(self) -> None:
+        secret = "ambiguous-review-secret owner@example.com"
+
+        class AmbiguousResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"choices": [{"message": {"content": secret}}]}
+
+        review_config = {
+            "enabled": True,
+            "base_url": "https://review.example",
+            "api_key": "review-key",
+            "model": "review-model",
+            "fail_open": True,
+        }
+        with (
+            mock.patch.object(content_filter_module, "config", mock.Mock(sensitive_words=[], ai_review=review_config)),
+            mock.patch.object(content_filter_module.requests, "post", return_value=AmbiguousResponse()),
+            mock.patch.object(content_filter_module.logger, "warning") as warning,
+        ):
+            content_filter_module.check_request("hello")
+
+        logged = json.dumps(warning.call_args_list, ensure_ascii=False, default=str)
+        self.assertNotIn(secret, logged)
+        self.assertNotIn("owner@example.com", logged)
 
     def test_unknown_exception_is_fail_closed_but_explicit_safe_error_survives(self) -> None:
         secret = "opaque-token-7f3d owner@example.com upstream fragment"

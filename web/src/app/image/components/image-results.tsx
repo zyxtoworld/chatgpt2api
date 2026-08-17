@@ -4,9 +4,12 @@ import { memo, useEffect, useRef, useState } from "react";
 import { Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { createDownloadAbortRegistry } from "@/lib/download-lifecycle.js";
+import { downloadBlobFile } from "@/lib/download-text.js";
+import { fetchImageAsFile } from "@/lib/image-download.js";
 import { getElapsedSeconds } from "@/lib/elapsed-display";
 import { setImageDimension } from "@/lib/image-dimensions";
-import { getStoredImageSrc } from "@/lib/stored-image-source";
+import { getStoredImageSrc, normalizeStoredImageUrl } from "@/lib/stored-image-source";
 import { cn } from "@/lib/utils";
 import type { ImageConversation, ImageTurnStatus, StoredImage, StoredReferenceImage } from "@/store/image-conversations";
 
@@ -31,41 +34,37 @@ type ImageResultsProps = {
   formatConversationTime: (value: string) => string;
 };
 
-async function downloadStoredImage(image: StoredImage, index: number) {
+async function downloadStoredImage(image: StoredImage, index: number, signal?: AbortSignal) {
   let blob: Blob | null = null;
   try {
+    if (signal?.aborted) return;
     if (image.b64_json) {
       const binary = atob(image.b64_json);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      if (signal?.aborted) return;
       blob = new Blob([bytes], { type: "image/png" });
     } else if (image.url) {
       // 确保 URL 是绝对路径
-      const url = image.url.startsWith("http") ? image.url : `${window.location.origin}${image.url}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      blob = await res.blob();
+      const safeUrl = normalizeStoredImageUrl(image.url);
+      if (!safeUrl) return;
+      const url = safeUrl.startsWith("http") ? safeUrl : `${window.location.origin}${safeUrl}`;
+      blob = await fetchImageAsFile(url, `image-${index + 1}.png`, signal);
     } else {
       return;
     }
   } catch (err) {
+    if (signal?.aborted) return;
     console.error("Failed to download image:", err);
     // 如果 fetch 失败，尝试直接在新窗口打开
-    if (image.url) {
-      window.open(image.url, "_blank");
+    const safeUrl = normalizeStoredImageUrl(image.url);
+    if (safeUrl) {
+      window.open(safeUrl, "_blank", "noopener,noreferrer");
     }
     return;
   }
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `image-${index + 1}.png`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  if (!blob || signal?.aborted) return;
+  downloadBlobFile(blob, `image-${index + 1}.png`);
 }
 
 export function ImageResults({
@@ -83,6 +82,13 @@ export function ImageResults({
 }: ImageResultsProps) {
   const [imageDimensions, setImageDimensions] = useState<Record<string, string>>({});
   const [currentTime, setCurrentTime] = useState(0);
+  const downloadOwnerRef = useRef(createDownloadAbortRegistry());
+
+  useEffect(() => {
+    const downloadOwner = downloadOwnerRef.current;
+    downloadOwner.activate();
+    return () => downloadOwner.cancel();
+  }, []);
   
   // 仅在存在 loading 图片时启动定时器，避免空闲时无谓重渲染
   const hasLoadingImages = selectedConversation?.turns.some(
@@ -277,7 +283,13 @@ export function ImageResults({
                                   variant="outline"
                                   size="sm"
                                   className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
-                                  onClick={() => void downloadStoredImage(image, index)}
+                                      onClick={() => {
+                                        const downloadOwner = downloadOwnerRef.current;
+                                        const controller = downloadOwner.begin();
+                                        void downloadStoredImage(image, index, controller.signal).finally(() => {
+                                          downloadOwner.finish(controller);
+                                        });
+                                      }}
                                   aria-label="下载"
                                 >
                                   <Download className="size-3 sm:size-4" />

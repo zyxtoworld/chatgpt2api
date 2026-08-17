@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import json
+import tempfile
+import threading
+import urllib.error
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fastapi import HTTPException
 
 import services.openai_backend_api as backend_module
 from services.openai_backend_api import CODEX_RESPONSES_MODEL, OpenAIBackendAPI
+from services.account_service import AccountService
 from services.protocol import openai_v1_chat_complete, openai_v1_response
+from services.storage.json_storage import JSONStorageBackend
 
 
 FUNCTION_TOOL = {
@@ -181,6 +187,92 @@ class _IncrementalSSE:
 class CodexToolCallContractTests(unittest.TestCase):
     def setUp(self) -> None:
         _FakeCodexBackend.instances.clear()
+
+    def test_late_responses_usage_does_not_mutate_replaced_same_token_account(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingBackend:
+            def iter_codex_response_events(self, _payload: dict[str, object]):
+                yield {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("responses stream did not receive release")
+                yield {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "object": "response",
+                        "status": "completed",
+                        "model": CODEX_RESPONSES_MODEL,
+                        "output": [],
+                        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    },
+                }
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = AccountService(JSONStorageBackend(Path(temp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "responses-token", "type": "Pro", "source_type": "codex", "status": "正常"}])
+            service.get_text_access_token = lambda **_kwargs: "responses-token"
+            with (
+                mock.patch.object(openai_v1_response, "account_service", service),
+                mock.patch.object(openai_v1_response, "OpenAIBackendAPI", return_value=BlockingBackend()),
+                mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+            ):
+                stream = openai_v1_response.stream_codex_response(
+                    {"model": "auto", "input": "hello", "stream": True}
+                )
+                first = next(stream)
+                self.assertEqual(first["type"], "response.created")
+                remaining: list[dict[str, object]] = []
+                stream_errors: list[BaseException] = []
+
+                def consume_remaining() -> None:
+                    try:
+                        remaining.extend(stream)
+                    except BaseException as exc:
+                        stream_errors.append(exc)
+
+                consumer = threading.Thread(target=consume_remaining)
+                consumer.start()
+                self.assertTrue(entered.wait(5))
+                service.update_account(
+                    "responses-token",
+                    {"last_used_at": "2000-01-01 00:00:00", "success": 99},
+                )
+                release.set()
+                consumer.join(5)
+                self.assertFalse(consumer.is_alive())
+                self.assertEqual(stream_errors, [])
+                self.assertEqual([event["type"] for event in remaining], ["response.completed"])
+
+            current = service.get_account("responses-token")
+            self.assertIsNotNone(current)
+            self.assertEqual(current["last_used_at"], "2000-01-01 00:00:00")
+            self.assertEqual(current["success"], 99)
+
+    def test_responses_lease_capture_failure_does_not_create_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = AccountService(JSONStorageBackend(Path(temp_dir) / "accounts.json"))
+            service.add_account_items([{"access_token": "responses-token", "type": "Pro", "status": "正常"}])
+            service.get_text_access_token = lambda **_kwargs: "responses-token"
+            with (
+                mock.patch.object(
+                    service,
+                    "_get_account_lease",
+                    side_effect=RuntimeError("lease capture failed"),
+                ),
+                mock.patch.object(openai_v1_response, "account_service", service),
+                mock.patch.object(openai_v1_response, "OpenAIBackendAPI") as backend,
+                mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+                self.assertRaisesRegex(RuntimeError, "lease capture failed"),
+            ):
+                list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
+
+            backend.assert_not_called()
 
     def test_responses_function_tool_stream_uses_codex_account_and_native_events(self) -> None:
         body = {
@@ -561,6 +653,16 @@ class CodexToolCallContractTests(unittest.TestCase):
                         "tools": [tool],
                     })
                 self.assertEqual(raised.exception.status_code, 400)
+
+    def test_responses_rejects_noncanonical_tool_type(self) -> None:
+        with self.assertRaises(HTTPException) as raised:
+            openai_v1_response.codex_response_payload({
+                "model": "auto",
+                "input": "Use the weather tool",
+                "tools": [{**FUNCTION_TOOL, "type": " function "}],
+            })
+
+        self.assertEqual(raised.exception.status_code, 400)
 
     def test_responses_compaction_stream_preserves_opaque_output_item(self) -> None:
         compaction_item = {
@@ -1503,6 +1605,45 @@ class CodexToolCallContractTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], 17)
         backend._ensure_codex_source_account.assert_called_once_with()
 
+    def test_codex_http_error_body_is_bounded_closed_and_not_exposed(self) -> None:
+        class ErrorBody:
+            def __init__(self) -> None:
+                self.closed = False
+                self.read_sizes: list[int] = []
+                self.body = b"opaque-codex-secret owner@example.com" * 100
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                if size < 0:
+                    return self.body
+                return self.body[:size]
+
+            def close(self) -> None:
+                self.closed = True
+
+        payload = {"model": CODEX_RESPONSES_MODEL, "input": "hello", "stream": True}
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.base_url = "https://chatgpt.example"
+        backend._ensure_codex_source_account = mock.Mock()
+        backend._codex_responses_headers = mock.Mock(return_value={"Authorization": "Bearer codex-token"})
+        error_body = ErrorBody()
+        error = urllib.error.HTTPError(
+            "https://chatgpt.example/backend-api/codex/responses",
+            502,
+            "bad gateway",
+            {},
+            error_body,
+        )
+
+        with mock.patch.object(backend_module.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaises(backend_module.UpstreamHTTPError) as raised:
+                list(backend.iter_codex_response_events(payload, timeout=1))
+
+        self.assertTrue(error_body.closed)
+        self.assertTrue(error.read_sizes)
+        self.assertNotIn("opaque-codex-secret", str(raised.exception))
+
 
 class ChatFunctionToolContractTests(unittest.TestCase):
     @staticmethod
@@ -2115,6 +2256,111 @@ class ChatFunctionToolContractTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 list(openai_v1_chat_complete._stream_chat_response_from_codex(self._chat_body()))
+
+    def test_chat_rejects_missing_required_codex_output_item(self) -> None:
+        terminal = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_missing_item",
+                "model": "auto",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+        for event_type in ("response.output_item.added", "response.output_item.done"):
+            with self.subTest(event_type=event_type):
+                events = [
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_missing_item", "model": "auto"},
+                    },
+                    {"type": event_type, "output_index": 0, "item": None},
+                    terminal,
+                ]
+                with mock.patch.object(
+                    openai_v1_chat_complete.openai_v1_response,
+                    "stream_codex_response",
+                    return_value=iter(events),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "malformed output item"):
+                        list(openai_v1_chat_complete._stream_chat_response_from_codex(self._chat_body(stream=True)))
+
+    def test_chat_stream_rejects_malformed_codex_message_content(self) -> None:
+        canary = "message-content-container-canary owner@example.test"
+        message = {
+            "id": "msg_bad_stream_content",
+            "type": "message",
+            "content": {"secret": canary},
+        }
+        events = [
+            {"type": "response.output_item.done", "output_index": 0, "item": message},
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_bad_stream_content",
+                    "model": "auto",
+                    "output": [message],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            },
+        ]
+        with mock.patch.object(
+            openai_v1_chat_complete.openai_v1_response,
+            "stream_codex_response",
+            return_value=iter(events),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "malformed message content") as raised:
+                list(openai_v1_chat_complete._stream_chat_response_from_codex(self._chat_body(stream=True)))
+        self.assertNotIn(canary, str(raised.exception))
+
+    def test_chat_rejects_malformed_codex_citation_scalars(self) -> None:
+        canary = "citation-container-canary owner@example.test"
+        message = {
+            "id": "msg_bad_citation",
+            "type": "message",
+            "content": [{
+                "type": "output_text",
+                "text": "answer",
+                "annotations": [{
+                    "type": "url_citation",
+                    "url": {"secret": canary},
+                    "title": "Example",
+                    "start_index": 0,
+                    "end_index": 6,
+                }],
+            }],
+        }
+        terminal = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_bad_citation",
+                "model": "auto",
+                "output": [message],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+        with mock.patch.object(
+            openai_v1_chat_complete.openai_v1_response,
+            "stream_codex_response",
+            return_value=iter([terminal]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "malformed citation") as raised:
+                openai_v1_chat_complete._chat_response_from_codex(self._chat_body())
+        self.assertNotIn(canary, str(raised.exception))
+
+        stream_events = [
+            {"type": "response.output_item.done", "item": message},
+            terminal,
+        ]
+        with mock.patch.object(
+            openai_v1_chat_complete.openai_v1_response,
+            "stream_codex_response",
+            return_value=iter(stream_events),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "malformed citation") as raised:
+                list(openai_v1_chat_complete._stream_chat_response_from_codex(self._chat_body(stream=True)))
+        self.assertNotIn(canary, str(raised.exception))
 
     def test_chat_tool_text_parts_map_to_plain_function_output(self) -> None:
         body = {
@@ -2752,6 +2998,19 @@ class IncompleteResponseContractTests(unittest.TestCase):
 
         self.assertEqual(response["incomplete_details"], {"reason": "content_filter"})
         self.assertNotIn("private-detail", json.dumps(response, ensure_ascii=False))
+
+    def test_non_stream_terminal_response_drops_unknown_public_fields(self) -> None:
+        canary = "terminal-response-internal-canary"
+        event = self._terminal_event()
+        event["response"]["future_response_field"] = canary
+        event["response"]["metadata"] = {"nested": canary}
+
+        with mock.patch.object(openai_v1_response, "response_events", return_value=iter([event])):
+            response = openai_v1_response.handle({"model": "auto", "input": "hello"})
+
+        self.assertNotIn("future_response_field", response)
+        self.assertNotIn("metadata", response)
+        self.assertNotIn(canary, json.dumps(response, ensure_ascii=False))
 
 
 class ToolRequestValidationContractTests(unittest.TestCase):

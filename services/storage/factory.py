@@ -85,10 +85,5 @@ def _mask_password(url: str) -> str:
 
 
 def _mask_token(url: str) -> str:
-    """隐藏 URL 中的 token"""
-    if "@" in url and "://" in url:
-        protocol, rest = url.split("://", 1)
-        if "@" in rest:
-            _, host = rest.split("@", 1)
-            return f"{protocol}://****@{host}"
-    return url
+    """返回可写入日志的仓库地址投影，不保留凭据、query 或 fragment。"""
+    return redact_url_credentials(url) or "[REDACTED_URL]"

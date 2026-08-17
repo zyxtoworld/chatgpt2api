@@ -26,7 +26,6 @@ import {
   resumeImagePoll,
   type Account,
   type ImageModel,
-  type Model,
   type ImageTask,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
@@ -36,6 +35,14 @@ import { createConversationQueueGate } from "@/lib/image-conversation-queue-gate
 import { applyImageConversationUpdate, findImageTaskConversation } from "@/lib/image-conversation-update";
 import { createScrollCleanupSnapshot } from "@/lib/image-scroll-cleanup";
 import { settleImageTaskSubmissions } from "@/lib/image-task-submission";
+import { fetchImageAsFile } from "@/lib/image-download";
+import { formatAvailableImageQuota } from "@/lib/image-account-state";
+import {
+  canSubmitImage,
+  resolveImageModelLoadError,
+  resolveImageModelLoadSuccess,
+  selectImageModel,
+} from "@/lib/image-model-state";
 import { readOptionalStorageItem, removeOptionalStorageItem, writeOptionalStorageItem } from "@/lib/optional-storage";
 import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
 import { useSettingsStore } from "@/app/settings/store";
@@ -63,6 +70,7 @@ const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
+type ImageModelLoadStatus = "loading" | "ready" | "empty" | "error";
 
 function loadScrollPositions(): Map<string, number> {
   if (typeof window === "undefined") return new Map();
@@ -121,8 +129,7 @@ function formatConversationTime(value: string) {
 }
 
 function formatAvailableQuota(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status !== "禁用");
-  return String(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+  return formatAvailableImageQuota(accounts);
 }
 
 function createId() {
@@ -149,20 +156,6 @@ function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
   return new File([bytes], fileName, { type: mimeType || matchedMimeType || "image/png" });
 }
 
-function filterImageModels(items: Model[]): ImageModel[] {
-  return items
-    .map((item) => String(item.id || "").trim())
-    .filter((id, index, list) => id.toLowerCase().includes("image") && list.indexOf(id) === index);
-}
-
-function normalizeStoredImageModel(value: string | null, availableModels: ImageModel[]): ImageModel {
-  const normalized = String(value || "").trim();
-  if (normalized && availableModels.includes(normalized)) {
-    return normalized;
-  }
-  return availableModels[0] || "gpt-image-2";
-}
-
 function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
   if (!image.b64_json) {
     return null;
@@ -175,16 +168,7 @@ function buildReferenceImageFromResult(image: StoredImage, fileName: string): St
   };
 }
 
-async function fetchImageAsFile(url: string, fileName: string) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error("读取结果图失败");
-  }
-  const blob = await response.blob();
-  return new File([blob], fileName, { type: blob.type || "image/png" });
-}
-
-async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string) {
+async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string, signal?: AbortSignal) {
   const direct = buildReferenceImageFromResult(image, fileName);
   if (direct) {
     return {
@@ -196,7 +180,7 @@ async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: 
   if (!image.url) {
     return null;
   }
-  const file = await fetchImageAsFile(image.url, fileName);
+  const file = await fetchImageAsFile(image.url, fileName, signal);
   return {
     referenceImage: {
       name: file.name,
@@ -464,6 +448,7 @@ async function recoverConversationHistory(items: ImageConversation[], isCurrent:
 function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const quotaOwnerRef = useRef(createLatestActionOwner());
   const continueEditOwnerRef = useRef(createLatestActionOwner());
+  const continueEditAbortRef = useRef<AbortController | null>(null);
   const historyLoadOwnerRef = useRef(createLatestActionOwner());
   const referenceImageReadOwnerRef = useRef(createLifecycleActionOwner());
   const historyMutationOwnerRef = useRef(createLifecycleActionOwner());
@@ -490,8 +475,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imageWidth, setImageWidth] = useState("1024");
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
-  const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
-  const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2"]);
+  const [imageModel, setImageModel] = useState<ImageModel>("");
+  const [imageModels, setImageModels] = useState<ImageModel[]>([]);
+  const [imageModelStatus, setImageModelStatus] = useState<ImageModelLoadStatus>("loading");
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
@@ -713,21 +699,23 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     const loadImageModels = async () => {
       try {
         const data = await fetchModels();
-        const available = filterImageModels(Array.isArray(data.data) ? data.data : []);
-        if (cancelled || available.length === 0) {
+        const loaded = resolveImageModelLoadSuccess(data);
+        if (cancelled) {
           return;
         }
+        const available = loaded.models as ImageModel[];
         setImageModels(available);
         const storedModel = typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_MODEL_STORAGE_KEY) : null;
         setImageModel((current) => {
-          if (available.includes(current)) {
-            return current;
-          }
-          return normalizeStoredImageModel(storedModel, available);
+          return selectImageModel(current || storedModel, available);
         });
+        setImageModelStatus(loaded.status as ImageModelLoadStatus);
       } catch {
         if (!cancelled) {
-          setImageModels(["gpt-image-2"]);
+          const failed = resolveImageModelLoadError();
+          setImageModels(failed.models);
+          setImageModel("");
+          setImageModelStatus(failed.status as ImageModelLoadStatus);
         }
       }
     };
@@ -766,7 +754,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   useEffect(() => {
     const continueEditOwner = continueEditOwnerRef.current;
     continueEditOwner.activate();
-    return () => continueEditOwner.cancel();
+    return () => {
+      continueEditOwner.cancel();
+      continueEditAbortRef.current?.abort();
+      continueEditAbortRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -789,6 +781,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   useEffect(() => {
     continueEditOwnerRef.current.invalidate();
+    continueEditAbortRef.current?.abort();
+    continueEditAbortRef.current = null;
     referenceImageReadOwnerRef.current.invalidate();
   }, [selectedConversationId]);
 
@@ -990,6 +984,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const clearComposerInputs = useCallback(() => {
     referenceImageReadOwnerRef.current.invalidate();
     continueEditOwnerRef.current.invalidate();
+    continueEditAbortRef.current?.abort();
+    continueEditAbortRef.current = null;
     setImagePrompt("");
     setReferenceImageFiles([]);
     setReferenceImages([]);
@@ -1252,6 +1248,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
       const continueEditOwner = continueEditOwnerRef.current;
       const requestOwner = continueEditOwner.begin(conversationId);
+      continueEditAbortRef.current?.abort();
+      const abortController = new AbortController();
+      continueEditAbortRef.current = abortController;
       try {
         const nextReference =
           "dataUrl" in image
@@ -1259,7 +1258,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
                 referenceImage: image,
                 file: dataUrlToFile(image.dataUrl, image.name, image.type),
               }
-            : await buildReferenceImageFromStoredImage(image, `conversation-${conversationId}-${Date.now()}.png`);
+            : await buildReferenceImageFromStoredImage(
+                image,
+                `conversation-${conversationId}-${Date.now()}.png`,
+                abortController.signal,
+              );
         if (!nextReference) {
           return;
         }
@@ -1281,6 +1284,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         }
         const message = error instanceof Error ? error.message : "读取结果图失败";
         toast.error(message);
+      } finally {
+        if (continueEditAbortRef.current === abortController) {
+          continueEditAbortRef.current = null;
+        }
       }
     },
     [],
@@ -1784,6 +1791,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       toast.error("请输入提示词");
       return;
     }
+    if (!canSubmitImage({ prompt, model: imageModel, models: imageModels, status: imageModelStatus })) {
+      toast.error(
+        imageModelStatus === "loading"
+          ? "模型列表加载中，请稍候"
+          : "当前没有可用的图片模型",
+      );
+      return;
+    }
 
     const historyMutationOwner = historyMutationOwnerRef.current;
     const mutationOwner = beginHistoryMutation();
@@ -1969,6 +1984,13 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             imageQuality={imageQuality}
             imageModel={imageModel}
             imageModels={imageModels}
+            imageModelStatus={imageModelStatus}
+            canSubmit={canSubmitImage({
+              prompt: imagePrompt,
+              model: imageModel,
+              models: imageModels,
+              status: imageModelStatus,
+            })}
             availableQuota={availableQuota}
             activeTaskCount={activeTaskCount}
             referenceImages={referenceImages}
