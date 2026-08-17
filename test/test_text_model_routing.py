@@ -21,6 +21,7 @@ from services.protocol import (
 )
 from services.storage.json_storage import JSONStorageBackend
 from test.fixtures.image_inputs import image_fixture_bytes
+from utils.helper import UpstreamHTTPError
 
 
 class TextAccountRoutingTests(unittest.TestCase):
@@ -72,6 +73,43 @@ class TextAccountRoutingTests(unittest.TestCase):
             }
 
         self.assertEqual(tokens, {"free", "plus", "pro"})
+
+    def test_transient_upstream_failure_fails_over_before_emitting_text(self) -> None:
+        request = conversation.ConversationRequest(
+            model="auto",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        created_tokens: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+                self.closed = 0
+                created_tokens.append(access_token)
+
+            def close(self) -> None:
+                self.closed += 1
+
+        def events(backend: Backend, **_kwargs: object):
+            if backend.access_token == "bad":
+                raise UpstreamHTTPError("conversation", 502, {"error": "upstream_error"})
+            yield {"type": "conversation.delta", "delta": "ok"}
+
+        with (
+            mock.patch.object(conversation, "account_service", self.service),
+            mock.patch.object(conversation, "OpenAIBackendAPI", Backend),
+            mock.patch.object(conversation, "conversation_events", side_effect=events),
+            mock.patch.object(
+                self.service,
+                "get_text_access_token",
+                return_value="good",
+            ) as select_fallback,
+        ):
+            result = list(conversation._stream_text_deltas(Backend("bad"), request))
+
+        self.assertEqual(result, ["ok"])
+        self.assertEqual(created_tokens, ["bad", "bad", "good"])
+        select_fallback.assert_called_once_with(excluded_tokens={"bad"}, model="auto")
 
     def test_late_text_usage_cannot_mutate_replaced_same_token_account(self) -> None:
         entered = threading.Event()

@@ -25,6 +25,7 @@ from utils.helper import (
     is_codex_image_model,
     is_supported_image_model,
     split_image_model,
+    UpstreamHTTPError,
 )
 from utils.image_tokens import _decode_bounded_base64, count_image_content_tokens
 from utils.log import logger
@@ -965,6 +966,19 @@ def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest)
                         model=request.model,
                     )
                 if token:
+                    continue
+            if (
+                    token
+                    and not emitted
+                    and isinstance(exc, UpstreamHTTPError)
+                    and exc.status_code in {429, 500, 502, 503, 504}
+            ):
+                fallback_token = account_service.get_text_access_token(
+                    excluded_tokens=set(attempted_tokens),
+                    model=request.model,
+                )
+                if fallback_token and fallback_token not in attempted_tokens:
+                    token = fallback_token
                     continue
             raise
         finally:
