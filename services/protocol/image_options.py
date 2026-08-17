@@ -11,6 +11,7 @@ IMAGE_OUTPUT_FORMAT_VALUES = frozenset({"png", "jpeg", "webp"})
 _IMAGE_SIZE_PATTERN = re.compile(r"([1-9][0-9]{0,3})x([1-9][0-9]{0,3})")
 _MAX_IMAGE_LONG_EDGE = 3840
 _MAX_IMAGE_SHORT_EDGE = 2160
+_MIN_IMAGE_PIXELS = 655_360
 _MAX_IMAGE_PIXELS = _MAX_IMAGE_LONG_EDGE * _MAX_IMAGE_SHORT_EDGE
 
 
@@ -52,6 +53,7 @@ def normalize_image_size(value: object, *, editing: bool = False) -> str | None:
         or long_edge > short_edge * 3
         or long_edge > _MAX_IMAGE_LONG_EDGE
         or short_edge > _MAX_IMAGE_SHORT_EDGE
+        or width * height < _MIN_IMAGE_PIXELS
         or width * height > _MAX_IMAGE_PIXELS
     ):
         raise PublicSafeValueError("size is outside the supported gpt-image-2 limits")

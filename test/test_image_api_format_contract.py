@@ -833,6 +833,7 @@ class ImageAPIFormatContractTests(unittest.TestCase):
                 for invalid in (
                     {"quality": "ultra"},
                     {"size": "1000x1000"},
+                    {"size": "512x1024"},
                     {"size": "3840x3840"},
                     {"size": f"{'9' * 5000}x16"},
                 )
