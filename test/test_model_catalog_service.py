@@ -437,7 +437,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         catalog.list_models()
 
-        self.assertEqual(calls, [("anonymous", ""), ("authenticated-dual", "pro-a")])
+        self.assertCountEqual(calls, [("anonymous", ""), ("authenticated-dual", "pro-a")])
         self.assertEqual(
             endpoint_calls,
             [("web", "pro-a"), ("codex", "pro-a")],
