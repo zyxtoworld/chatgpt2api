@@ -132,6 +132,26 @@ class ModelCatalogServiceTests(unittest.TestCase):
         )
         self.assertTrue(shared_route.allow_anonymous)
 
+    def test_empty_account_catalog_is_not_published_as_ready(self) -> None:
+        self.outcomes["pro"] = model_list()
+
+        with self.assertRaises(ModelCatalogPendingError):
+            self.catalog.list_models()
+
+        self.assertNotIn(
+            "pro",
+            self.catalog._ready_account_types,
+        )
+        self.assertGreater(
+            self.catalog._account_group_retry_not_before[("web", "Pro")],
+            self.now,
+        )
+
+        self.outcomes["pro"] = model_list("pro-recovered")
+        self.now += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
+        result = self.catalog.list_models()
+        self.assertIn("pro-recovered", {item["id"] for item in result["data"]})
+
     def test_catalog_keeps_web_and_codex_same_plan_in_separate_capability_groups(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "source-groups-accounts.json")

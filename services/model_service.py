@@ -199,7 +199,14 @@ class ModelCatalogService:
             # obtains its account metadata from a different singleton.
             setattr(backend, "_catalog_source_type", source_type)
         try:
-            return self._model_map(backend.list_models(deadline=deadline))
+            models = self._model_map(backend.list_models(deadline=deadline))
+            if not models:
+                # A successful HTTP response with no usable model is not a
+                # ready catalog.  Publishing it would make the account group
+                # look healthy, suppress retry backoff, and can turn a cold
+                # /v1/models response into a misleading synthetic-only list.
+                raise RuntimeError("upstream model catalog is empty")
+            return models
         finally:
             backend.close()
 
