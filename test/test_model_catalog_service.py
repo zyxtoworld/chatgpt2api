@@ -20,6 +20,12 @@ from services.openai_backend_api import InvalidAccessTokenError
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import UpstreamHTTPError
 
+# Contract provenance: upstream/main at dc105e51 (services/openai_backend_api.py)
+# uses one anonymous endpoint (/backend-anon/models?iim=false&is_gizmo=false)
+# and one authenticated Web endpoint (/backend-api/models?history_and_training_disabled=false).
+# This fork additionally routes Codex source groups through its dedicated Codex endpoint;
+# catalogs are unioned per (source_type, normalized plan), never across sources.
+
 
 def model_list(*model_ids: str) -> dict:
     return {
