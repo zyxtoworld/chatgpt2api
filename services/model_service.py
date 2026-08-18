@@ -25,6 +25,7 @@ from utils.log import logger
 
 
 AccountModelGroup = tuple[str, str]
+AccountGroupSignature = tuple[tuple[AccountModelGroup, tuple[str, ...]], ...]
 
 
 _MODEL_IO_THREAD_CAPACITY = 4
@@ -112,7 +113,7 @@ class ModelCatalogService:
         self._lock = RLock()
         self._catalog_condition = Condition(self._lock)
         self._expires_at = 0.0
-        self._account_signature: tuple[str, ...] = ()
+        self._account_signature: AccountGroupSignature = ()
         self._anonymous_models: dict[str, dict[str, Any]] = {}
         self._anonymous_ready = False
         self._anonymous_retry_not_before = 0.0
@@ -160,8 +161,11 @@ class ModelCatalogService:
         return groups
 
     @staticmethod
-    def _signature(groups: dict[AccountModelGroup, list[str]]) -> tuple[AccountModelGroup, ...]:
-        return tuple(sorted(groups))
+    def _signature(groups: dict[AccountModelGroup, list[str]]) -> AccountGroupSignature:
+        return tuple(
+            (account_group, tuple(groups[account_group]))
+            for account_group in sorted(groups)
+        )
 
     def _active_accounts_by_type(self) -> dict[str, list[str]]:
         """Compatibility view used by image/public helpers; routing uses groups."""
@@ -331,9 +335,14 @@ class ModelCatalogService:
         dict[str, dict[str, dict[str, Any]]],
         set[str],
         bool,
+        dict[AccountModelGroup, _IncrementalAccountTypeCatalogResult],
     ]:
         models_by_account_type: dict[AccountModelGroup, dict[str, dict[str, Any]]] = {}
         successful_account_types: set[AccountModelGroup] = set()
+        successful_account_results: dict[
+            AccountModelGroup,
+            _IncrementalAccountTypeCatalogResult,
+        ] = {}
         anonymous_succeeded = False
         futures = []
         try:
@@ -389,6 +398,7 @@ class ModelCatalogService:
                     if result.models is not None:
                         models_by_account_type[account_type] = result.models
                         successful_account_types.add(account_type)
+                        successful_account_results[account_type] = result
                     elif account_type in previous_models_by_account_type:
                         models_by_account_type[account_type] = deepcopy(
                             previous_models_by_account_type[account_type]
@@ -407,6 +417,7 @@ class ModelCatalogService:
             models_by_account_type,
             successful_account_types,
             anonymous_succeeded,
+            successful_account_results,
         )
 
     def _prune_inactive_account_types_locked(
@@ -419,6 +430,58 @@ class ModelCatalogService:
             self._ready_account_groups.discard(account_group)
         for account_group in set(self._account_group_retry_not_before) - active_groups:
             self._account_group_retry_not_before.pop(account_group, None)
+
+    def _reconcile_ready_groups_locked(
+        self,
+        *,
+        started_signature: AccountGroupSignature,
+        current_groups: dict[AccountModelGroup, list[str]],
+        successful_results: dict[
+            AccountModelGroup,
+            _IncrementalAccountTypeCatalogResult,
+        ],
+        previous_ready_groups: set[AccountModelGroup],
+    ) -> None:
+        """Reconcile per-group readiness against one live owner snapshot."""
+        started_groups = dict(started_signature)
+        now = self._clock()
+        ready_groups: set[AccountModelGroup] = set()
+        retry_at: dict[AccountModelGroup, float] = {}
+
+        for account_group, access_tokens in current_groups.items():
+            current_tokens = tuple(access_tokens)
+            membership_stable = started_groups.get(account_group) == current_tokens
+            result = successful_results.get(account_group)
+            owner_valid = False
+            if result is not None and result.models is not None:
+                resolved_token, current_account = self._get_account_lease(
+                    result.resolved_token
+                )
+                owner_valid = (
+                    resolved_token == result.resolved_token
+                    and current_account is result.expected_account
+                    and result.resolved_token in current_tokens
+                )
+
+            if owner_valid:
+                ready_groups.add(account_group)
+                continue
+
+            if membership_stable and account_group in previous_ready_groups:
+                ready_groups.add(account_group)
+                retry_at[account_group] = now + MODEL_CATALOG_RETRY_BACKOFF_SECS
+            elif membership_stable:
+                retry_at[account_group] = now + MODEL_CATALOG_RETRY_BACKOFF_SECS
+            else:
+                retry_at[account_group] = now
+
+        self._ready_account_groups = ready_groups
+        for account_group in current_groups:
+            retry = retry_at.get(account_group)
+            if retry is None:
+                self._account_group_retry_not_before.pop(account_group, None)
+            else:
+                self._account_group_retry_not_before[account_group] = retry
 
     def _has_cold_ready_snapshot_locked(
         self,
@@ -439,10 +502,20 @@ class ModelCatalogService:
             refresh_types = set(groups)
             refresh_anonymous = True
         elif signature_changed:
+            signature_groups = dict(self._account_signature)
+            changed_groups = {
+                account_group
+                for account_group, access_tokens in groups.items()
+                if signature_groups.get(account_group) != tuple(access_tokens)
+            }
+            for account_group in changed_groups:
+                self._ready_account_groups.discard(account_group)
+                self._account_group_retry_not_before[account_group] = now
             refresh_types = {
                 account_type
                 for account_type in groups
-                if account_type not in self._ready_account_groups
+                if account_type in changed_groups
+                or account_type not in self._ready_account_groups
                 or (
                     account_type in self._account_group_retry_not_before
                     and now >= self._account_group_retry_not_before[account_type]
@@ -450,8 +523,21 @@ class ModelCatalogService:
             }
             refresh_anonymous = (
                 not self._anonymous_ready
-                or now >= self._anonymous_retry_not_before
+                or (
+                    self._anonymous_retry_not_before > 0
+                    and now >= self._anonymous_retry_not_before
+                )
             )
+            if not refresh_types and not refresh_anonymous:
+                current_signature = self._signature(groups)
+                self._account_signature = current_signature
+                self._catalog_complete = (
+                    self._anonymous_ready
+                    and set(groups) <= self._ready_account_groups
+                )
+                if self._catalog_complete and now >= self._expires_at:
+                    refresh_types = set(groups)
+                    refresh_anonymous = True
         elif self._catalog_complete and now >= self._expires_at:
             refresh_types = {
                 account_type
@@ -555,12 +641,18 @@ class ModelCatalogService:
         refresh_anonymous: bool = True,
     ) -> None:
         started_signature = self._signature(groups)
+        with self._lock:
+            previous_ready_groups = set(self._ready_account_groups)
         account_types = set(groups) if refresh_account_types is None else set(refresh_account_types)
         pending = [
             (account_type, groups[account_type])
             for account_type in sorted(account_types & set(groups))
         ]
         futures: dict[object, tuple[str, str | None]] = {}
+        successful_account_results: dict[
+            AccountModelGroup,
+            _IncrementalAccountTypeCatalogResult,
+        ] = {}
         anonymous_finished = not refresh_anonymous
         anonymous_succeeded = not refresh_anonymous
         admission_blocked = False
@@ -628,6 +720,8 @@ class ModelCatalogService:
                             generation,
                         )
                     elif isinstance(value, _IncrementalAccountTypeCatalogResult):
+                        if value.models is not None:
+                            successful_account_results[value.account_type] = value
                         self._publish_incremental_account_type_result(
                             value,
                             previous_models_by_account_type,
@@ -669,11 +763,16 @@ class ModelCatalogService:
                         self._account_group_retry_not_before[account_type] = retry_not_before
                 if unfinished_anonymous:
                     self._anonymous_retry_not_before = retry_not_before
-                self._account_signature = started_signature
+                self._reconcile_ready_groups_locked(
+                    started_signature=started_signature,
+                    current_groups=current_groups,
+                    successful_results=successful_account_results,
+                    previous_ready_groups=previous_ready_groups,
+                )
+                self._account_signature = current_signature
                 self._catalog_complete = (
-                    current_signature == started_signature
-                    and work_complete
-                    and account_types <= self._ready_account_groups
+                    work_complete
+                    and set(current_groups) <= self._ready_account_groups
                     and (anonymous_succeeded or self._anonymous_ready)
                 )
                 if self._catalog_complete:
@@ -761,6 +860,7 @@ class ModelCatalogService:
                 models_by_account_type,
                 successful_account_types,
                 anonymous_succeeded,
+                successful_account_results,
             ) = self._refresh(
                 groups,
                 previous_anonymous_models,
@@ -785,9 +885,6 @@ class ModelCatalogService:
 
         current_groups = self._active_accounts_by_group()
         current_signature = self._signature(current_groups)
-        # 当前账号的上游目录失败时仍沿用本轮已有/旧快照并遵守 TTL；只有刷新期间
-        # 账号集合发生变化，才必须立即让下一次读取重新按新身份拉取目录。
-        cache_complete = current_signature == signature
 
         with self._lock:
             self._anonymous_models = anonymous_models
@@ -803,23 +900,15 @@ class ModelCatalogService:
                 for account_group, models in models_by_account_type.items()
                 if account_group in current_groups
             }
-            self._ready_account_groups = {
-                account_group
-                for account_group in current_groups
-                if account_group in successful_account_types
-                or account_group in previous_ready_account_types
-            }
-            for account_group in current_groups:
-                if account_group in successful_account_types:
-                    self._account_group_retry_not_before.pop(account_group, None)
-                else:
-                    self._account_group_retry_not_before[account_group] = (
-                        self._clock() + MODEL_CATALOG_RETRY_BACKOFF_SECS
-                    )
+            self._reconcile_ready_groups_locked(
+                started_signature=signature,
+                current_groups=current_groups,
+                successful_results=successful_account_results,
+                previous_ready_groups=previous_ready_account_types,
+            )
             self._account_signature = current_signature
             cache_complete = (
-                cache_complete
-                and self._anonymous_ready
+                self._anonymous_ready
                 and set(current_groups) <= self._ready_account_groups
             )
             self._catalog_complete = cache_complete

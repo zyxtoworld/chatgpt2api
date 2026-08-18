@@ -335,6 +335,63 @@ class ModelCatalogServiceTests(unittest.TestCase):
             frozenset({"free-live"}),
         )
 
+    def test_invalid_group_removal_does_not_freeze_remaining_catalog_refresh(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "invalid-group-refresh-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "free-live", "type": "free", "source_type": "codex", "status": "正常"},
+            {"access_token": "pro-invalid", "type": "Pro", "source_type": "codex", "status": "正常"},
+        ])
+        accounts.refresh_access_token = lambda token, **_kwargs: token
+        outcomes = {
+            "": model_list("anonymous-v1"),
+            "free-live": model_list("free-v1"),
+            "pro-invalid": InvalidAccessTokenError("fixture token invalid"),
+        }
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                outcome = outcomes[self.access_token]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+            def close(self) -> None:
+                pass
+
+        now = [1000.0]
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            cache_ttl_seconds=1,
+            clock=lambda: now[0],
+        )
+        first = catalog.list_models()
+        self.assertIn("free-v1", {item["id"] for item in first["data"]})
+        self.assertEqual(
+            catalog._account_signature,
+            catalog._signature({("codex", "free"): ["free-live"]}),
+        )
+
+        outcomes[""] = model_list("anonymous-v2")
+        outcomes["free-live"] = model_list("free-v2")
+        now[0] += 2
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        second = catalog.list_models(wait_for_cold=False)
+
+        self.assertIn("free-v2", {item["id"] for item in second["data"]})
+        self.assertNotIn("free-v1", {item["id"] for item in second["data"]})
+        self.assertTrue(catalog._catalog_complete)
+        self.assertEqual(
+            catalog._account_signature,
+            catalog._signature({("codex", "free"): ["free-live"]}),
+        )
+
     def test_transient_representative_failures_do_not_disable_accounts(self) -> None:
         failures = (
             UpstreamHTTPError("models", 429, {"error": "upstream_error"}),
@@ -638,13 +695,14 @@ class ModelCatalogServiceTests(unittest.TestCase):
         accounts.pop(0)
         accounts.append({"access_token": "same-type-replacement", "type": "free", "status": "正常"})
         catalog.list_models(wait_for_cold=False)
-        self.assertEqual(len(calls), 3)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        self.assertEqual(len(calls), 4)
 
         now[0] += 301
         catalog.list_models(wait_for_cold=False)
         self.assertTrue(catalog._refresh_done.wait(timeout=3))
         self.assertEqual(calls.count(""), 2)
-        refreshed_non_anonymous = [token for token in calls[3:] if token]
+        refreshed_non_anonymous = [token for token in calls[4:] if token]
         self.assertEqual(len(refreshed_non_anonymous), len(account_types))
         self.assertEqual(
             {
@@ -1323,6 +1381,36 @@ class ModelCatalogServiceTests(unittest.TestCase):
             frozenset(),
         )
 
+    def test_removed_group_without_fetch_converges_signature_and_refreshes_remaining_groups(self) -> None:
+        self.catalog.list_models()
+        self.accounts.delete_accounts(["pro"])
+
+        self.catalog.list_models(wait_for_cold=False)
+        self.assertEqual(
+            self.catalog._account_signature,
+            self.catalog._signature({
+                ("web", "free"): ["free-bad", "free-good"],
+                ("web", "Plus"): ["plus"],
+            }),
+        )
+        self.assertTrue(self.catalog._catalog_complete)
+
+        self.outcomes["free-good"] = model_list("free-refreshed")
+        self.now += 301
+        self.catalog.list_models(wait_for_cold=False)
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
+        result = self.catalog.list_models(wait_for_cold=False)
+
+        self.assertIn("free-refreshed", {item["id"] for item in result["data"]})
+        self.assertNotIn("free-only", {item["id"] for item in result["data"]})
+        self.assertEqual(
+            self.catalog._account_signature,
+            self.catalog._signature({
+                ("web", "free"): ["free-bad", "free-good"],
+                ("web", "Plus"): ["plus"],
+            }),
+        )
+
     def test_account_removed_during_failed_refresh_drops_stale_token_capabilities(self) -> None:
         self.catalog.list_models()
 
@@ -1448,13 +1536,15 @@ class ModelCatalogServiceTests(unittest.TestCase):
             [{"access_token": "pro-new", "type": "PRO", "status": "正常"}]
         )
 
-        result = self.catalog.list_models()
+        self.catalog.list_models(wait_for_cold=False)
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
+        result = self.catalog.list_models(wait_for_cold=False)
 
-        self.assertIn("pro-only", {item["id"] for item in result["data"]})
-        self.assertNotIn("pro-new-only", {item["id"] for item in result["data"]})
-        self.assertEqual(self.calls.count("pro-new"), 0)
+        self.assertIn("pro-new-only", {item["id"] for item in result["data"]})
+        self.assertNotIn("pro-only", {item["id"] for item in result["data"]})
+        self.assertEqual(self.calls.count("pro-new"), 1)
         self.assertEqual(
-            self.catalog.route_for_model("pro-only").access_tokens,
+            self.catalog.route_for_model("pro-new-only").access_tokens,
             frozenset({"pro-new"}),
         )
 
@@ -1512,13 +1602,19 @@ class ModelCatalogServiceTests(unittest.TestCase):
             frozenset({"pro", "pro-alt"}),
         )
 
-    def test_same_type_membership_changes_update_routes_without_refetching_catalog(self) -> None:
+    def test_same_type_membership_changes_invalidate_owner_and_refresh_catalog(self) -> None:
         self.catalog.list_models()
         initial_calls = list(self.calls)
+        self.outcomes["pro-alt"] = model_list("pro-only")
 
         self.accounts.add_account_items(
             [{"access_token": "pro-alt", "type": "PRO", "status": "正常"}]
         )
+        self.assertEqual(
+            self.catalog.route_for_model("pro-only").access_tokens,
+            frozenset(),
+        )
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
         self.assertEqual(
             self.catalog.route_for_model("pro-only").access_tokens,
             frozenset({"pro", "pro-alt"}),
@@ -1526,9 +1622,14 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.accounts.delete_accounts(["pro"])
         self.assertEqual(
             self.catalog.route_for_model("pro-only").access_tokens,
+            frozenset(),
+        )
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
+        self.assertEqual(
+            self.catalog.route_for_model("pro-only").access_tokens,
             frozenset({"pro-alt"}),
         )
-        self.assertEqual(self.calls, initial_calls)
+        self.assertNotEqual(self.calls, initial_calls)
 
     def test_rate_limited_account_does_not_publish_its_model_catalog(self) -> None:
         self.accounts.add_account_items([
