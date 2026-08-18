@@ -2397,15 +2397,34 @@ def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     return terminal
 
 
-def response_events(body: dict[str, Any], *, cache_scope: str = "") -> Iterator[dict[str, Any]]:
+def response_events(
+    body: dict[str, Any],
+    *,
+    cache_scope: str = "",
+    authenticated: bool = False,
+) -> Iterator[dict[str, Any]]:
     validate_response_core_parameters(body)
     if uses_native_codex_responses(body):
         yield from stream_codex_response(body)
         return
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
-        selected_token = account_service.get_text_access_token(model=model) if cache_scope else None
-        effective_scope = resolve_access_token_cache_scope(cache_scope, selected_token or "")
+        selected_token = (
+            account_service.get_text_access_token(model=model)
+            if authenticated or cache_scope
+            else None
+        )
+        account_generation = (
+            account_service.get_account_cache_scope(selected_token)
+            if selected_token
+            else ""
+        )
+        effective_scope = resolve_access_token_cache_scope(
+            cache_scope,
+            selected_token or "",
+            authenticated=authenticated,
+            account_generation=account_generation,
+        )
         compute = lambda: stream_text_response(
             text_backend(model, access_token=selected_token)
             if selected_token is not None
@@ -2469,14 +2488,24 @@ def response_events(body: dict[str, Any], *, cache_scope: str = "") -> Iterator[
     )
 
 
-def handle(body: dict[str, Any], *, cache_scope: str = "") -> dict[str, Any] | Iterator[dict[str, Any]]:
+def handle(
+    body: dict[str, Any],
+    *,
+    cache_scope: str = "",
+    authenticated: bool = False,
+) -> dict[str, Any] | Iterator[dict[str, Any]]:
     validate_response_core_parameters(body)
     validate_tool_container(body)
-    events = (
-        response_events(body, cache_scope=cache_scope)
-        if cache_scope
-        else response_events(body)
-    )
+    if authenticated:
+        events = response_events(
+            body,
+            cache_scope=cache_scope,
+            authenticated=True,
+        )
+    elif cache_scope:
+        events = response_events(body, cache_scope=cache_scope)
+    else:
+        events = response_events(body)
     if body.get("stream"):
         return events
     return collect_response(events)

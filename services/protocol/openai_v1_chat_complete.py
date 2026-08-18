@@ -1379,7 +1379,17 @@ def handle(
                 access_token=selected_token,
                 deadline=codex_deadline,
             )
-        effective_scope = resolve_access_token_cache_scope(cache_scope, selected_token or "")
+        account_generation = (
+            account_service.get_account_cache_scope(selected_token)
+            if selected_token
+            else ""
+        )
+        effective_scope = resolve_access_token_cache_scope(
+            cache_scope,
+            selected_token or "",
+            authenticated=authenticated,
+            account_generation=account_generation,
+        )
         compute = lambda: stream_text_chat_completion(
             text_backend(model, access_token=selected_token) if selected_token is not None else text_backend(model),
             messages,
@@ -1410,7 +1420,17 @@ def handle(
             access_token=selected_token,
             deadline=codex_deadline,
         )
-    effective_scope = resolve_access_token_cache_scope(cache_scope, selected_token or "")
+    account_generation = (
+        account_service.get_account_cache_scope(selected_token)
+        if selected_token
+        else ""
+    )
+    effective_scope = resolve_access_token_cache_scope(
+        cache_scope,
+        selected_token or "",
+        authenticated=authenticated,
+        account_generation=account_generation,
+    )
     compute = lambda: completion_response(
         model,
         collect_text(

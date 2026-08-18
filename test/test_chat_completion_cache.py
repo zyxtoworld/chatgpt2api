@@ -6,15 +6,19 @@ import unittest
 from unittest import mock
 import json
 import base64
+import tempfile
+from pathlib import Path
 
 from fastapi import HTTPException
 
 from services.config import config
+from services.account_service import AccountService
 from services.log_service import run_ai_in_threadpool
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 import services.protocol.chat_completion_cache as cache_module
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
+from services.storage.json_storage import JSONStorageBackend
 from utils.helper import extract_image_from_message_content
 
 
@@ -147,6 +151,90 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         self.assertEqual(first["choices"][0]["message"]["content"], "answer-a")
         self.assertEqual(second["choices"][0]["message"]["content"], "answer-b")
+
+    def test_same_token_account_replacement_does_not_reuse_old_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            accounts = AccountService(JSONStorageBackend(Path(temp_dir) / "accounts.json"))
+            accounts.add_account_items([{
+                "access_token": "same-token",
+                "type": "free",
+                "status": "正常",
+                "quota": 1,
+            }])
+
+            calls = 0
+
+            def fake_collect_text(_backend, _request):
+                nonlocal calls
+                calls += 1
+                return f"answer-{calls}"
+
+            def cache_scope_for(token: str) -> str:
+                resolved, account = accounts._get_account_lease(token)
+                return f"{resolved}:owner-{id(account)}"
+
+            body = {
+                "model": "gpt-test",
+                "messages": [{"role": "user", "content": "same prompt"}],
+            }
+            with (
+                mock.patch.object(
+                    openai_v1_chat_complete.account_service,
+                    "get_text_access_token",
+                    return_value="same-token",
+                ),
+                mock.patch.object(
+                    openai_v1_chat_complete.account_service,
+                    "get_account_cache_scope",
+                    side_effect=cache_scope_for,
+                    create=True,
+                ),
+                mock.patch.object(
+                    openai_v1_chat_complete,
+                    "text_backend",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    openai_v1_chat_complete,
+                    "collect_text",
+                    side_effect=fake_collect_text,
+                ),
+            ):
+                first = openai_v1_chat_complete.handle(body, cache_scope="user-key")
+                accounts.delete_accounts(["same-token"])
+                accounts.add_account_items([{
+                    "access_token": "same-token",
+                    "type": "free",
+                    "status": "正常",
+                    "quota": 9,
+                }])
+                second = openai_v1_chat_complete.handle(body, cache_scope="user-key")
+
+            self.assertEqual(first["choices"][0]["message"]["content"], "answer-1")
+            self.assertEqual(second["choices"][0]["message"]["content"], "answer-2")
+            self.assertEqual(calls, 2)
+
+    def test_account_cache_scope_changes_after_same_token_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            accounts = AccountService(JSONStorageBackend(Path(temp_dir) / "accounts.json"))
+            accounts.add_account_items([{
+                "access_token": "same-token",
+                "type": "free",
+                "status": "正常",
+                "quota": 1,
+            }])
+            first_scope = accounts.get_account_cache_scope("same-token")
+
+            accounts.delete_accounts(["same-token"])
+            accounts.add_account_items([{
+                "access_token": "same-token",
+                "type": "free",
+                "status": "正常",
+                "quota": 9,
+            }])
+
+            self.assertTrue(first_scope)
+            self.assertNotEqual(first_scope, accounts.get_account_cache_scope("same-token"))
 
     def test_response_cache_binds_to_selected_account(self) -> None:
         class Backend:

@@ -361,6 +361,27 @@ class TrackingStorage:
         return {"type": "memory"}
 
 
+def test_account_cache_generation_bumps_only_after_persistence(tmp_path) -> None:
+    storage = TrackingStorage(accounts=[])
+    with mock.patch.object(config_module, "DATA_DIR", tmp_path):
+        service = AccountService(storage)
+        service.add_account_items([{"access_token": "generation-token", "quota": 1}])
+        before_update = service.get_account_cache_scope("generation-token")
+
+        service.update_account("generation-token", {"quota": 2})
+        after_success = service.get_account_cache_scope("generation-token")
+        assert after_success != before_update
+        assert storage.load_accounts()[0]["quota"] == 2
+
+        with mock.patch.object(service, "_save_accounts", side_effect=StorageDataError()):
+            with pytest.raises(StorageDataError):
+                service.update_account("generation-token", {"quota": 3})
+
+        assert service.get_account_cache_scope("generation-token") == after_success
+        assert service.list_accounts()[0]["quota"] == 2
+        assert storage.load_accounts()[0]["quota"] == 2
+
+
 def test_account_add_does_not_publish_cumulative_state_before_account_snapshot(
     tmp_path,
 ) -> None:

@@ -159,6 +159,51 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertEqual(seen["native_access_token"], "codex-route-token")
         self.assertIn("native-route", response.text)
 
+    def test_responses_route_keeps_source_routing_when_identity_cache_scope_is_empty(self) -> None:
+        seen: dict[str, object] = {}
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                seen["selector_kwargs"] = kwargs
+                return "codex-responses-route-token"
+
+            def get_account_cache_scope(self, _token: str) -> str:
+                return ""
+
+        class FakeBackend:
+            def close(self) -> None:
+                pass
+
+        def text_backend(_model: str, *, access_token: str | None = None) -> FakeBackend:
+            seen["backend_access_token"] = access_token
+            if access_token != "codex-responses-route-token":
+                raise AssertionError("Responses must preserve account-source routing")
+            return FakeBackend()
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(ai_module.openai_v1_response, "text_backend", side_effect=text_backend),
+            mock.patch.object(
+                ai_module.openai_v1_response,
+                "stream_text_deltas",
+                return_value=iter(["responses-route"]),
+            ),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/responses",
+                headers=AUTH_HEADERS,
+                json={"model": "auto", "input": "hello"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(seen["backend_access_token"], "codex-responses-route-token")
+
     def test_chat_route_nonstream_carries_one_deadline_through_initial_codex_selection(self) -> None:
         completed = {
             "type": "response.completed",
@@ -524,6 +569,76 @@ class PublicErrorContractTests(unittest.TestCase):
 
             self.assertEqual(first.status_code, 200)
             self.assertEqual(second.status_code, 200)
+            self.assertIn("response-for-a", first.text)
+            self.assertIn("response-for-b", second.text)
+            self.assertEqual(stream_text_deltas.call_count, 2)
+        finally:
+            chat_completion_cache.clear()
+            if old_settings is None:
+                config.data.pop("chat_completion_cache", None)
+            else:
+                config.data["chat_completion_cache"] = old_settings
+
+    def test_responses_cache_binds_authenticated_empty_scope_to_selected_account(self) -> None:
+        old_settings = config.data.get("chat_completion_cache")
+        config.data["chat_completion_cache"] = {
+            "enabled": True,
+            "ttl_seconds": 60,
+            "max_entries": 32,
+            "dedupe_inflight": True,
+            "stream_cache": True,
+            "normalize_messages": True,
+            "drop_adjacent_duplicates": False,
+            "drop_assistant_history": False,
+        }
+        from services.protocol.chat_completion_cache import chat_completion_cache
+
+        chat_completion_cache.clear()
+        try:
+            class AccountService:
+                def __init__(self) -> None:
+                    self.tokens = iter(("account-a-token", "account-b-token"))
+
+                def get_text_access_token(self, **_kwargs: object) -> str:
+                    return next(self.tokens)
+
+                def get_account_cache_scope(self, _token: str) -> str:
+                    return ""
+
+            class FakeBackend:
+                def close(self) -> None:
+                    pass
+
+            account_service = AccountService()
+            with (
+                mock.patch.object(
+                    ai_module,
+                    "require_identity_async",
+                    new=mock.AsyncMock(return_value={"id": "", "role": "user"}),
+                ),
+                mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                mock.patch.object(ai_module.openai_v1_response, "account_service", account_service),
+                mock.patch.object(ai_module.openai_v1_response, "text_backend", return_value=FakeBackend()),
+                mock.patch.object(
+                    ai_module.openai_v1_response,
+                    "stream_text_deltas",
+                    side_effect=[iter(["response-for-a"]), iter(["response-for-b"])],
+                ) as stream_text_deltas,
+            ):
+                client = TestClient(_app_with_ai_router())
+                first = client.post(
+                    "/v1/responses",
+                    json={"model": "auto", "input": "same prompt"},
+                    headers={"Authorization": "Bearer a"},
+                )
+                second = client.post(
+                    "/v1/responses",
+                    json={"model": "auto", "input": "same prompt"},
+                    headers={"Authorization": "Bearer b"},
+                )
+
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(second.status_code, 200, second.text)
             self.assertIn("response-for-a", first.text)
             self.assertIn("response-for-b", second.text)
             self.assertEqual(stream_text_deltas.call_count, 2)

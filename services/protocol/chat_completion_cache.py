@@ -88,12 +88,21 @@ def cache_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def resolve_access_token_cache_scope(cache_scope: str, access_token: str) -> str:
+def resolve_access_token_cache_scope(
+    cache_scope: str,
+    access_token: str,
+    *,
+    authenticated: bool = False,
+    account_generation: str = "",
+) -> str:
     """Bind a request cache to the selected account generation."""
-    if not cache_scope:
+    if not cache_scope and not authenticated:
         return ""
     token_digest = hashlib.sha256(str(access_token or "<anonymous>").encode("utf-8")).hexdigest()
-    return f"{cache_scope}\x00account:{token_digest}"
+    owner_scope = cache_scope or "authenticated"
+    if account_generation:
+        owner_scope = f"{owner_scope}\x00{account_generation}"
+    return f"{owner_scope}\x00account:{token_digest}"
 
 
 def _message_signature(message: dict[str, Any]) -> str:

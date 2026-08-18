@@ -254,7 +254,9 @@ class AccountService:
         self._watcher_operation_generation = 0
         self._refresh_operations: dict[int, _RefreshOperationState] = {}
         self._index = 0
+        self._account_cache_generations: dict[str, int] = {}
         self._accounts = self._load_accounts()
+        self._account_cache_generations = {token: 1 for token in self._accounts}
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
@@ -575,6 +577,29 @@ class AccountService:
         except BaseException:
             self._restore_account_state_locked(state)
             raise
+        self._bump_account_cache_generations_locked(state[0])
+
+    def _bump_account_cache_generations_locked(
+        self,
+        previous_accounts: dict[str, dict],
+    ) -> None:
+        generations = getattr(self, "_account_cache_generations", None)
+        if not isinstance(generations, dict):
+            generations = {}
+            self._account_cache_generations = generations
+        for token in set(previous_accounts) | set(self._accounts):
+            if previous_accounts.get(token) != self._accounts.get(token):
+                generations[token] = int(generations.get(token, 0)) + 1
+
+    def get_account_cache_scope(self, access_token: str) -> str:
+        """Return a cache owner scope fenced by the live account generation."""
+        with self._lock:
+            resolved = self._resolve_access_token_locked(access_token)
+            if not resolved or resolved not in self._accounts:
+                return ""
+            generations = getattr(self, "_account_cache_generations", {})
+            generation = int(generations.get(resolved, 0)) if isinstance(generations, dict) else 0
+            return f"generation:{generation}"
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -2517,6 +2542,7 @@ class AccountService:
                 self._cumulative_total = original_cumulative_total
                 self._accounts_snapshot = original_accounts_snapshot
                 raise
+            self._bump_account_cache_generations_locked(original_accounts)
             items = [dict(item) for item in self._accounts.values()]
             _account_log(
                 f"新增 {added} 个账号，跳过 {skipped} 个",
