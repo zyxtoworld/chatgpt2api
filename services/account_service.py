@@ -2039,6 +2039,7 @@ class AccountService:
             model: str = "auto",
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            deadline: float | None = None,
     ) -> str:
         excluded = set(excluded_tokens or set())
         requested_model = str(model or "auto").strip() or "auto"
@@ -2085,6 +2086,7 @@ class AccountService:
             self.refresh_access_token(
                 access_token,
                 event="get_text_access_token",
+                deadline=deadline,
                 expected_account=expected_account,
             )
             or access_token

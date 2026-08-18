@@ -360,6 +360,11 @@ class CodexToolCallContractTests(unittest.TestCase):
             )
 
         self.assertEqual([event["type"] for event in events], ["response.completed"])
+        deadline = selector_calls[0]["deadline"]
+        self.assertIsInstance(deadline, float)
+        self.assertTrue(all(call["deadline"] == deadline for call in selector_calls))
+        for call in selector_calls:
+            call.pop("deadline")
         self.assertEqual(
             selector_calls,
             [
@@ -468,7 +473,7 @@ class CodexToolCallContractTests(unittest.TestCase):
             mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
             mock.patch.object(openai_v1_response, "OpenAIBackendAPI", Backend),
             mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
-            mock.patch.object(openai_v1_response.time, "monotonic", side_effect=[100.0, 100.1, 131.0]),
+            mock.patch.object(openai_v1_response.time, "monotonic", side_effect=[100.0, 100.1, 100.2, 100.3, 131.0]),
             self.assertRaises(openai_v1_response.UpstreamHTTPError) as raised,
         ):
             list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
@@ -476,6 +481,58 @@ class CodexToolCallContractTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 502)
         self.assertEqual([backend.access_token for backend in Backend.instances], ["codex-1"])
         self.assertTrue(all(backend.closed for backend in Backend.instances))
+
+    def test_native_codex_text_selector_timeout_preserves_last_retryable_error(self) -> None:
+        selector_deadlines: list[float] = []
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                deadline = kwargs.get("deadline")
+                self.assert_deadline(deadline)
+                selector_deadlines.append(deadline)
+                if len(selector_deadlines) == 1:
+                    return "codex-1"
+                raise TimeoutError("selector deadline exceeded")
+
+            @staticmethod
+            def assert_deadline(value: object) -> None:
+                if not isinstance(value, float):
+                    raise AssertionError("selector did not receive the absolute deadline")
+
+        class Backend:
+            def __init__(self, access_token: str) -> None:
+                del access_token
+                self.closed = False
+
+            def iter_codex_response_events(
+                self,
+                _payload: dict[str, object],
+                *,
+                timeout: float,
+            ):
+                self.timeout = timeout
+                raise openai_v1_response.UpstreamHTTPError(
+                    "codex",
+                    502,
+                    {"error": "transient"},
+                )
+                yield  # pragma: no cover
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", Backend),
+            mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+            mock.patch.object(openai_v1_response.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.3, 0.4]),
+            self.assertRaises(openai_v1_response.UpstreamHTTPError) as raised,
+        ):
+            list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual(len(selector_deadlines), 2)
+        self.assertEqual(selector_deadlines[0], selector_deadlines[1])
 
     def test_native_codex_text_does_not_failover_after_created_event(self) -> None:
         selector_calls: list[dict[str, object]] = []
@@ -512,7 +569,10 @@ class CodexToolCallContractTests(unittest.TestCase):
         ):
             list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
 
-        self.assertEqual(selector_calls, [{"model": "auto", "source_type": "codex"}])
+        self.assertEqual(len(selector_calls), 1)
+        self.assertEqual(selector_calls[0]["model"], "auto")
+        self.assertEqual(selector_calls[0]["source_type"], "codex")
+        self.assertIsInstance(selector_calls[0]["deadline"], float)
         self.assertEqual(len(CreatedThenErrorBackend.instances), 1)
         self.assertTrue(CreatedThenErrorBackend.instances[0].closed)
 
@@ -655,7 +715,10 @@ class CodexToolCallContractTests(unittest.TestCase):
         ):
             list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
 
-        self.assertEqual(selector_calls, [{"model": "auto", "source_type": "codex"}])
+        self.assertEqual(len(selector_calls), 1)
+        self.assertEqual(selector_calls[0]["model"], "auto")
+        self.assertEqual(selector_calls[0]["source_type"], "codex")
+        self.assertIsInstance(selector_calls[0]["deadline"], float)
         self.assertEqual(len(PartialBackend.instances), 1)
         self.assertTrue(PartialBackend.instances[0].closed)
 
@@ -691,9 +754,34 @@ class CodexToolCallContractTests(unittest.TestCase):
         ):
             list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
 
-        self.assertEqual(selector_calls, [{"model": "auto", "source_type": "codex"}])
+        self.assertEqual(len(selector_calls), 1)
+        self.assertEqual(selector_calls[0]["model"], "auto")
+        self.assertEqual(selector_calls[0]["source_type"], "codex")
+        self.assertIsInstance(selector_calls[0]["deadline"], float)
         self.assertEqual(len(ClientErrorBackend.instances), 1)
         self.assertTrue(ClientErrorBackend.instances[0].closed)
+
+    def test_account_text_selector_forwards_absolute_deadline_to_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            service = AccountService(JSONStorageBackend(Path(temp_dir) / "accounts.json"))
+            service.add_account_items([{
+                "access_token": "codex-deadline",
+                "source_type": "codex",
+                "type": "Pro",
+                "status": "正常",
+            }])
+            with mock.patch.object(
+                service,
+                "refresh_access_token",
+                return_value="codex-deadline",
+            ) as refresh:
+                selected = service.get_text_access_token(
+                    source_type="codex",
+                    deadline=123.5,
+                )
+
+        self.assertEqual(selected, "codex-deadline")
+        self.assertEqual(refresh.call_args.kwargs["deadline"], 123.5)
 
     def test_late_responses_usage_does_not_mutate_replaced_same_token_account(self) -> None:
         entered = threading.Event()
@@ -808,7 +896,7 @@ class CodexToolCallContractTests(unittest.TestCase):
             events = list(openai_v1_response.handle(body))
 
         self.assertEqual(events, function_events())
-        selector.assert_called_once_with(model="auto", source_type="codex")
+        selector.assert_called_once_with(model="auto", source_type="codex", deadline=mock.ANY)
         mark_used.assert_called_once_with("codex-token")
         self.assertEqual(len(_FakeCodexBackend.instances), 1)
         backend = _FakeCodexBackend.instances[0]

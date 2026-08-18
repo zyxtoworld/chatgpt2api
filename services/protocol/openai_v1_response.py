@@ -1916,18 +1916,28 @@ def stream_codex_response(
     failover_deadline = time.monotonic() + _CODEX_TEXT_FAILOVER_DEADLINE_SECONDS
     while True:
         if not current_token:
+            if time.monotonic() >= failover_deadline:
+                if last_retryable_error is not None:
+                    raise last_retryable_error
+                raise TimeoutError("codex response failover deadline expired")
             try:
                 if attempted_tokens:
                     current_token = account_service.get_text_access_token(
                         model=model,
                         source_type="codex",
                         excluded_tokens=set(attempted_tokens),
+                        deadline=failover_deadline,
                     )
                 else:
                     current_token = account_service.get_text_access_token(
                         model=model,
                         source_type="codex",
+                        deadline=failover_deadline,
                     )
+            except TimeoutError:
+                if last_retryable_error is not None:
+                    raise last_retryable_error
+                raise
             except ModelUnavailableError as exc:
                 if last_retryable_error is not None:
                     raise last_retryable_error
@@ -1935,6 +1945,10 @@ def stream_codex_response(
                     status_code=503,
                     detail={"error": "native tools require an active Codex OAuth account"},
                 ) from exc
+            if time.monotonic() >= failover_deadline:
+                if last_retryable_error is not None:
+                    raise last_retryable_error
+                raise TimeoutError("codex response failover deadline expired")
         if not current_token or current_token in attempted_tokens:
             raise ModelUnavailableError("no active Codex OAuth account is available")
         remaining = failover_deadline - time.monotonic()
