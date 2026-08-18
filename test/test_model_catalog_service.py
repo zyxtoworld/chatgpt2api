@@ -1631,6 +1631,43 @@ class ModelCatalogServiceTests(unittest.TestCase):
         )
         self.assertNotEqual(self.calls, initial_calls)
 
+    def test_public_list_does_not_publish_stale_catalog_while_group_membership_refreshes(self) -> None:
+        self.catalog.list_models()
+        refresh_started = Event()
+        release_refresh = Event()
+        self.outcomes["pro"] = RuntimeError("old representative unavailable")
+        self.accounts.add_account_items(
+            [{"access_token": "pro-alt", "type": "PRO", "status": "正常"}]
+        )
+
+        original_factory = self.catalog._backend_factory
+
+        def backend_factory(access_token: str = ""):
+            backend = original_factory(access_token=access_token)
+            if access_token != "pro-alt":
+                return backend
+            original_list_models = backend.list_models
+
+            def list_models(**kwargs) -> dict:
+                refresh_started.set()
+                self.assertTrue(release_refresh.wait(timeout=2))
+                return original_list_models(**kwargs)
+
+            backend.list_models = list_models
+            return backend
+
+        self.catalog._backend_factory = backend_factory
+        self.now += 301
+        self.catalog.list_models(wait_for_cold=False)
+        self.assertTrue(refresh_started.wait(timeout=1))
+
+        try:
+            result = self.catalog.list_models(wait_for_cold=False)
+            self.assertNotIn("pro-only", {item["id"] for item in result["data"]})
+        finally:
+            release_refresh.set()
+        self.assertTrue(self.catalog._refresh_done.wait(timeout=3))
+
     def test_rate_limited_account_does_not_publish_its_model_catalog(self) -> None:
         self.accounts.add_account_items([
             {"access_token": "limited-pro", "type": "Pro", "status": "限流"},

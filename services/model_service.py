@@ -984,7 +984,8 @@ class ModelCatalogService:
                 model_id: deepcopy(item)
                 for model_id, item in self._anonymous_models.items()
             }
-            for account_group in sorted(self._models_by_account_group):
+            ready_account_groups = set(self._ready_account_groups)
+            for account_group in sorted(ready_account_groups):
                 for model_id, item in self._models_by_account_group[account_group].items():
                     union.setdefault(model_id, deepcopy(item))
             data = []
@@ -994,6 +995,7 @@ class ModelCatalogService:
                 item["supported_account_types"] = sorted({
                     account_type.lower()
                     for (_source_type, account_type), models in self._models_by_account_group.items()
+                    if (_source_type, account_type) in ready_account_groups
                     if model_id in models
                 })
                 data.append(item)
