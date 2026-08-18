@@ -92,6 +92,73 @@ class PublicErrorContractTests(unittest.TestCase):
             else:
                 config.data["chat_completion_cache"] = old_settings
 
+    def test_chat_route_keeps_source_routing_when_identity_cache_scope_is_empty(self) -> None:
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_codex_route",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5",
+                "output": [{
+                    "id": "msg_codex_route",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "native-route", "annotations": []}],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+        seen: dict[str, object] = {}
+
+        class CodexAccountService:
+            def get_text_access_token(self, **_kwargs: object) -> str:
+                return "codex-route-token"
+
+            def get_account(self, _token: str) -> dict[str, str]:
+                return {"source_type": "codex"}
+
+        async def invoke(_self, handler, payload, **kwargs):
+            seen.update(kwargs)
+            return handler(payload, **kwargs)
+
+        def native_events(_body: dict[str, object], **kwargs: object):
+            seen["native_access_token"] = kwargs.get("access_token")
+            yield completed
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+            mock.patch.object(ai_module.openai_v1_chat_complete, "account_service", CodexAccountService()),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete.openai_v1_response,
+                "stream_codex_response",
+                side_effect=native_events,
+            ),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete,
+                "text_backend",
+                side_effect=AssertionError("empty cache scope must not force Web routing"),
+            ),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/chat/completions",
+                headers=AUTH_HEADERS,
+                json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(seen["cache_scope"], "")
+        self.assertIs(seen["authenticated"], True)
+        self.assertEqual(seen["native_access_token"], "codex-route-token")
+        self.assertIn("native-route", response.text)
+
     def test_responses_cache_does_not_share_response_between_authenticated_identities(self) -> None:
         old_settings = config.data.get("chat_completion_cache")
         config.data["chat_completion_cache"] = {

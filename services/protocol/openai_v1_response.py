@@ -47,6 +47,7 @@ from services.protocol.web_search_tool import (
     has_web_search_tool,
 )
 from utils.helper import (
+    UpstreamHTTPError,
     extract_image_from_message_content,
     extract_response_prompt,
     has_response_image_generation_tool,
@@ -73,6 +74,7 @@ SUPPORTED_RESPONSE_MESSAGE_ROLES = {"user", "assistant", "system", "developer"}
 SUPPORTED_RESPONSE_MESSAGE_PHASES = {"commentary", "final_answer"}
 SUPPORTED_RESPONSE_MESSAGE_STATUSES = {"in_progress", "completed", "incomplete"}
 SUPPORTED_FUNCTION_CALL_OUTPUT_FIELDS = {"type", "id", "call_id", "output", "status"}
+_CODEX_TEXT_FAILOVER_STATUSES = frozenset({429, 500, 502, 503, 504})
 SUPPORTED_FUNCTION_CALL_OUTPUT_STATUSES = {"in_progress", "completed", "incomplete"}
 SUPPORTED_CUSTOM_TOOL_CALL_OUTPUT_FIELDS = {"type", "id", "call_id", "name", "output"}
 SUPPORTED_FUNCTION_CALL_FIELDS = {
@@ -1899,51 +1901,82 @@ def project_public_codex_response_event(event: dict[str, Any]) -> dict[str, Any]
         raise RuntimeError("codex returned malformed public response event") from None
 
 
-def stream_codex_response(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+def stream_codex_response(
+    body: dict[str, Any],
+    *,
+    access_token: str | None = None,
+) -> Iterator[dict[str, Any]]:
     payload = codex_response_payload(body)
     model = str(body.get("model") or "auto").strip() or "auto"
-    try:
-        access_token = account_service.get_text_access_token(model=model, source_type="codex")
-    except ModelUnavailableError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "native tools require an active Codex OAuth account"},
-        ) from exc
-    resolve_codex_reasoning_effort(payload, access_token=access_token)
-    expected_account = None
-    get_account_lease = getattr(account_service, "_get_account_lease", None)
-    if callable(get_account_lease):
-        _, expected_account = get_account_lease(access_token)
-    backend = OpenAIBackendAPI(access_token=access_token)
-    try:
-        for event in backend.iter_codex_response_events(payload):
-            public_event = project_public_codex_response_event(event)
-            if public_event is None:
-                continue
-            event = public_event
-            active = created_response_from_event(event)
-            if active is None:
-                active = in_progress_response_from_event(event)
-            terminal = None if active is not None else terminal_response_from_event(event)
-            if active is not None:
-                event = {**event, "response": active}
-            elif terminal is not None:
-                event = {**event, "response": terminal}
-            yield event
-            if terminal is not None:
-                if expected_account is None:
-                    account_service.mark_text_used(access_token)
-                else:
-                    account_service.mark_text_used(
-                        access_token,
-                        expected_account=expected_account,
+    attempted_tokens: set[str] = set()
+    current_token = access_token
+    emitted_public_event = False
+    while True:
+        if not current_token:
+            try:
+                if attempted_tokens:
+                    current_token = account_service.get_text_access_token(
+                        model=model,
+                        source_type="codex",
+                        excluded_tokens=set(attempted_tokens),
                     )
-                return
-            if event.get("type") in {"response.failed", "error"}:
-                return
-        raise RuntimeError("codex response ended without a terminal response event")
-    finally:
-        backend.close()
+                else:
+                    current_token = account_service.get_text_access_token(
+                        model=model,
+                        source_type="codex",
+                    )
+            except ModelUnavailableError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail={"error": "native tools require an active Codex OAuth account"},
+                ) from exc
+        if not current_token or current_token in attempted_tokens:
+            raise ModelUnavailableError("no active Codex OAuth account is available")
+        attempted_tokens.add(current_token)
+        backend = None
+        try:
+            attempt_payload = copy.deepcopy(payload)
+            resolve_codex_reasoning_effort(attempt_payload, access_token=current_token)
+            expected_account = None
+            get_account_lease = getattr(account_service, "_get_account_lease", None)
+            if callable(get_account_lease):
+                _, expected_account = get_account_lease(current_token)
+            backend = OpenAIBackendAPI(access_token=current_token)
+            for event in backend.iter_codex_response_events(attempt_payload):
+                public_event = project_public_codex_response_event(event)
+                if public_event is None:
+                    continue
+                event = public_event
+                active = created_response_from_event(event)
+                if active is None:
+                    active = in_progress_response_from_event(event)
+                terminal = None if active is not None else terminal_response_from_event(event)
+                if active is not None:
+                    event = {**event, "response": active}
+                elif terminal is not None:
+                    event = {**event, "response": terminal}
+                emitted_public_event = True
+                yield event
+                if terminal is not None:
+                    if expected_account is None:
+                        account_service.mark_text_used(current_token)
+                    else:
+                        account_service.mark_text_used(
+                            current_token,
+                            expected_account=expected_account,
+                        )
+                    return
+                if event.get("type") in {"response.failed", "error"}:
+                    return
+            raise RuntimeError("codex response ended without a terminal response event")
+        except UpstreamHTTPError as exc:
+            if emitted_public_event or exc.status_code not in _CODEX_TEXT_FAILOVER_STATUSES:
+                raise
+            current_token = None
+            continue
+        finally:
+            if backend is not None:
+                backend.close()
 
 
 def response_image_tool(body: dict[str, Any]) -> dict[str, object]:

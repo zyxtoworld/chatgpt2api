@@ -187,6 +187,364 @@ class CodexToolCallContractTests(unittest.TestCase):
     def setUp(self) -> None:
         _FakeCodexBackend.instances.clear()
 
+    def test_plain_chat_with_codex_account_uses_native_responses(self) -> None:
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_plain_codex",
+                "object": "response",
+                "status": "completed",
+                "model": CODEX_RESPONSES_MODEL,
+                "output": [{
+                    "id": "msg_plain_codex",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "native",
+                        "annotations": [],
+                    }],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+
+        class CodexAccountService:
+            def get_text_access_token(self, **_kwargs: object) -> str:
+                return "codex-token"
+
+            def get_account(self, _token: str) -> dict[str, str]:
+                return {"source_type": "codex"}
+
+        captured: dict[str, object] = {}
+
+        def native_events(_body: dict[str, object], **kwargs: object):
+            captured.update(kwargs)
+            yield completed
+
+        with (
+            mock.patch.object(openai_v1_chat_complete, "account_service", CodexAccountService()),
+            mock.patch.object(
+                openai_v1_chat_complete.openai_v1_response,
+                "stream_codex_response",
+                side_effect=native_events,
+            ),
+            mock.patch.object(
+                openai_v1_chat_complete,
+                "text_backend",
+                side_effect=AssertionError("Codex plain chat must not use web conversation"),
+            ),
+        ):
+            response = openai_v1_chat_complete.handle(body, authenticated=True)
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "native")
+        self.assertEqual(captured, {"access_token": "codex-token"})
+
+    def test_plain_stream_chat_with_codex_account_uses_native_responses(self) -> None:
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        }
+        created = {
+            "type": "response.created",
+            "response": {"id": "resp_plain_codex", "model": CODEX_RESPONSES_MODEL},
+        }
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_plain_codex",
+                "object": "response",
+                "status": "completed",
+                "model": CODEX_RESPONSES_MODEL,
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+
+        class CodexAccountService:
+            def get_text_access_token(self, **_kwargs: object) -> str:
+                return "codex-token"
+
+            def get_account(self, _token: str) -> dict[str, str]:
+                return {"source_type": "codex"}
+
+        captured: dict[str, object] = {}
+
+        def native_events(_body: dict[str, object], **kwargs: object):
+            captured.update(kwargs)
+            yield created
+            yield completed
+
+        with (
+            mock.patch.object(openai_v1_chat_complete, "account_service", CodexAccountService()),
+            mock.patch.object(
+                openai_v1_chat_complete.openai_v1_response,
+                "stream_codex_response",
+                side_effect=native_events,
+            ),
+            mock.patch.object(
+                openai_v1_chat_complete,
+                "text_backend",
+                side_effect=AssertionError("Codex plain chat must not use web conversation"),
+            ),
+        ):
+            chunks = list(openai_v1_chat_complete.handle(body, authenticated=True))
+
+        self.assertTrue(chunks)
+        self.assertEqual(captured, {"access_token": "codex-token"})
+
+    def test_native_codex_text_failover_reaches_third_route_candidate(self) -> None:
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_failover",
+                "object": "response",
+                "status": "completed",
+                "model": CODEX_RESPONSES_MODEL,
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+        selector_calls: list[dict[str, object]] = []
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                excluded = set(kwargs.get("excluded_tokens") or set())
+                for token in ("codex-1", "codex-2", "codex-3"):
+                    if token not in excluded:
+                        return token
+                raise AssertionError("selector returned an exhausted candidate set")
+
+            def mark_text_used(self, _token: str) -> None:
+                pass
+
+        class FailoverBackend:
+            instances: list["FailoverBackend"] = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.closed = False
+                self.instances.append(self)
+
+            def iter_codex_response_events(self, _payload: dict[str, object]):
+                if self.access_token != "codex-3":
+                    raise openai_v1_response.UpstreamHTTPError(
+                        "codex",
+                        502,
+                        {"error": "transient"},
+                    )
+                yield completed
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", FailoverBackend),
+            mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+        ):
+            events = list(
+                openai_v1_response.stream_codex_response(
+                    {"model": "auto", "input": "hello"},
+                )
+            )
+
+        self.assertEqual([event["type"] for event in events], ["response.completed"])
+        self.assertEqual(
+            selector_calls,
+            [
+                {"model": "auto", "source_type": "codex"},
+                {"model": "auto", "source_type": "codex", "excluded_tokens": {"codex-1"}},
+                {
+                    "model": "auto",
+                    "source_type": "codex",
+                    "excluded_tokens": {"codex-1", "codex-2"},
+                },
+            ],
+        )
+        self.assertEqual([backend.access_token for backend in FailoverBackend.instances], [
+            "codex-1",
+            "codex-2",
+            "codex-3",
+        ])
+        self.assertTrue(all(backend.closed for backend in FailoverBackend.instances))
+
+    def test_native_codex_text_does_not_failover_after_created_event(self) -> None:
+        selector_calls: list[dict[str, object]] = []
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                return "codex-1" if not kwargs.get("excluded_tokens") else "codex-2"
+
+        class CreatedThenErrorBackend:
+            instances: list["CreatedThenErrorBackend"] = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.closed = False
+                self.instances.append(self)
+
+            def iter_codex_response_events(self, _payload: dict[str, object]):
+                yield {
+                    "type": "response.created",
+                    "response": {"id": "resp_committed", "status": "in_progress"},
+                }
+                raise openai_v1_response.UpstreamHTTPError("codex", 502, {"error": "late"})
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", CreatedThenErrorBackend),
+            mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+            self.assertRaises(openai_v1_response.UpstreamHTTPError),
+        ):
+            list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
+
+        self.assertEqual(selector_calls, [{"model": "auto", "source_type": "codex"}])
+        self.assertEqual(len(CreatedThenErrorBackend.instances), 1)
+        self.assertTrue(CreatedThenErrorBackend.instances[0].closed)
+
+    def test_native_codex_text_failover_rebuilds_payload_for_each_candidate(self) -> None:
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                return "codex-1" if not kwargs.get("excluded_tokens") else "codex-2"
+
+            def mark_text_used(self, _token: str) -> None:
+                pass
+
+        class PayloadBackend:
+            payloads: dict[str, dict[str, object]] = {}
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.closed = False
+
+            def iter_codex_response_events(self, payload: dict[str, object]):
+                self.payloads[self.access_token] = payload
+                if self.access_token == "codex-1":
+                    raise openai_v1_response.UpstreamHTTPError("codex", 502, {"error": "transient"})
+                yield {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_payload",
+                        "object": "response",
+                        "status": "completed",
+                        "model": CODEX_RESPONSES_MODEL,
+                        "output": [],
+                        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    },
+                }
+
+            def close(self) -> None:
+                self.closed = True
+
+        def mutate_only_first(payload: dict[str, object], *, access_token: str) -> None:
+            if access_token == "codex-1":
+                payload["reasoning"]["effort"] = "minimal"  # type: ignore[index]
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", PayloadBackend),
+            mock.patch.object(
+                openai_v1_response,
+                "resolve_codex_reasoning_effort",
+                side_effect=mutate_only_first,
+            ),
+        ):
+            events = list(
+                openai_v1_response.stream_codex_response(
+                    {
+                        "model": "auto",
+                        "input": "hello",
+                        "reasoning": {"effort": "high"},
+                    }
+                )
+            )
+
+        self.assertEqual([event["type"] for event in events], ["response.completed"])
+        self.assertEqual(PayloadBackend.payloads["codex-1"]["reasoning"], {"effort": "minimal"})
+        self.assertEqual(PayloadBackend.payloads["codex-2"]["reasoning"], {"effort": "high"})
+
+    def test_native_codex_text_does_not_failover_after_delta(self) -> None:
+        selector_calls: list[dict[str, object]] = []
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                return "codex-1"
+
+        class PartialBackend:
+            instances: list["PartialBackend"] = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.closed = False
+                self.instances.append(self)
+
+            def iter_codex_response_events(self, _payload: dict[str, object]):
+                yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "part"}
+                raise openai_v1_response.UpstreamHTTPError("codex", 502, {"error": "late"})
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", PartialBackend),
+            mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+            self.assertRaises(openai_v1_response.UpstreamHTTPError),
+        ):
+            list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
+
+        self.assertEqual(selector_calls, [{"model": "auto", "source_type": "codex"}])
+        self.assertEqual(len(PartialBackend.instances), 1)
+        self.assertTrue(PartialBackend.instances[0].closed)
+
+    def test_native_codex_text_does_not_failover_client_errors(self) -> None:
+        selector_calls: list[dict[str, object]] = []
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                return "codex-1"
+
+        class ClientErrorBackend:
+            instances: list["ClientErrorBackend"] = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.closed = False
+                self.instances.append(self)
+
+            def iter_codex_response_events(self, _payload: dict[str, object]):
+                raise openai_v1_response.UpstreamHTTPError("codex", 400, {"error": "invalid"})
+                yield  # pragma: no cover
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", ClientErrorBackend),
+            mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+            self.assertRaises(openai_v1_response.UpstreamHTTPError),
+        ):
+            list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
+
+        self.assertEqual(selector_calls, [{"model": "auto", "source_type": "codex"}])
+        self.assertEqual(len(ClientErrorBackend.instances), 1)
+        self.assertTrue(ClientErrorBackend.instances[0].closed)
+
     def test_late_responses_usage_does_not_mutate_replaced_same_token_account(self) -> None:
         entered = threading.Event()
         release = threading.Event()

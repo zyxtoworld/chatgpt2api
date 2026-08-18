@@ -271,6 +271,7 @@ def create_router() -> APIRouter:
             openai_v1_chat_complete.handle,
             payload,
             cache_scope=str(identity.get("id") or ""),
+            authenticated=True,
         )
 
     @router.post("/v1/responses")
