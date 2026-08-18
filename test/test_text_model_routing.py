@@ -12,6 +12,7 @@ from unittest import mock
 from fastapi import HTTPException
 
 from services.account_service import AccountService, TokenRefreshError
+import services.openai_backend_api as openai_backend_module
 from services.model_service import ModelRoute, ModelUnavailableError
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol import (
@@ -51,6 +52,49 @@ class TextAccountRoutingTests(unittest.TestCase):
             token = self.service.get_text_access_token(model="pro-only")
 
         self.assertEqual(token, "pro")
+
+    def test_web_capability_rejects_explicit_model_without_a_catalog_route(self) -> None:
+        with mock.patch(
+            "services.model_service.model_catalog_service.route_for_model",
+            return_value=None,
+        ), self.assertRaisesRegex(ModelUnavailableError, "unrouted-model"):
+            self.service.get_text_access_token(
+                model="unrouted-model",
+                backend_capability="web",
+            )
+
+    def test_web_capability_rejects_unrouted_explicit_model_without_accounts(self) -> None:
+        empty_service = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "empty-accounts.json")
+        )
+        with mock.patch(
+            "services.model_service.model_catalog_service.route_for_model",
+            return_value=None,
+        ), self.assertRaisesRegex(ModelUnavailableError, "unrouted-model"):
+            empty_service.get_text_access_token(
+                model="unrouted-model",
+                backend_capability="web",
+            )
+
+    def test_explicit_model_routing_keeps_one_deadline_for_catalog_selection(self) -> None:
+        route = ModelRoute(access_tokens=frozenset({"pro"}), allow_anonymous=False)
+        with mock.patch(
+            "services.model_service.model_catalog_service.route_for_model",
+            return_value=route,
+        ) as route_for_model:
+            token = self.service.get_text_access_token(
+                model="pro-only",
+                deadline=123.5,
+            )
+
+        self.assertEqual(token, "pro")
+        self.assertEqual(
+            route_for_model.call_args_list,
+            [
+                mock.call("pro-only", deadline=123.5),
+                mock.call("pro-only", deadline=123.5),
+            ],
+        )
 
     def test_plan_filtered_text_selection_keeps_refresh_owner_contract(self) -> None:
         with mock.patch.object(self.service, "_index", 0):
@@ -110,7 +154,9 @@ class TextAccountRoutingTests(unittest.TestCase):
 
         self.assertEqual(result, ["ok"])
         self.assertEqual(created_tokens, ["bad", "bad", "good"])
-        select_fallback.assert_called_once_with(excluded_tokens={"bad"}, model="auto")
+        select_fallback.assert_called_once_with(
+            excluded_tokens={"bad"}, model="auto", backend_capability="web"
+        )
 
     def test_transient_bootstrap_502_fails_over_before_emitting_text(self) -> None:
         request = conversation.ConversationRequest(
@@ -125,11 +171,16 @@ class TextAccountRoutingTests(unittest.TestCase):
                 pass
 
         class ErrorSession:
+            def __init__(self) -> None:
+                self.calls = 0
+
             def get(self, *_args: object, **_kwargs: object) -> ErrorResponse:
+                self.calls += 1
                 return ErrorResponse()
 
         class BootstrapFailureBackend(OpenAIBackendAPI):
             def __init__(self, access_token: str = "") -> None:
+                created_backends.append(self)
                 self.access_token = access_token
                 self.base_url = "https://upstream.invalid"
                 self.user_agent = "test-agent"
@@ -145,26 +196,34 @@ class TextAccountRoutingTests(unittest.TestCase):
                 self.closed += 1
 
         def events(backend: object, **_kwargs: object):
-            if getattr(backend, "access_token", "") == "bad":
+            if getattr(backend, "access_token", "") == "plus":
                 yield from backend.stream_conversation()  # type: ignore[attr-defined]
             else:
                 yield {"type": "conversation.delta", "delta": "ok"}
 
-        initial_backend = BootstrapFailureBackend("bad")
+        created_backends: list[BootstrapFailureBackend] = []
+        initial_backend = BootstrapFailureBackend("plus")
+        created_backends.clear()
         with (
             mock.patch.object(conversation, "account_service", self.service),
+            mock.patch.object(openai_backend_module, "account_service", self.service),
             mock.patch.object(conversation, "OpenAIBackendAPI", BootstrapFailureBackend),
             mock.patch.object(conversation, "conversation_events", side_effect=events),
             mock.patch.object(
                 self.service,
                 "get_text_access_token",
-                return_value="good",
+                return_value="pro",
             ) as select_fallback,
         ):
             result = list(conversation.stream_text_deltas(initial_backend, request))
 
         self.assertEqual(result, ["ok"])
-        select_fallback.assert_called_once_with(excluded_tokens={"bad"}, model="auto")
+        self.assertEqual([backend.access_token for backend in created_backends], ["plus", "pro"])
+        self.assertEqual(created_backends[0].session.calls, 1)
+        self.assertEqual(created_backends[1].session.calls, 0)
+        select_fallback.assert_called_once_with(
+            excluded_tokens={"plus"}, model="auto", backend_capability="web"
+        )
 
     def test_backend_stage_http_errors_keep_status_and_retry_after(self) -> None:
         class Response:
@@ -221,7 +280,7 @@ class TextAccountRoutingTests(unittest.TestCase):
                 list(conversation.stream_text_deltas(Backend("bad-1"), request))
 
         select_fallback.assert_called_once_with(
-            excluded_tokens={"bad-1"}, model="auto"
+            excluded_tokens={"bad-1"}, model="auto", backend_capability="web"
         )
         self.assertEqual([backend.closed for backend in backends], [1, 1, 1])
 
@@ -291,7 +350,7 @@ class TextAccountRoutingTests(unittest.TestCase):
             )
 
         select_fallback.assert_called_once_with(
-            excluded_tokens={"bad"}, model="pro-only"
+            excluded_tokens={"bad"}, model="pro-only", backend_capability="web"
         )
 
     def test_client_errors_do_not_trigger_transient_failover(self) -> None:
@@ -389,6 +448,17 @@ class TextAccountRoutingTests(unittest.TestCase):
             token = self.service.get_text_access_token(model="anon-only")
 
         self.assertEqual(token, "")
+
+    def test_web_backend_capability_does_not_anonymously_fallback_explicit_model(self) -> None:
+        route = ModelRoute(access_tokens=frozenset(), allow_anonymous=True)
+        with mock.patch(
+            "services.model_service.model_catalog_service.route_for_model",
+            return_value=route,
+        ), self.assertRaisesRegex(ModelUnavailableError, "explicit-anon"):
+            self.service.get_text_access_token(
+                model="explicit-anon",
+                backend_capability="web",
+            )
 
     def test_model_without_eligible_account_fails_closed(self) -> None:
         route = ModelRoute(access_tokens=frozenset({"team-token"}), allow_anonymous=False)
@@ -700,6 +770,105 @@ class TextAccountRoutingTests(unittest.TestCase):
 
 
 class TextProtocolRoutingTests(unittest.TestCase):
+    def test_text_backend_mixed_sources_selects_web_account_for_initial_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(
+                JSONStorageBackend(Path(directory) / "mixed-sources.json")
+            )
+            service.add_account_items([
+                {"access_token": "codex-token", "type": "Pro", "source_type": "codex", "status": "正常"},
+                {"access_token": "web-token", "type": "Pro", "source_type": "web", "status": "正常"},
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            backend = object()
+            with (
+                mock.patch.object(conversation, "account_service", service),
+                mock.patch.object(conversation, "OpenAIBackendAPI", return_value=backend) as factory,
+            ):
+                self.assertIs(conversation.text_backend("auto"), backend)
+
+        factory.assert_called_once_with(access_token="web-token")
+
+    def test_conversation_invalid_token_fallback_skips_codex_source(self) -> None:
+        request = conversation.ConversationRequest(
+            model="auto",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(
+                JSONStorageBackend(Path(directory) / "mixed-sources.json")
+            )
+            service.add_account_items([
+                {"access_token": "codex-token", "type": "Pro", "source_type": "codex", "status": "正常"},
+                {"access_token": "web-token", "type": "Pro", "source_type": "web", "status": "正常"},
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            created: list[str] = []
+
+            class Backend:
+                def __init__(self, access_token: str = "") -> None:
+                    self.access_token = access_token
+                    created.append(access_token)
+
+                def close(self) -> None:
+                    pass
+
+            def events(backend: Backend, **_kwargs: object):
+                if backend.access_token == "web-token":
+                    yield {"type": "conversation.delta", "delta": "ok"}
+                    return
+                raise RuntimeError("token_invalidated")
+
+            with (
+                mock.patch.object(conversation, "account_service", service),
+                mock.patch.object(conversation, "OpenAIBackendAPI", Backend),
+                mock.patch.object(conversation, "conversation_events", side_effect=events),
+            ):
+                result = list(conversation._stream_text_deltas(Backend("codex-token"), request))
+
+        self.assertEqual(result, ["ok"])
+        self.assertEqual(created, ["codex-token", "codex-token", "web-token"])
+
+    def test_conversation_transient_fallback_skips_codex_source(self) -> None:
+        request = conversation.ConversationRequest(
+            model="auto",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(
+                JSONStorageBackend(Path(directory) / "mixed-sources.json")
+            )
+            service.add_account_items([
+                {"access_token": "codex-token", "type": "Pro", "source_type": "codex", "status": "正常"},
+                {"access_token": "web-token", "type": "Pro", "source_type": "web", "status": "正常"},
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            created: list[str] = []
+
+            class Backend:
+                def __init__(self, access_token: str = "") -> None:
+                    self.access_token = access_token
+                    created.append(access_token)
+
+                def close(self) -> None:
+                    pass
+
+            def events(backend: Backend, **_kwargs: object):
+                if backend.access_token == "web-token":
+                    yield {"type": "conversation.delta", "delta": "ok"}
+                    return
+                raise UpstreamHTTPError("conversation", 502, {"error": "upstream_error"})
+
+            with (
+                mock.patch.object(conversation, "account_service", service),
+                mock.patch.object(conversation, "OpenAIBackendAPI", Backend),
+                mock.patch.object(conversation, "conversation_events", side_effect=events),
+            ):
+                result = list(conversation._stream_text_deltas(Backend("codex-token"), request))
+
+        self.assertEqual(result, ["ok"])
+        self.assertEqual(created, ["codex-token", "codex-token", "web-token"])
+
     def test_text_backend_passes_requested_model_to_account_selector(self) -> None:
         backend = mock.Mock()
         with (
@@ -713,7 +882,7 @@ class TextProtocolRoutingTests(unittest.TestCase):
             result = conversation.text_backend("pro-only")
 
         self.assertIs(result, backend)
-        selector.assert_called_once_with(model="pro-only")
+        selector.assert_called_once_with(model="pro-only", backend_capability="web")
 
     def test_chat_completions_passes_requested_model_to_text_backend(self) -> None:
         body = {
@@ -728,6 +897,29 @@ class TextProtocolRoutingTests(unittest.TestCase):
 
         backend.assert_called_once_with("pro-chat")
 
+    def test_authenticated_chat_web_fallback_declares_web_capability(self) -> None:
+        body = {
+            "model": "auto",
+            "messages": [{"role": "user", "content": "web capability"}],
+        }
+        with (
+            mock.patch.object(
+                openai_v1_chat_complete.account_service,
+                "get_text_access_token",
+                return_value="",
+            ) as selector,
+            mock.patch.object(openai_v1_chat_complete, "text_backend", return_value=object()),
+            mock.patch.object(openai_v1_chat_complete, "collect_text", return_value="ok"),
+            mock.patch.object(
+                openai_v1_chat_complete.chat_completion_cache,
+                "get_or_compute_response",
+                side_effect=lambda _key, compute, **_kwargs: compute(),
+            ),
+        ):
+            openai_v1_chat_complete.handle(body, authenticated=True)
+
+        self.assertEqual(selector.call_args.kwargs["backend_capability"], "web")
+
     def test_responses_passes_requested_model_to_text_backend(self) -> None:
         body = {"model": "pro-response", "input": "route response"}
         with (
@@ -737,6 +929,26 @@ class TextProtocolRoutingTests(unittest.TestCase):
             openai_v1_response.handle(body)
 
         backend.assert_called_once_with("pro-response")
+
+    def test_authenticated_responses_web_fallback_declares_web_capability(self) -> None:
+        body = {"model": "auto", "input": "web capability"}
+        with (
+            mock.patch.object(
+                openai_v1_response.account_service,
+                "get_text_access_token",
+                return_value="",
+            ) as selector,
+            mock.patch.object(openai_v1_response, "text_backend", return_value=object()),
+            mock.patch.object(openai_v1_response, "stream_text_response", return_value=iter(())),
+            mock.patch.object(
+                openai_v1_response.chat_completion_cache,
+                "get_or_compute_stream",
+                side_effect=lambda _key, compute, **_kwargs: compute(),
+            ),
+        ):
+            list(openai_v1_response.response_events(body, authenticated=True))
+
+        self.assertEqual(selector.call_args.kwargs["backend_capability"], "web")
 
     def test_anthropic_messages_passes_requested_model_to_account_selector(self) -> None:
         with (
@@ -753,7 +965,116 @@ class TextProtocolRoutingTests(unittest.TestCase):
             })
 
         self.assertEqual(request.model, "pro-anthropic")
-        selector.assert_called_once_with(model="pro-anthropic")
+        selector.assert_called_once_with(
+            model="pro-anthropic",
+            backend_capability="web",
+        )
+
+    def test_anthropic_messages_does_not_pass_codex_token_to_web_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_service = AccountService(
+                JSONStorageBackend(Path(directory) / "anthropic-codex-only.json")
+            )
+            codex_service.add_account_items([
+                {"access_token": "codex-only", "type": "Pro", "source_type": "codex", "status": "正常"},
+            ])
+            codex_service.refresh_access_token = lambda token, **_kwargs: token
+
+            with (
+                mock.patch.object(anthropic_v1_messages, "account_service", codex_service),
+                mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend_factory,
+            ):
+                request = anthropic_v1_messages.message_request({
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "must not use web"}],
+                })
+
+        self.assertIsNotNone(request.backend)
+        backend_factory.assert_called_once_with(access_token="")
+
+    def test_anthropic_messages_does_not_pass_unknown_source_to_web_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
+            service.add_account_items([
+                {
+                    "access_token": "future-only",
+                    "type": "Pro",
+                    "source_type": "future-incompatible",
+                    "status": "正常",
+                },
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            with (
+                mock.patch.object(anthropic_v1_messages, "account_service", service),
+                mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend_factory,
+            ):
+                request = anthropic_v1_messages.message_request({
+                    "model": "auto",
+                    "messages": [{"role": "user", "content": "unknown source"}],
+                })
+
+        self.assertIsNotNone(request.backend)
+        backend_factory.assert_called_once_with(access_token="")
+
+    def test_web_backend_capability_accepts_legacy_account_sources(self) -> None:
+        for source_type in ("web", "password", "password-oauth"):
+            with tempfile.TemporaryDirectory() as directory:
+                service = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
+                service.add_account_items([
+                    {"access_token": source_type, "type": "Pro", "source_type": source_type, "status": "正常"},
+                ])
+                service.refresh_access_token = lambda token, **_kwargs: token
+                self.assertEqual(
+                    service.get_text_access_token(model="auto", backend_capability="web"),
+                    source_type,
+                )
+
+    def test_web_backend_capability_rechecks_source_after_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(
+                JSONStorageBackend(Path(directory) / "refresh-source.json")
+            )
+            service.add_account_items([
+                {"access_token": "web-token", "type": "Pro", "source_type": "web", "status": "正常"},
+            ])
+
+            def refresh(token: str, **_kwargs: object) -> str:
+                service.update_account(token, {"source_type": "future-incompatible"})
+                return token
+
+            service.refresh_access_token = refresh
+            with self.assertRaises(ModelUnavailableError):
+                service.get_text_access_token(model="auto", backend_capability="web")
+
+    def test_anthropic_explicit_codex_model_fails_closed_without_anonymous_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_service = AccountService(
+                JSONStorageBackend(Path(directory) / "anthropic-codex-only.json")
+            )
+            codex_service.add_account_items([
+                {"access_token": "codex-only", "type": "Pro", "source_type": "codex", "status": "正常"},
+            ])
+            codex_service.refresh_access_token = lambda token, **_kwargs: token
+
+            with (
+                mock.patch.object(anthropic_v1_messages, "account_service", codex_service),
+                mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend_factory,
+                mock.patch(
+                    "services.model_service.model_catalog_service.route_for_model",
+                    return_value=ModelRoute(
+                        access_tokens=frozenset({"codex-only"}),
+                        allow_anonymous=False,
+                        catalog_complete=True,
+                    ),
+                ),
+                self.assertRaises(ModelUnavailableError),
+            ):
+                anthropic_v1_messages.message_request({
+                    "model": "codex-model",
+                    "messages": [{"role": "user", "content": "must not use anonymous web"}],
+                })
+
+        backend_factory.assert_not_called()
 
     def test_anthropic_text_block_rejects_container_text(self) -> None:
         with self.assertRaises(HTTPException) as raised:
@@ -1016,6 +1337,22 @@ class TextProtocolRoutingTests(unittest.TestCase):
 
         self.assertNotIn("anthropic-choices-canary", str(raised.exception))
 
+    def test_anthropic_stream_rejects_eof_without_terminal_finish_reason(self) -> None:
+        chunks = [{
+            "choices": [{
+                "delta": {"content": "partial"},
+                "finish_reason": None,
+            }],
+        }]
+
+        with self.assertRaisesRegex(RuntimeError, "without terminal finish reason"):
+            list(anthropic_v1_messages.stream_events(
+                chunks,
+                "auto",
+                0,
+                lambda _text: 0,
+            ))
+
     def test_anthropic_system_text_block_rejects_container_text(self) -> None:
         with self.assertRaises(HTTPException) as raised:
             anthropic_v1_messages.message_request({
@@ -1137,6 +1474,7 @@ class TextProtocolRoutingTests(unittest.TestCase):
         )
         source = iter((
             {"choices": [{"delta": {"content": "reply"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
         ))
         with (
             mock.patch.object(anthropic_v1_messages, "message_request", return_value=request),

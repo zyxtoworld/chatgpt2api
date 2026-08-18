@@ -20,6 +20,24 @@ class FakeResponse:
 
 
 class ImageStreamHardTimeoutTests(unittest.TestCase):
+    def test_image_download_close_failure_does_not_mask_body_failure(self) -> None:
+        class Response:
+            status_code = 200
+            headers: dict[str, str] = {}
+
+            def iter_content(self, **_kwargs: object):
+                raise RuntimeError("body failure")
+
+            def close(self) -> None:
+                raise RuntimeError("close failure")
+
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.session = mock.Mock()
+        backend.session.get.return_value = Response()
+
+        with self.assertRaisesRegex(RuntimeError, "body failure"):
+            backend.download_image_bytes(["https://example.invalid/image.png"])
+
     def test_payload_arriving_after_deadline_is_not_emitted(self) -> None:
         response = FakeResponse()
         backend = object.__new__(OpenAIBackendAPI)

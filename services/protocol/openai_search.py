@@ -29,7 +29,10 @@ def _public_search_result(result: object) -> dict[str, object]:
 
 
 def handle(body: dict[str, object]) -> dict[str, object]:
-    token = account_service.get_text_access_token(model=MODEL)
+    token = account_service.get_text_access_token(
+        model=MODEL,
+        backend_capability="web",
+    )
     expected_account = None
     get_account_lease = getattr(account_service, "_get_account_lease", None)
     if callable(get_account_lease):

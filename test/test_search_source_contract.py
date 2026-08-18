@@ -14,6 +14,7 @@ import services.protocol.openai_search as openai_search
 import services.protocol.web_search_tool as web_search_tool
 from services.account_service import AccountService
 from services.openai_backend_api import OpenAIBackendAPI
+from services.model_service import ModelUnavailableError
 from services.protocol.web_search_tool import (
     message_text,
     normalized_sources,
@@ -235,7 +236,10 @@ def test_direct_search_selects_an_account_for_the_search_model() -> None:
     ):
         openai_search.handle({"prompt": "fixture query"})
 
-    select_token.assert_called_once_with(model=openai_search.MODEL)
+    select_token.assert_called_once_with(
+        model=openai_search.MODEL,
+        backend_capability="web",
+    )
 
 
 def test_web_search_selects_an_account_for_the_search_model() -> None:
@@ -253,7 +257,36 @@ def test_web_search_selects_an_account_for_the_search_model() -> None:
     ):
         web_search_tool.run_web_search("fixture query")
 
-    select_token.assert_called_once_with(model=web_search_tool.SEARCH_MODEL)
+    select_token.assert_called_once_with(
+        model=web_search_tool.SEARCH_MODEL,
+        backend_capability="web",
+    )
+
+
+def test_web_search_callers_reject_unknown_web_sources(tmp_path) -> None:
+    service = AccountService(JSONStorageBackend(tmp_path / "accounts.json"))
+    service.add_account_items([
+        {
+            "access_token": "future-only",
+            "type": "Pro",
+            "source_type": "future-incompatible",
+            "status": "正常",
+        },
+    ])
+    service.refresh_access_token = lambda token, **_kwargs: token
+
+    for module, invoke in (
+        (openai_search, lambda: openai_search.handle({"prompt": "fixture query"})),
+        (web_search_tool, lambda: web_search_tool.run_web_search("fixture query")),
+    ):
+        with (
+            mock.patch.object(module, "account_service", service),
+            mock.patch.object(module, "OpenAIBackendAPI") as backend_factory,
+            pytest.raises(ModelUnavailableError),
+        ):
+            invoke()
+
+        backend_factory.assert_not_called()
 
 
 def test_direct_search_does_not_mark_usage_when_public_projection_fails() -> None:

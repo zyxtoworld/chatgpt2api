@@ -1369,7 +1369,11 @@ def handle(
             return stream_web_search_chat_completion(messages, model, include_usage=include_usage)
         thinking_effort = thinking_effort_from_body(body)
         selected_token = (
-            account_service.get_text_access_token(model=model, deadline=codex_deadline)
+            account_service.get_text_access_token(
+                model=model,
+                backend_capability="web",
+                deadline=codex_deadline,
+            )
             if authenticated or cache_scope
             else None
         )
@@ -1410,7 +1414,11 @@ def handle(
         return web_search_chat_response(messages, model)
     thinking_effort = thinking_effort_from_body(body)
     selected_token = (
-        account_service.get_text_access_token(model=model, deadline=codex_deadline)
+        account_service.get_text_access_token(
+            model=model,
+            backend_capability="web",
+            deadline=codex_deadline,
+        )
         if authenticated or cache_scope
         else None
     )

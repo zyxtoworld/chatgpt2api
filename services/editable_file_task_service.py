@@ -256,7 +256,10 @@ def _file_url(
 
 def _editable_access_token() -> str:
     try:
-        return account_service.get_text_access_token(plan_types=EDITABLE_FILE_PLAN_TYPES)
+        return account_service.get_text_access_token(
+            plan_types=EDITABLE_FILE_PLAN_TYPES,
+            backend_capability="web",
+        )
     except Exception as exc:
         from services.model_service import ModelUnavailableError
 

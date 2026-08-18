@@ -5,13 +5,16 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Condition, Event, Lock
 from unittest import mock
 
 from services.account_service import AccountService
+import services.openai_backend_api as openai_backend_module
 from services.model_service import ModelCatalogService
 from services.openai_backend_api import OpenAIBackendAPI, SearchTimeoutError
 from services.protocol import openai_v1_chat_complete, openai_v1_response
@@ -61,6 +64,71 @@ class _HeaderObservingSession:
 
 
 class UpstreamModelEffortContractTests(unittest.TestCase):
+    def test_web_transport_rejects_non_web_or_missing_live_identity_before_io(self) -> None:
+        for source_type, live_account in (
+            ("codex", {"access_token": "token", "source_type": "codex"}),
+            ("future-incompatible", {"access_token": "token", "source_type": "future-incompatible"}),
+            ("missing", None),
+        ):
+            with self.subTest(source_type=source_type):
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.access_token = "token"
+                backend.base_url = "https://chatgpt.com"
+                backend.session = mock.Mock()
+                backend.session.get.return_value = mock.Mock(status_code=200)
+                backend._read_json_response = mock.Mock(return_value={})
+                backend._search_remaining = mock.Mock(return_value=1.0)
+                with mock.patch.object(
+                    openai_backend_module.account_service,
+                    "get_account",
+                    return_value=live_account,
+                ), self.assertRaisesRegex(RuntimeError, "web backend"):
+                    backend._get_me()
+                backend.session.get.assert_not_called()
+
+    def test_web_transport_accepts_legacy_sources_and_anonymous_before_io(self) -> None:
+        for access_token, live_account in (
+            ("web-token", {"access_token": "web-token", "source_type": "web"}),
+            ("password-token", {"access_token": "password-token", "source_type": "password"}),
+            ("oauth-token", {"access_token": "oauth-token", "source_type": "password-oauth"}),
+            ("", None),
+        ):
+            with self.subTest(access_token=access_token):
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.access_token = access_token
+                backend.base_url = "https://chatgpt.com"
+                backend.session = mock.Mock()
+                backend.session.headers = {}
+                backend.session.get.return_value = mock.Mock(status_code=200)
+                backend._read_json_response = mock.Mock(return_value={})
+                backend._search_remaining = mock.Mock(return_value=1.0)
+                with mock.patch.object(
+                    openai_backend_module.account_service,
+                    "get_account",
+                    return_value=live_account,
+                ):
+                    backend._get_me()
+                backend.session.get.assert_called_once()
+
+    def test_web_bootstrap_rejects_non_web_identity_before_io(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.base_url = "https://chatgpt.com"
+        backend.user_agent = "test-agent"
+        backend.session = mock.Mock()
+        backend.session.headers = {
+            "Sec-Ch-Ua": '"Chromium"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+        }
+        with mock.patch.object(
+            openai_backend_module.account_service,
+            "get_account",
+            return_value={"access_token": "codex-token", "source_type": "codex"},
+        ), self.assertRaisesRegex(RuntimeError, "web backend"):
+            backend._bootstrap()
+        backend.session.get.assert_not_called()
+
     def test_codex_model_version_missing_environment_fails_closed(self) -> None:
         environment = dict(os.environ)
         environment.pop("CODEX_MODELS_CLIENT_VERSION", None)
@@ -415,6 +483,7 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         for _ in range(5):
             with self.assertRaises(SearchTimeoutError):
                 backend.list_catalog_models(timeout_secs=0.03)
+        release.set()
 
         def fast_fetch(
             _session: object,
@@ -434,11 +503,73 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
             [item["id"] for item in result["data"]],
             ["codex-model", "web-model"],
         )
-        release.set()
         self.assertTrue(
             all(session.close.called for session in created_sessions),
             "timed-out Codex sessions were not closed",
         )
+
+    def test_dual_catalog_timeouts_do_not_create_unbounded_endpoint_threads(self) -> None:
+        backend = self._dual_catalog_backend()
+        release = Event()
+        started_condition = Condition(Lock())
+        started = 0
+        finished = 0
+
+        def blocked_fetch(
+            _session: object,
+            _path: str,
+            _route: str,
+            _headers: dict[str, str],
+            **_kwargs: object,
+        ) -> dict[str, dict[str, str]]:
+            nonlocal started, finished
+            with started_condition:
+                started += 1
+                started_condition.notify_all()
+            try:
+                release.wait(timeout=2.0)
+                return {}
+            finally:
+                with started_condition:
+                    finished += 1
+                    started_condition.notify_all()
+
+        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=blocked_fetch)
+        callers = ThreadPoolExecutor(max_workers=1)
+        try:
+            for _ in range(6):
+                request = callers.submit(
+                    backend.list_catalog_models,
+                    deadline=time.monotonic() + 0.05,
+                )
+                with started_condition:
+                    started_condition.wait_for(
+                        lambda: started >= 2 or request.done(),
+                        timeout=1.0,
+                    )
+                with self.assertRaises(SearchTimeoutError):
+                    request.result(timeout=1.0)
+
+            endpoint_threads = [
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("model-catalog-endpoint")
+            ]
+            self.assertLessEqual(
+                len(endpoint_threads),
+                2,
+                "timed-out catalog calls accumulated endpoint workers",
+            )
+        finally:
+            release.set()
+            with started_condition:
+                self.assertTrue(
+                    started_condition.wait_for(
+                        lambda: finished == started,
+                        timeout=2.0,
+                    )
+                )
+            callers.shutdown(wait=True)
 
     def test_dual_catalog_timeout_closes_pending_web_transport(self) -> None:
         backend = self._dual_catalog_backend()

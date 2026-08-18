@@ -170,7 +170,10 @@ def text_with_url_citations(result: dict[str, Any]) -> tuple[str, list[dict[str,
 
 
 def run_web_search(query: str) -> dict[str, Any]:
-    token = account_service.get_text_access_token(model=SEARCH_MODEL)
+    token = account_service.get_text_access_token(
+        model=SEARCH_MODEL,
+        backend_capability="web",
+    )
     expected_account = None
     get_account_lease = getattr(account_service, "_get_account_lease", None)
     if callable(get_account_lease):

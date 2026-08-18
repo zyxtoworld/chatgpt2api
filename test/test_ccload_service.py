@@ -391,6 +391,37 @@ class CCLoadServiceContractTests(unittest.TestCase):
         self.assertEqual(models, ["valid-channel-model"])
         self.assertNotIn(canary, repr(models))
 
+    def test_channel_model_ids_binds_codex_catalog_identity(self) -> None:
+        class CapturingBackend:
+            instances: list["CapturingBackend"] = []
+
+            def __init__(self, access_token: str = ""):
+                self.access_token = access_token
+                self._catalog_source_type = ""
+                self._catalog_account_id = ""
+                self.closed = False
+                self.__class__.instances.append(self)
+
+            def list_models(self, **_kwargs):
+                return {"object": "list", "data": [{"id": "codex-model"}]}
+
+            def close(self):
+                self.closed = True
+
+        with mock.patch.object(ccload_module, "OpenAIBackendAPI", CapturingBackend):
+            models = ccload_module._channel_model_ids(
+                "channel-token",
+                account_id="channel-account",
+            )
+
+        self.assertEqual(models, ["codex-model"])
+        self.assertEqual(len(CapturingBackend.instances), 1)
+        backend = CapturingBackend.instances[0]
+        self.assertEqual(backend.access_token, "channel-token")
+        self.assertEqual(backend._catalog_source_type, "codex")
+        self.assertEqual(backend._catalog_account_id, "channel-account")
+        self.assertTrue(backend.closed)
+
     def test_expired_browse_deadline_does_not_start_unbounded_logout_cleanup(self) -> None:
         with (
             mock.patch.object(ccload_module, "Session", _FakeCCLoadSession),

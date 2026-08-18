@@ -67,6 +67,15 @@ def logged_text(calls: object) -> str:
 
 
 class OpenAIBackendLogContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._web_backend_identity = mock.patch.object(
+            backend_module.account_service,
+            "get_account",
+            side_effect=lambda token: {"access_token": token, "source_type": "web"},
+        )
+        self._web_backend_identity.start()
+        self.addCleanup(self._web_backend_identity.stop)
+
     def test_editable_artifact_deadline_uses_monotonic_clock(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
         clock = {"value": 0.0}

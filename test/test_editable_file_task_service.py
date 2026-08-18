@@ -413,7 +413,26 @@ class EditableFileTaskErrorContractTests(unittest.TestCase):
     def test_editable_access_token_skips_rate_limited_accounts(self) -> None:
         with mock.patch.object(editable_module.account_service, "get_text_access_token", return_value="ready-token") as select:
             self.assertEqual(editable_module._editable_access_token(), "ready-token")
-        select.assert_called_once_with(plan_types=editable_module.EDITABLE_FILE_PLAN_TYPES)
+        select.assert_called_once_with(
+            plan_types=editable_module.EDITABLE_FILE_PLAN_TYPES,
+            backend_capability="web",
+        )
+
+    def test_editable_access_token_rejects_unknown_web_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
+            service.add_account_items([
+                {
+                    "access_token": "future-only",
+                    "type": "Pro",
+                    "source_type": "future-incompatible",
+                    "status": "正常",
+                },
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            with mock.patch.object(editable_module, "account_service", service):
+                with self.assertRaisesRegex(RuntimeError, "no available plus/team/pro account"):
+                    editable_module._editable_access_token()
 
     def test_editable_access_token_rechecks_account_after_refresh(self) -> None:
         from services.model_service import ModelUnavailableError

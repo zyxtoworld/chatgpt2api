@@ -212,6 +212,7 @@ class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
     _ACCOUNT_STATUSES = frozenset({"正常", "限流", "异常", "禁用"})
+    _WEB_COMPATIBLE_SOURCE_TYPES = frozenset({"web", "password", "password-oauth"})
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
@@ -642,6 +643,15 @@ class AccountService:
     @staticmethod
     def _normalize_source_type(value: object) -> str:
         return str(value or "web").strip().lower() or "web"
+
+    @classmethod
+    def is_web_backend_compatible(cls, account: object) -> bool:
+        """Return whether a live account may use ChatGPT Web endpoints."""
+        return (
+            isinstance(account, dict)
+            and cls._normalize_source_type(account.get("source_type"))
+            in cls._WEB_COMPATIBLE_SOURCE_TYPES
+        )
 
     @staticmethod
     def _normalize_counter(item: dict, field: str) -> int | None:
@@ -2063,18 +2073,32 @@ class AccountService:
             excluded_tokens: set[str] | None = None,
             model: str = "auto",
             source_type: str | None = None,
+            backend_capability: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             deadline: float | None = None,
     ) -> str:
         excluded = set(excluded_tokens or set())
         requested_model = str(model or "auto").strip() or "auto"
         requested_source = self._normalize_source_type(source_type) if source_type else None
+        if backend_capability not in (None, "web"):
+            raise ValueError("unsupported text backend capability")
+        allowed_sources = (
+            self._WEB_COMPATIBLE_SOURCE_TYPES
+            if backend_capability == "web"
+            else None
+        )
         route = None
         if requested_model != "auto":
             from services.model_service import model_catalog_service
 
             route_kwargs = {"deadline": deadline} if deadline is not None else {}
             route = model_catalog_service.route_for_model(requested_model, **route_kwargs)
+            if backend_capability == "web" and route is None:
+                from services.model_service import ModelUnavailableError
+
+                raise ModelUnavailableError(
+                    f"model {requested_model!r} is not available to any active account"
+                )
         with self._lock:
             candidates = [
                 (token, account)
@@ -2083,6 +2107,10 @@ class AccountService:
                    and (token := account.get("access_token") or "")
                    and (route is None or token in route.access_tokens)
                    and self._account_matches_source_type(account, requested_source)
+                   and (
+                       allowed_sources is None
+                       or self.is_web_backend_compatible(account)
+                   )
                    and self._account_matches_any_plan_type(account, plan_types)
                    and token not in excluded
             ]
@@ -2099,7 +2127,10 @@ class AccountService:
                     from services.model_service import ModelUnavailableError
 
                     raise ModelUnavailableError("no active account matches the requested plan")
-                if route is None or route.allow_anonymous:
+                if route is None or (
+                    route.allow_anonymous
+                    and (requested_model == "auto" or backend_capability is None)
+                ):
                     return ""
                 from services.model_service import ModelUnavailableError
 
@@ -2120,6 +2151,10 @@ class AccountService:
         resolved_account = self.get_account(resolved_token)
         if (
             not self._is_text_account_available(resolved_account)
+            or (
+                allowed_sources is not None
+                and not self.is_web_backend_compatible(resolved_account)
+            )
             or not self._account_matches_any_plan_type(resolved_account or {}, plan_types)
         ):
             from services.model_service import ModelUnavailableError
@@ -2135,6 +2170,12 @@ class AccountService:
                 requested_model,
                 **route_kwargs,
             )
+            if backend_capability == "web" and refreshed_route is None:
+                from services.model_service import ModelUnavailableError
+
+                raise ModelUnavailableError(
+                    f"model {requested_model!r} is not available to any active account"
+                )
             if not refreshed_route.catalog_complete:
                 from services.model_service import ModelCatalogPendingError
 

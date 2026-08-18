@@ -178,6 +178,12 @@ _ACCOUNT_INFO_EXECUTOR = ThreadPoolExecutor(
     max_workers=ACCOUNT_INFO_WORKERS,
     thread_name_prefix="account-info",
 )
+_MODEL_CATALOG_ENDPOINT_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="model-catalog-endpoint",
+)
+_MODEL_CATALOG_ENDPOINT_SLOTS = threading.BoundedSemaphore(2)
+_MODEL_CATALOG_ENDPOINT_ADMISSION_LOCK = threading.Lock()
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 CODEX_RESPONSE_MAX_EVENT_BYTES = 64 * 1024 * 1024
@@ -552,12 +558,25 @@ class OpenAIBackendAPI:
 
     def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
+        self._ensure_web_backend_account()
         headers = dict(self.session.headers)
         headers["X-OpenAI-Target-Path"] = path
         headers["X-OpenAI-Target-Route"] = path
         if extra:
             headers.update(extra)
         return headers
+
+    def _ensure_web_backend_account(self) -> None:
+        """Fail closed before any Web request for a non-Web live account."""
+        access_token = getattr(self, "access_token", "")
+        if not access_token:
+            return
+        account = account_service.get_account(access_token)
+        if not account_service.is_web_backend_compatible(account):
+            raise RuntimeError("web backend requires a compatible live account")
+        live_token = account.get("access_token") if isinstance(account, dict) else None
+        if live_token != access_token:
+            raise RuntimeError("web backend account identity is stale")
 
     @staticmethod
     def _sanitize_limits_progress(value: object) -> list[dict[str, Any]]:
@@ -1983,7 +2002,7 @@ class OpenAIBackendAPI:
                     break
                 conversation_id = conversation_id or self._find_editable_value(payload, "conversation_id")
         finally:
-            response.close()
+            close_response(response)
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
@@ -2204,7 +2223,7 @@ class OpenAIBackendAPI:
             atomic_write_stream(target_path, output_dir, chunks())
             return target_path
         finally:
-            response.close()
+            close_response(response)
 
     def _resolve_editable_download_url(self, conversation_id: str, artifact: EditableFileArtifact) -> str:
         ids: list[str] = []
@@ -2618,7 +2637,7 @@ class OpenAIBackendAPI:
                 if payload == "[DONE]":
                     break
         finally:
-            response.close()
+            close_response(response)
         if not conversation_id:
             raise RuntimeError("conversation_id not found in stream")
         return conversation_id
@@ -2635,7 +2654,7 @@ class OpenAIBackendAPI:
         def expire() -> None:
             timeout_event.set()
             try:
-                response.close()
+                close_response(response)
             except Exception:
                 pass
 
@@ -3388,7 +3407,7 @@ class OpenAIBackendAPI:
                 if image not in images:
                     images.append(image)
             finally:
-                response.close()
+                close_response(response)
         return images
 
     def stream_conversation(
@@ -3421,7 +3440,7 @@ class OpenAIBackendAPI:
         try:
             yield from iter_sse_payloads(response)
         finally:
-            response.close()
+            close_response(response)
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
@@ -3466,7 +3485,7 @@ class OpenAIBackendAPI:
         def expire() -> None:
             timeout_event.set()
             try:
-                response.close()
+                close_response(response)
             except Exception:
                 pass
 
@@ -3492,12 +3511,17 @@ class OpenAIBackendAPI:
         finally:
             watchdog.cancel()
             try:
-                response.close()
+                close_response(response)
             except Exception:
                 pass
 
     def _bootstrap(self, *, timeout_secs: float = 30.0, deadline: float | None = None) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
+        # Bootstrap is a Web capability request too, but it predates the
+        # endpoint-specific _headers() call.  Keep the identity fence before
+        # the first session operation so unsupported/stale accounts cannot
+        # reach the Web transport through this side door.
+        self._ensure_web_backend_account()
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
@@ -3749,10 +3773,6 @@ class OpenAIBackendAPI:
         )
         futures: dict[Any, str] = {}
         pending: set[Any] = set()
-        endpoint_executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="model-catalog-endpoint",
-        )
         endpoint_state_lock = threading.Lock()
         endpoint_state: dict[str, Any] = {
             "cancelled": False,
@@ -3840,8 +3860,46 @@ class OpenAIBackendAPI:
         web_error: BaseException | None = None
         codex_error: BaseException | None = None
         try:
-            futures[endpoint_executor.submit(fetch_web)] = "web"
-            futures[endpoint_executor.submit(fetch_codex)] = "codex"
+            endpoint_functions = (("web", fetch_web), ("codex", fetch_codex))
+            reserved_slots = 0
+            try:
+                # Reserve the complete pair before submitting either endpoint.
+                # This prevents two callers from each owning one slot while
+                # waiting forever for the other half of their dual-source
+                # catalog.
+                with _MODEL_CATALOG_ENDPOINT_ADMISSION_LOCK:
+                    for _source, _function in endpoint_functions:
+                        remaining = owner_deadline - time.monotonic()
+                        if remaining <= 0 or not _MODEL_CATALOG_ENDPOINT_SLOTS.acquire(
+                            timeout=remaining
+                        ):
+                            raise SearchTimeoutError(
+                                "model catalog endpoint admission timed out"
+                            )
+                        reserved_slots += 1
+
+                def run_endpoint(function: Callable[[], dict[str, dict[str, Any]]]):
+                    try:
+                        return function()
+                    finally:
+                        _MODEL_CATALOG_ENDPOINT_SLOTS.release()
+
+                for source, function in endpoint_functions:
+                    future = _MODEL_CATALOG_ENDPOINT_EXECUTOR.submit(
+                        run_endpoint,
+                        function,
+                    )
+                    reserved_slots -= 1
+                    future.add_done_callback(
+                        lambda done, _slots=_MODEL_CATALOG_ENDPOINT_SLOTS: (
+                            _slots.release() if done.cancelled() else None
+                        )
+                    )
+                    futures[future] = source
+            except BaseException:
+                for _ in range(reserved_slots):
+                    _MODEL_CATALOG_ENDPOINT_SLOTS.release()
+                raise
 
             remaining = max(0.0, owner_deadline - time.monotonic())
             done, pending = wait(futures, timeout=remaining)
@@ -3875,9 +3933,6 @@ class OpenAIBackendAPI:
             if unfinished:
                 pending = unfinished
                 cancel_pending_endpoints()
-                endpoint_executor.shutdown(wait=False, cancel_futures=True)
-            else:
-                endpoint_executor.shutdown(wait=True, cancel_futures=True)
 
         merged = {}
         self._merge_model_items(merged, web_models)

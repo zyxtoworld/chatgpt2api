@@ -24,6 +24,15 @@ from utils.helper import anonymize_token, split_image_model
 
 
 class AccountCapabilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._web_backend_identity = patch.object(
+            account_module.account_service,
+            "get_account",
+            side_effect=lambda token: {"access_token": token, "source_type": "web"},
+        )
+        self._web_backend_identity.start()
+        self.addCleanup(self._web_backend_identity.stop)
+
     def test_backend_model_catalog_rejects_container_slug_and_owner(self) -> None:
         canary = "backend-model-container-canary"
         backend = OpenAIBackendAPI(access_token="token-1")

@@ -876,7 +876,11 @@ def conversation_events(
 
 
 def text_backend(model: str = "auto", *, access_token: str | None = None) -> OpenAIBackendAPI:
-    token = access_token if access_token is not None else account_service.get_text_access_token(model=model)
+    token = (
+        access_token
+        if access_token is not None
+        else account_service.get_text_access_token(model=model, backend_capability="web")
+    )
     return OpenAIBackendAPI(access_token=token)
 
 
@@ -949,12 +953,19 @@ def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest)
                         from services.model_service import model_catalog_service
 
                         refreshed_route = model_catalog_service.route_for_model(request.model)
+                        if refreshed_route is None:
+                            from services.model_service import ModelUnavailableError
+
+                            raise ModelUnavailableError(
+                                f"model {request.model!r} is not available to any active account"
+                            )
                         if refreshed_token in refreshed_route.access_tokens:
                             token = refreshed_token
                         else:
                             token = account_service.get_text_access_token(
                                 excluded_tokens=set(attempted_tokens),
                                 model=request.model,
+                                backend_capability="web",
                             )
                 else:
                     account_service.remove_invalid_token(
@@ -965,6 +976,7 @@ def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest)
                     token = account_service.get_text_access_token(
                         excluded_tokens=set(attempted_tokens),
                         model=request.model,
+                        backend_capability="web",
                     )
                 if token:
                     continue
@@ -979,6 +991,7 @@ def _stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest)
                 fallback_token = account_service.get_text_access_token(
                     excluded_tokens=set(attempted_tokens),
                     model=request.model,
+                    backend_capability="web",
                 )
                 if fallback_token and fallback_token not in attempted_tokens:
                     token = fallback_token

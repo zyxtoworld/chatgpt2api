@@ -2563,23 +2563,33 @@ class ResourceLifecycleTests(unittest.TestCase):
                 finally:
                     fetch_finished.set()
 
-            with (
-                mock.patch.object(service, "refresh_access_token", return_value="watcher-token"),
-                mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend),
-            ):
-                worker = threading.Thread(target=fetch)
-                worker.start()
-                self.assertTrue(sibling_started.wait(1))
-                self.assertTrue(fetch_finished.wait(1))
-                self.assertFalse(close_called.is_set())
-                self.assertTrue(errors)
-                self.assertIsInstance(errors[0], TimeoutError)
+            try:
+                with (
+                    mock.patch.object(backend_module, "_ACCOUNT_INFO_EXECUTOR", executor),
+                    mock.patch.object(
+                        backend_module.account_service,
+                        "get_account",
+                        return_value={"access_token": "watcher-token", "source_type": "web"},
+                    ),
+                    mock.patch.object(service, "refresh_access_token", return_value="watcher-token"),
+                    mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend),
+                ):
+                    worker = threading.Thread(target=fetch)
+                    worker.start()
+                    self.assertTrue(sibling_started.wait(1))
+                    self.assertTrue(fetch_finished.wait(1))
+                    self.assertFalse(close_called.is_set())
+                    self.assertTrue(errors)
+                    self.assertIsInstance(errors[0], TimeoutError)
 
+                    release_siblings.set()
+                    self.assertTrue(siblings_finished.wait(2))
+                    self.assertTrue(close_called.wait(1))
+                    self.assertEqual(getattr(backend, "_account_info_pending", -1), 0)
+                    worker.join(1)
+            finally:
                 release_siblings.set()
-                self.assertTrue(siblings_finished.wait(2))
-                self.assertTrue(close_called.wait(1))
-                self.assertEqual(getattr(backend, "_account_info_pending", -1), 0)
-                worker.join(1)
+                executor.shutdown(wait=True, cancel_futures=True)
 
         self.assertEqual(close_overlapped_request, [False])
 

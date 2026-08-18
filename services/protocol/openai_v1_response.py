@@ -2410,7 +2410,10 @@ def response_events(
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
         selected_token = (
-            account_service.get_text_access_token(model=model)
+            account_service.get_text_access_token(
+                model=model,
+                backend_capability="web",
+            )
             if authenticated or cache_scope
             else None
         )
