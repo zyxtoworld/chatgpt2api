@@ -2406,8 +2406,10 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         client = TestClient(app)
         seen_inputs: list[object] = []
 
-        def fake_response_events(body: dict[str, object], *, cache_scope: str = ""):
-            del cache_scope
+        def fake_response_events(
+            body: dict[str, object], *, cache_scope: str = "", authenticated: bool = False
+        ):
+            del cache_scope, authenticated
             seen_inputs.append(body.get("input"))
             response_id = f"resp_{len(seen_inputs)}"
             yield {
@@ -2564,8 +2566,10 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         client = TestClient(app)
         seen_inputs: list[object] = []
 
-        def fake_response_events(body: dict[str, object], *, cache_scope: str = ""):
-            del cache_scope
+        def fake_response_events(
+            body: dict[str, object], *, cache_scope: str = "", authenticated: bool = False
+        ):
+            del cache_scope, authenticated
             seen_inputs.append(body.get("input"))
             response_id = f"resp_{len(seen_inputs)}"
             yield {
@@ -2626,8 +2630,10 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         app.include_router(ai_module.create_router())
         calls: list[dict[str, object]] = []
 
-        def fake_response_events(body: dict[str, object], *, cache_scope: str = ""):
-            del cache_scope
+        def fake_response_events(
+            body: dict[str, object], *, cache_scope: str = "", authenticated: bool = False
+        ):
+            del cache_scope, authenticated
             calls.append(body)
             if len(calls) == 1:
                 yield {
