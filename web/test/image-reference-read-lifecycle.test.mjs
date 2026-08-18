@@ -8,7 +8,7 @@ import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner.js
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/image/page.tsx", import.meta.url)),
   "utf8",
-);
+).replace(/\r\n/g, "\n");
 
 test("image reference reads are wired to a dedicated lifecycle owner", () => {
   assert.match(source, /referenceImageReadOwnerRef/);
