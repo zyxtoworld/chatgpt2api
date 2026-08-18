@@ -2463,6 +2463,7 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(ai_module.create_router())
         scopes: list[str] = []
+        authenticated_values: list[bool] = []
 
         class UnavailableNativeTransport:
             def events(self, _turn):
@@ -2474,9 +2475,12 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         def authenticate(authorization: str | None):
             return {"id": str(authorization or "").split()[-1], "role": "user"}
 
-        def fake_response_events(body: dict[str, object], *, cache_scope: str = ""):
+        def fake_response_events(
+            body: dict[str, object], *, cache_scope: str = "", authenticated: bool = False
+        ):
             del body
             scopes.append(cache_scope)
+            authenticated_values.append(authenticated)
             yield {
                 "type": "response.completed",
                 "response": {
