@@ -2511,6 +2511,7 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
                     self.assertEqual(completed["type"], "response.completed")
         self.assertEqual(completed["response"]["id"], f"resp-{expected_scope}")
         self.assertEqual(scopes, ["alpha", "beta"])
+        self.assertEqual(authenticated_values, [True, True])
 
     def test_fallback_stops_consuming_a_turn_after_terminal_event(self) -> None:
         app = FastAPI()
