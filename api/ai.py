@@ -96,6 +96,7 @@ def _responses_websocket_turn_events(
         native_transport: CodexResponsesWebSocketTransport,
         turn: PreparedResponsesWebSocketTurn,
         cache_scope: str = "",
+        authenticated: bool = False,
 ):
     warmup = turn.incremental_body.get("generate") is False
     try:
@@ -109,9 +110,21 @@ def _responses_websocket_turn_events(
         pass
     native_transport.close()
     if cache_scope:
+        if authenticated:
+            yield from openai_v1_response.response_events(
+                turn.replay_body,
+                cache_scope=cache_scope,
+                authenticated=True,
+            )
+        else:
+            yield from openai_v1_response.response_events(
+                turn.replay_body,
+                cache_scope=cache_scope,
+            )
+    elif authenticated:
         yield from openai_v1_response.response_events(
             turn.replay_body,
-            cache_scope=cache_scope,
+            authenticated=True,
         )
     else:
         yield from openai_v1_response.response_events(turn.replay_body)
@@ -294,6 +307,7 @@ def create_router() -> APIRouter:
             payload,
             sse="responses",
             cache_scope=str(identity.get("id") or ""),
+            authenticated=True,
         )
 
     @router.websocket("/v1/responses")
@@ -394,6 +408,7 @@ def create_router() -> APIRouter:
                     native_transport,
                     turn,
                     cache_scope=str(identity.get("id") or ""),
+                    authenticated=True,
                 )
                 events = call.stream(raw_events)
                 turn_terminal = False
