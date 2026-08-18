@@ -244,7 +244,8 @@ class CodexToolCallContractTests(unittest.TestCase):
             response = openai_v1_chat_complete.handle(body, authenticated=True)
 
         self.assertEqual(response["choices"][0]["message"]["content"], "native")
-        self.assertEqual(captured, {"access_token": "codex-token"})
+        self.assertEqual(captured["access_token"], "codex-token")
+        self.assertIsInstance(captured["deadline"], float)
 
     def test_plain_stream_chat_with_codex_account_uses_native_responses(self) -> None:
         body = {
@@ -298,7 +299,8 @@ class CodexToolCallContractTests(unittest.TestCase):
             chunks = list(openai_v1_chat_complete.handle(body, authenticated=True))
 
         self.assertTrue(chunks)
-        self.assertEqual(captured, {"access_token": "codex-token"})
+        self.assertEqual(captured["access_token"], "codex-token")
+        self.assertIsInstance(captured["deadline"], float)
 
     def test_native_codex_text_failover_reaches_third_route_candidate(self) -> None:
         completed = {
@@ -2445,7 +2447,7 @@ class ChatFunctionToolContractTests(unittest.TestCase):
     def test_chat_non_stream_function_call_uses_native_codex_and_official_shape(self) -> None:
         captured: dict[str, object] = {}
 
-        def fake_codex(body):
+        def fake_codex(body, **_kwargs: object):
             captured.update(body)
             yield from function_events()
 
@@ -2491,7 +2493,7 @@ class ChatFunctionToolContractTests(unittest.TestCase):
         }
         native_bodies: list[dict[str, object]] = []
 
-        def native_events(converted: dict[str, object]):
+        def native_events(converted: dict[str, object], **_kwargs: object):
             native_bodies.append(converted)
             yield {
                 "type": "response.completed",
@@ -2549,7 +2551,7 @@ class ChatFunctionToolContractTests(unittest.TestCase):
         }
         native_bodies: list[dict[str, object]] = []
 
-        def native_events(converted: dict[str, object]):
+        def native_events(converted: dict[str, object], **_kwargs: object):
             native_bodies.append(converted)
             yield {
                 "type": "response.completed",
@@ -3193,7 +3195,7 @@ class ChatFunctionToolContractTests(unittest.TestCase):
         }
         native_bodies: list[dict[str, object]] = []
 
-        def native_events(converted: dict[str, object]):
+        def native_events(converted: dict[str, object], **_kwargs: object):
             native_bodies.append(converted)
             yield {
                 "type": "response.completed",
@@ -3320,7 +3322,7 @@ class ChatFunctionToolContractTests(unittest.TestCase):
         }
         captured: dict[str, object] = {}
 
-        def fake_codex(payload: dict[str, object]):
+        def fake_codex(payload: dict[str, object], **_kwargs: object):
             captured.update(payload)
             return iter(web_search_events())
 
@@ -3511,7 +3513,7 @@ class NativeWebSearchContractTests(unittest.TestCase):
         }
         captured: dict[str, object] = {}
 
-        def fake_native(converted):
+        def fake_native(converted, **_kwargs: object):
             captured.update(converted)
             yield from web_search_events()
 

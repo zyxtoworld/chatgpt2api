@@ -1906,6 +1906,7 @@ def stream_codex_response(
     body: dict[str, Any],
     *,
     access_token: str | None = None,
+    deadline: float | None = None,
 ) -> Iterator[dict[str, Any]]:
     payload = codex_response_payload(body)
     model = str(body.get("model") or "auto").strip() or "auto"
@@ -1913,7 +1914,11 @@ def stream_codex_response(
     current_token = access_token
     emitted_public_event = False
     last_retryable_error: UpstreamHTTPError | None = None
-    failover_deadline = time.monotonic() + _CODEX_TEXT_FAILOVER_DEADLINE_SECONDS
+    failover_deadline = (
+        deadline
+        if deadline is not None
+        else time.monotonic() + _CODEX_TEXT_FAILOVER_DEADLINE_SECONDS
+    )
     while True:
         if not current_token:
             if time.monotonic() >= failover_deadline:

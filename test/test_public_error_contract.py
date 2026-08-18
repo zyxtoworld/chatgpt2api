@@ -159,6 +159,333 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertEqual(seen["native_access_token"], "codex-route-token")
         self.assertIn("native-route", response.text)
 
+    def test_chat_route_nonstream_carries_one_deadline_through_initial_codex_selection(self) -> None:
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_chat_deadline_nonstream",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5",
+                "output": [{
+                    "id": "msg_chat_deadline_nonstream",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+        selector_calls: list[dict[str, object]] = []
+        backend_deadlines: list[object] = []
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                return "codex-chat-deadline"
+
+            def get_account(self, _token: str) -> dict[str, str]:
+                return {"source_type": "codex"}
+
+        async def invoke(_self, handler, payload, **kwargs):
+            return handler(payload, **kwargs)
+
+        def native_events(_body: dict[str, object], **kwargs: object):
+            backend_deadlines.append(kwargs.get("deadline"))
+            yield completed
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+            mock.patch.object(ai_module.openai_v1_chat_complete, "account_service", CodexAccountService()),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete.openai_v1_response,
+                "stream_codex_response",
+                side_effect=native_events,
+            ),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete,
+                "text_backend",
+                side_effect=AssertionError("Codex chat must not use the Web backend"),
+            ),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/chat/completions",
+                headers=AUTH_HEADERS,
+                json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(selector_calls), 1)
+        self.assertIsInstance(selector_calls[0].get("deadline"), float)
+        self.assertEqual(backend_deadlines, [selector_calls[0]["deadline"]])
+
+    def test_chat_route_stream_carries_one_deadline_through_initial_codex_selection(self) -> None:
+        created = {
+            "type": "response.created",
+            "response": {"id": "resp_chat_deadline_stream", "model": "gpt-5"},
+        }
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_chat_deadline_stream",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+        selector_calls: list[dict[str, object]] = []
+        backend_deadlines: list[object] = []
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                return "codex-chat-stream-deadline"
+
+            def get_account(self, _token: str) -> dict[str, str]:
+                return {"source_type": "codex"}
+
+        async def invoke(_self, handler, payload, **kwargs):
+            return handler(payload, **kwargs)
+
+        def native_events(_body: dict[str, object], **kwargs: object):
+            backend_deadlines.append(kwargs.get("deadline"))
+            yield created
+            yield completed
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+            mock.patch.object(ai_module.openai_v1_chat_complete, "account_service", CodexAccountService()),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete.openai_v1_response,
+                "stream_codex_response",
+                side_effect=native_events,
+            ),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete,
+                "text_backend",
+                side_effect=AssertionError("Codex chat must not use the Web backend"),
+            ),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/chat/completions",
+                headers=AUTH_HEADERS,
+                json={
+                    "model": "auto",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("resp_chat_deadline_stream", response.text)
+        self.assertEqual(len(selector_calls), 1)
+        self.assertIsInstance(selector_calls[0].get("deadline"), float)
+        self.assertEqual(backend_deadlines, [selector_calls[0]["deadline"]])
+
+    def test_chat_route_initial_selector_timeout_does_not_construct_backend(self) -> None:
+        selector_calls: list[dict[str, object]] = []
+
+        class TimeoutAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                raise TimeoutError("refresh deadline expired")
+
+        backend_factory = mock.Mock(side_effect=AssertionError("backend must not be constructed"))
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "log", return_value=None),
+            mock.patch.object(ai_module.openai_v1_chat_complete, "account_service", TimeoutAccountService()),
+            mock.patch.object(openai_v1_response_module, "account_service", TimeoutAccountService()),
+            mock.patch.object(openai_v1_response_module, "OpenAIBackendAPI", backend_factory),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete,
+                "text_backend",
+                side_effect=AssertionError("selector timeout must not fall through to Web"),
+            ),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/chat/completions",
+                headers=AUTH_HEADERS,
+                json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        self.assertEqual(response.status_code, 502, response.text)
+        self.assertEqual(len(selector_calls), 1)
+        self.assertIsInstance(selector_calls[0].get("deadline"), float)
+        backend_factory.assert_not_called()
+
+    def test_chat_route_failover_preserves_one_deadline_and_last_upstream_error(self) -> None:
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_chat_failover",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        }
+        selector_calls: list[dict[str, object]] = []
+        backend_timeouts: list[float] = []
+
+        class FailoverAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                excluded = set(kwargs.get("excluded_tokens") or set())
+                if "codex-chat-first" not in excluded:
+                    return "codex-chat-first"
+                if "codex-chat-second" not in excluded:
+                    return "codex-chat-second"
+                raise AssertionError("selector must not loop after candidates are exhausted")
+
+            def get_account(self, _token: str) -> dict[str, str]:
+                return {"source_type": "codex"}
+
+            def mark_text_used(self, _token: str) -> None:
+                pass
+
+        class FailoverBackend:
+            instances: list["FailoverBackend"] = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.__class__.instances.append(self)
+
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                backend_timeouts.append(timeout)
+                if self.access_token == "codex-chat-first":
+                    raise openai_v1_response_module.UpstreamHTTPError(
+                        "codex",
+                        502,
+                        {"error": "transient"},
+                    )
+                yield completed
+
+            def close(self) -> None:
+                pass
+
+        service = FailoverAccountService()
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "log", return_value=None),
+            mock.patch.object(ai_module.openai_v1_chat_complete, "account_service", service),
+            mock.patch.object(openai_v1_response_module, "account_service", service),
+            mock.patch.object(openai_v1_response_module, "OpenAIBackendAPI", FailoverBackend),
+            mock.patch.object(openai_v1_response_module, "resolve_codex_reasoning_effort"),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete,
+                "text_backend",
+                side_effect=AssertionError("Codex failover must not use Web"),
+            ),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/chat/completions",
+                headers=AUTH_HEADERS,
+                json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(selector_calls), 2)
+        deadline = selector_calls[0]["deadline"]
+        self.assertIsInstance(deadline, float)
+        self.assertEqual(selector_calls[1]["deadline"], deadline)
+        self.assertEqual(len(backend_timeouts), 2)
+        self.assertTrue(all(timeout > 0 for timeout in backend_timeouts))
+        self.assertTrue(all(timeout <= 30.0 for timeout in backend_timeouts))
+
+    def test_chat_route_failover_timeout_keeps_last_502(self) -> None:
+        selector_calls: list[dict[str, object]] = []
+        backend_calls: list[str] = []
+
+        class ExhaustedAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                excluded = set(kwargs.get("excluded_tokens") or set())
+                if "codex-chat-first" not in excluded:
+                    return "codex-chat-first"
+                if "codex-chat-second" not in excluded:
+                    return "codex-chat-second"
+                raise TimeoutError("failover deadline expired")
+
+            def get_account(self, _token: str) -> dict[str, str]:
+                return {"source_type": "codex"}
+
+            def mark_text_used(self, _token: str) -> None:
+                pass
+
+        class AlwaysFailingBackend:
+            def __init__(self, access_token: str) -> None:
+                backend_calls.append(access_token)
+
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                del timeout
+                raise openai_v1_response_module.UpstreamHTTPError(
+                    "codex",
+                    502,
+                    {"error": "transient"},
+                )
+                yield  # pragma: no cover
+
+            def close(self) -> None:
+                pass
+
+        service = ExhaustedAccountService()
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "log", return_value=None),
+            mock.patch.object(ai_module.openai_v1_chat_complete, "account_service", service),
+            mock.patch.object(openai_v1_response_module, "account_service", service),
+            mock.patch.object(openai_v1_response_module, "OpenAIBackendAPI", AlwaysFailingBackend),
+            mock.patch.object(openai_v1_response_module, "resolve_codex_reasoning_effort"),
+            mock.patch.object(
+                ai_module.openai_v1_chat_complete,
+                "text_backend",
+                side_effect=AssertionError("Codex failover must not use Web"),
+            ),
+        ):
+            response = TestClient(_app_with_ai_router()).post(
+                "/v1/chat/completions",
+                headers=AUTH_HEADERS,
+                json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        self.assertEqual(response.status_code, 502, response.text)
+        self.assertEqual(backend_calls, ["codex-chat-first", "codex-chat-second"])
+        self.assertEqual(len(selector_calls), 3)
+        self.assertEqual(selector_calls[0]["deadline"], selector_calls[1]["deadline"])
+        self.assertEqual(selector_calls[1]["deadline"], selector_calls[2]["deadline"])
+
     def test_responses_cache_does_not_share_response_between_authenticated_identities(self) -> None:
         old_settings = config.data.get("chat_completion_cache")
         config.data["chat_completion_cache"] = {

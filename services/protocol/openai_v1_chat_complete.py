@@ -878,14 +878,16 @@ def _chat_codex_events(
     body: dict[str, Any],
     *,
     access_token: str | None = None,
+    deadline: float | None = None,
 ) -> Iterator[dict[str, Any]]:
     payload = chat_codex_response_body(body)
     if access_token is None:
-        yield from openai_v1_response.stream_codex_response(payload)
+        yield from openai_v1_response.stream_codex_response(payload, deadline=deadline)
     else:
         yield from openai_v1_response.stream_codex_response(
             payload,
             access_token=access_token,
+            deadline=deadline,
         )
 
 
@@ -893,10 +895,11 @@ def _chat_response_from_codex(
     body: dict[str, Any],
     *,
     access_token: str | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     terminal: dict[str, Any] = {}
     terminal_type = ""
-    for event in _chat_codex_events(body, access_token=access_token):
+    for event in _chat_codex_events(body, access_token=access_token, deadline=deadline):
         candidate = openai_v1_response.terminal_response_from_event(event)
         if candidate is not None:
             terminal = candidate
@@ -969,6 +972,7 @@ def _stream_chat_response_from_codex(
     body: dict[str, Any],
     *,
     access_token: str | None = None,
+    deadline: float | None = None,
 ) -> Iterator[dict[str, Any]]:
     include_usage = include_stream_usage(body)
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -991,7 +995,7 @@ def _stream_chat_response_from_codex(
                 include_usage=include_usage,
             )
 
-    for event in _chat_codex_events(body, access_token=access_token):
+    for event in _chat_codex_events(body, access_token=access_token, deadline=deadline):
         event_type = event.get("type")
         if event_type == "response.created":
             response = openai_v1_response.created_response_from_event(event)
@@ -1342,10 +1346,15 @@ def handle(
 ) -> dict[str, Any] | Iterator[dict[str, Any]]:
     validate_chat_core_parameters(body)
     openai_v1_response.validate_tool_container(body)
+    codex_deadline = (
+        time.monotonic() + openai_v1_response._CODEX_TEXT_FAILOVER_DEADLINE_SECONDS
+        if authenticated
+        else None
+    )
     if uses_chat_native_codex(body):
         if body.get("stream"):
-            return _stream_chat_response_from_codex(body)
-        return _chat_response_from_codex(body)
+            return _stream_chat_response_from_codex(body, deadline=codex_deadline)
+        return _chat_response_from_codex(body, deadline=codex_deadline)
     image_request = is_image_chat_request(body)
     if image_request:
         validate_image_chat_parameters(body)
@@ -1360,12 +1369,16 @@ def handle(
             return stream_web_search_chat_completion(messages, model, include_usage=include_usage)
         thinking_effort = thinking_effort_from_body(body)
         selected_token = (
-            account_service.get_text_access_token(model=model)
+            account_service.get_text_access_token(model=model, deadline=codex_deadline)
             if authenticated or cache_scope
             else None
         )
         if selected_token and _is_codex_account_token(selected_token):
-            return _stream_chat_response_from_codex(body, access_token=selected_token)
+            return _stream_chat_response_from_codex(
+                body,
+                access_token=selected_token,
+                deadline=codex_deadline,
+            )
         effective_scope = resolve_access_token_cache_scope(cache_scope, selected_token or "")
         compute = lambda: stream_text_chat_completion(
             text_backend(model, access_token=selected_token) if selected_token is not None else text_backend(model),
@@ -1387,12 +1400,16 @@ def handle(
         return web_search_chat_response(messages, model)
     thinking_effort = thinking_effort_from_body(body)
     selected_token = (
-        account_service.get_text_access_token(model=model)
+        account_service.get_text_access_token(model=model, deadline=codex_deadline)
         if authenticated or cache_scope
         else None
     )
     if selected_token and _is_codex_account_token(selected_token):
-        return _chat_response_from_codex(body, access_token=selected_token)
+        return _chat_response_from_codex(
+            body,
+            access_token=selected_token,
+            deadline=codex_deadline,
+        )
     effective_scope = resolve_access_token_cache_scope(cache_scope, selected_token or "")
     compute = lambda: completion_response(
         model,
