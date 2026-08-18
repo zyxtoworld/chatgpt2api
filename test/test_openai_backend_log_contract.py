@@ -972,10 +972,11 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
         self.assertNotIn(canary, logged_text(warning.call_args_list))
 
         backend.access_token = "fixture-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
         backend.base_url = "https://example.test"
         backend._ensure_codex_source_account = mock.Mock()
         with (
-            mock.patch.object(backend_module.urllib.request, "urlopen", side_effect=RuntimeError("transport")),
+            mock.patch.object(backend_module.requests, "Session", side_effect=RuntimeError("transport")),
             mock.patch.object(backend_module.logger, "info") as info,
             self.assertRaisesRegex(RuntimeError, "transport"),
         ):
@@ -986,6 +987,7 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
         canary = "codex-stream-canary owner@example.com opaque-token"
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "fixture-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
         backend.base_url = "https://example.test"
         backend._ensure_codex_source_account = mock.Mock()
         payload = {
@@ -995,7 +997,7 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
             "stream": {"secret": canary},
         }
         with (
-            mock.patch.object(backend_module.urllib.request, "urlopen", side_effect=RuntimeError("transport")),
+            mock.patch.object(backend_module.requests, "Session", side_effect=RuntimeError("transport")),
             mock.patch.object(backend_module.logger, "info") as info,
             self.assertRaisesRegex(RuntimeError, "transport"),
         ):
@@ -1006,12 +1008,13 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
         canary = "codex-timeout-canary owner@example.com opaque-token"
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "fixture-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
         backend.base_url = "https://example.test"
         backend._ensure_codex_source_account = mock.Mock()
         payload = {"model": "gpt-5.5", "input": [], "tools": [], "stream": True}
         timeout = {"secret": canary}
         with (
-            mock.patch.object(backend_module.urllib.request, "urlopen", side_effect=RuntimeError("transport")),
+            mock.patch.object(backend_module.requests, "Session", side_effect=RuntimeError("transport")),
             mock.patch.object(backend_module.logger, "info") as info,
             self.assertRaisesRegex(RuntimeError, "transport"),
         ):

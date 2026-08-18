@@ -24,7 +24,192 @@ def _stream_response(payload: dict) -> mock.Mock:
     return response
 
 
+class _HeaderObservingSession:
+    def __init__(self, response: mock.Mock) -> None:
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 web-fingerprint",
+            "Origin": "https://chatgpt.com",
+            "Referer": "https://chatgpt.com/",
+            "OAI-Client-Version": "prod-web-build",
+            "OAI-Client-Build-Number": "123",
+            "X-OpenAI-Target-Path": "/web-default",
+            "X-OpenAI-Target-Route": "/web-default",
+            "Sec-Ch-Ua": '"Chromium"',
+            "OAI-Device-Id": "web-device",
+            "OAI-Session-Id": "web-session",
+        }
+        self._response = response
+        self.effective_headers: dict[str, str] | None = None
+        self.get_calls = 0
+        self.close_calls = 0
+
+    def get(self, _url: str, *, headers: dict[str, str], **_kwargs: object) -> mock.Mock:
+        self.get_calls += 1
+        self.effective_headers = dict(self.headers)
+        self.effective_headers.update(headers)
+        return self._response
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
 class UpstreamModelEffortContractTests(unittest.TestCase):
+    def test_codex_responses_headers_use_official_client_defaults(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend.codex_client_version = "0.147.0"
+
+        headers = backend._codex_responses_headers()
+
+        self.assertEqual(headers["Authorization"], "Bearer codex-token")
+        self.assertEqual(headers["ChatGPT-Account-ID"], "acct-codex")
+        self.assertEqual(headers["version"], "0.147.0")
+        self.assertEqual(headers["originator"], "codex_cli_rs")
+        self.assertTrue(headers["User-Agent"].startswith("codex_cli_rs/0.147.0"))
+
+    def test_codex_model_list_uses_codex_endpoint_headers_and_api_capability_filter(self) -> None:
+        response = _stream_response({
+            "models": [
+                {
+                    "slug": "codex-listed",
+                    "visibility": "list",
+                    "supported_in_api": True,
+                    "supported_reasoning_levels": [{"effort": "high"}],
+                },
+                {
+                    "slug": "codex-hidden",
+                    "visibility": "hide",
+                    "supported_in_api": True,
+                    "supported_reasoning_levels": [{"effort": "medium"}],
+                },
+                {
+                    "slug": "codex-unlisted",
+                    "visibility": "none",
+                    "supported_in_api": True,
+                    "supported_reasoning_levels": [{"effort": "low"}],
+                },
+                {
+                    "slug": "codex-no-api",
+                    "visibility": "list",
+                    "supported_in_api": False,
+                },
+            ]
+        })
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend.base_url = "https://chatgpt.com"
+        backend.codex_client_version = "0.147.0"
+        backend.fp = {"impersonate": "chrome110"}
+        web_session = _HeaderObservingSession(response)
+        codex_session = _HeaderObservingSession(response)
+        backend.session = web_session
+        backend._bootstrap = mock.Mock()
+
+        with mock.patch(
+            "services.openai_backend_api.requests.Session",
+            return_value=codex_session,
+        ) as session_factory:
+            result = backend.list_models()
+
+        self.assertEqual(
+            [item["id"] for item in result["data"]],
+            ["codex-hidden", "codex-listed", "codex-unlisted"],
+        )
+        self.assertEqual(
+            result["data"][1]["supported_reasoning_efforts"],
+            ["high"],
+        )
+        self.assertEqual(web_session.get_calls, 0)
+        self.assertEqual(codex_session.get_calls, 1)
+        headers = codex_session.effective_headers
+        self.assertIsNotNone(headers)
+        assert headers is not None
+        self.assertEqual(headers["Authorization"], "Bearer codex-token")
+        self.assertEqual(headers["ChatGPT-Account-ID"], "acct-codex")
+        self.assertEqual(headers["version"], "0.147.0")
+        self.assertEqual(headers["originator"], "codex_cli_rs")
+        self.assertTrue(
+            headers["User-Agent"].startswith("codex_cli_rs/0.147.0")
+        )
+        session_kwargs = session_factory.call_args.kwargs
+        self.assertFalse(session_kwargs["default_headers"])
+        self.assertNotIn("impersonate", session_kwargs)
+        for forbidden in (
+            "Origin",
+            "Referer",
+            "OAI-Client-Version",
+            "OAI-Client-Build-Number",
+            "X-OpenAI-Target-Path",
+            "X-OpenAI-Target-Route",
+            "Sec-Ch-Ua",
+            "OAI-Device-Id",
+            "OAI-Session-Id",
+        ):
+            self.assertNotIn(forbidden, headers)
+        self.assertEqual(codex_session.close_calls, 1)
+        backend._bootstrap.assert_not_called()
+
+    def test_codex_model_list_rejects_invalid_client_version_before_request(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend.base_url = "https://chatgpt.com"
+        backend.codex_client_version = "prod-web-build"
+        backend.session = mock.Mock()
+        backend._bootstrap = mock.Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "client version"):
+            backend.list_models()
+
+        backend.session.get.assert_not_called()
+
+    def test_codex_model_session_cleanup_does_not_mask_primary_error(self) -> None:
+        class Response:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+
+            def iter_content(self, **_kwargs: object):
+                raise RuntimeError("response-secret")
+
+            def close(self) -> None:
+                raise RuntimeError("response-close-secret")
+
+        class Session:
+            def __init__(self) -> None:
+                self.headers: dict[str, str] = {}
+                self.close_calls = 0
+
+            def get(self, _url: str, **_kwargs: object) -> Response:
+                return Response()
+
+            def close(self) -> None:
+                self.close_calls += 1
+                raise RuntimeError("session-secret")
+
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend.base_url = "https://chatgpt.com"
+        backend.codex_client_version = "0.147.0"
+        backend.fp = {"impersonate": "chrome110"}
+        backend.session = mock.Mock()
+        backend._bootstrap = mock.Mock()
+        session = Session()
+
+        with (
+            mock.patch("services.openai_backend_api.requests.Session", return_value=session),
+            mock.patch("services.openai_backend_api.logger.warning") as warning,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid response body"):
+                backend.list_models()
+
+        self.assertEqual(session.close_calls, 1)
+        logged = str(warning.call_args_list)
+        self.assertIn("models_session", logged)
+        self.assertNotIn("session-secret", logged)
+
     def test_backend_model_list_preserves_only_normalized_effort_capabilities(self) -> None:
         response = _stream_response({
             "models": [
@@ -54,6 +239,9 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
             result["data"][0]["supported_reasoning_efforts"],
             ["min", "standard", "extended", "max"],
         )
+        headers = backend.session.get.call_args.kwargs["headers"]
+        self.assertNotIn("originator", headers)
+        self.assertNotIn("version", headers)
         self.assertNotIn("opaque_upstream_field", result["data"][0])
 
     def test_backend_model_list_downgrades_malformed_created_timestamp(self) -> None:

@@ -8,15 +8,13 @@ import re
 import threading
 import time
 
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from curl_cffi import requests
 from PIL import Image
@@ -163,6 +161,13 @@ class ChatRequirements:
 
 
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
+# Codex's models client sends its own semver-like client version.  It is not
+# the Web client's `prod-*` build identifier.  This release value is explicit
+# and independently configurable for a coordinated Codex client rollout.
+CODEX_MODELS_CLIENT_VERSION = os.getenv("CODEX_MODELS_CLIENT_VERSION", "0.147.0").strip()
+_CODEX_CLIENT_VERSION_RE = re.compile(
+    r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$"
+)
 DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 ACCOUNT_INFO_WORKERS = 30
@@ -175,6 +180,30 @@ CODEX_RESPONSES_MODEL = "gpt-5.5"
 CODEX_RESPONSE_MAX_EVENT_BYTES = 64 * 1024 * 1024
 CODEX_RESPONSE_MAX_BODY_BYTES = 128 * 1024 * 1024
 CODEX_HTTP_ERROR_MAX_BODY_BYTES = 1 * 1024 * 1024
+
+
+def _close_codex_resource(resource: Any, resource_name: str) -> BaseException | None:
+    """Close one Codex-owned resource without hiding the operation exception."""
+    close = getattr(resource, "close", None)
+    if not callable(close):
+        return None
+    try:
+        close()
+    except BaseException as exc:
+        # Do not include exception text: adapters may put response bodies or
+        # credentials in it.  The active operation exception remains primary.
+        try:
+            logger.warning({
+                "event": "codex_response_cleanup_failed",
+                "resource": resource_name,
+                "error_type": type(exc).__name__,
+            })
+        except Exception:
+            pass
+        return exc
+    return None
+
+
 _MAX_MODEL_CREATED_DIGITS = 19
 _MAX_MODEL_CREATED = (1 << 63) - 1
 _MAX_BACKEND_JSON_BYTES = 16 * 1024 * 1024
@@ -937,11 +966,74 @@ class OpenAIBackendAPI:
             headers["X-Oai-Turn-Trace-Id"] = new_uuid()
         return self._headers(path, headers)
 
+    def _codex_client_version(self) -> str:
+        raw_client_version = str(
+            getattr(
+                self,
+                "codex_client_version",
+                CODEX_MODELS_CLIENT_VERSION,
+            )
+        ).strip()
+        if not _CODEX_CLIENT_VERSION_RE.fullmatch(raw_client_version):
+            raise RuntimeError("codex models client version is required")
+        return raw_client_version
+
     def _codex_responses_headers(self) -> Dict[str, str]:
-        return {
+        client_version = self._codex_client_version()
+        headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
+            "originator": "codex_cli_rs",
+            "User-Agent": f"codex_cli_rs/{client_version}",
+            "version": client_version,
         }
+        account = getattr(self, "account", {})
+        account_id = ""
+        if isinstance(account, dict):
+            account_id = _safe_upstream_text(
+                account.get("account_id") or account.get("chatgpt_account_id"),
+                max_length=256,
+            ) or ""
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
+        return headers
+
+    def _codex_models_headers(self, client_version: str) -> Dict[str, str]:
+        account = getattr(self, "account", {})
+        account_id = ""
+        if isinstance(account, dict):
+            account_id = _safe_upstream_text(
+                account.get("account_id") or account.get("chatgpt_account_id"),
+                max_length=256,
+            ) or ""
+        if not account_id:
+            raise RuntimeError("codex account id is required for model discovery")
+        return {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "ChatGPT-Account-ID": account_id,
+            "originator": "codex_cli_rs",
+            "User-Agent": f"codex_cli_rs/{client_version}",
+            "version": client_version,
+        }
+
+    def _codex_session(self) -> Any:
+        """Create a Codex transport without inheriting Web fingerprint headers."""
+        session = None
+        try:
+            session = requests.Session(**proxy_settings.build_session_kwargs(
+                account=self.account,
+                verify=True,
+                default_headers=False,
+            ))
+            # Keep this explicit even with default_headers=False: this
+            # short-lived session must never inherit a Web fingerprint.
+            session.headers.clear()
+            return session
+        except BaseException:
+            if session is not None:
+                session.close()
+            raise
 
     def _ensure_codex_source_account(self) -> None:
         account = account_service.get_account(self.access_token)
@@ -1072,7 +1164,9 @@ class OpenAIBackendAPI:
     def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:
         raw_content_type = raw.headers.get("content-type")
         content_type = raw_content_type.lower() if isinstance(raw_content_type, str) else ""
-        status_code = _safe_codex_log_status(getattr(raw, "status", None))
+        status_code = _safe_codex_log_status(
+            getattr(raw, "status_code", getattr(raw, "status", None))
+        )
         parse_error_count = 0
         response_bytes = 0
         event_count = 0
@@ -1120,7 +1214,8 @@ class OpenAIBackendAPI:
 
             parts: list[str] = []
             event_bytes = 0
-            for raw_line in raw:
+            line_iterator = raw.iter_lines() if callable(getattr(raw, "iter_lines", None)) else raw
+            for raw_line in line_iterator:
                 encoded_line = raw_line.encode("utf-8") if isinstance(raw_line, str) else bytes(raw_line)
                 response_bytes += len(encoded_line)
                 if response_bytes > CODEX_RESPONSE_MAX_BODY_BYTES:
@@ -1168,12 +1263,6 @@ class OpenAIBackendAPI:
             raise TypeError("codex responses payload must be an object")
         self._ensure_codex_source_account()
         path = "/backend-api/codex/responses"
-        request = urllib.request.Request(
-            self.base_url + path,
-            json.dumps(payload).encode(),
-            self._codex_responses_headers(),
-            method="POST",
-        )
         tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
         input_value = payload.get("input")
         model_value = payload.get("model")
@@ -1181,7 +1270,7 @@ class OpenAIBackendAPI:
         logger.info({
             "event": "codex_responses_request_debug",
             "path": path,
-            "transport": "urllib.request",
+            "transport": "curl_cffi.Session",
             "timeout_secs": _safe_codex_log_timeout(timeout),
             "request": {
                 "model_len": len(model_value) if isinstance(model_value, str) else 0,
@@ -1190,21 +1279,44 @@ class OpenAIBackendAPI:
                 "input_count": len(input_value) if isinstance(input_value, list) else int(input_value is not None),
             },
         })
+        session = self._codex_session()
+        response = None
+        primary_error: BaseException | None = None
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as raw:
-                yield from self._iter_codex_response_events(raw)
-        except urllib.error.HTTPError as error:
-            try:
-                self._read_bounded_codex_body(error, CODEX_HTTP_ERROR_MAX_BODY_BYTES)
-            except Exception:
-                pass
-            finally:
-                close_response(error)
-            body: Any = {"error": "upstream_error"}
-            self._log_codex_response_failure(path, error.code, error.headers, payload, body)
-            retry_after_header = error.headers.get("Retry-After") if error.headers else None
-            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
-            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
+            response = session.post(
+                self.base_url + path,
+                data=json.dumps(payload).encode(),
+                headers=self._codex_responses_headers(),
+                timeout=timeout,
+                stream=True,
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if not 200 <= status_code < 300:
+                try:
+                    self._read_bounded_codex_body(response, CODEX_HTTP_ERROR_MAX_BODY_BYTES)
+                except Exception:
+                    pass
+                body: Any = {"error": "upstream_error"}
+                response_headers = getattr(response, "headers", {})
+                self._log_codex_response_failure(path, status_code, response_headers, payload, body)
+                retry_after_header = response_headers.get("Retry-After") if response_headers else None
+                retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
+                raise UpstreamHTTPError(path, status_code, body, retry_after=retry_after)
+            yield from self._iter_codex_response_events(response)
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            cleanup_errors: list[BaseException] = []
+            if response is not None:
+                cleanup_error = _close_codex_resource(response, "response")
+                if cleanup_error is not None:
+                    cleanup_errors.append(cleanup_error)
+            cleanup_error = _close_codex_resource(session, "session")
+            if cleanup_error is not None:
+                cleanup_errors.append(cleanup_error)
+            if cleanup_errors and primary_error is None:
+                raise cleanup_errors[0]
 
     def iter_codex_image_response_events(
             self,
@@ -3461,10 +3573,12 @@ class OpenAIBackendAPI:
     @staticmethod
     def _model_reasoning_efforts(item: Dict[str, Any]) -> list[str] | None:
         keys = (
+            "supported_reasoning_levels",
             "supported_reasoning_efforts",
             "supported_thinking_efforts",
             "reasoning_efforts",
             "thinking_efforts",
+            "reasoning_levels",
         )
         containers = [item]
         capabilities = item.get("capabilities")
@@ -3510,45 +3624,81 @@ class OpenAIBackendAPI:
             deadline: float | None = None,
     ) -> Dict[str, Any]:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""
-        self._bootstrap(timeout_secs=timeout_secs, deadline=deadline)
         # Model discovery must request the account's complete catalog. Tying this
         # query to the conversation privacy mode hides paid-plan models upstream.
-        path = "/backend-api/models?history_and_training_disabled=false" if self.access_token else (
-            "/backend-anon/models?iim=false&is_gizmo=false"
-        )
-        route = "/backend-api/models" if self.access_token else "/backend-anon/models"
+        account = getattr(self, "account", {})
+        source_type = str(getattr(self, "_catalog_source_type", "") or "").strip().lower()
+        if not source_type:
+            source_type = (
+                str(account.get("source_type") or "").strip().lower()
+                if isinstance(account, dict)
+                else ""
+            )
+        is_codex = bool(self.access_token and source_type == "codex")
+        request_session = self.session
+        codex_session = None
+        if is_codex:
+            # Codex's ModelsClient talks directly to the Codex endpoint.  It does
+            # not participate in the web sentinel/bootstrap flow; running that
+            # handshake first can reject an otherwise valid Codex session.
+            raw_client_version = self._codex_client_version()
+            client_version = quote(raw_client_version, safe="")
+            path = f"/backend-api/codex/models?client_version={client_version}"
+            route = "/backend-api/codex/models"
+            request_headers = self._codex_models_headers(raw_client_version)
+            codex_session = self._codex_session()
+            request_session = codex_session
+        else:
+            self._bootstrap(timeout_secs=timeout_secs, deadline=deadline)
+            path = "/backend-api/models?history_and_training_disabled=false" if self.access_token else (
+                "/backend-anon/models?iim=false&is_gizmo=false"
+            )
+            route = "/backend-api/models" if self.access_token else "/backend-anon/models"
+            request_headers = self._headers(route)
         context = "auth_models" if self.access_token else "anon_models"
-        response = self.session.get(
-            self.base_url + path,
-            headers=self._headers(route),
-            timeout=self._search_remaining(deadline, timeout_secs),
-            stream=True,
-        )
-        payload = self._read_json_response(response, context)
-        data = []
-        seen = set()
-        if not isinstance(payload, dict):
+        primary_error: BaseException | None = None
+        try:
+            response = request_session.get(
+                self.base_url + path,
+                headers=request_headers,
+                timeout=self._search_remaining(deadline, timeout_secs),
+                stream=True,
+            )
+            payload = self._read_json_response(response, context)
+            data = []
+            seen = set()
+            if not isinstance(payload, dict):
+                return {"object": "list", "data": data}
+            for item in payload.get("models", []):
+                if not isinstance(item, dict):
+                    continue
+                if is_codex and item.get("supported_in_api") is not True:
+                    continue
+                slug = parse_model_text(item.get("slug"))
+                if not slug or slug in seen:
+                    continue
+                seen.add(slug)
+                owned_by = parse_model_text(item.get("owned_by"), default="chatgpt")
+                model_item = {
+                    "id": slug,
+                    "object": "model",
+                    "created": _parse_model_created(item.get("created")),
+                    "owned_by": owned_by,
+                    "permission": [],
+                    "root": slug,
+                    "parent": None,
+                }
+                supported_efforts = self._model_reasoning_efforts(item)
+                if supported_efforts is not None:
+                    model_item["supported_reasoning_efforts"] = supported_efforts
+                data.append(model_item)
+            data.sort(key=lambda item: item["id"])
             return {"object": "list", "data": data}
-        for item in payload.get("models", []):
-            if not isinstance(item, dict):
-                continue
-            slug = parse_model_text(item.get("slug"))
-            if not slug or slug in seen:
-                continue
-            seen.add(slug)
-            owned_by = parse_model_text(item.get("owned_by"), default="chatgpt")
-            model_item = {
-                "id": slug,
-                "object": "model",
-                "created": _parse_model_created(item.get("created")),
-                "owned_by": owned_by,
-                "permission": [],
-                "root": slug,
-                "parent": None,
-            }
-            supported_efforts = self._model_reasoning_efforts(item)
-            if supported_efforts is not None:
-                model_item["supported_reasoning_efforts"] = supported_efforts
-            data.append(model_item)
-        data.sort(key=lambda item: item["id"])
-        return {"object": "list", "data": data}
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if codex_session is not None:
+                cleanup_error = _close_codex_resource(codex_session, "models_session")
+                if cleanup_error is not None and primary_error is None:
+                    raise cleanup_error

@@ -82,9 +82,10 @@ def _public_model_item(item: object) -> dict[str, Any] | None:
 
 
 def list_models() -> dict[str, Any]:
-    # The public discovery route returns the last-good/partial snapshot while
-    # the bounded background owner fills one representative catalog per type.
-    result = model_catalog_service.list_models(wait_for_cold=False)
+    # Cold discovery must not turn an empty catalog into a successful response.
+    # Once a snapshot exists, the service still returns it without waiting for
+    # unrelated type refreshes.
+    result = model_catalog_service.list_models(wait_for_cold=True)
     if not isinstance(result, dict):
         return {"object": "list", "data": []}
     data = result.get("data")

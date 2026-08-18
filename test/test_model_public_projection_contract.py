@@ -8,19 +8,19 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
-from services.model_service import ModelCatalogService
+from services.model_service import ModelCatalogPendingError, ModelCatalogService
 from services.openai_backend_api import OpenAIBackendAPI
 
 
 class ModelPublicProjectionContractTests(unittest.TestCase):
-    def test_models_route_uses_partial_catalog_without_waiting_for_cold_scan(self) -> None:
+    def test_models_route_returns_pending_for_cold_catalog_without_ready_snapshot(self) -> None:
         calls: list[bool] = []
 
         class ColdCatalog:
             def list_models(self, *, wait_for_cold: bool = True) -> dict[str, object]:
                 calls.append(wait_for_cold)
                 if wait_for_cold:
-                    raise RuntimeError("full catalog scan is still warming up")
+                    raise ModelCatalogPendingError("full catalog scan is still warming up")
                 return {"object": "list", "data": []}
 
         app = FastAPI()
@@ -40,9 +40,11 @@ class ModelPublicProjectionContractTests(unittest.TestCase):
                 headers={"Authorization": "Bearer test-key"},
             )
 
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json(), {"object": "list", "data": []})
-        self.assertEqual(calls, [False])
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.json()["error"]["code"], "upstream_error")
+        self.assertIn("warming up", response.json()["error"]["message"])
+        self.assertEqual(response.headers.get("retry-after"), "5")
+        self.assertEqual(calls, [True])
 
     def test_backend_catalog_route_rejects_container_model_fields(self) -> None:
         secret = "backend-model-container-canary"

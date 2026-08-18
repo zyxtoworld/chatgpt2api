@@ -132,6 +132,149 @@ class ModelCatalogServiceTests(unittest.TestCase):
         )
         self.assertTrue(shared_route.allow_anonymous)
 
+    def test_catalog_keeps_web_and_codex_same_plan_in_separate_capability_groups(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "source-groups-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "web-pro", "type": "Pro", "source_type": "web", "status": "正常"},
+            {"access_token": "web-pro-2", "type": "pro", "source_type": "web", "status": "正常"},
+            {"access_token": "codex-pro", "type": "Pro", "source_type": "codex", "status": "正常"},
+            {"access_token": "codex-pro-2", "type": "pro", "source_type": "codex", "status": "正常"},
+        ])
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                return model_list(
+                    "web-pro-model" if self.access_token.startswith("web") else
+                    "codex-pro-model" if self.access_token.startswith("codex") else
+                    "anonymous-model"
+                )
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+
+        result = catalog.list_models()
+
+        self.assertEqual(calls.count("web-pro"), 1)
+        self.assertEqual(calls.count("codex-pro"), 1)
+        self.assertEqual(calls.count("web-pro-2"), 0)
+        self.assertEqual(calls.count("codex-pro-2"), 0)
+        self.assertEqual(
+            catalog.route_for_model("web-pro-model").access_tokens,
+            frozenset({"web-pro", "web-pro-2"}),
+        )
+        self.assertEqual(
+            catalog.route_for_model("codex-pro-model").access_tokens,
+            frozenset({"codex-pro", "codex-pro-2"}),
+        )
+        self.assertEqual(
+            {item["id"] for item in result["data"]},
+            {"anonymous-model", "web-pro-model", "codex-pro-model"},
+        )
+
+    def test_codex_group_tries_next_representative_after_first_failure(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "codex-failover-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "codex-bad", "type": "Pro", "source_type": "codex", "status": "正常"},
+            {"access_token": "codex-good", "type": "pro", "source_type": "codex", "status": "正常"},
+        ])
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                if self.access_token == "codex-bad":
+                    raise RuntimeError("codex representative failed")
+                return model_list("codex-recovered-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+
+        catalog.list_models()
+
+        self.assertEqual(calls.count("codex-bad"), 1)
+        self.assertEqual(calls.count("codex-good"), 1)
+        self.assertEqual(
+            catalog.route_for_model("codex-recovered-model").access_tokens,
+            frozenset({"codex-bad", "codex-good"}),
+        )
+
+    def test_cold_catalog_requires_every_active_type_before_public_success(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "cold-all-types-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "free-token", "type": "free", "status": "正常"},
+            {"access_token": "pro-token", "type": "pro", "status": "正常"},
+        ])
+        outcomes: dict[str, object] = {
+            "": model_list("anonymous-model"),
+            "free-token": model_list("free-real-model"),
+            "pro-token": RuntimeError("pro representative unavailable"),
+        }
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                outcome = outcomes[self.access_token]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+            def close(self) -> None:
+                pass
+
+        now = [1000.0]
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: now[0],
+        )
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
+
+        partial = catalog.list_models(wait_for_cold=False)
+        self.assertIn("free-real-model", {item["id"] for item in partial["data"]})
+        self.assertNotIn("pro-real-model", {item["id"] for item in partial["data"]})
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
+
+        outcomes["pro-token"] = model_list(
+            "pro-real-1",
+            "pro-real-2",
+            "pro-real-3",
+            "pro-real-4",
+        )
+        now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
+        complete = catalog.list_models()
+        ids = {item["id"] for item in complete["data"]}
+        self.assertTrue({"pro-real-1", "pro-real-2", "pro-real-3", "pro-real-4"} <= ids)
+
     def test_model_map_rejects_container_ids_instead_of_stringifying_them(self) -> None:
         canary = "catalog-container-id-canary"
         result = {
@@ -480,6 +623,41 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertIn("recovered-model", {item["id"] for item in catalog.list_models()["data"]})
         self.assertEqual(attempts, 2)
 
+    def test_cold_failure_backoff_prevents_repeated_blocking_reads(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "cold-failure-backoff.json")
+        )
+        accounts.add_account_items([{"access_token": "free-token", "type": "free", "status": "正常"}])
+        calls: list[str] = []
+        now = [1000.0]
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                if self.access_token:
+                    raise RuntimeError("representative unavailable")
+                return model_list("anonymous-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: now[0],
+        )
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
+        first_attempts = list(calls)
+
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
+
+        self.assertEqual(calls, first_attempts)
+
     def test_type_refresh_tries_third_candidate_after_first_two_fail(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "third-candidate-accounts.json")
@@ -555,7 +733,8 @@ class ModelCatalogServiceTests(unittest.TestCase):
             else None,
         )
         catalog = ModelCatalogService(accounts, backend_factory=Backend)
-        catalog.list_models()
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
 
         self.assertEqual(calls, ["canonical"])
 
@@ -588,11 +767,15 @@ class ModelCatalogServiceTests(unittest.TestCase):
             backend_factory=Backend,
             clock=lambda: now[0],
         )
-        first = catalog.list_models()
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
         self.assertNotIn(
             "synchronous-recovered-model",
-            {item["id"] for item in first["data"]},
+            {item["id"] for item in catalog.list_models(wait_for_cold=False)["data"]},
         )
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
+        self.assertEqual(attempts, 1)
 
         now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
         catalog.list_models()
@@ -642,7 +825,8 @@ class ModelCatalogServiceTests(unittest.TestCase):
             backend_factory=Backend,
             clock=lambda: now[0],
         )
-        catalog.list_models()
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
         self.assertEqual(calls.count("ready-token"), 1)
         self.assertEqual(calls.count("bad-one") + calls.count("bad-two"), 2)
 

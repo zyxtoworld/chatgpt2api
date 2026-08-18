@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
-import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1563,6 +1562,7 @@ class CodexToolCallContractTests(unittest.TestCase):
 
         class Raw:
             status = 200
+            status_code = 200
             headers = {"content-type": "text/event-stream"}
 
             def __init__(self) -> None:
@@ -1580,33 +1580,132 @@ class CodexToolCallContractTests(unittest.TestCase):
             def __next__(self):
                 return next(self._lines)
 
+            def close(self) -> None:
+                pass
+
+        class Session:
+            def __init__(self) -> None:
+                self.headers: dict[str, str] = {"User-Agent": "web-default"}
+                self.close_calls = 0
+
+            def post(self, url: str, **kwargs: object) -> Raw:
+                captured["url"] = url
+                captured["kwargs"] = kwargs
+                return Raw()
+
+            def close(self) -> None:
+                self.close_calls += 1
+
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend.codex_client_version = "0.147.0"
+        backend.fp = {"impersonate": "chrome110"}
         backend.base_url = "https://chatgpt.example"
         backend._ensure_codex_source_account = mock.Mock()
         backend._codex_responses_headers = mock.Mock(
             return_value={"Authorization": "Bearer codex-token", "Content-Type": "application/json"}
         )
         captured: dict[str, object] = {}
+        session = Session()
 
-        def fake_urlopen(request, timeout):
-            captured["request"] = request
-            captured["timeout"] = timeout
-            return Raw()
-
-        with mock.patch.object(backend_module.urllib.request, "urlopen", side_effect=fake_urlopen):
+        with mock.patch.object(backend_module.requests, "Session", return_value=session):
             events = list(backend.iter_codex_response_events(payload, timeout=17))
 
         self.assertEqual(events, function_events())
-        request = captured["request"]
-        self.assertEqual(request.full_url, "https://chatgpt.example/backend-api/codex/responses")
-        self.assertEqual(request.method, "POST")
-        self.assertEqual(json.loads(request.data), payload)
-        self.assertEqual(captured["timeout"], 17)
+        self.assertEqual(captured["url"], "https://chatgpt.example/backend-api/codex/responses")
+        kwargs = captured["kwargs"]
+        self.assertEqual(json.loads(kwargs["data"]), payload)
+        self.assertEqual(kwargs["timeout"], 17)
+        self.assertTrue(kwargs["stream"])
+        self.assertEqual(session.close_calls, 1)
         backend._ensure_codex_source_account.assert_called_once_with()
+
+    def test_codex_responses_uses_configured_proxy_session(self) -> None:
+        payload = {
+            "model": CODEX_RESPONSES_MODEL,
+            "input": [{"type": "input_text", "text": "hello"}],
+            "stream": True,
+        }
+        response_body = b'data: {"type":"response.completed"}\n\n'
+
+        class Raw:
+            status = 200
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            def __init__(self) -> None:
+                self._lines = iter(response_body.splitlines(keepends=True))
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._lines)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def close(self) -> None:
+                pass
+
+        class Session:
+            def __init__(self) -> None:
+                self.headers: dict[str, str] = {"User-Agent": "web-default"}
+                self.post_calls: list[dict[str, object]] = []
+                self.close_calls = 0
+
+            def post(self, url: str, **kwargs: object) -> Raw:
+                self.post_calls.append({"url": url, **kwargs})
+                return Raw()
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend.codex_client_version = "0.147.0"
+        backend.fp = {"impersonate": "chrome110"}
+        backend.base_url = "https://chatgpt.example"
+        backend._ensure_codex_source_account = mock.Mock()
+        session = Session()
+
+        with (
+            mock.patch.object(
+                backend_module.proxy_settings,
+                "build_session_kwargs",
+                side_effect=lambda **kwargs: {
+                    "proxy": "http://proxy.example",
+                    **kwargs,
+                },
+            ) as build_session_kwargs,
+            mock.patch.object(backend_module.requests, "Session", return_value=session) as session_factory,
+        ):
+            events = list(backend.iter_codex_response_events(payload, timeout=17))
+
+        self.assertEqual(events, [{"type": "response.completed"}])
+        build_session_kwargs.assert_called_once()
+        self.assertEqual(
+            build_session_kwargs.call_args.kwargs["account"],
+            backend.account,
+        )
+        session_kwargs = session_factory.call_args.kwargs
+        self.assertFalse(session_kwargs["default_headers"])
+        self.assertNotIn("impersonate", session_kwargs)
+        self.assertEqual(session.post_calls[0]["timeout"], 17)
+        self.assertTrue(session.post_calls[0]["stream"])
+        self.assertEqual(session.headers, {})
+        self.assertEqual(session.close_calls, 1)
 
     def test_codex_http_error_body_is_bounded_closed_and_not_exposed(self) -> None:
         class ErrorBody:
+            status_code = 502
+            headers = {"content-type": "application/json"}
+
             def __init__(self) -> None:
                 self.closed = False
                 self.read_sizes: list[int] = []
@@ -1624,25 +1723,94 @@ class CodexToolCallContractTests(unittest.TestCase):
         payload = {"model": CODEX_RESPONSES_MODEL, "input": "hello", "stream": True}
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend.codex_client_version = "0.147.0"
+        backend.fp = {"impersonate": "chrome110"}
         backend.base_url = "https://chatgpt.example"
         backend._ensure_codex_source_account = mock.Mock()
         backend._codex_responses_headers = mock.Mock(return_value={"Authorization": "Bearer codex-token"})
         error_body = ErrorBody()
-        error = urllib.error.HTTPError(
-            "https://chatgpt.example/backend-api/codex/responses",
-            502,
-            "bad gateway",
-            {},
-            error_body,
-        )
 
-        with mock.patch.object(backend_module.urllib.request, "urlopen", side_effect=error):
+        class Session:
+            def __init__(self) -> None:
+                self.headers: dict[str, str] = {}
+                self.close_calls = 0
+
+            def post(self, _url: str, **_kwargs: object) -> ErrorBody:
+                return error_body
+
+            def close(self) -> None:
+                self.close_calls += 1
+
+        session = Session()
+
+        with mock.patch.object(backend_module.requests, "Session", return_value=session) as session_factory:
             with self.assertRaises(backend_module.UpstreamHTTPError) as raised:
                 list(backend.iter_codex_response_events(payload, timeout=1))
 
         self.assertTrue(error_body.closed)
-        self.assertTrue(error.read_sizes)
+        self.assertTrue(error_body.read_sizes)
+        self.assertEqual(session.close_calls, 1)
+        self.assertFalse(session_factory.call_args.kwargs["default_headers"])
+        self.assertNotIn("impersonate", session_factory.call_args.kwargs)
         self.assertNotIn("opaque-codex-secret", str(raised.exception))
+
+    def test_codex_response_cleanup_attempts_both_without_masking_primary_error(self) -> None:
+        class Raw:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            def __iter__(self):
+                return iter([b"data: {not-json}\n\n"])
+
+            def close(self) -> None:
+                self.close_calls += 1
+                raise RuntimeError("response-secret")
+
+        class Session:
+            def __init__(self, raw: Raw) -> None:
+                self.headers: dict[str, str] = {}
+                self.raw = raw
+                self.close_calls = 0
+
+            def post(self, _url: str, **_kwargs: object) -> Raw:
+                return self.raw
+
+            def close(self) -> None:
+                self.close_calls += 1
+                raise RuntimeError("session-secret")
+
+        raw = Raw()
+        session = Session(raw)
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend.codex_client_version = "0.147.0"
+        backend.fp = {"impersonate": "chrome110"}
+        backend.base_url = "https://chatgpt.example"
+        backend._ensure_codex_source_account = mock.Mock()
+        backend._codex_responses_headers = mock.Mock(return_value={"Authorization": "Bearer codex-token"})
+
+        with (
+            mock.patch.object(backend_module.requests, "Session", return_value=session),
+            mock.patch.object(backend_module.logger, "warning") as warning,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "malformed codex response event"):
+                list(backend.iter_codex_response_events(
+                    {"model": CODEX_RESPONSES_MODEL, "input": "hello", "stream": True},
+                    timeout=1,
+                ))
+
+        self.assertEqual(raw.close_calls, 1)
+        self.assertEqual(session.close_calls, 1)
+        logged = str(warning.call_args_list)
+        self.assertIn("response", logged)
+        self.assertIn("session", logged)
+        self.assertNotIn("response-secret", logged)
+        self.assertNotIn("session-secret", logged)
 
 
 class ChatFunctionToolContractTests(unittest.TestCase):

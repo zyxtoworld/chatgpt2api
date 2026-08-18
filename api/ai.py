@@ -32,6 +32,7 @@ from services.log_service import (
 from services.protocol.error_response import (
     PUBLIC_SERVER_ERROR_MESSAGE,
     exception_log_message,
+    openai_error_response,
     public_exception_message,
 )
 from services.protocol.responses_websocket import (
@@ -51,7 +52,7 @@ from services.protocol import (
     openai_search,
 )
 from services.opened_file_response import OpenedFileResponse
-from services.model_service import run_model_catalog_in_threadpool
+from services.model_service import ModelCatalogPendingError, run_model_catalog_in_threadpool
 
 
 _RESPONSES_WEBSOCKET_CAPACITY = 64
@@ -203,6 +204,13 @@ def create_router() -> APIRouter:
         await require_identity_async(authorization)
         try:
             return await run_model_catalog_in_threadpool(openai_v1_models.list_models)
+        except ModelCatalogPendingError as exc:
+            return openai_error_response(
+                exc,
+                exc.status_code,
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+                safe_message=public_exception_message(exc, "The model catalog is still warming up."),
+            )
         except Exception as exc:
             raise HTTPException(status_code=502, detail={"error": PUBLIC_SERVER_ERROR_MESSAGE}) from exc
 
