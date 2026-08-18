@@ -485,6 +485,7 @@ def _stream_events(chunks: Iterable[dict[str, object]], model: str, input_tokens
     tool_mode = isinstance(tools, list) and bool(tools)
     tool_started = False
     text_open = False
+    terminal = False
     yield {"type": "message_start", "message": {"id": message_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}}
     if not tool_mode:
         text_open = True
@@ -521,6 +522,7 @@ def _stream_events(chunks: Iterable[dict[str, object]], model: str, input_tokens
                         yield {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text_delta}}
                 tool_started = tool_mode and visible_text != current_text
         if choice.get("finish_reason"):
+            terminal = True
             content, stop_reason = content_blocks(current_text, tools)
             if text_open:
                 yield {"type": "content_block_stop", "index": 0}
@@ -539,6 +541,8 @@ def _stream_events(chunks: Iterable[dict[str, object]], model: str, input_tokens
                 yield from _stream_buffered_blocks(content, start_index)
             yield {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens(current_text)}}
             break
+    if not terminal:
+        raise RuntimeError("upstream stream ended without terminal finish reason")
     yield {"type": "message_stop", "created": created}
 
 

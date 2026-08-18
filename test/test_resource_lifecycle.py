@@ -2551,6 +2551,7 @@ class ResourceLifecycleTests(unittest.TestCase):
             service = account_module.AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
             service.add_accounts(["watcher-token"])
             errors: list[BaseException] = []
+            executor = ThreadPoolExecutor(max_workers=3)
 
             def fetch() -> None:
                 try:
