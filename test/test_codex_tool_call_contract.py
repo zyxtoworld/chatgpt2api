@@ -414,6 +414,50 @@ class CodexToolCallContractTests(unittest.TestCase):
         self.assertEqual(len(CreatedThenErrorBackend.instances), 1)
         self.assertTrue(CreatedThenErrorBackend.instances[0].closed)
 
+    def test_native_codex_text_exhaustion_preserves_last_upstream_status(self) -> None:
+        selector_calls: list[dict[str, object]] = []
+
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                selector_calls.append(kwargs)
+                excluded = set(kwargs.get("excluded_tokens") or set())
+                for token in ("codex-1", "codex-2", "codex-3"):
+                    if token not in excluded:
+                        return token
+                raise openai_v1_response.ModelUnavailableError("exhausted")
+
+        class ExhaustedBackend:
+            instances: list["ExhaustedBackend"] = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.closed = False
+                self.instances.append(self)
+
+            def iter_codex_response_events(self, _payload: dict[str, object]):
+                raise openai_v1_response.UpstreamHTTPError(
+                    "codex",
+                    429,
+                    {"error": "rate_limited"},
+                )
+                yield  # pragma: no cover
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", ExhaustedBackend),
+            mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+            self.assertRaises(openai_v1_response.UpstreamHTTPError) as raised,
+        ):
+            list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(len(ExhaustedBackend.instances), 3)
+        self.assertTrue(all(backend.closed for backend in ExhaustedBackend.instances))
+        self.assertEqual(len(selector_calls), 4)
+
     def test_native_codex_text_failover_rebuilds_payload_for_each_candidate(self) -> None:
         class CodexAccountService:
             def get_text_access_token(self, **kwargs: object) -> str:

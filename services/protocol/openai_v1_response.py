@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import math
 import re
 import time
@@ -75,6 +76,7 @@ SUPPORTED_RESPONSE_MESSAGE_PHASES = {"commentary", "final_answer"}
 SUPPORTED_RESPONSE_MESSAGE_STATUSES = {"in_progress", "completed", "incomplete"}
 SUPPORTED_FUNCTION_CALL_OUTPUT_FIELDS = {"type", "id", "call_id", "output", "status"}
 _CODEX_TEXT_FAILOVER_STATUSES = frozenset({429, 500, 502, 503, 504})
+_CODEX_TEXT_FAILOVER_DEADLINE_SECONDS = 30.0
 SUPPORTED_FUNCTION_CALL_OUTPUT_STATUSES = {"in_progress", "completed", "incomplete"}
 SUPPORTED_CUSTOM_TOOL_CALL_OUTPUT_FIELDS = {"type", "id", "call_id", "name", "output"}
 SUPPORTED_FUNCTION_CALL_FIELDS = {
@@ -1911,6 +1913,8 @@ def stream_codex_response(
     attempted_tokens: set[str] = set()
     current_token = access_token
     emitted_public_event = False
+    last_retryable_error: UpstreamHTTPError | None = None
+    failover_deadline = time.monotonic() + _CODEX_TEXT_FAILOVER_DEADLINE_SECONDS
     while True:
         if not current_token:
             try:
@@ -1926,12 +1930,19 @@ def stream_codex_response(
                         source_type="codex",
                     )
             except ModelUnavailableError as exc:
+                if last_retryable_error is not None:
+                    raise last_retryable_error
                 raise HTTPException(
                     status_code=503,
                     detail={"error": "native tools require an active Codex OAuth account"},
                 ) from exc
         if not current_token or current_token in attempted_tokens:
             raise ModelUnavailableError("no active Codex OAuth account is available")
+        remaining = failover_deadline - time.monotonic()
+        if remaining <= 0:
+            if last_retryable_error is not None:
+                raise last_retryable_error
+            raise RuntimeError("codex response failover deadline expired")
         attempted_tokens.add(current_token)
         backend = None
         try:
@@ -1942,7 +1953,16 @@ def stream_codex_response(
             if callable(get_account_lease):
                 _, expected_account = get_account_lease(current_token)
             backend = OpenAIBackendAPI(access_token=current_token)
-            for event in backend.iter_codex_response_events(attempt_payload):
+            event_reader = backend.iter_codex_response_events
+            parameters = inspect.signature(event_reader).parameters
+            if "timeout" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                events = event_reader(attempt_payload, timeout=max(1.0, remaining))
+            else:
+                events = event_reader(attempt_payload)
+            for event in events:
                 public_event = project_public_codex_response_event(event)
                 if public_event is None:
                     continue
@@ -1972,6 +1992,7 @@ def stream_codex_response(
         except UpstreamHTTPError as exc:
             if emitted_public_event or exc.status_code not in _CODEX_TEXT_FAILOVER_STATUSES:
                 raise
+            last_retryable_error = exc
             current_token = None
             continue
         finally:
