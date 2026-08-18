@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import math
 import re
 import time
@@ -1953,15 +1952,10 @@ def stream_codex_response(
             if callable(get_account_lease):
                 _, expected_account = get_account_lease(current_token)
             backend = OpenAIBackendAPI(access_token=current_token)
-            event_reader = backend.iter_codex_response_events
-            parameters = inspect.signature(event_reader).parameters
-            if "timeout" in parameters or any(
-                parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            ):
-                events = event_reader(attempt_payload, timeout=max(1.0, remaining))
-            else:
-                events = event_reader(attempt_payload)
+            events = backend.iter_codex_response_events(
+                attempt_payload,
+                timeout=max(1.0, remaining),
+            )
             for event in events:
                 public_event = project_public_codex_response_event(event)
                 if public_event is None:

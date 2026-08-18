@@ -146,7 +146,8 @@ class _FakeCodexBackend:
         self.closed = False
         self.instances.append(self)
 
-    def iter_codex_response_events(self, payload: dict[str, object]):
+    def iter_codex_response_events(self, payload: dict[str, object], *, timeout: float):
+        del timeout
         self.payload = payload
         yield from function_events()
 
@@ -330,10 +331,12 @@ class CodexToolCallContractTests(unittest.TestCase):
 
             def __init__(self, access_token: str) -> None:
                 self.access_token = access_token
+                self.timeout = 0.0
                 self.closed = False
                 self.instances.append(self)
 
-            def iter_codex_response_events(self, _payload: dict[str, object]):
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                self.timeout = timeout
                 if self.access_token != "codex-3":
                     raise openai_v1_response.UpstreamHTTPError(
                         "codex",
@@ -374,7 +377,105 @@ class CodexToolCallContractTests(unittest.TestCase):
             "codex-2",
             "codex-3",
         ])
+        self.assertTrue(all(backend.timeout > 0 for backend in FailoverBackend.instances))
+        self.assertTrue(all(
+            earlier.timeout >= later.timeout
+            for earlier, later in zip(FailoverBackend.instances, FailoverBackend.instances[1:])
+        ))
+        self.assertTrue(all(
+            backend.timeout <= openai_v1_response._CODEX_TEXT_FAILOVER_DEADLINE_SECONDS
+            for backend in FailoverBackend.instances
+        ))
         self.assertTrue(all(backend.closed for backend in FailoverBackend.instances))
+
+    def test_native_codex_text_does_not_inspect_event_reader_signature(self) -> None:
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_no_inspect",
+                "object": "response",
+                "status": "completed",
+                "model": CODEX_RESPONSES_MODEL,
+                "output": [],
+            },
+        }
+
+        class CodexAccountService:
+            def get_text_access_token(self, **_kwargs: object) -> str:
+                return "codex-1"
+
+            def mark_text_used(self, _token: str) -> None:
+                pass
+
+        class Backend:
+            def __init__(self, access_token: str) -> None:
+                del access_token
+                self.closed = False
+
+            def iter_codex_response_events(
+                self,
+                _payload: dict[str, object],
+                *,
+                timeout: float,
+            ):
+                self.timeout = timeout
+                yield completed
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", Backend),
+            mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+            mock.patch("inspect.signature", side_effect=AssertionError("signature reflection is forbidden")),
+        ):
+            events = list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
+
+        self.assertEqual([event["type"] for event in events], ["response.completed"])
+
+    def test_native_codex_text_deadline_preserves_last_retryable_error(self) -> None:
+        class CodexAccountService:
+            def get_text_access_token(self, **kwargs: object) -> str:
+                return "codex-1" if not kwargs.get("excluded_tokens") else "codex-2"
+
+        class Backend:
+            instances: list["Backend"] = []
+
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                self.closed = False
+                self.instances.append(self)
+
+            def iter_codex_response_events(
+                self,
+                _payload: dict[str, object],
+                *,
+                timeout: float,
+            ):
+                self.timeout = timeout
+                raise openai_v1_response.UpstreamHTTPError(
+                    "codex",
+                    502,
+                    {"error": "transient"},
+                )
+                yield  # pragma: no cover
+
+            def close(self) -> None:
+                self.closed = True
+
+        with (
+            mock.patch.object(openai_v1_response, "account_service", CodexAccountService()),
+            mock.patch.object(openai_v1_response, "OpenAIBackendAPI", Backend),
+            mock.patch.object(openai_v1_response, "resolve_codex_reasoning_effort"),
+            mock.patch.object(openai_v1_response.time, "monotonic", side_effect=[100.0, 100.1, 131.0]),
+            self.assertRaises(openai_v1_response.UpstreamHTTPError) as raised,
+        ):
+            list(openai_v1_response.stream_codex_response({"model": "auto", "input": "hello"}))
+
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertEqual([backend.access_token for backend in Backend.instances], ["codex-1"])
+        self.assertTrue(all(backend.closed for backend in Backend.instances))
 
     def test_native_codex_text_does_not_failover_after_created_event(self) -> None:
         selector_calls: list[dict[str, object]] = []
@@ -392,7 +493,8 @@ class CodexToolCallContractTests(unittest.TestCase):
                 self.closed = False
                 self.instances.append(self)
 
-            def iter_codex_response_events(self, _payload: dict[str, object]):
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                del timeout
                 yield {
                     "type": "response.created",
                     "response": {"id": "resp_committed", "status": "in_progress"},
@@ -434,7 +536,8 @@ class CodexToolCallContractTests(unittest.TestCase):
                 self.closed = False
                 self.instances.append(self)
 
-            def iter_codex_response_events(self, _payload: dict[str, object]):
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                del timeout
                 raise openai_v1_response.UpstreamHTTPError(
                     "codex",
                     429,
@@ -473,7 +576,8 @@ class CodexToolCallContractTests(unittest.TestCase):
                 self.access_token = access_token
                 self.closed = False
 
-            def iter_codex_response_events(self, payload: dict[str, object]):
+            def iter_codex_response_events(self, payload: dict[str, object], *, timeout: float):
+                del timeout
                 self.payloads[self.access_token] = payload
                 if self.access_token == "codex-1":
                     raise openai_v1_response.UpstreamHTTPError("codex", 502, {"error": "transient"})
@@ -535,7 +639,8 @@ class CodexToolCallContractTests(unittest.TestCase):
                 self.closed = False
                 self.instances.append(self)
 
-            def iter_codex_response_events(self, _payload: dict[str, object]):
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                del timeout
                 yield {"type": "response.output_text.delta", "item_id": "msg_1", "delta": "part"}
                 raise openai_v1_response.UpstreamHTTPError("codex", 502, {"error": "late"})
 
@@ -570,7 +675,8 @@ class CodexToolCallContractTests(unittest.TestCase):
                 self.closed = False
                 self.instances.append(self)
 
-            def iter_codex_response_events(self, _payload: dict[str, object]):
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                del timeout
                 raise openai_v1_response.UpstreamHTTPError("codex", 400, {"error": "invalid"})
                 yield  # pragma: no cover
 
@@ -594,7 +700,8 @@ class CodexToolCallContractTests(unittest.TestCase):
         release = threading.Event()
 
         class BlockingBackend:
-            def iter_codex_response_events(self, _payload: dict[str, object]):
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                del timeout
                 yield {"type": "response.created", "response": {"id": "resp_1", "status": "in_progress"}}
                 entered.set()
                 if not release.wait(5):
@@ -722,7 +829,8 @@ class CodexToolCallContractTests(unittest.TestCase):
         class EventBackend(_FakeCodexBackend):
             emitted_events: list[dict[str, object]] = []
 
-            def iter_codex_response_events(self, payload: dict[str, object]):
+            def iter_codex_response_events(self, payload: dict[str, object], *, timeout: float):
+                del timeout
                 self.payload = payload
                 yield from self.emitted_events
 
@@ -765,7 +873,8 @@ class CodexToolCallContractTests(unittest.TestCase):
         class EventBackend(_FakeCodexBackend):
             emitted_events: list[dict[str, object]] = []
 
-            def iter_codex_response_events(self, payload: dict[str, object]):
+            def iter_codex_response_events(self, payload: dict[str, object], *, timeout: float):
+                del timeout
                 self.payload = payload
                 yield from self.emitted_events
 
@@ -817,7 +926,8 @@ class CodexToolCallContractTests(unittest.TestCase):
         class EventBackend(_FakeCodexBackend):
             emitted_events: list[dict[str, object]] = []
 
-            def iter_codex_response_events(self, payload: dict[str, object]):
+            def iter_codex_response_events(self, payload: dict[str, object], *, timeout: float):
+                del timeout
                 self.payload = payload
                 yield from self.emitted_events
 
@@ -869,7 +979,8 @@ class CodexToolCallContractTests(unittest.TestCase):
         class EventBackend(_FakeCodexBackend):
             emitted_events: list[dict[str, object]] = []
 
-            def iter_codex_response_events(self, payload: dict[str, object]):
+            def iter_codex_response_events(self, payload: dict[str, object], *, timeout: float):
+                del timeout
                 self.payload = payload
                 yield from self.emitted_events
 
@@ -932,7 +1043,8 @@ class CodexToolCallContractTests(unittest.TestCase):
 
     def test_native_responses_projects_usage_to_known_public_fields(self) -> None:
         class EventBackend(_FakeCodexBackend):
-            def iter_codex_response_events(self, payload: dict[str, object]):
+            def iter_codex_response_events(self, payload: dict[str, object], *, timeout: float):
+                del timeout
                 self.payload = payload
                 terminal = function_events()[-1]
                 terminal["response"]["usage"] = {
@@ -1085,7 +1197,8 @@ class CodexToolCallContractTests(unittest.TestCase):
         ]
 
         class CompactionBackend(_FakeCodexBackend):
-            def iter_codex_response_events(self, payload: dict[str, object]):
+            def iter_codex_response_events(self, payload: dict[str, object], *, timeout: float):
+                del timeout
                 self.payload = payload
                 yield from events
 
