@@ -1147,18 +1147,41 @@ class OpenAIBackendAPI:
     def _read_bounded_codex_body(raw: Any, max_bytes: int) -> bytes:
         chunks: list[bytes] = []
         total = 0
-        while True:
-            chunk = raw.read(min(64 * 1024, max_bytes - total + 1))
-            if not chunk:
-                break
-            if not isinstance(chunk, (bytes, bytearray, memoryview)):
-                raise RuntimeError("codex response body is invalid")
-            part = bytes(chunk)
-            total += len(part)
-            if total > max_bytes:
+        iterator_factory = getattr(raw, "iter_content", None)
+        if callable(iterator_factory):
+            iterator = iterator_factory(chunk_size=min(64 * 1024, max_bytes + 1))
+            for chunk in iterator:
+                if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                    raise RuntimeError("codex response body is invalid")
+                part = bytes(chunk)
+                total += len(part)
+                if total > max_bytes:
+                    raise RuntimeError("codex response body exceeds the maximum size")
+                if part:
+                    chunks.append(part)
+            return b"".join(chunks)
+
+        read = getattr(raw, "read", None)
+        if callable(read):
+            while True:
+                chunk = read(min(64 * 1024, max_bytes - total + 1))
+                if not chunk:
+                    break
+                if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                    raise RuntimeError("codex response body is invalid")
+                part = bytes(chunk)
+                total += len(part)
+                if total > max_bytes:
+                    raise RuntimeError("codex response body exceeds the maximum size")
+                chunks.append(part)
+            return b"".join(chunks)
+
+        content = getattr(raw, "content", None)
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            if len(content) > max_bytes:
                 raise RuntimeError("codex response body exceeds the maximum size")
-            chunks.append(part)
-        return b"".join(chunks)
+            return bytes(content)
+        raise RuntimeError("codex response body is invalid")
 
     @staticmethod
     def _iter_codex_response_events(raw: Any) -> Iterator[Dict[str, Any]]:

@@ -952,6 +952,23 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
             )
         self.assertNotIn(SECRET, logged_text(warning.call_args_list))
 
+    def test_codex_json_response_accepts_curl_cffi_iter_content_without_read(self) -> None:
+        event = {"type": "response.completed", "response": {"id": "resp-json"}}
+        body = json.dumps(event).encode("utf-8")
+
+        class CurlResponse:
+            headers = {"content-type": "application/json"}
+            status_code = 200
+
+            def iter_content(self, chunk_size=None):
+                del chunk_size
+                yield body
+
+        self.assertEqual(
+            list(OpenAIBackendAPI._iter_codex_response_events(CurlResponse())),
+            [event],
+        )
+
     def test_codex_logs_do_not_include_untrusted_model_text(self) -> None:
         canary = "codex-request-model-canary owner@example.com opaque-token"
         backend = object.__new__(OpenAIBackendAPI)

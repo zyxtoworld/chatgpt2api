@@ -14,7 +14,7 @@ import anyio
 
 from services.account_service import AccountService, account_service
 from services.model_contract import parse_model_text
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 from services.protocol.error_response import PublicSafeErrorMarker
 from services.protocol.reasoning_effort import (
     canonical_conversation_effort,
@@ -234,6 +234,8 @@ class ModelCatalogService:
         # exhausted; never truncate a type's candidate set arbitrarily.
         attempted_tokens: set[str] = set()
         for access_token in candidate_tokens:
+            resolved_token = access_token
+            expected_account = None
             try:
                 resolved_token = (
                     self._accounts.refresh_access_token(
@@ -264,6 +266,19 @@ class ModelCatalogService:
                 )
             except Exception as exc:  # noqa: BLE001 - try the bounded fallback
                 last_error = exc
+                if isinstance(exc, InvalidAccessTokenError) and expected_account is not None:
+                    try:
+                        self._accounts.remove_invalid_token(
+                            resolved_token,
+                            "model_catalog",
+                            quiet=True,
+                            expected_account=expected_account,
+                        )
+                    except Exception as transition_error:  # noqa: BLE001 - preserve the 401 owner error
+                        logger.warning({
+                            "event": "model_catalog_invalid_transition_failed",
+                            "error_type": type(transition_error).__name__,
+                        })
                 logger.warning({
                     "event": "model_catalog_account_failed",
                     "account_type": account_type,

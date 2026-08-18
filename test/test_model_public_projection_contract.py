@@ -1,18 +1,104 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import api.ai as ai_module
+from services.account_service import AccountService
 from services.model_service import ModelCatalogPendingError, ModelCatalogService
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+from services.storage.json_storage import JSONStorageBackend
 
 
 class ModelPublicProjectionContractTests(unittest.TestCase):
+    def test_models_route_drops_invalid_pro_representative_without_blocking_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            accounts = AccountService(
+                JSONStorageBackend(Path(temp_dir) / "accounts.json")
+            )
+            accounts.add_account_items([
+                {
+                    "access_token": "free-live",
+                    "type": "free",
+                    "source_type": "codex",
+                    "status": "正常",
+                },
+                {
+                    "access_token": "pro-invalid",
+                    "type": "Pro",
+                    "source_type": "codex",
+                    "status": "正常",
+                },
+            ])
+            accounts.refresh_access_token = lambda token, **_kwargs: token
+
+            def model_list(model_id: str) -> dict[str, object]:
+                return {
+                    "object": "list",
+                    "data": [{
+                        "id": model_id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "chatgpt",
+                        "permission": [],
+                        "root": model_id,
+                        "parent": None,
+                    }],
+                }
+
+            class Backend:
+                def __init__(self, access_token: str = "") -> None:
+                    self.access_token = access_token
+
+                def list_models(self, **_kwargs: object) -> dict[str, object]:
+                    if self.access_token == "pro-invalid":
+                        raise InvalidAccessTokenError("fixture token invalid")
+                    if self.access_token == "free-live":
+                        return model_list("free-live-model")
+                    return model_list("anonymous-model")
+
+                def close(self) -> None:
+                    pass
+
+            catalog = ModelCatalogService(accounts, backend_factory=Backend)
+            app = FastAPI()
+            app.include_router(ai_module.create_router())
+
+            with (
+                mock.patch.object(
+                    ai_module,
+                    "require_identity_async",
+                    new=mock.AsyncMock(return_value="test-identity"),
+                ),
+                mock.patch.object(ai_module.openai_v1_models, "model_catalog_service", catalog),
+                mock.patch.object(ai_module.openai_v1_models, "account_service", accounts),
+            ):
+                response = TestClient(app, raise_server_exceptions=False).get(
+                    "/v1/models",
+                    headers={"Authorization": "Bearer test-key"},
+                )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            model_ids = {item["id"] for item in response.json()["data"]}
+            self.assertIn("free-live-model", model_ids)
+            self.assertIn("anonymous-model", model_ids)
+            self.assertNotIn("pro-invalid-model", model_ids)
+            self.assertTrue(all(
+                "pro" not in item.get("supported_account_types", [])
+                for item in response.json()["data"]
+            ))
+            self.assertNotIn(("codex", "Pro"), catalog._active_accounts_by_group())
+            self.assertEqual(
+                catalog.route_for_model("free-live-model").access_tokens,
+                frozenset({"free-live"}),
+            )
+
     def test_models_route_returns_pending_for_cold_catalog_without_ready_snapshot(self) -> None:
         calls: list[bool] = []
 

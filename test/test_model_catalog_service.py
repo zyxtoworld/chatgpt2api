@@ -16,7 +16,9 @@ from services.model_service import (
     ModelCatalogService,
     ModelUnavailableError,
 )
+from services.openai_backend_api import InvalidAccessTokenError
 from services.storage.json_storage import JSONStorageBackend
+from utils.helper import UpstreamHTTPError
 
 
 def model_list(*model_ids: str) -> dict:
@@ -294,6 +296,129 @@ class ModelCatalogServiceTests(unittest.TestCase):
         complete = catalog.list_models()
         ids = {item["id"] for item in complete["data"]}
         self.assertTrue({"pro-real-1", "pro-real-2", "pro-real-3", "pro-real-4"} <= ids)
+
+    def test_invalid_representative_is_invalidated_and_does_not_block_other_groups(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "invalid-representative-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "free-live", "type": "free", "source_type": "codex", "status": "正常"},
+            {"access_token": "pro-invalid", "type": "Pro", "source_type": "codex", "status": "正常"},
+        ])
+        accounts.refresh_access_token = lambda token, **_kwargs: token
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                if self.access_token == "pro-invalid":
+                    raise InvalidAccessTokenError("fixture token invalid")
+                return model_list("free-live-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+        result = catalog.list_models()
+
+        self.assertIn("free-live-model", {item["id"] for item in result["data"]})
+        self.assertNotIn("pro-invalid", catalog._active_accounts_by_group().get(("codex", "Pro"), []))
+        invalid_account = accounts.get_account("pro-invalid")
+        self.assertTrue(invalid_account is None or invalid_account.get("status") == "异常")
+        self.assertEqual(
+            catalog.route_for_model("free-live-model").access_tokens,
+            frozenset({"free-live"}),
+        )
+
+    def test_transient_representative_failures_do_not_disable_accounts(self) -> None:
+        failures = (
+            UpstreamHTTPError("models", 429, {"error": "upstream_error"}),
+            UpstreamHTTPError("models", 503, {"error": "upstream_error"}),
+            TimeoutError("catalog timeout"),
+        )
+        for index, failure in enumerate(failures):
+            with self.subTest(failure=type(failure).__name__, index=index):
+                accounts = AccountService(
+                    JSONStorageBackend(Path(self.temp_dir.name) / f"transient-{index}.json")
+                )
+                token = f"transient-{index}"
+                accounts.add_account_items([
+                    {"access_token": token, "type": "Pro", "source_type": "codex", "status": "正常"},
+                ])
+                accounts.refresh_access_token = lambda value, **_kwargs: value
+
+                class Backend:
+                    def __init__(self, access_token: str = "") -> None:
+                        self.access_token = access_token
+
+                    def list_models(self, **_kwargs: object) -> dict:
+                        if self.access_token:
+                            raise failure
+                        return model_list("anonymous-model")
+
+                    def close(self) -> None:
+                        pass
+
+                catalog = ModelCatalogService(
+                    accounts,
+                    backend_factory=Backend,
+                    clock=lambda: self.now,
+                )
+                with self.assertRaises(ModelCatalogPendingError):
+                    catalog.list_models()
+
+                current = accounts.get_account(token)
+                self.assertIsNotNone(current)
+                self.assertEqual(current["status"], "正常")
+                self.assertIn(("codex", "Pro"), catalog._active_accounts_by_group())
+
+    def test_invalid_transition_cannot_disable_replaced_account_identity(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "invalid-replacement-accounts.json")
+        )
+        token = "replaced-before-invalid-transition"
+        accounts.add_account_items([
+            {"access_token": token, "type": "Pro", "source_type": "codex", "status": "正常"},
+        ])
+        accounts.refresh_access_token = lambda value, **_kwargs: value
+        entered = Event()
+        release = Event()
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                if not self.access_token:
+                    return model_list("anonymous-model")
+                entered.set()
+                if not release.wait(timeout=2):
+                    raise AssertionError("invalid transition barrier was not released")
+                raise InvalidAccessTokenError("fixture token invalid")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(entered.wait(timeout=2))
+        accounts.update_account(token, {"quota": 42})
+        release.set()
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+
+        current = accounts.get_account(token)
+        self.assertIsNotNone(current)
+        self.assertEqual(current["status"], "正常")
+        self.assertEqual(current["quota"], 42)
 
     def test_model_map_rejects_container_ids_instead_of_stringifying_them(self) -> None:
         canary = "catalog-container-id-canary"

@@ -1708,14 +1708,12 @@ class CodexToolCallContractTests(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.closed = False
-                self.read_sizes: list[int] = []
+                self.chunk_sizes: list[int | None] = []
                 self.body = b"opaque-codex-secret owner@example.com" * 100
 
-            def read(self, size: int = -1) -> bytes:
-                self.read_sizes.append(size)
-                if size < 0:
-                    return self.body
-                return self.body[:size]
+            def iter_content(self, chunk_size: int | None = None):
+                self.chunk_sizes.append(chunk_size)
+                yield self.body
 
             def close(self) -> None:
                 self.closed = True
@@ -1749,7 +1747,11 @@ class CodexToolCallContractTests(unittest.TestCase):
                 list(backend.iter_codex_response_events(payload, timeout=1))
 
         self.assertTrue(error_body.closed)
-        self.assertTrue(error_body.read_sizes)
+        self.assertTrue(error_body.chunk_sizes)
+        self.assertLessEqual(
+            error_body.chunk_sizes[0] or 0,
+            backend_module.CODEX_HTTP_ERROR_MAX_BODY_BYTES + 1,
+        )
         self.assertEqual(session.close_calls, 1)
         self.assertFalse(session_factory.call_args.kwargs["default_headers"])
         self.assertNotIn("impersonate", session_factory.call_args.kwargs)
