@@ -98,6 +98,7 @@ def create_app() -> FastAPI:
             if backup_start_attempted:
                 run_cleanup("backup_scheduler", backup_service.stop)
             await run_async_cleanup("management_tasks", accounts.wait_for_management_tasks)
+            await run_async_cleanup("health_probe_tasks", system.wait_for_health_probe_tasks)
             await run_async_cleanup(
                 "background_tasks",
                 lambda: asyncio.to_thread(wait_for_background_tasks),

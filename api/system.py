@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import html
+import logging
 import threading
+import weakref
 from functools import partial
 from urllib.parse import quote
 
@@ -35,25 +38,125 @@ from services.protocol.error_response import PublicSafeValueError, public_except
 from services.storage.base import STORAGE_HEALTH_ERROR_MESSAGE
 
 
+logger = logging.getLogger(__name__)
 _STORAGE_HEALTH_THREAD_STATE = threading.local()
 _ACCOUNT_STATS_THREAD_STATE = threading.local()
 _IMAGE_IO_THREAD_CAPACITY = 8
 _IMAGE_IO_THREAD_STATE = threading.local()
 _SYSTEM_MANAGEMENT_IO_THREAD_CAPACITY = 4
 _SYSTEM_MANAGEMENT_IO_THREAD_STATE = threading.local()
+_HEALTH_OVERALL_TIMEOUT_SECONDS = 2.0
+_HEALTH_SUBCHECK_TIMEOUT_SECONDS = 1.5
+_HEALTH_SHUTDOWN_TIMEOUT_SECONDS = 0.5
+_HEALTH_PROBE_STAGE_NAMES = (
+    "account_stats",
+    "storage_health",
+    "storage_factory",
+    "backend_info",
+    "proxy_status",
+)
 
 
-async def _storage_health_async(storage) -> dict:
+class _HealthProbeOwner:
+    def __init__(self) -> None:
+        self.guards = {stage: threading.Lock() for stage in _HEALTH_PROBE_STAGE_NAMES}
+        self.tasks: dict[str, asyncio.Task] = {}
+
+
+_HEALTH_PROBE_OWNERS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    weakref.ReferenceType[_HealthProbeOwner],
+] = (
+    weakref.WeakKeyDictionary()
+)
+_HEALTH_PROBE_OWNERS_LOCK = threading.Lock()
+
+
+def _health_probe_owner() -> _HealthProbeOwner:
+    loop = asyncio.get_running_loop()
+    with _HEALTH_PROBE_OWNERS_LOCK:
+        owner_ref = _HEALTH_PROBE_OWNERS.get(loop)
+        owner = owner_ref() if owner_ref is not None else None
+        if owner is None:
+            owner = _HealthProbeOwner()
+            _HEALTH_PROBE_OWNERS[loop] = weakref.ref(owner)
+        return owner
+
+
+def _consume_health_task_result(owner: _HealthProbeOwner, stage: str, task: asyncio.Task) -> None:
+    if owner.tasks.get(stage) is task:
+        del owner.tasks[stage]
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def wait_for_health_probe_tasks(timeout: float = _HEALTH_SHUTDOWN_TIMEOUT_SECONDS) -> bool:
+    """Wait briefly for this event loop's workers without abandoning them."""
+    owner = _health_probe_owner()
+    deadline = anyio.current_time() + timeout
+    while owner.tasks:
+        tasks = tuple(owner.tasks.values())
+        remaining = max(0.0, deadline - anyio.current_time())
+        if remaining <= 0:
+            logger.warning("health probe shutdown timed out", extra={"pending_stages": tuple(owner.tasks)})
+            return False
+        _done, pending = await asyncio.wait(tasks, timeout=remaining)
+        if pending:
+            logger.warning("health probe workers remain tracked during shutdown", extra={"pending_stages": tuple(owner.tasks)})
+            return False
+        await asyncio.sleep(0)
+    return True
+
+
+async def _bounded_health_io(
+    stage: str,
+    limiter: anyio.CapacityLimiter,
+    func,
+    *args,
+    deadline: float | None = None,
+):
+    owner = _health_probe_owner()
+    guard = owner.guards[stage]
+    if not guard.acquire(blocking=False):
+        return None
+
+    async def run_probe():
+        try:
+            return await anyio.to_thread.run_sync(
+                partial(func, *args),
+                limiter=limiter,
+            )
+        finally:
+            guard.release()
+
+    task = asyncio.create_task(run_probe())
+    owner.tasks[stage] = task
+    task.add_done_callback(partial(_consume_health_task_result, owner, stage))
+    timeout = _HEALTH_SUBCHECK_TIMEOUT_SECONDS
+    if deadline is not None:
+        timeout = min(timeout, max(0.0, deadline - anyio.current_time()))
+    if timeout <= 0:
+        return None
+    try:
+        with anyio.fail_after(timeout):
+            return await asyncio.shield(task)
+    except TimeoutError:
+        return None
+
+
+async def _storage_health_async(storage, *, deadline: float | None = None) -> dict | None:
     limiter = getattr(_STORAGE_HEALTH_THREAD_STATE, "limiter", None)
     if limiter is None:
         # Git health checks may pull a repository. Serialize them outside the
         # event loop so concurrent probes cannot freeze unrelated API traffic.
         limiter = anyio.CapacityLimiter(1)
         _STORAGE_HEALTH_THREAD_STATE.limiter = limiter
-    return await anyio.to_thread.run_sync(storage.health_check, limiter=limiter)
+    return await _bounded_health_io("storage_health", limiter, storage.health_check, deadline=deadline)
 
 
-async def _account_stats_async(account_service) -> dict:
+async def _account_stats_async(account_service, *, deadline: float | None = None) -> dict | None:
     limiter = getattr(_ACCOUNT_STATS_THREAD_STATE, "limiter", None)
     if limiter is None:
         # Account mutations can hold the service lock while a storage snapshot
@@ -61,7 +164,7 @@ async def _account_stats_async(account_service) -> dict:
         # the single ASGI event-loop thread.
         limiter = anyio.CapacityLimiter(1)
         _ACCOUNT_STATS_THREAD_STATE.limiter = limiter
-    return await anyio.to_thread.run_sync(account_service.get_stats, limiter=limiter)
+    return await _bounded_health_io("account_stats", limiter, account_service.get_stats, deadline=deadline)
 
 
 def _image_io_thread_limiter() -> anyio.CapacityLimiter:
@@ -91,6 +194,21 @@ async def run_system_management_io(func, *args, **kwargs):
     return await anyio.to_thread.run_sync(
         partial(func, *args, **kwargs),
         limiter=_system_management_io_thread_limiter(),
+    )
+
+
+async def _bounded_system_management_health_io(
+    stage: str,
+    func,
+    *args,
+    deadline: float | None = None,
+):
+    return await _bounded_health_io(
+        stage,
+        _system_management_io_thread_limiter(),
+        func,
+        *args,
+        deadline=deadline,
     )
 
 
@@ -253,9 +371,14 @@ def _public_account_stats(value: object) -> dict[str, object]:
 def _public_storage_snapshot(storage_info: object, storage_health: object) -> tuple[dict[str, object], bool]:
     info = storage_info if isinstance(storage_info, dict) else {}
     backend_type = info.get("type") or info.get("backend")
-    if not isinstance(backend_type, str) or backend_type not in _PUBLIC_STORAGE_BACKEND_TYPES:
+    info_healthy = isinstance(backend_type, str) and backend_type in _PUBLIC_STORAGE_BACKEND_TYPES
+    if not info_healthy:
         backend_type = "unknown"
-    storage_healthy = isinstance(storage_health, dict) and storage_health.get("status") == "healthy"
+    storage_healthy = (
+        info_healthy
+        and isinstance(storage_health, dict)
+        and storage_health.get("status") == "healthy"
+    )
     health: dict[str, object] = {
         "status": "healthy" if storage_healthy else "unhealthy",
     }
@@ -667,32 +790,71 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):
         from services.account_service import account_service as acct_svc
-        try:
-            raw_stats = await _account_stats_async(acct_svc)
-        except Exception:
-            raw_stats = _empty_account_stats()
+        stages: dict[str, object] = {}
+        deadline = anyio.current_time() + _HEALTH_OVERALL_TIMEOUT_SECONDS
+
+        async def run_stage(name: str, operation) -> None:
+            try:
+                stages[name] = await operation()
+            except Exception:
+                stages[name] = None
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(
+                run_stage,
+                "stats",
+                lambda: _account_stats_async(acct_svc, deadline=deadline),
+            )
+            task_group.start_soon(
+                run_stage,
+                "storage",
+                lambda: _bounded_system_management_health_io(
+                    "storage_factory",
+                    config.get_storage_backend,
+                    deadline=deadline,
+                ),
+            )
+            task_group.start_soon(
+                run_stage,
+                "proxy",
+                lambda: _bounded_system_management_health_io(
+                    "proxy_status",
+                    proxy_settings.get_runtime_status,
+                    deadline=deadline,
+                ),
+            )
+
+        raw_stats = stages.get("stats") or _empty_account_stats()
         stats = _public_account_stats(raw_stats)
         storage_health: object = {}
         backend_info: object = {}
-        try:
-            storage = await run_system_management_io(config.get_storage_backend)
-            storage_health = await _storage_health_async(storage)
-            backend_info = await run_system_management_io(storage.get_backend_info)
-        except Exception:
-            # An anonymous health probe must stay available and fail closed if
-            # storage initialization or either probe fails.
-            storage_health = {}
-            backend_info = {}
+        storage = stages.get("storage")
+        if storage is not None:
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(
+                    run_stage,
+                    "storage_health",
+                    lambda: _storage_health_async(storage, deadline=deadline),
+                )
+                task_group.start_soon(
+                    run_stage,
+                    "backend_info",
+                    lambda: _bounded_system_management_health_io(
+                        "backend_info",
+                        storage.get_backend_info,
+                        deadline=deadline,
+                    ),
+                )
+            storage_health = stages.get("storage_health") or {}
+            backend_info = stages.get("backend_info") or {}
+            if stages.get("storage_health") is None:
+                backend_info = {}
         public_storage, storage_healthy = _public_storage_snapshot(
             backend_info,
             storage_health,
         )
         healthy = stats["active"] > 0 and storage_healthy
-
-        try:
-            raw_proxy_runtime = proxy_settings.get_runtime_status()
-        except Exception:
-            raw_proxy_runtime = {}
+        raw_proxy_runtime = stages.get("proxy") or {}
 
         stats_json = {
             "status": "ok" if healthy else "degraded",

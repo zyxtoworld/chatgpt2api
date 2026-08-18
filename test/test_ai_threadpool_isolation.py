@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import threading
+import time
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest import mock
 
@@ -652,6 +655,211 @@ class AIThreadPoolIsolationContractTests(unittest.TestCase):
             ),
         ):
             anyio.run(scenario)
+
+    def test_public_health_returns_degraded_when_account_stats_is_blocked(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_stats() -> dict[str, object]:
+            entered.set()
+            release.wait(3)
+            return {"active": 1}
+
+        class HealthyStorage:
+            def health_check(self) -> dict[str, object]:
+                return {"status": "healthy"}
+
+            def get_backend_info(self) -> dict[str, object]:
+                return {"type": "json"}
+
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                response = await client.get("/health?format=json")
+            self.assertEqual(response.status_code, 200, response.text)
+            return response
+
+        try:
+            with (
+                mock.patch.object(account_module.account_service, "get_stats", side_effect=blocked_stats),
+                mock.patch.object(system_module.config, "get_storage_backend", return_value=HealthyStorage()),
+                mock.patch.object(
+                    system_module.proxy_settings,
+                    "get_runtime_status",
+                    return_value={"enabled": False, "clearance_enabled": False},
+                ),
+            ):
+                started = time.monotonic()
+                response = anyio.run(scenario)
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 2.0, "blocked account stats kept the health route open")
+            self.assertFalse(response.json()["healthy"])
+        finally:
+            release.set()
+
+    def test_public_health_bounds_each_blocking_subcheck(self) -> None:
+        for stage in ("account", "storage", "proxy"):
+            release = threading.Event()
+
+            def blocked() -> dict[str, object]:
+                release.wait(3)
+                return {}
+
+            class HealthyStorage:
+                def health_check(self) -> dict[str, object]:
+                    return blocked() if stage == "storage" else {"status": "healthy"}
+
+                def get_backend_info(self) -> dict[str, object]:
+                    return {"type": "json"}
+
+            async def scenario() -> object:
+                app = create_app()
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                    return await client.get("/health?format=json")
+
+            try:
+                with (
+                    mock.patch.object(
+                        account_module.account_service,
+                        "get_stats",
+                        side_effect=blocked if stage == "account" else lambda: {"active": 1},
+                    ),
+                    mock.patch.object(system_module.config, "get_storage_backend", return_value=HealthyStorage()),
+                    mock.patch.object(
+                        system_module.proxy_settings,
+                        "get_runtime_status",
+                        side_effect=blocked if stage == "proxy" else lambda: {
+                            "enabled": False,
+                            "clearance_enabled": False,
+                        },
+                    ),
+                ):
+                    started = time.monotonic()
+                    response = anyio.run(scenario)
+                    elapsed = time.monotonic() - started
+                self.assertLess(elapsed, 2.0, f"{stage} health subcheck exceeded its bound")
+                self.assertEqual(response.status_code, 200, response.text)
+                if stage != "proxy":
+                    self.assertFalse(response.json()["healthy"])
+            finally:
+                release.set()
+
+    def test_public_health_has_one_overall_budget_for_all_blocking_subchecks(self) -> None:
+        release = threading.Event()
+
+        def blocked() -> dict[str, object]:
+            release.wait(3)
+            return {}
+
+        class BlockingStorage:
+            def health_check(self) -> dict[str, object]:
+                return blocked()
+
+            def get_backend_info(self) -> dict[str, object]:
+                return blocked()
+
+        async def scenario() -> object:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                return await client.get("/health?format=json")
+
+        try:
+            with (
+                mock.patch.object(account_module.account_service, "get_stats", side_effect=blocked),
+                mock.patch.object(system_module.config, "get_storage_backend", return_value=BlockingStorage()),
+                mock.patch.object(system_module.proxy_settings, "get_runtime_status", side_effect=blocked),
+            ):
+                started = time.monotonic()
+                response = anyio.run(scenario)
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 2.5, "health subchecks exceeded the production liveness budget")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertFalse(response.json()["healthy"])
+        finally:
+            release.set()
+
+    def test_public_health_keeps_storage_and_proxy_results_during_repeated_concurrent_probes(self) -> None:
+        class HealthyStorage:
+            def __init__(self) -> None:
+                self._factory_barrier = threading.Barrier(2)
+                self._details_barrier = threading.Barrier(2)
+
+            def health_check(self) -> dict[str, object]:
+                self._details_barrier.wait(2)
+                return {"status": "healthy"}
+
+            def get_backend_info(self) -> dict[str, object]:
+                self._details_barrier.wait(2)
+                return {"type": "json"}
+
+        storage = HealthyStorage()
+
+        def get_storage_backend() -> HealthyStorage:
+            storage._factory_barrier.wait(2)
+            return storage
+
+        def get_runtime_status() -> dict[str, object]:
+            storage._factory_barrier.wait(2)
+            return {"enabled": True, "clearance_enabled": True}
+
+        async def scenario() -> None:
+            app = create_app()
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                for _ in range(5):
+                    response = await client.get("/health?format=json")
+                    self.assertEqual(response.status_code, 200, response.text)
+                    payload = response.json()
+                    self.assertTrue(payload["healthy"], payload)
+                    self.assertEqual(payload["storage"], {"backend": "json", "health": {"status": "healthy"}})
+                    self.assertEqual(
+                        payload["proxy_runtime"],
+                        {"enabled": True, "clearance_enabled": True},
+                    )
+
+        with (
+            mock.patch.object(account_module.account_service, "get_stats", return_value={"active": 1}),
+            mock.patch.object(system_module.config, "get_storage_backend", side_effect=get_storage_backend),
+            mock.patch.object(system_module.proxy_settings, "get_runtime_status", side_effect=get_runtime_status),
+        ):
+            anyio.run(scenario)
+
+    def test_health_probe_shutdown_is_bounded_and_loop_scoped(self) -> None:
+        owner_refs: list[weakref.ReferenceType[object]] = []
+
+        async def scenario() -> None:
+            owner_refs.append(weakref.ref(system_module._health_probe_owner()))
+            entered = threading.Event()
+            release = threading.Event()
+
+            def blocked_stats() -> dict[str, object]:
+                entered.set()
+                release.wait(3)
+                return {"active": 1}
+
+            probe_task = asyncio.create_task(
+                system_module._account_stats_async(SimpleNamespace(get_stats=blocked_stats))
+            )
+            with anyio.fail_after(1):
+                await anyio.to_thread.run_sync(entered.wait, 1)
+
+            started = time.monotonic()
+            drained = await system_module.wait_for_health_probe_tasks(timeout=0.05)
+            elapsed = time.monotonic() - started
+            self.assertFalse(drained)
+            self.assertLess(elapsed, 0.5)
+
+            release.set()
+            self.assertEqual(await probe_task, {"active": 1})
+            self.assertTrue(await system_module.wait_for_health_probe_tasks(timeout=0.5))
+
+        anyio.run(scenario)
+        anyio.run(scenario)
+        gc.collect()
+        self.assertTrue(all(reference() is None for reference in owner_refs))
 
     def test_public_image_reads_and_thumbnail_generation_do_not_run_on_the_asgi_event_loop(self) -> None:
         def image_response(_path: str):
