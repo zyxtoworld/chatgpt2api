@@ -1103,7 +1103,8 @@ class PublicErrorContractTests(unittest.TestCase):
             def __init__(self, *, access_token: str) -> None:
                 self.access_token = access_token
 
-            def iter_codex_response_events(self, _payload):
+            def iter_codex_response_events(self, _payload, *, timeout: float):
+                del timeout
                 yield from upstream_events
 
             def close(self) -> None:
