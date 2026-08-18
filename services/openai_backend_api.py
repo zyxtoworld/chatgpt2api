@@ -7,8 +7,9 @@ import random
 import re
 import threading
 import time
+from copy import deepcopy
 
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -1008,16 +1009,16 @@ class OpenAIBackendAPI:
                 account.get("account_id") or account.get("chatgpt_account_id"),
                 max_length=256,
             ) or ""
-        if not account_id:
-            raise RuntimeError("codex account id is required for model discovery")
-        return {
+        headers = {
             "Accept": "application/json",
             "Authorization": f"Bearer {self.access_token}",
-            "ChatGPT-Account-ID": account_id,
             "originator": "codex_cli_rs",
             "User-Agent": f"codex_cli_rs/{client_version}",
             "version": client_version,
         }
+        if account_id:
+            headers["ChatGPT-Account-ID"] = account_id
+        return headers
 
     def _codex_session(self) -> Any:
         """Create a Codex transport without inheriting Web fingerprint headers."""
@@ -3642,6 +3643,264 @@ class OpenAIBackendAPI:
                 efforts.append(normalized)
         return efforts
 
+    @classmethod
+    def _merge_model_items(
+        cls,
+        target: dict[str, dict[str, Any]],
+        incoming: dict[str, dict[str, Any]],
+    ) -> None:
+        for model_id, model_item in incoming.items():
+            existing = target.get(model_id)
+            if existing is None:
+                target[model_id] = deepcopy(model_item)
+                continue
+            existing_efforts = existing.get("supported_reasoning_efforts")
+            new_efforts = model_item.get("supported_reasoning_efforts")
+            if isinstance(existing_efforts, list) and isinstance(new_efforts, list):
+                existing["supported_reasoning_efforts"] = list(dict.fromkeys(
+                    [*existing_efforts, *new_efforts]
+                ))
+            elif existing_efforts is None and new_efforts is not None:
+                existing["supported_reasoning_efforts"] = deepcopy(new_efforts)
+
+    @classmethod
+    def _parse_model_catalog_payload(
+        cls,
+        payload: object,
+        *,
+        is_codex: bool,
+    ) -> dict[str, dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return {}
+        models: dict[str, dict[str, Any]] = {}
+        for item in payload.get("models", []):
+            if not isinstance(item, dict):
+                continue
+            if is_codex and item.get("supported_in_api") is not True:
+                continue
+            slug = parse_model_text(item.get("slug"))
+            if not slug:
+                continue
+            model_item = {
+                "id": slug,
+                "object": "model",
+                "created": _parse_model_created(item.get("created")),
+                "owned_by": parse_model_text(item.get("owned_by"), default="chatgpt"),
+                "permission": [],
+                "root": slug,
+                "parent": None,
+            }
+            supported_efforts = cls._model_reasoning_efforts(item)
+            if supported_efforts is not None:
+                model_item["supported_reasoning_efforts"] = supported_efforts
+            cls._merge_model_items(models, {slug: model_item})
+        return models
+
+    def _fetch_model_catalog_endpoint(
+        self,
+        request_session: Any,
+        path: str,
+        route: str,
+        headers: Dict[str, str],
+        *,
+        is_codex: bool,
+        timeout_secs: float,
+        deadline: float | None,
+    ) -> dict[str, dict[str, Any]]:
+        response = request_session.get(
+            self.base_url + path,
+            headers=headers,
+            timeout=self._search_remaining(deadline, timeout_secs),
+            stream=True,
+        )
+        return self._parse_model_catalog_payload(
+            self._read_json_response(response, route),
+            is_codex=is_codex,
+        )
+
+    def list_catalog_models(
+        self,
+        *,
+        timeout_secs: float = 30.0,
+        deadline: float | None = None,
+    ) -> Dict[str, Any]:
+        """Fetch both authenticated catalog sources for one representative.
+
+        A representative account owns one logical catalog.  The two upstream
+        sources are independent: one successful source is publishable, while
+        both failing is returned to the type-level retry/failover owner.
+        """
+        if not self.access_token:
+            return self.list_models(timeout_secs=timeout_secs, deadline=deadline)
+
+        account = getattr(self, "account", {})
+        owner_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + self._search_remaining(None, timeout_secs)
+        )
+        web_path = "/backend-api/models?history_and_training_disabled=false"
+        web_route = "/backend-api/models"
+        account_id = _safe_upstream_text(
+            getattr(self, "_catalog_account_id", None)
+            or (account.get("account_id") if isinstance(account, dict) else None)
+            or (account.get("chatgpt_account_id") if isinstance(account, dict) else None),
+            max_length=256,
+        )
+        futures: dict[Any, str] = {}
+        pending: set[Any] = set()
+        endpoint_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="model-catalog-endpoint",
+        )
+        endpoint_state_lock = threading.Lock()
+        endpoint_state: dict[str, Any] = {
+            "cancelled": False,
+            "codex_session": None,
+            "codex_closed": False,
+            "web_closed": False,
+        }
+
+        def endpoint_cancelled() -> bool:
+            with endpoint_state_lock:
+                return bool(endpoint_state["cancelled"])
+
+        def close_codex_session() -> None:
+            with endpoint_state_lock:
+                session = endpoint_state["codex_session"]
+                if session is None or endpoint_state["codex_closed"]:
+                    return
+                endpoint_state["codex_closed"] = True
+            _close_codex_resource(session, "models_session")
+
+        def close_web_session() -> None:
+            with endpoint_state_lock:
+                if endpoint_state["web_closed"]:
+                    return
+                endpoint_state["web_closed"] = True
+            _close_codex_resource(self.session, "models_web_session")
+
+        def cancel_pending_endpoints() -> None:
+            with endpoint_state_lock:
+                endpoint_state["cancelled"] = True
+            for future in pending:
+                future.cancel()
+            close_codex_session()
+            if any(futures.get(future) == "web" for future in pending):
+                close_web_session()
+
+        def fetch_web() -> dict[str, dict[str, Any]]:
+            if endpoint_cancelled():
+                raise SearchTimeoutError("web model catalog timed out")
+            self._bootstrap(
+                timeout_secs=self._search_remaining(owner_deadline, timeout_secs),
+                deadline=owner_deadline,
+            )
+            web_headers = self._headers(web_route)
+            if account_id:
+                web_headers["ChatGPT-Account-ID"] = account_id
+            return self._fetch_model_catalog_endpoint(
+                self.session,
+                web_path,
+                web_route,
+                web_headers,
+                is_codex=False,
+                timeout_secs=timeout_secs,
+                deadline=owner_deadline,
+            )
+
+        def fetch_codex() -> dict[str, dict[str, Any]]:
+            if endpoint_cancelled():
+                raise SearchTimeoutError("codex model catalog timed out")
+            client_version = self._codex_client_version()
+            codex_session = self._codex_session()
+            with endpoint_state_lock:
+                endpoint_state["codex_session"] = codex_session
+                cancelled = bool(endpoint_state["cancelled"])
+            if cancelled:
+                close_codex_session()
+                raise SearchTimeoutError("codex model catalog timed out")
+            result: dict[str, dict[str, Any]] = {}
+            try:
+                result = self._fetch_model_catalog_endpoint(
+                    codex_session,
+                    f"/backend-api/codex/models?client_version={quote(client_version, safe='')}",
+                    "/backend-api/codex/models",
+                    self._codex_models_headers(client_version),
+                    is_codex=True,
+                    timeout_secs=timeout_secs,
+                    deadline=owner_deadline,
+                )
+            finally:
+                close_codex_session()
+            return result
+
+        web_models: dict[str, dict[str, Any]] = {}
+        codex_models: dict[str, dict[str, Any]] = {}
+        web_error: BaseException | None = None
+        codex_error: BaseException | None = None
+        try:
+            futures[endpoint_executor.submit(fetch_web)] = "web"
+            futures[endpoint_executor.submit(fetch_codex)] = "codex"
+
+            remaining = max(0.0, owner_deadline - time.monotonic())
+            done, pending = wait(futures, timeout=remaining)
+            pending_errors: dict[str, BaseException] = {}
+            for future in pending:
+                source = futures[future]
+                pending_errors[source] = SearchTimeoutError(
+                    f"{source} model catalog timed out"
+                )
+                future.cancel()
+
+            for future in done:
+                source = futures[future]
+                try:
+                    models = future.result()
+                except BaseException as exc:
+                    if source == "web":
+                        web_error = exc
+                    else:
+                        codex_error = exc
+                else:
+                    if source == "web":
+                        web_models = models
+                    else:
+                        codex_models = models
+
+            web_error = pending_errors.get("web", web_error)
+            codex_error = pending_errors.get("codex", codex_error)
+        finally:
+            unfinished = {future for future in futures if not future.done()}
+            if unfinished:
+                pending = unfinished
+                cancel_pending_endpoints()
+                endpoint_executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                endpoint_executor.shutdown(wait=True, cancel_futures=True)
+
+        merged = {}
+        self._merge_model_items(merged, web_models)
+        self._merge_model_items(merged, codex_models)
+        if not merged:
+            errors = [error for error in (web_error, codex_error) if error is not None]
+            pending_errors = [
+                error
+                for error in errors
+                if isinstance(error, SearchTimeoutError)
+            ]
+            primary_error = (pending_errors or errors or [RuntimeError(
+                "upstream model catalog is empty"
+            )])[0]
+            cause = next(
+                (error for error in errors if error is not primary_error),
+                None,
+            )
+            if cause is not None:
+                raise primary_error from cause
+            raise primary_error
+        return {"object": "list", "data": [merged[key] for key in sorted(merged)]}
+
     def list_models(
             self,
             *,
@@ -3690,42 +3949,16 @@ class OpenAIBackendAPI:
         context = "auth_models" if self.access_token else "anon_models"
         primary_error: BaseException | None = None
         try:
-            response = request_session.get(
-                self.base_url + path,
-                headers=request_headers,
-                timeout=self._search_remaining(deadline, timeout_secs),
-                stream=True,
+            models = self._fetch_model_catalog_endpoint(
+                request_session,
+                path,
+                route,
+                request_headers,
+                is_codex=is_codex,
+                timeout_secs=timeout_secs,
+                deadline=deadline,
             )
-            payload = self._read_json_response(response, context)
-            data = []
-            seen = set()
-            if not isinstance(payload, dict):
-                return {"object": "list", "data": data}
-            for item in payload.get("models", []):
-                if not isinstance(item, dict):
-                    continue
-                if is_codex and item.get("supported_in_api") is not True:
-                    continue
-                slug = parse_model_text(item.get("slug"))
-                if not slug or slug in seen:
-                    continue
-                seen.add(slug)
-                owned_by = parse_model_text(item.get("owned_by"), default="chatgpt")
-                model_item = {
-                    "id": slug,
-                    "object": "model",
-                    "created": _parse_model_created(item.get("created")),
-                    "owned_by": owned_by,
-                    "permission": [],
-                    "root": slug,
-                    "parent": None,
-                }
-                supported_efforts = self._model_reasoning_efforts(item)
-                if supported_efforts is not None:
-                    model_item["supported_reasoning_efforts"] = supported_efforts
-                data.append(model_item)
-            data.sort(key=lambda item: item["id"])
-            return {"object": "list", "data": data}
+            return {"object": "list", "data": [models[key] for key in sorted(models)]}
         except BaseException as exc:
             primary_error = exc
             raise

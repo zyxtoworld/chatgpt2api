@@ -197,14 +197,20 @@ class ModelCatalogService:
         setattr(backend, "_catalog_account_id", catalog_account_id)
         if access_token:
             # The historical authenticated catalog contract is the Web models
-            # endpoint for every account type.  Codex source metadata is still
-            # used by conversation/Responses, but must not redirect discovery
-            # to the Codex Responses models endpoint.
+            # endpoint for every account type.  The representative may also
+            # expose the dedicated Codex catalog; list_catalog_models keeps
+            # those two upstream sources independent and merges them once.
             setattr(backend, "_catalog_source_type", "web")
         elif source_type:
             setattr(backend, "_catalog_source_type", source_type)
         try:
-            models = self._model_map(backend.list_models(deadline=deadline))
+            list_catalog = getattr(backend, "list_catalog_models", None)
+            raw_models = (
+                list_catalog(deadline=deadline)
+                if access_token and callable(list_catalog)
+                else backend.list_models(deadline=deadline)
+            )
+            models = self._model_map(raw_models)
             if not models:
                 # A successful HTTP response with no usable model is not a
                 # ready catalog.  Publishing it would make the account group

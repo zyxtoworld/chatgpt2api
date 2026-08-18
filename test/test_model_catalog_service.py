@@ -23,9 +23,9 @@ from utils.helper import UpstreamHTTPError
 # Contract provenance: upstream/main at dc105e51 (services/openai_backend_api.py)
 # uses one anonymous endpoint (/backend-anon/models?iim=false&is_gizmo=false)
 # and one authenticated Web endpoint (/backend-api/models?history_and_training_disabled=false).
-# The catalog key is normalized account type only.  Source metadata selects the
-# actual conversation/Responses transport; it does not split or duplicate the
-# model catalog, and Codex's dedicated models endpoint is not a catalog source.
+# This fork additionally merges the dedicated Codex catalog when the selected
+# representative has a Codex source/account identity; the key remains the
+# normalized account type and a type still has one representative.
 
 
 def model_list(*model_ids: str) -> dict:
@@ -106,6 +106,172 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in result["data"]], ["anon", "shared"])
         self.assertEqual(self.calls, [""])
+
+    def test_image_restore_at_does_not_disable_text_catalog_representative(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "image-restore-catalog-accounts.json")
+        )
+        accounts.add_account_items([
+            {
+                "access_token": "image-cooling",
+                "type": "Pro",
+                "status": "正常",
+                "quota": 0,
+                "restore_at": "2099-01-01T00:00:00Z",
+            },
+            {
+                "access_token": "text-ready",
+                "type": "Pro",
+                "status": "正常",
+                "quota": 3,
+                "restore_at": "2099-01-01T00:00:00Z",
+            },
+        ])
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                return model_list("pro-text-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+
+        result = catalog.list_models()
+
+        self.assertIn("pro-text-model", {item["id"] for item in result["data"]})
+        self.assertCountEqual(calls, ["", "image-cooling"])
+
+    def test_limited_account_is_not_a_catalog_representative(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "limited-catalog-accounts.json")
+        )
+        accounts.add_account_items([
+            {
+                "access_token": "limited-pro",
+                "type": "Pro",
+                "status": "限流",
+                "quota": 3,
+            },
+        ])
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                return model_list("anonymous-only-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+
+        result = catalog.list_models()
+
+        self.assertIn("anonymous-only-model", {item["id"] for item in result["data"]})
+        self.assertEqual(calls, [""])
+
+    def test_anonymous_failure_preserves_authenticated_last_good_catalog(self) -> None:
+        catalog = self.catalog
+        original_outcomes = self.outcomes
+        catalog.list_models()
+
+        self.outcomes[""] = RuntimeError("anonymous catalog unavailable")
+        self.outcomes["pro"] = model_list("pro-v2")
+        self.now += 301
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+
+        result = catalog.list_models(wait_for_cold=False)
+        ids = {item["id"] for item in result["data"]}
+        self.assertIn("pro-v2", ids)
+        self.assertIn("anon", ids)
+        self.outcomes = original_outcomes
+
+    def test_authenticated_failure_preserves_anonymous_last_good_catalog(self) -> None:
+        catalog = self.catalog
+        original_outcomes = self.outcomes
+        catalog.list_models()
+
+        self.outcomes[""] = model_list("anon-v2")
+        self.outcomes["pro"] = RuntimeError("authenticated catalog unavailable")
+        self.now += 301
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+
+        result = catalog.list_models(wait_for_cold=False)
+        ids = {item["id"] for item in result["data"]}
+        self.assertIn("anon-v2", ids)
+        self.assertIn("pro-only", ids)
+        self.outcomes = original_outcomes
+
+    def test_dual_catalog_failure_keeps_last_good_type_snapshot(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "dual-last-good-accounts.json")
+        )
+        accounts.add_account_items([
+            {
+                "access_token": "codex-pro",
+                "type": "Pro",
+                "source_type": "codex",
+                "chatgpt_account_id": "acct-pro",
+                "status": "正常",
+            },
+        ])
+        calls = {"anonymous": 0, "catalog": 0}
+        now = [1000.0]
+        catalog_outcome: object = model_list("pro-v1")
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls["anonymous"] += 1
+                return model_list("anon-v1")
+
+            def list_catalog_models(self, **_kwargs: object) -> dict:
+                calls["catalog"] += 1
+                if isinstance(catalog_outcome, Exception):
+                    raise catalog_outcome
+                return catalog_outcome
+
+            def close(self) -> None:
+                pass
+
+        service = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            cache_ttl_seconds=1,
+            clock=lambda: now[0],
+        )
+        service.list_models()
+        catalog_outcome = RuntimeError("dual catalog temporarily unavailable")
+        now[0] += 2
+        service.list_models(wait_for_cold=False)
+        self.assertTrue(service._refresh_done.wait(timeout=3))
+
+        result = service.list_models(wait_for_cold=False)
+        ids = {item["id"] for item in result["data"]}
+        self.assertIn("pro-v1", ids)
+        self.assertIn("anon-v1", ids)
+        self.assertEqual(calls["catalog"], 2)
 
     def test_catalog_unions_anonymous_and_each_active_account_type(self) -> None:
         result = self.catalog.list_models()
@@ -232,6 +398,52 @@ class ModelCatalogServiceTests(unittest.TestCase):
             {item["id"] for item in result["data"]},
             {"anonymous-model", "authenticated-pro-model"},
         )
+
+    def test_catalog_uses_one_dual_source_representative_per_account_type(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "dual-source-catalog-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "pro-a", "type": "Pro", "status": "正常"},
+            {"access_token": "pro-b", "type": "Pro", "status": "正常"},
+        ])
+        calls: list[tuple[str, str]] = []
+        endpoint_calls: list[tuple[str, str]] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(("anonymous", self.access_token))
+                return model_list("anonymous-model")
+
+            def list_catalog_models(self, **_kwargs: object) -> dict:
+                calls.append(("authenticated-dual", self.access_token))
+                endpoint_calls.extend([
+                    ("web", self.access_token),
+                    ("codex", self.access_token),
+                ])
+                return model_list("web-model", "codex-model", "shared-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+
+        catalog.list_models()
+
+        self.assertEqual(calls, [("anonymous", ""), ("authenticated-dual", "pro-a")])
+        self.assertEqual(
+            endpoint_calls,
+            [("web", "pro-a"), ("codex", "pro-a")],
+        )
+        route = catalog.route_for_model("shared-model")
+        self.assertEqual(route.access_tokens, frozenset({"pro-a", "pro-b"}))
 
     def test_codex_group_tries_next_representative_after_first_failure(self) -> None:
         accounts = AccountService(
