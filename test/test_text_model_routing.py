@@ -76,6 +76,23 @@ class TextAccountRoutingTests(unittest.TestCase):
                 backend_capability="web",
             )
 
+    def test_default_capability_rejects_explicit_model_without_a_catalog_route(self) -> None:
+        with mock.patch(
+            "services.model_service.model_catalog_service.route_for_model",
+            return_value=None,
+        ), self.assertRaisesRegex(ModelUnavailableError, "unrouted-model"):
+            self.service.get_text_access_token(model="unrouted-model")
+
+    def test_codex_source_rejects_explicit_model_without_a_catalog_route(self) -> None:
+        with mock.patch(
+            "services.model_service.model_catalog_service.route_for_model",
+            return_value=None,
+        ), self.assertRaisesRegex(ModelUnavailableError, "unrouted-model"):
+            self.service.get_text_access_token(
+                model="unrouted-model",
+                source_type="codex",
+            )
+
     def test_explicit_model_routing_keeps_one_deadline_for_catalog_selection(self) -> None:
         route = ModelRoute(access_tokens=frozenset({"pro"}), allow_anonymous=False)
         with mock.patch(
@@ -1741,6 +1758,7 @@ class TextProtocolRoutingTests(unittest.TestCase):
         selector.assert_called_once_with(
             excluded_tokens={"bad"},
             model="pro-only",
+            backend_capability="web",
         )
 
     def test_invalid_token_refresh_rechecks_model_capability_before_retry(self) -> None:
@@ -1790,6 +1808,7 @@ class TextProtocolRoutingTests(unittest.TestCase):
         selector.assert_called_once_with(
             excluded_tokens={"bad"},
             model="pro-only",
+            backend_capability="web",
         )
 
     def test_empty_upstream_stream_fails_closed_and_is_not_marked_success(self) -> None:

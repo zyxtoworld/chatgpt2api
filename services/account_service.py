@@ -2093,7 +2093,7 @@ class AccountService:
 
             route_kwargs = {"deadline": deadline} if deadline is not None else {}
             route = model_catalog_service.route_for_model(requested_model, **route_kwargs)
-            if backend_capability == "web" and route is None:
+            if route is None:
                 from services.model_service import ModelUnavailableError
 
                 raise ModelUnavailableError(
@@ -2170,7 +2170,7 @@ class AccountService:
                 requested_model,
                 **route_kwargs,
             )
-            if backend_capability == "web" and refreshed_route is None:
+            if refreshed_route is None:
                 from services.model_service import ModelUnavailableError
 
                 raise ModelUnavailableError(
