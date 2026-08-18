@@ -951,21 +951,34 @@ class CCLoadImportService:
         expected_job_id: str | None = None,
         **updates: object,
     ) -> bool:
-        current = self._config.get_import_job(server_id)
-        if current is None:
-            return False
-        if expected_job_id is not None and current.get("job_id") != expected_job_id:
-            return False
-        next_job = {**current, **updates, "updated_at": _now_iso()}
-        if expected_job_id is None:
-            saved = self._config.set_import_job(server_id, next_job)
-        else:
-            saved = self._config.set_import_job(
-                server_id,
-                next_job,
-                expected_job_id=expected_job_id,
-            )
-        return saved is not None
+        attempts = 2 if expected_job_id is not None else 1
+        for attempt in range(attempts):
+            current = self._config.get_import_job(server_id)
+            if current is None:
+                return False
+            if expected_job_id is not None and current.get("job_id") != expected_job_id:
+                return False
+            next_job = {**current, **updates, "updated_at": _now_iso()}
+            try:
+                if expected_job_id is None:
+                    saved = self._config.set_import_job(server_id, next_job)
+                else:
+                    saved = self._config.set_import_job(
+                        server_id,
+                        next_job,
+                        expected_job_id=expected_job_id,
+                    )
+            except StorageConflictError:
+                if expected_job_id is None:
+                    raise
+                latest = self._config.get_import_job(server_id)
+                if latest is None or latest.get("job_id") != expected_job_id:
+                    return False
+                if attempt + 1 >= attempts:
+                    return False
+                continue
+            return saved is not None
+        return False
 
     def _job_is_current(self, server_id: str, expected_job_id: str) -> bool:
         current = self._config.get_import_job(server_id)

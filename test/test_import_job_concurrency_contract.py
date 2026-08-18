@@ -707,8 +707,7 @@ class ImportJobConcurrencyContractTests(unittest.TestCase):
                 max_active = max(max_active, active)
                 condition.notify_all()
             try:
-                if not release.wait(timeout=5):
-                    raise AssertionError("import worker was not released")
+                self.assertTrue(release.wait(timeout=10), "import worker release timed out")
             finally:
                 with condition:
                     active -= 1

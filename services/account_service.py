@@ -2073,7 +2073,8 @@ class AccountService:
         if requested_model != "auto":
             from services.model_service import model_catalog_service
 
-            route = model_catalog_service.route_for_model(requested_model)
+            route_kwargs = {"deadline": deadline} if deadline is not None else {}
+            route = model_catalog_service.route_for_model(requested_model, **route_kwargs)
         with self._lock:
             candidates = [
                 (token, account)
@@ -2129,7 +2130,11 @@ class AccountService:
         # never hand the stale alias to the backend.
         resolved_token = str((resolved_account or {}).get("access_token") or resolved_token)
         if requested_model != "auto":
-            refreshed_route = model_catalog_service.route_for_model(requested_model)
+            route_kwargs = {"deadline": deadline} if deadline is not None else {}
+            refreshed_route = model_catalog_service.route_for_model(
+                requested_model,
+                **route_kwargs,
+            )
             if not refreshed_route.catalog_complete:
                 from services.model_service import ModelCatalogPendingError
 

@@ -164,7 +164,9 @@ DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
 # Codex's models client sends its own semver-like client version.  It is not
 # the Web client's `prod-*` build identifier.  This release value is explicit
 # and independently configurable for a coordinated Codex client rollout.
-CODEX_MODELS_CLIENT_VERSION = os.getenv("CODEX_MODELS_CLIENT_VERSION", "0.147.0").strip()
+# This is a release-controlled protocol value.  Do not silently reuse a
+# possibly stale client version when the deployment has not configured it.
+CODEX_MODELS_CLIENT_VERSION = os.getenv("CODEX_MODELS_CLIENT_VERSION", "").strip()
 _CODEX_CLIENT_VERSION_RE = re.compile(
     r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$"
 )
@@ -3678,6 +3680,13 @@ class OpenAIBackendAPI:
             )
             route = "/backend-api/models" if self.access_token else "/backend-anon/models"
             request_headers = self._headers(route)
+            if self.access_token:
+                catalog_account_id = _safe_upstream_text(
+                    getattr(self, "_catalog_account_id", None),
+                    max_length=256,
+                )
+                if catalog_account_id:
+                    request_headers["ChatGPT-Account-ID"] = catalog_account_id
         context = "auth_models" if self.access_token else "anon_models"
         primary_error: BaseException | None = None
         try:

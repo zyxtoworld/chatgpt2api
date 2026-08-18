@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,6 +57,28 @@ class _HeaderObservingSession:
 
 
 class UpstreamModelEffortContractTests(unittest.TestCase):
+    def test_codex_model_version_missing_environment_fails_closed(self) -> None:
+        environment = dict(os.environ)
+        environment.pop("CODEX_MODELS_CLIENT_VERSION", None)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from services.openai_backend_api import OpenAIBackendAPI; "
+                    "OpenAIBackendAPI._codex_client_version("
+                    "object.__new__(OpenAIBackendAPI))"
+                ),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("client version", result.stderr.lower())
+
     def test_codex_responses_headers_use_official_client_defaults(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "codex-token"
@@ -297,6 +322,7 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         )
         backend._bootstrap = mock.Mock()
         backend._headers = mock.Mock(return_value={})
+        backend._catalog_account_id = "acct-catalog"
 
         with mock.patch(
             "services.model_service.model_catalog_service.normalize_reasoning_effort",
@@ -317,6 +343,10 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         self.assertEqual(
             backend.session.get.call_args.args[0],
             "https://chatgpt.com/backend-api/models?history_and_training_disabled=false",
+        )
+        self.assertEqual(
+            backend.session.get.call_args.kwargs["headers"]["ChatGPT-Account-ID"],
+            "acct-catalog",
         )
 
     def test_invalid_or_unsupported_effort_uses_selected_models_strongest_level(self) -> None:

@@ -23,8 +23,9 @@ from utils.helper import UpstreamHTTPError
 # Contract provenance: upstream/main at dc105e51 (services/openai_backend_api.py)
 # uses one anonymous endpoint (/backend-anon/models?iim=false&is_gizmo=false)
 # and one authenticated Web endpoint (/backend-api/models?history_and_training_disabled=false).
-# This fork additionally routes Codex source groups through its dedicated Codex endpoint;
-# catalogs are unioned per (source_type, normalized plan), never across sources.
+# The catalog key is normalized account type only.  Source metadata selects the
+# actual conversation/Responses transport; it does not split or duplicate the
+# model catalog, and Codex's dedicated models endpoint is not a catalog source.
 
 
 def model_list(*model_ids: str) -> dict:
@@ -151,7 +152,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
             self.catalog._ready_account_types,
         )
         self.assertGreater(
-            self.catalog._account_group_retry_not_before[("web", "Pro")],
+            self.catalog._account_group_retry_not_before["Pro"],
             self.now,
         )
 
@@ -160,28 +161,40 @@ class ModelCatalogServiceTests(unittest.TestCase):
         result = self.catalog.list_models()
         self.assertIn("pro-recovered", {item["id"] for item in result["data"]})
 
-    def test_catalog_keeps_web_and_codex_same_plan_in_separate_capability_groups(self) -> None:
+    def test_same_type_across_sources_uses_one_web_catalog_representative(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "source-groups-accounts.json")
         )
         accounts.add_account_items([
             {"access_token": "web-pro", "type": "Pro", "source_type": "web", "status": "正常"},
             {"access_token": "web-pro-2", "type": "pro", "source_type": "web", "status": "正常"},
-            {"access_token": "codex-pro", "type": "Pro", "source_type": "codex", "status": "正常"},
+            {
+                "access_token": "codex-pro",
+                "type": "Pro",
+                "source_type": "codex",
+                "chatgpt_account_id": "codex-account",
+                "status": "正常",
+            },
             {"access_token": "codex-pro-2", "type": "pro", "source_type": "codex", "status": "正常"},
         ])
-        calls: list[str] = []
+        calls: list[tuple[str, object, object]] = []
 
         class Backend:
             def __init__(self, access_token: str = "") -> None:
                 self.access_token = access_token
 
             def list_models(self, **_kwargs: object) -> dict:
-                calls.append(self.access_token)
+                calls.append(
+                    (
+                        self.access_token,
+                        getattr(self, "_catalog_source_type", None),
+                        getattr(self, "_catalog_account_id", None),
+                    )
+                )
                 return model_list(
-                    "web-pro-model" if self.access_token.startswith("web") else
-                    "codex-pro-model" if self.access_token.startswith("codex") else
-                    "anonymous-model"
+                    "authenticated-pro-model"
+                    if self.access_token
+                    else "anonymous-model"
                 )
 
             def close(self) -> None:
@@ -195,21 +208,29 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         result = catalog.list_models()
 
-        self.assertEqual(calls.count("web-pro"), 1)
-        self.assertEqual(calls.count("codex-pro"), 1)
-        self.assertEqual(calls.count("web-pro-2"), 0)
-        self.assertEqual(calls.count("codex-pro-2"), 0)
         self.assertEqual(
-            catalog.route_for_model("web-pro-model").access_tokens,
-            frozenset({"web-pro", "web-pro-2"}),
+            [token for token, _source, _account_id in calls if token],
+            ["codex-pro"],
         )
         self.assertEqual(
-            catalog.route_for_model("codex-pro-model").access_tokens,
-            frozenset({"codex-pro", "codex-pro-2"}),
+            [(token, source) for token, source, _account_id in calls if token],
+            [("codex-pro", "web")],
+        )
+        self.assertEqual(
+            [
+                (token, source, account_id)
+                for token, source, account_id in calls
+                if token
+            ],
+            [("codex-pro", "web", "codex-account")],
+        )
+        self.assertEqual(
+            catalog.route_for_model("authenticated-pro-model").access_tokens,
+            frozenset({"web-pro", "web-pro-2", "codex-pro", "codex-pro-2"}),
         )
         self.assertEqual(
             {item["id"] for item in result["data"]},
-            {"anonymous-model", "web-pro-model", "codex-pro-model"},
+            {"anonymous-model", "authenticated-pro-model"},
         )
 
     def test_codex_group_tries_next_representative_after_first_failure(self) -> None:
@@ -333,7 +354,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         result = catalog.list_models()
 
         self.assertIn("free-live-model", {item["id"] for item in result["data"]})
-        self.assertNotIn("pro-invalid", catalog._active_accounts_by_group().get(("codex", "Pro"), []))
+        self.assertNotIn("pro-invalid", catalog._active_accounts_by_group().get("Pro", []))
         invalid_account = accounts.get_account("pro-invalid")
         self.assertTrue(invalid_account is None or invalid_account.get("status") == "异常")
         self.assertEqual(
@@ -380,7 +401,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertIn("free-v1", {item["id"] for item in first["data"]})
         self.assertEqual(
             catalog._account_signature,
-            catalog._signature({("codex", "free"): ["free-live"]}),
+            catalog._signature({"free": ["free-live"]}),
         )
 
         outcomes[""] = model_list("anonymous-v2")
@@ -395,7 +416,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertTrue(catalog._catalog_complete)
         self.assertEqual(
             catalog._account_signature,
-            catalog._signature({("codex", "free"): ["free-live"]}),
+            catalog._signature({"free": ["free-live"]}),
         )
 
     def test_transient_representative_failures_do_not_disable_accounts(self) -> None:
@@ -438,7 +459,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
                 current = accounts.get_account(token)
                 self.assertIsNotNone(current)
                 self.assertEqual(current["status"], "正常")
-                self.assertIn(("codex", "Pro"), catalog._active_accounts_by_group())
+                self.assertIn("Pro", catalog._active_accounts_by_group())
 
     def test_invalid_transition_cannot_disable_replaced_account_identity(self) -> None:
         accounts = AccountService(
@@ -564,6 +585,34 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(set(deadlines), {5090.0})
         self.assertEqual(len(refresh_deadlines), 3)
         self.assertEqual(set(refresh_deadlines), {5090.0})
+
+    def test_expired_route_deadline_does_not_start_catalog_owner(self) -> None:
+        calls: list[str] = []
+
+        class DeadlineBackend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                return model_list("must-not-run")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            self.accounts,
+            backend_factory=DeadlineBackend,
+            clock=lambda: 1000.0,
+            deadline_clock=lambda: 200.0,
+        )
+
+        route = catalog.route_for_model("cold-model", deadline=199.0)
+
+        self.assertEqual(route.access_tokens, frozenset())
+        self.assertFalse(route.catalog_complete)
+        self.assertEqual(calls, [])
+        self.assertFalse(catalog._refresh_in_progress)
 
     def test_cold_nonblocking_refresh_uses_one_representative_for_large_type(self) -> None:
         total_accounts = 1495
@@ -1395,8 +1444,8 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(
             self.catalog._account_signature,
             self.catalog._signature({
-                ("web", "free"): ["free-bad", "free-good"],
-                ("web", "Plus"): ["plus"],
+                "free": ["free-bad", "free-good"],
+                "Plus": ["plus"],
             }),
         )
         self.assertTrue(self.catalog._catalog_complete)
@@ -1412,8 +1461,8 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(
             self.catalog._account_signature,
             self.catalog._signature({
-                ("web", "free"): ["free-bad", "free-good"],
-                ("web", "Plus"): ["plus"],
+                "free": ["free-bad", "free-good"],
+                "Plus": ["plus"],
             }),
         )
 

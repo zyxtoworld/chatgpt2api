@@ -93,7 +93,7 @@ class ModelPublicProjectionContractTests(unittest.TestCase):
                 "pro" not in item.get("supported_account_types", [])
                 for item in response.json()["data"]
             ))
-            self.assertNotIn(("codex", "Pro"), catalog._active_accounts_by_group())
+            self.assertNotIn("Pro", catalog._active_accounts_by_group())
             self.assertEqual(
                 catalog.route_for_model("free-live-model").access_tokens,
                 frozenset({"free-live"}),

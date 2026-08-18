@@ -24,8 +24,11 @@ from services.protocol.reasoning_effort import (
 from utils.log import logger
 
 
-AccountModelGroup = tuple[str, str]
-AccountGroupSignature = tuple[tuple[AccountModelGroup, tuple[str, ...]], ...]
+# Model discovery is keyed by normalized account type.  The source of a live
+# token remains account metadata for conversation/Responses routing, but it is
+# not a second catalog dimension.
+AccountModelGroup = str
+AccountGroupSignature = tuple[tuple[str, tuple[str, ...]], ...]
 
 
 _MODEL_IO_THREAD_CAPACITY = 4
@@ -87,7 +90,7 @@ class ModelCatalogRefreshTimeout(TimeoutError):
 
 @dataclass(frozen=True)
 class _IncrementalAccountTypeCatalogResult:
-    account_type: AccountModelGroup
+    account_type: str
     resolved_token: str
     expected_account: object | None
     models: dict[str, dict[str, Any]] | None
@@ -117,9 +120,9 @@ class ModelCatalogService:
         self._anonymous_models: dict[str, dict[str, Any]] = {}
         self._anonymous_ready = False
         self._anonymous_retry_not_before = 0.0
-        self._models_by_account_group: dict[AccountModelGroup, dict[str, dict[str, Any]]] = {}
-        self._ready_account_groups: set[AccountModelGroup] = set()
-        self._account_group_retry_not_before: dict[AccountModelGroup, float] = {}
+        self._models_by_account_group: dict[str, dict[str, dict[str, Any]]] = {}
+        self._ready_account_groups: set[str] = set()
+        self._account_group_retry_not_before: dict[str, float] = {}
         self._catalog_loaded = False
         self._cold_retry_not_before = 0.0
         self._catalog_complete = False
@@ -141,21 +144,15 @@ class ModelCatalogService:
                 models[model_id] = deepcopy(item)
         return models
 
-    def _active_accounts_by_group(self) -> dict[AccountModelGroup, list[str]]:
+    def _active_accounts_by_group(self) -> dict[str, list[str]]:
         groups: dict[AccountModelGroup, list[str]] = {}
-        source_normalizer = getattr(self._accounts, "_normalize_source_type", None)
         for account in self._accounts.list_accounts():
             if not isinstance(account, dict) or not self._accounts._is_text_account_available(account):
                 continue
             access_token = str(account.get("access_token") or "").strip()
             account_type = self._accounts._normalize_account_type(account.get("type"))
-            source_type = (
-                source_normalizer(account.get("source_type"))
-                if callable(source_normalizer)
-                else str(account.get("source_type") or "web").strip().lower() or "web"
-            )
-            if access_token and account_type and source_type:
-                groups.setdefault((source_type, account_type), []).append(access_token)
+            if access_token and account_type:
+                groups.setdefault(account_type, []).append(access_token)
         for access_tokens in groups.values():
             access_tokens[:] = sorted(dict.fromkeys(access_tokens))
         return groups
@@ -168,39 +165,43 @@ class ModelCatalogService:
         )
 
     def _active_accounts_by_type(self) -> dict[str, list[str]]:
-        """Compatibility view used by image/public helpers; routing uses groups."""
-        groups: dict[str, list[str]] = {}
-        for (_source_type, account_type), access_tokens in self._active_accounts_by_group().items():
-            groups.setdefault(account_type, []).extend(access_tokens)
-        for access_tokens in groups.values():
-            access_tokens[:] = sorted(dict.fromkeys(access_tokens))
-        return groups
+        """Compatibility view used by image/public helpers."""
+        return self._active_accounts_by_group()
 
     @property
     def _models_by_account_type(self) -> dict[str, dict[str, dict[str, Any]]]:
-        """Read-only compatibility projection; source-aware state lives by group."""
-        result: dict[str, dict[str, dict[str, Any]]] = {}
-        for (_source_type, account_type), models in self._models_by_account_group.items():
-            target = result.setdefault(account_type, {})
-            for model_id, item in models.items():
-                target.setdefault(model_id, deepcopy(item))
-        return result
+        """Read-only compatibility projection."""
+        return {
+            account_type: deepcopy(models)
+            for account_type, models in self._models_by_account_group.items()
+        }
 
     @property
     def _ready_account_types(self) -> set[str]:
-        return {account_type for _source_type, account_type in self._ready_account_groups}
+        return set(self._ready_account_groups)
 
     def _fetch_models(
         self,
         access_token: str = "",
         *,
         source_type: str | None = None,
+        account: object | None = None,
         deadline: float | None = None,
     ) -> dict[str, dict[str, Any]]:
         backend = self._backend_factory(access_token=access_token)
-        if source_type:
-            # Keep the discovery owner explicit even when a backend factory
-            # obtains its account metadata from a different singleton.
+        catalog_account_id = None
+        if isinstance(account, dict):
+            raw_account_id = account.get("account_id") or account.get("chatgpt_account_id")
+            if isinstance(raw_account_id, str) and raw_account_id.strip():
+                catalog_account_id = raw_account_id.strip()
+        setattr(backend, "_catalog_account_id", catalog_account_id)
+        if access_token:
+            # The historical authenticated catalog contract is the Web models
+            # endpoint for every account type.  Codex source metadata is still
+            # used by conversation/Responses, but must not redirect discovery
+            # to the Codex Responses models endpoint.
+            setattr(backend, "_catalog_source_type", "web")
+        elif source_type:
             setattr(backend, "_catalog_source_type", source_type)
         try:
             models = self._model_map(backend.list_models(deadline=deadline))
@@ -226,7 +227,7 @@ class ModelCatalogService:
 
     def _fetch_account_type_models(
         self,
-        account_type: AccountModelGroup,
+        account_type: str,
         candidate_tokens: tuple[str, ...],
         deadline: float,
     ) -> _IncrementalAccountTypeCatalogResult:
@@ -259,7 +260,8 @@ class ModelCatalogService:
                     raise RuntimeError("representative account disappeared")
                 models = self._fetch_models(
                     resolved_token,
-                    source_type=account_type[0],
+                    source_type="web",
+                    account=expected_account,
                     deadline=deadline,
                 )
                 return _IncrementalAccountTypeCatalogResult(
@@ -780,7 +782,9 @@ class ModelCatalogService:
                 else:
                     self._expires_at = self._clock()
 
-    def _ensure_catalog_nonblocking(self) -> None:
+    def _ensure_catalog_nonblocking(self, *, deadline: float | None = None) -> None:
+        if deadline is not None and self._deadline_clock() >= deadline:
+            return
         groups = self._active_accounts_by_group()
         with self._lock:
             self._prune_inactive_account_types_locked(groups)
@@ -805,7 +809,11 @@ class ModelCatalogService:
                     dict(groups),
                     previous_models_by_account_type,
                     generation,
-                    self._deadline_clock() + MODEL_CATALOG_REFRESH_TIMEOUT_SECS,
+                    (
+                        deadline
+                        if deadline is not None
+                        else self._deadline_clock() + MODEL_CATALOG_REFRESH_TIMEOUT_SECS
+                    ),
                     set(refresh_groups),
                     refresh_anonymous,
                 )
@@ -948,16 +956,27 @@ class ModelCatalogService:
                 for account_group in groups
             )
 
-    def _ensure_catalog_for_model(self, model: str) -> None:
-        self._ensure_catalog_nonblocking()
-        deadline = self._deadline_clock() + MODEL_CATALOG_REFRESH_TIMEOUT_SECS
+    def _ensure_catalog_for_model(
+        self,
+        model: str,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        if deadline is not None and self._deadline_clock() >= deadline:
+            return
+        self._ensure_catalog_nonblocking(deadline=deadline)
+        wait_deadline = (
+            deadline
+            if deadline is not None
+            else self._deadline_clock() + MODEL_CATALOG_REFRESH_TIMEOUT_SECS
+        )
         while True:
             if self._model_is_ready(model):
                 return
             with self._catalog_condition:
                 if not self._refresh_in_progress:
                     return
-                remaining = deadline - self._deadline_clock()
+                remaining = wait_deadline - self._deadline_clock()
                 if remaining <= 0:
                     return
                 self._catalog_condition.wait(timeout=min(0.05, remaining))
@@ -994,8 +1013,8 @@ class ModelCatalogService:
                 item["allow_anonymous"] = model_id in self._anonymous_models
                 item["supported_account_types"] = sorted({
                     account_type.lower()
-                    for (_source_type, account_type), models in self._models_by_account_group.items()
-                    if (_source_type, account_type) in ready_account_groups
+                    for account_type, models in self._models_by_account_group.items()
+                    if account_type in ready_account_groups
                     if model_id in models
                 })
                 data.append(item)
@@ -1004,14 +1023,20 @@ class ModelCatalogService:
             "data": data,
         }
 
-    def route_for_model(self, model: str, *, wait_for_cold: bool = True) -> ModelRoute:
+    def route_for_model(
+        self,
+        model: str,
+        *,
+        wait_for_cold: bool = True,
+        deadline: float | None = None,
+    ) -> ModelRoute:
         model = str(model or "").strip()
         with self._lock:
             cold = not self._catalog_loaded
         if wait_for_cold and cold:
-            self._ensure_catalog_for_model(model)
+            self._ensure_catalog_for_model(model, deadline=deadline)
         else:
-            self._ensure_catalog_for_read(wait_for_cold=False)
+            self._ensure_catalog_nonblocking(deadline=deadline)
         groups = self._active_accounts_by_group()
         with self._lock:
             access_tokens = frozenset(
@@ -1048,15 +1073,7 @@ class ModelCatalogService:
                 account_type = self._accounts._normalize_account_type(
                     account.get("type") if isinstance(account, dict) else None
                 )
-                source_normalizer = getattr(self._accounts, "_normalize_source_type", None)
-                source_type = (
-                    source_normalizer(account.get("source_type") if isinstance(account, dict) else None)
-                    if callable(source_normalizer)
-                    else str((account or {}).get("source_type") or "web").strip().lower()
-                    if isinstance(account, dict)
-                    else "web"
-                )
-                models = self._models_by_account_group.get((source_type, account_type), {})
+                models = self._models_by_account_group.get(account_type, {})
             else:
                 models = self._anonymous_models
             item = models.get(model)
