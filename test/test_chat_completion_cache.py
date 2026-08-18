@@ -306,6 +306,69 @@ class ChatCompletionCacheTests(unittest.TestCase):
 
         self.assertNotEqual(without_usage, with_usage)
 
+    def test_cache_key_distinguishes_all_added_response_options(self) -> None:
+        messages = [{"role": "user", "content": "same prompt"}]
+        base = {"model": "auto", "messages": messages}
+        base_key = cache_key(base, messages, stream=False)
+
+        for field, value in (
+            ("modalities", ["text"]),
+            ("n", 1),
+            ("parallel_tool_calls", False),
+            ("prompt", "alternate prompt"),
+            ("prompt_cache_key", "conversation-a"),
+            ("service_tier", "flex"),
+            ("store", False),
+            ("verbosity", "high"),
+            ("web_search_options", {"search_context_size": "low"}),
+        ):
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    base_key,
+                    cache_key({**base, field: value}, messages, stream=False),
+                )
+
+    def test_cache_key_distinguishes_unlisted_business_fields(self) -> None:
+        messages = [{"role": "user", "content": "same prompt"}]
+        base = {"model": "auto", "messages": messages}
+
+        self.assertNotEqual(
+            cache_key(base, messages, stream=False),
+            cache_key(
+                {**base, "future_response_option": {"enabled": True}},
+                messages,
+                stream=False,
+            ),
+        )
+
+    def test_cache_key_uses_normalized_messages_stream_and_stable_json_values(self) -> None:
+        normalized_messages = [{"role": "user", "content": "normalized"}]
+        first = {
+            "z_future": {"b": 2, "a": 1},
+            "messages": [{"role": "user", "content": "caller value"}],
+            "stream": False,
+            "payload": b"stable-bytes",
+        }
+        second = {
+            "payload": bytearray(b"stable-bytes"),
+            "stream": False,
+            "messages": [{"role": "system", "content": "different caller value"}],
+            "z_future": {"a": 1, "b": 2},
+        }
+
+        self.assertEqual(
+            cache_key(first, normalized_messages, stream=True),
+            cache_key(second, normalized_messages, stream=True),
+        )
+        self.assertNotEqual(
+            cache_key(first, normalized_messages, stream=True),
+            cache_key(first, normalized_messages, stream=False),
+        )
+        self.assertNotEqual(
+            cache_key(first, normalized_messages, stream=True),
+            cache_key(first, [{"role": "user", "content": "other"}], stream=True),
+        )
+
     def test_chat_stream_include_usage_emits_official_terminal_usage_chunk(self) -> None:
         body = {
             "model": "auto",
