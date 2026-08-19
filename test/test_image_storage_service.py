@@ -209,7 +209,9 @@ class ImageStorageServiceTests(unittest.TestCase):
         payload_b = jpeg_bytes()
         rel_a = "2026/01/01/a.png"
         rel_b = "2026/01/01/b.jpg"
-        cleanup_barrier = threading.Barrier(2)
+        cleanup_started = [threading.Event(), threading.Event()]
+        release_cleanup = threading.Event()
+        saves_finished = [threading.Event(), threading.Event()]
         cleanup_calls = 0
         cleanup_calls_lock = threading.Lock()
 
@@ -218,24 +220,24 @@ class ImageStorageServiceTests(unittest.TestCase):
             with cleanup_calls_lock:
                 cleanup_index = cleanup_calls
                 cleanup_calls += 1
-            cleanup_barrier.wait(timeout=2)
+            cleanup_started[cleanup_index].set()
+            release_cleanup.wait()
             other_rel = rel_b if cleanup_index == 0 else rel_a
             with image_storage_module._image_rel_lock(service.index_file, other_rel):
                 return
 
-        def save(payload: bytes) -> None:
-            service.save(payload, "http://app.test")
-
         errors: list[BaseException] = []
-        def save_checked(payload: bytes) -> None:
+        def save_checked(index: int, payload: bytes) -> None:
             try:
-                save(payload)
+                service.save(payload, "http://app.test")
             except BaseException as exc:
                 errors.append(exc)
+            finally:
+                saves_finished[index].set()
 
         threads = [
-            threading.Thread(target=save_checked, args=(payload,), daemon=True)
-            for payload in (payload_a, payload_b)
+            threading.Thread(target=save_checked, args=(index, payload), daemon=True)
+            for index, payload in enumerate((payload_a, payload_b))
         ]
         with (
             mock.patch.object(
@@ -247,8 +249,16 @@ class ImageStorageServiceTests(unittest.TestCase):
         ):
             for thread in threads:
                 thread.start()
-            for thread in threads:
-                thread.join(timeout=3)
+            try:
+                for started in cleanup_started:
+                    self.assertTrue(started.wait(timeout=10), "save did not enter cleanup")
+                release_cleanup.set()
+                for finished in saves_finished:
+                    self.assertTrue(finished.wait(timeout=10), "save deadlocked after cleanup release")
+            finally:
+                release_cleanup.set()
+                for thread in threads:
+                    thread.join(timeout=1)
 
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
