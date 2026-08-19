@@ -213,6 +213,7 @@ class AccountService:
 
     _ACCOUNT_STATUSES = frozenset({"正常", "限流", "异常", "禁用"})
     _WEB_COMPATIBLE_SOURCE_TYPES = frozenset({"web", "password", "password-oauth"})
+    _STANDARD_TEXT_COMPATIBLE_SOURCE_TYPES = _WEB_COMPATIBLE_SOURCE_TYPES | {"codex"}
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
     _ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 24 * 60 * 60
@@ -671,6 +672,14 @@ class AccountService:
             isinstance(account, dict)
             and cls._normalize_source_type(account.get("source_type"))
             in cls._WEB_COMPATIBLE_SOURCE_TYPES
+        )
+
+    @classmethod
+    def is_codex_backend_compatible(cls, account: object) -> bool:
+        """Return whether a live account may use ChatGPT Codex endpoints."""
+        return (
+            isinstance(account, dict)
+            and cls._normalize_source_type(account.get("source_type")) == "codex"
         )
 
     @staticmethod
@@ -2125,13 +2134,13 @@ class AccountService:
         excluded = set(excluded_tokens or set())
         requested_model = str(model or "auto").strip() or "auto"
         requested_source = self._normalize_source_type(source_type) if source_type else None
-        if backend_capability not in (None, "web"):
+        if backend_capability not in (None, "web", "standard"):
             raise ValueError("unsupported text backend capability")
-        allowed_sources = (
-            self._WEB_COMPATIBLE_SOURCE_TYPES
-            if backend_capability == "web"
-            else None
-        )
+        allowed_sources = None
+        if backend_capability == "web":
+            allowed_sources = self._WEB_COMPATIBLE_SOURCE_TYPES
+        elif backend_capability == "standard":
+            allowed_sources = self._STANDARD_TEXT_COMPATIBLE_SOURCE_TYPES
         route = None
         if requested_model != "auto":
             from services.model_service import model_catalog_service
@@ -2154,7 +2163,8 @@ class AccountService:
                    and self._account_matches_source_type(account, requested_source)
                    and (
                        allowed_sources is None
-                       or self.is_web_backend_compatible(account)
+                       or self._normalize_source_type(account.get("source_type"))
+                       in allowed_sources
                    )
                    and self._account_matches_any_plan_type(account, plan_types)
                    and token not in excluded
@@ -2172,6 +2182,10 @@ class AccountService:
                     from services.model_service import ModelUnavailableError
 
                     raise ModelUnavailableError("no active account matches the requested plan")
+                if backend_capability == "standard":
+                    from services.model_service import ModelUnavailableError
+
+                    raise ModelUnavailableError("no active account has a supported text backend")
                 if route is None or (
                     route.allow_anonymous
                     and (requested_model == "auto" or backend_capability is None)
@@ -2198,7 +2212,8 @@ class AccountService:
             not self._is_text_account_available(resolved_account)
             or (
                 allowed_sources is not None
-                and not self.is_web_backend_compatible(resolved_account)
+                and self._normalize_source_type((resolved_account or {}).get("source_type"))
+                not in allowed_sources
             )
             or not self._account_matches_any_plan_type(resolved_account or {}, plan_types)
         ):

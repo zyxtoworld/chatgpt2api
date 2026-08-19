@@ -9,7 +9,7 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
-from services.account_service import account_service
+from services.account_service import AccountService, account_service
 from services.model_service import ModelUnavailableError, model_catalog_service
 from services.openai_backend_api import CODEX_RESPONSES_MODEL, OpenAIBackendAPI
 from services.protocol.chat_completion_cache import (
@@ -98,6 +98,14 @@ SUPPORTED_CUSTOM_TOOL_CALL_FIELDS = {
     "input",
     "status",
 }
+
+
+def _is_codex_account_token(access_token: str) -> bool:
+    return AccountService.is_codex_backend_compatible(
+        account_service.get_account(access_token)
+    )
+
+
 SUPPORTED_TOOL_CALL_STATUSES = {"in_progress", "completed", "incomplete"}
 SUPPORTED_REASONING_FIELDS = {
     "type",
@@ -2003,6 +2011,17 @@ def stream_codex_response(
                     return
             raise RuntimeError("codex response ended without a terminal response event")
         except UpstreamHTTPError as exc:
+            if exc.status_code == 401:
+                account_service.remove_invalid_token(
+                    current_token,
+                    "codex_responses_unauthorized",
+                    expected_account=expected_account,
+                )
+                if emitted_public_event:
+                    raise
+                last_retryable_error = exc
+                current_token = None
+                continue
             if emitted_public_event or exc.status_code not in _CODEX_TEXT_FAILOVER_STATUSES:
                 raise
             last_retryable_error = exc
@@ -2404,19 +2423,35 @@ def response_events(
     authenticated: bool = False,
 ) -> Iterator[dict[str, Any]]:
     validate_response_core_parameters(body)
+    codex_deadline = (
+        time.monotonic() + _CODEX_TEXT_FAILOVER_DEADLINE_SECONDS
+        if authenticated
+        else None
+    )
     if uses_native_codex_responses(body):
-        yield from stream_codex_response(body)
+        if codex_deadline is None:
+            yield from stream_codex_response(body)
+        else:
+            yield from stream_codex_response(body, deadline=codex_deadline)
         return
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
         selected_token = (
             account_service.get_text_access_token(
                 model=model,
-                backend_capability="web",
+                backend_capability="standard",
+                deadline=codex_deadline,
             )
             if authenticated or cache_scope
             else None
         )
+        if selected_token and _is_codex_account_token(selected_token):
+            yield from stream_codex_response(
+                body,
+                access_token=selected_token,
+                deadline=codex_deadline,
+            )
+            return
         account_generation = (
             account_service.get_account_cache_scope(selected_token)
             if selected_token

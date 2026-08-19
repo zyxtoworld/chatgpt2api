@@ -10,7 +10,7 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
-from services.account_service import account_service
+from services.account_service import AccountService, account_service
 from services.protocol.chat_completion_cache import (
     cache_key,
     chat_completion_cache,
@@ -370,27 +370,33 @@ def stream_text_chat_completion(
     sent_role = False
     content_parts: list[str] = []
     request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
-    for delta_text in stream_text_deltas(backend, request):
-        content_parts.append(delta_text)
-        if not sent_role:
-            sent_role = True
-            yield completion_chunk(
-                model,
-                {"role": "assistant", "content": delta_text},
-                None,
-                completion_id,
-                created,
-                include_usage=include_usage,
-            )
-        else:
-            yield completion_chunk(
-                model,
-                {"content": delta_text},
-                None,
-                completion_id,
-                created,
-                include_usage=include_usage,
-            )
+    deltas = iter(stream_text_deltas(backend, request))
+    try:
+        for delta_text in deltas:
+            content_parts.append(delta_text)
+            if not sent_role:
+                sent_role = True
+                yield completion_chunk(
+                    model,
+                    {"role": "assistant", "content": delta_text},
+                    None,
+                    completion_id,
+                    created,
+                    include_usage=include_usage,
+                )
+            else:
+                yield completion_chunk(
+                    model,
+                    {"content": delta_text},
+                    None,
+                    completion_id,
+                    created,
+                    include_usage=include_usage,
+                )
+    finally:
+        close = getattr(deltas, "close", None)
+        if callable(close):
+            close()
     if not sent_role:
         yield completion_chunk(
             model,
@@ -502,10 +508,8 @@ def _chat_codex_error(message: str) -> HTTPException:
 
 
 def _is_codex_account_token(access_token: str) -> bool:
-    account = account_service.get_account(access_token)
-    return (
-        isinstance(account, dict)
-        and str(account.get("source_type") or "").strip().lower() == "codex"
+    return AccountService.is_codex_backend_compatible(
+        account_service.get_account(access_token)
     )
 
 
@@ -1371,7 +1375,7 @@ def handle(
         selected_token = (
             account_service.get_text_access_token(
                 model=model,
-                backend_capability="web",
+                backend_capability="standard",
                 deadline=codex_deadline,
             )
             if authenticated or cache_scope
@@ -1416,7 +1420,7 @@ def handle(
     selected_token = (
         account_service.get_text_access_token(
             model=model,
-            backend_capability="web",
+            backend_capability="standard",
             deadline=codex_deadline,
         )
         if authenticated or cache_scope

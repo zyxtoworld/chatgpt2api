@@ -915,7 +915,7 @@ class TextProtocolRoutingTests(unittest.TestCase):
 
         backend.assert_called_once_with("pro-chat")
 
-    def test_authenticated_chat_web_fallback_declares_web_capability(self) -> None:
+    def test_authenticated_plain_chat_selects_account_before_backend_capability(self) -> None:
         body = {
             "model": "auto",
             "messages": [{"role": "user", "content": "web capability"}],
@@ -936,7 +936,120 @@ class TextProtocolRoutingTests(unittest.TestCase):
         ):
             openai_v1_chat_complete.handle(body, authenticated=True)
 
-        self.assertEqual(selector.call_args.kwargs["backend_capability"], "web")
+        self.assertEqual(selector.call_args.kwargs["backend_capability"], "standard")
+        self.assertIsInstance(selector.call_args.kwargs["deadline"], float)
+
+    def test_authenticated_plain_chat_routes_a_codex_only_pool_to_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "chat-codex.json"))
+            service.add_account_items([
+                {
+                    "access_token": "codex-chat",
+                    "type": "free",
+                    "source_type": "codex",
+                    "status": "正常",
+                },
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            completed = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_plain_chat",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "gpt-5.5",
+                    "output": [{
+                        "id": "msg_plain_chat",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+                    }],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                },
+            }
+            seen: dict[str, object] = {}
+
+            def native_events(_body: dict[str, object], **kwargs: object):
+                seen.update(kwargs)
+                yield completed
+
+            with (
+                mock.patch.object(openai_v1_chat_complete, "account_service", service),
+                mock.patch.object(
+                    openai_v1_chat_complete.openai_v1_response,
+                    "stream_codex_response",
+                    side_effect=native_events,
+                ),
+                mock.patch.object(
+                    openai_v1_chat_complete,
+                    "text_backend",
+                    side_effect=AssertionError("Codex account must not use the Web backend"),
+                ),
+            ):
+                response = openai_v1_chat_complete.handle(
+                    {
+                        "model": "auto",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                    authenticated=True,
+                )
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(seen["access_token"], "codex-chat")
+
+    def test_authenticated_plain_chat_honors_explicit_model_route_in_a_mixed_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "chat-mixed.json"))
+            service.add_account_items([
+                {"access_token": "web-chat", "type": "free", "source_type": "web", "status": "正常"},
+                {"access_token": "codex-chat", "type": "free", "source_type": "codex", "status": "正常"},
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            completed = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_mixed_chat",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "codex-owned",
+                    "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                },
+            }
+            seen: dict[str, object] = {}
+
+            def native_events(_body: dict[str, object], **kwargs: object):
+                seen.update(kwargs)
+                yield completed
+
+            route = ModelRoute(access_tokens=frozenset({"codex-chat"}), allow_anonymous=False)
+            with (
+                mock.patch.object(openai_v1_chat_complete, "account_service", service),
+                mock.patch(
+                    "services.model_service.model_catalog_service.route_for_model",
+                    return_value=route,
+                ),
+                mock.patch.object(
+                    openai_v1_chat_complete.openai_v1_response,
+                    "stream_codex_response",
+                    side_effect=native_events,
+                ),
+                mock.patch.object(
+                    openai_v1_chat_complete,
+                    "text_backend",
+                    side_effect=AssertionError("model route must not cross backend capability"),
+                ),
+            ):
+                openai_v1_chat_complete.handle(
+                    {
+                        "model": "codex-owned",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                    authenticated=True,
+                )
+
+        self.assertEqual(seen["access_token"], "codex-chat")
 
     def test_responses_passes_requested_model_to_text_backend(self) -> None:
         body = {"model": "pro-response", "input": "route response"}
@@ -948,7 +1061,7 @@ class TextProtocolRoutingTests(unittest.TestCase):
 
         backend.assert_called_once_with("pro-response")
 
-    def test_authenticated_responses_web_fallback_declares_web_capability(self) -> None:
+    def test_authenticated_plain_responses_selects_account_before_backend_capability(self) -> None:
         body = {"model": "auto", "input": "web capability"}
         with (
             mock.patch.object(
@@ -966,7 +1079,213 @@ class TextProtocolRoutingTests(unittest.TestCase):
         ):
             list(openai_v1_response.response_events(body, authenticated=True))
 
-        self.assertEqual(selector.call_args.kwargs["backend_capability"], "web")
+        self.assertEqual(selector.call_args.kwargs["backend_capability"], "standard")
+        self.assertIsInstance(selector.call_args.kwargs["deadline"], float)
+
+    def test_authenticated_plain_responses_routes_a_codex_only_pool_to_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "responses-codex.json"))
+            service.add_account_items([
+                {
+                    "access_token": "codex-responses",
+                    "type": "free",
+                    "source_type": "codex",
+                    "status": "正常",
+                },
+            ])
+            selector_deadlines: list[object] = []
+
+            def refresh(token: str, **kwargs: object) -> str:
+                selector_deadlines.append(kwargs.get("deadline"))
+                return token
+
+            service.refresh_access_token = refresh
+            completed = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_plain_responses",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "gpt-5.5",
+                    "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                },
+            }
+            seen: dict[str, object] = {}
+
+            def native_events(_body: dict[str, object], **kwargs: object):
+                seen.update(kwargs)
+                yield completed
+
+            with (
+                mock.patch.object(openai_v1_response, "account_service", service),
+                mock.patch.object(
+                    openai_v1_response,
+                    "stream_codex_response",
+                    side_effect=native_events,
+                ),
+                mock.patch.object(
+                    openai_v1_response,
+                    "text_backend",
+                    side_effect=AssertionError("Codex account must not use the Web backend"),
+                ),
+            ):
+                events = list(openai_v1_response.response_events(
+                    {"model": "auto", "input": "hello"},
+                    authenticated=True,
+                ))
+
+        self.assertEqual(events[-1]["type"], "response.completed")
+        self.assertEqual(seen["access_token"], "codex-responses")
+        self.assertIsInstance(seen["deadline"], float)
+        self.assertEqual(selector_deadlines, [seen["deadline"]])
+
+    def test_authenticated_plain_requests_keep_a_web_only_pool_on_web(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "plain-web.json"))
+            service.add_account_items([
+                {"access_token": "web-only", "type": "free", "source_type": "web", "status": "正常"},
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            seen: list[tuple[str, str | None]] = []
+
+            class Backend:
+                def close(self) -> None:
+                    pass
+
+            def backend(model: str, *, access_token: str | None = None) -> Backend:
+                seen.append((model, access_token))
+                return Backend()
+
+            with (
+                mock.patch.object(openai_v1_chat_complete, "account_service", service),
+                mock.patch.object(openai_v1_response, "account_service", service),
+                mock.patch.object(openai_v1_chat_complete, "text_backend", side_effect=backend),
+                mock.patch.object(openai_v1_chat_complete, "collect_text", return_value="ok"),
+                mock.patch.object(openai_v1_response, "text_backend", side_effect=backend),
+                mock.patch.object(openai_v1_response, "stream_text_response", return_value=iter(())),
+                mock.patch.object(
+                    openai_v1_chat_complete.chat_completion_cache,
+                    "get_or_compute_response",
+                    side_effect=lambda _key, compute, **_kwargs: compute(),
+                ),
+                mock.patch.object(
+                    openai_v1_response.chat_completion_cache,
+                    "get_or_compute_stream",
+                    side_effect=lambda _key, compute, **_kwargs: compute(),
+                ),
+                mock.patch.object(
+                    openai_v1_response,
+                    "stream_codex_response",
+                    side_effect=AssertionError("Web account must not use Codex responses"),
+                ),
+            ):
+                openai_v1_chat_complete.handle(
+                    {"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+                    authenticated=True,
+                )
+                list(openai_v1_response.response_events(
+                    {"model": "auto", "input": "hello"},
+                    authenticated=True,
+                ))
+
+        self.assertEqual(seen, [("auto", "web-only"), ("auto", "web-only")])
+
+    def test_authenticated_plain_requests_skip_unknown_sources_before_backend_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "plain-standard.json"))
+            service.add_account_items([
+                {
+                    "access_token": "future-incompatible",
+                    "type": "free",
+                    "source_type": "future-incompatible",
+                    "status": "正常",
+                },
+                {
+                    "access_token": "codex-compatible",
+                    "type": "free",
+                    "source_type": "codex",
+                    "status": "正常",
+                },
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            completed = {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_standard_source",
+                    "object": "response",
+                    "status": "completed",
+                    "model": "gpt-5.5",
+                    "output": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+                },
+            }
+            selected: list[str] = []
+
+            def native_events(_body: dict[str, object], **kwargs: object):
+                selected.append(str(kwargs.get("access_token") or ""))
+                yield completed
+
+            with (
+                mock.patch.object(openai_v1_chat_complete, "account_service", service),
+                mock.patch.object(openai_v1_response, "account_service", service),
+                mock.patch.object(
+                    openai_v1_chat_complete.openai_v1_response,
+                    "stream_codex_response",
+                    side_effect=native_events,
+                ),
+                mock.patch.object(
+                    openai_v1_response,
+                    "stream_codex_response",
+                    side_effect=native_events,
+                ),
+                mock.patch.object(
+                    openai_v1_chat_complete,
+                    "text_backend",
+                    side_effect=AssertionError("unknown source must not reach the Web backend"),
+                ),
+                mock.patch.object(
+                    openai_v1_response,
+                    "text_backend",
+                    side_effect=AssertionError("unknown source must not reach the Web backend"),
+                ),
+            ):
+                openai_v1_chat_complete.handle(
+                    {"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+                    authenticated=True,
+                )
+                list(openai_v1_response.response_events(
+                    {"model": "auto", "input": "hello"},
+                    authenticated=True,
+                ))
+
+        self.assertEqual(selected, ["codex-compatible", "codex-compatible"])
+
+    def test_authenticated_plain_responses_reject_an_unknown_only_pool_before_backend_io(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "plain-unknown.json"))
+            service.add_account_items([
+                {
+                    "access_token": "future-incompatible",
+                    "type": "free",
+                    "source_type": "future-incompatible",
+                    "status": "正常",
+                },
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            with (
+                mock.patch.object(openai_v1_response, "account_service", service),
+                mock.patch.object(
+                    openai_v1_response,
+                    "text_backend",
+                    side_effect=AssertionError("unknown source must not reach backend I/O"),
+                ),
+                self.assertRaises(ModelUnavailableError),
+            ):
+                list(openai_v1_response.response_events(
+                    {"model": "auto", "input": "hello"},
+                    authenticated=True,
+                ))
 
     def test_anthropic_messages_passes_requested_model_to_account_selector(self) -> None:
         with (

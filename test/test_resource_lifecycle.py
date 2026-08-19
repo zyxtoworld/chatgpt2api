@@ -23,6 +23,7 @@ import api.support as support_api_module
 import api.system as system_api_module
 from api.errors import install_exception_handlers
 import services.protocol.conversation as conversation_module
+import services.protocol.openai_v1_chat_complete as openai_chat_module
 import services.protocol.openai_v1_response as openai_response_module
 import services.protocol.web_search_tool as web_search_module
 import services.backup_service as backup_module
@@ -2905,6 +2906,28 @@ class ResourceLifecycleTests(unittest.TestCase):
                 await response.body_iterator.aclose()
 
         asyncio.run(disconnect_after_first_chunk())
+
+        self.assertTrue(closed.is_set())
+
+    def test_chat_completion_stream_close_closes_retained_delta_iterator(self) -> None:
+        closed = threading.Event()
+
+        def deltas():
+            try:
+                yield "first"
+                yield "second"
+            finally:
+                closed.set()
+
+        retained = deltas()
+        with mock.patch.object(openai_chat_module, "stream_text_deltas", return_value=retained):
+            stream = openai_chat_module.stream_text_chat_completion(
+                object(),
+                [{"role": "user", "content": "hello"}],
+                "auto",
+            )
+            next(stream)
+            stream.close()
 
         self.assertTrue(closed.is_set())
 

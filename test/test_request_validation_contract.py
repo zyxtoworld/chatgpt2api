@@ -634,6 +634,77 @@ class RequestValidationContractTests(unittest.TestCase):
                     self.assertEqual(response.status_code, status_code, response.text)
         run.assert_not_awaited()
 
+    def test_anthropic_route_requires_version_header_before_auth_or_backend(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+        app.include_router(ai_module.create_router())
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "user-1", "role": "user"}),
+            ) as require_identity,
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(
+                ai_module.LoggedCall,
+                "run",
+                new=mock.AsyncMock(return_value={"accepted": True}),
+            ) as run,
+        ):
+            response = TestClient(app).post(
+                "/v1/messages",
+                headers={"x-api-key": "fixture-key"},
+                json={
+                    "model": "auto",
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["type"], "error")
+        self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+        require_identity.assert_not_awaited()
+        run.assert_not_awaited()
+
+    def test_anthropic_route_rejects_unsupported_version_before_auth_or_backend(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+        app.include_router(ai_module.create_router())
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "user-1", "role": "user"}),
+            ) as require_identity,
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(
+                ai_module.LoggedCall,
+                "run",
+                new=mock.AsyncMock(return_value={"accepted": True}),
+            ) as run,
+        ):
+            response = TestClient(app).post(
+                "/v1/messages",
+                headers={
+                    "x-api-key": "fixture-key",
+                    "anthropic-version": "2099-01-01",
+                },
+                json={
+                    "model": "auto",
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(response.json()["type"], "error")
+        self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
+        require_identity.assert_not_awaited()
+        run.assert_not_awaited()
+
     def test_anthropic_route_rejects_non_array_messages_before_backend(self) -> None:
         app = FastAPI()
         install_exception_handlers(app)

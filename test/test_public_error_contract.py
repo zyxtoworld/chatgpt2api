@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -21,11 +22,13 @@ import services.protocol.conversation as conversation_module
 import services.protocol.openai_v1_response as openai_v1_response_module
 import services.sub2api_service as sub2api_service_module
 from api.errors import install_exception_handlers
+from services.account_service import AccountService
 from services.log_service import LogService, LoggedCall
 from services.openai_backend_api import ImagePollTimeoutError
 from services.config import config
 from services.model_service import ModelCatalogPendingError
 from services.protocol.error_response import PublicSafeError, openai_error_payload, public_exception_message
+from services.storage.json_storage import JSONStorageBackend
 from utils.helper import UpstreamHTTPError, anthropic_sse_stream, responses_sse_stream, sse_json_stream
 
 
@@ -57,6 +60,19 @@ class PublicErrorContractTests(unittest.TestCase):
 
         chat_completion_cache.clear()
         try:
+            class WebAccountService:
+                @staticmethod
+                def get_text_access_token(**_kwargs: object) -> str:
+                    return "web-cache-token"
+
+                @staticmethod
+                def get_account_cache_scope(_token: str) -> str:
+                    return ""
+
+                @staticmethod
+                def get_account(_token: str) -> dict[str, str]:
+                    return {"source_type": "web"}
+
             app = _app_with_ai_router()
             body = {
                 "model": "auto",
@@ -69,6 +85,11 @@ class PublicErrorContractTests(unittest.TestCase):
                     new=mock.AsyncMock(side_effect=[{"id": "identity-a"}, {"id": "identity-b"}]),
                 ),
                 mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                mock.patch.object(
+                    ai_module.openai_v1_chat_complete,
+                    "account_service",
+                    WebAccountService(),
+                ),
                 mock.patch.object(ai_module.openai_v1_chat_complete, "text_backend", return_value=object()),
                 mock.patch.object(
                     ai_module.openai_v1_chat_complete,
@@ -161,24 +182,29 @@ class PublicErrorContractTests(unittest.TestCase):
 
     def test_responses_route_keeps_source_routing_when_identity_cache_scope_is_empty(self) -> None:
         seen: dict[str, object] = {}
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_codex_route",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+            },
+        }
 
         class CodexAccountService:
             def get_text_access_token(self, **kwargs: object) -> str:
                 seen["selector_kwargs"] = kwargs
                 return "codex-responses-route-token"
 
-            def get_account_cache_scope(self, _token: str) -> str:
-                return ""
+            def get_account(self, _token: str) -> dict[str, str]:
+                return {"source_type": "codex"}
 
-        class FakeBackend:
-            def close(self) -> None:
-                pass
-
-        def text_backend(_model: str, *, access_token: str | None = None) -> FakeBackend:
-            seen["backend_access_token"] = access_token
-            if access_token != "codex-responses-route-token":
-                raise AssertionError("Responses must preserve account-source routing")
-            return FakeBackend()
+        def native_events(_body: dict[str, object], **kwargs: object):
+            seen["native_access_token"] = kwargs.get("access_token")
+            yield completed
 
         with (
             mock.patch.object(
@@ -188,11 +214,15 @@ class PublicErrorContractTests(unittest.TestCase):
             ),
             mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
             mock.patch.object(ai_module.openai_v1_response, "account_service", CodexAccountService()),
-            mock.patch.object(ai_module.openai_v1_response, "text_backend", side_effect=text_backend),
             mock.patch.object(
                 ai_module.openai_v1_response,
-                "stream_text_deltas",
-                return_value=iter(["responses-route"]),
+                "stream_codex_response",
+                side_effect=native_events,
+            ),
+            mock.patch.object(
+                ai_module.openai_v1_response,
+                "text_backend",
+                side_effect=AssertionError("Codex Responses must not use the Web backend"),
             ),
         ):
             response = TestClient(_app_with_ai_router()).post(
@@ -202,7 +232,8 @@ class PublicErrorContractTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(seen["backend_access_token"], "codex-responses-route-token")
+        self.assertEqual(seen["native_access_token"], "codex-responses-route-token")
+        self.assertEqual(seen["selector_kwargs"]["backend_capability"], "standard")
 
     def test_chat_route_nonstream_carries_one_deadline_through_initial_codex_selection(self) -> None:
         completed = {
@@ -531,6 +562,79 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertEqual(selector_calls[0]["deadline"], selector_calls[1]["deadline"])
         self.assertEqual(selector_calls[1]["deadline"], selector_calls[2]["deadline"])
 
+    def test_codex_401_marks_exact_account_invalid_and_continues_failover(self) -> None:
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_after_invalid",
+                "object": "response",
+                "status": "completed",
+                "model": "gpt-5.5",
+                "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 0, "total_tokens": 1},
+            },
+        }
+        backend_calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+                backend_calls.append(access_token)
+
+            def iter_codex_response_events(self, _payload: dict[str, object], *, timeout: float):
+                self.assert_timeout(timeout)
+                if self.access_token == "codex-invalid":
+                    raise openai_v1_response_module.UpstreamHTTPError(
+                        "codex",
+                        401,
+                        {"error": "upstream_error"},
+                    )
+                yield completed
+
+            @staticmethod
+            def assert_timeout(timeout: float) -> None:
+                if timeout <= 0:
+                    raise AssertionError("timeout must remain positive")
+
+            def close(self) -> None:
+                pass
+
+        with TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
+            service.add_account_items([
+                {
+                    "access_token": "codex-invalid",
+                    "source_type": "codex",
+                    "type": "free",
+                    "status": "正常",
+                },
+                {
+                    "access_token": "codex-valid",
+                    "source_type": "codex",
+                    "type": "free",
+                    "status": "正常",
+                },
+            ])
+            service.refresh_access_token = lambda token, **_kwargs: token
+            with (
+                mock.patch.object(openai_v1_response_module, "account_service", service),
+                mock.patch.object(openai_v1_response_module, "OpenAIBackendAPI", Backend),
+                mock.patch.object(openai_v1_response_module, "resolve_codex_reasoning_effort"),
+                mock.patch.dict(config.data, {"auto_remove_invalid_accounts": False}),
+            ):
+                events = list(openai_v1_response_module.stream_codex_response(
+                    {"model": "auto", "input": "hello"},
+                    deadline=time.monotonic() + 5.0,
+                ))
+
+            invalid = service.get_account("codex-invalid")
+            valid = service.get_account("codex-valid")
+
+        self.assertEqual(events[-1]["type"], "response.completed")
+        self.assertEqual(backend_calls, ["codex-invalid", "codex-valid"])
+        self.assertEqual(invalid["status"], "异常")
+        self.assertEqual(valid["status"], "正常")
+
     def test_responses_cache_does_not_share_response_between_authenticated_identities(self) -> None:
         old_settings = config.data.get("chat_completion_cache")
         config.data["chat_completion_cache"] = {
@@ -547,6 +651,19 @@ class PublicErrorContractTests(unittest.TestCase):
 
         chat_completion_cache.clear()
         try:
+            class WebAccountService:
+                @staticmethod
+                def get_text_access_token(**_kwargs: object) -> str:
+                    return "web-cache-token"
+
+                @staticmethod
+                def get_account_cache_scope(_token: str) -> str:
+                    return ""
+
+                @staticmethod
+                def get_account(_token: str) -> dict[str, str]:
+                    return {"source_type": "web"}
+
             app = _app_with_ai_router()
             body = {"model": "auto", "input": "identity-sensitive responses cache probe"}
             with (
@@ -556,6 +673,11 @@ class PublicErrorContractTests(unittest.TestCase):
                     new=mock.AsyncMock(side_effect=[{"id": "identity-a"}, {"id": "identity-b"}]),
                 ),
                 mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+                mock.patch.object(
+                    ai_module.openai_v1_response,
+                    "account_service",
+                    WebAccountService(),
+                ),
                 mock.patch.object(ai_module.openai_v1_response, "text_backend", return_value=object()),
                 mock.patch.object(
                     ai_module.openai_v1_response,
@@ -604,6 +726,9 @@ class PublicErrorContractTests(unittest.TestCase):
 
                 def get_account_cache_scope(self, _token: str) -> str:
                     return ""
+
+                def get_account(self, _token: str) -> dict[str, str]:
+                    return {"source_type": "web"}
 
             class FakeBackend:
                 def close(self) -> None:

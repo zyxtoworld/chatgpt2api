@@ -59,6 +59,14 @@ _RESPONSES_WEBSOCKET_CAPACITY = 64
 _RESPONSES_WEBSOCKET_SLOTS = threading.BoundedSemaphore(_RESPONSES_WEBSOCKET_CAPACITY)
 _EDITABLE_TASK_IO_CAPACITY = 8
 _EDITABLE_TASK_IO_STATE = threading.local()
+_ANTHROPIC_API_VERSION = "2023-06-01"
+
+
+def _require_anthropic_version(value: str | None) -> None:
+    if value is None:
+        raise HTTPException(status_code=400, detail={"error": "anthropic-version header is required"})
+    if value != _ANTHROPIC_API_VERSION:
+        raise HTTPException(status_code=400, detail={"error": "anthropic-version is not supported"})
 
 
 def _editable_task_io_limiter() -> anyio.CapacityLimiter:
@@ -466,6 +474,7 @@ def create_router() -> APIRouter:
             x_api_key: str | None = Header(default=None, alias="x-api-key"),
             anthropic_version: str | None = Header(default=None, alias="anthropic-version"),
     ):
+        _require_anthropic_version(anthropic_version)
         identity = await require_identity_async(authorization or (f"Bearer {x_api_key}" if x_api_key else None))
         payload = body.model_dump(mode="python")
         model = str(payload.get("model") or "auto")
