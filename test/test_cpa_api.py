@@ -264,6 +264,42 @@ class CPAAPIPublicErrorTests(unittest.TestCase):
         self.assertNotIn(canary, repr((token, error)))
         self.assertTrue(session.closed)
 
+    def test_remote_file_download_preserves_plan_type_without_token_claim(self) -> None:
+        class Response:
+            ok = True
+
+            def __init__(self):
+                self.payload = {
+                    "access_token": "opaque-token-without-jwt-claims",
+                    "plan_type": "pro",
+                }
+                self.content = json.dumps(self.payload).encode("utf-8")
+
+            def json(self):
+                return self.payload
+
+        session = mock.Mock()
+        session.get.return_value = Response()
+
+        with (
+            mock.patch.object(cpa_module, "Session", return_value=session),
+            mock.patch.object(cpa_module.proxy_settings, "build_session_kwargs", return_value={}),
+        ):
+            item, error = cpa_module.fetch_remote_access_token(
+                {"base_url": "https://cpa.example.test", "secret_key": "management-secret"},
+                "account.json",
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(
+            item,
+            {
+                "access_token": "opaque-token-without-jwt-claims",
+                "plan_type": "pro",
+                "source_type": "codex",
+            },
+        )
+
     def test_remote_file_download_closes_http_error_response(self) -> None:
         response = mock.Mock(ok=False, status_code=502, iter_content=None)
         session = mock.Mock()

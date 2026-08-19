@@ -664,6 +664,63 @@ def test_cpa_add_exception_terminates_job_without_refresh(tmp_path) -> None:
     refresh_accounts.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("outcomes", "expected_items", "use_metadata"),
+    (
+        (
+            {"file-1.json": ({"access_token": "token-pro", "plan_type": "pro", "source_type": "codex"}, None)},
+            [{"access_token": "token-pro", "plan_type": "pro", "source_type": "codex"}],
+            True,
+        ),
+        ({"file-1.json": ("token-free", None)}, None, False),
+        (
+            {
+                "file-1.json": ({"access_token": "token-pro", "plan_type": "pro", "source_type": "codex"}, None),
+                "file-2.json": ("token-free", None),
+            },
+            [
+                {"access_token": "token-pro", "plan_type": "pro", "source_type": "codex"},
+                {"access_token": "token-free", "source_type": "codex"},
+            ],
+            True,
+        ),
+    ),
+)
+def test_cpa_import_preserves_plan_metadata_and_refreshes_only_tokens(
+    tmp_path, outcomes, expected_items, use_metadata
+) -> None:
+    config = CPAConfig(tmp_path / "cpa.json")
+    pool = config.add_pool("CPA", "https://cpa.example.test", "secret")
+    service = cpa_module.CPAImportService(config)
+    names = list(outcomes)
+    config.set_import_job(pool["id"], _job(status="pending", total=len(names), completed=0))
+    refresh_tokens = []
+
+    def refresh(tokens, **_kwargs):
+        refresh_tokens.extend(tokens)
+        return {"refreshed": len(tokens), "errors": []}
+
+    with (
+        mock.patch.object(cpa_module, "_CPA_FETCH_EXECUTOR", _ResultExecutor(outcomes)),
+        mock.patch.object(cpa_module, "as_completed", side_effect=lambda futures, **_kwargs: iter(futures)),
+        mock.patch.object(cpa_module.account_service, "add_account_items", return_value={"added": len(names), "skipped": 0}) as add_account_items,
+        mock.patch.object(cpa_module.account_service, "add_accounts", return_value={"added": len(names), "skipped": 0}) as add_accounts,
+        mock.patch.object(cpa_module.account_service, "refresh_accounts", side_effect=refresh),
+    ):
+        service._run_import(pool["id"], _cpa_pool_with_persisted_job(config, pool), names)
+
+    if use_metadata:
+        add_account_items.assert_called_once_with(expected_items)
+        add_accounts.assert_not_called()
+    else:
+        add_accounts.assert_called_once_with(["token-free"], source_type="codex")
+        add_account_items.assert_not_called()
+    assert refresh_tokens == [
+        item["access_token"] if isinstance(item, dict) else item
+        for item, _error in outcomes.values()
+    ]
+
+
 def test_cpa_impossible_add_counts_terminate_job_without_refresh(tmp_path) -> None:
     config = CPAConfig(tmp_path / "cpa.json")
     pool = config.add_pool("CPA", "https://cpa.example.test", "secret")
@@ -1003,6 +1060,67 @@ def test_sub2api_add_exception_terminates_job_without_refresh(tmp_path) -> None:
     assert job["refreshed"] == 0
     add_accounts.assert_called_once()
     refresh_accounts.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_items", "use_metadata"),
+    (
+        (
+            [{"access_token": "token-pro", "plan_type": "pro", "source_type": "codex"}],
+            [{"access_token": "token-pro", "plan_type": "pro", "source_type": "codex"}],
+            True,
+        ),
+        (["token-free"], None, False),
+        (
+            [
+                {"access_token": "token-pro", "plan_type": "pro", "source_type": "codex"},
+                "token-free",
+            ],
+            [
+                {"access_token": "token-pro", "plan_type": "pro", "source_type": "codex"},
+                {"access_token": "token-free", "source_type": "codex"},
+            ],
+            True,
+        ),
+    ),
+)
+def test_sub2api_import_preserves_plan_metadata_and_refreshes_only_tokens(
+    tmp_path, values, expected_items, use_metadata
+) -> None:
+    config, server, service = _sub2api_server_and_service(tmp_path)
+    config.set_import_job(server["id"], _job(status="pending", total=len(values), completed=0))
+    refresh_tokens = []
+
+    def refresh(tokens, **_kwargs):
+        refresh_tokens.extend(tokens)
+        return {"refreshed": len(tokens), "errors": []}
+
+    with (
+        mock.patch.object(sub2api_module, "_fetch_access_tokens_for_accounts", return_value=(values, [])),
+        mock.patch.object(sub2api_module.account_service, "add_account_items", return_value={"added": len(values), "skipped": 0}) as add_account_items,
+        mock.patch.object(sub2api_module.account_service, "add_accounts", return_value={"added": len(values), "skipped": 0}) as add_accounts,
+        mock.patch.object(sub2api_module.account_service, "refresh_accounts", side_effect=refresh),
+    ):
+        service._run_import(server["id"], server, [f"account-{index}" for index in range(len(values))])
+
+    if use_metadata:
+        add_account_items.assert_called_once_with(expected_items)
+        add_accounts.assert_not_called()
+    else:
+        add_accounts.assert_called_once_with(["token-free"], source_type="codex")
+        add_account_items.assert_not_called()
+    assert refresh_tokens == [item["access_token"] if isinstance(item, dict) else item for item in values]
+
+
+@pytest.mark.parametrize("module", (cpa_module, sub2api_module))
+def test_import_value_normalization_drops_empty_and_malformed_values(module) -> None:
+    assert module._normalize_import_values([
+        "",
+        None,
+        {"access_token": ""},
+        {"plan_type": "pro"},
+        {"access_token": 123},
+    ]) == ([], [], False)
 
 
 def test_sub2api_impossible_add_counts_terminate_job_without_refresh(tmp_path) -> None:

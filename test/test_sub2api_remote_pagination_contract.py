@@ -1011,6 +1011,38 @@ def test_sub2api_export_ignores_accounts_outside_selected_ids(monkeypatch):
     assert errors == []
 
 
+def test_sub2api_export_preserves_remote_plan_type_when_token_has_no_claim(monkeypatch):
+    class Session:
+        def get(self, *_args, **_kwargs):
+            return _Response({
+                "accounts": [{
+                    "id": "selected-id",
+                    "credentials": {
+                        "access_token": "opaque-token-without-jwt-claims",
+                        "plan_type": "pro",
+                    },
+                }],
+            })
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sub2api_module, "Session", lambda **_kwargs: Session())
+    monkeypatch.setattr(sub2api_module, "_auth_headers", lambda _server, **_kwargs: {})
+
+    items, errors = sub2api_module._fetch_access_tokens_for_accounts(
+        {"base_url": "https://sub2api.example.test"},
+        ["selected-id"],
+    )
+
+    assert errors == []
+    assert items == [{
+        "access_token": "opaque-token-without-jwt-claims",
+        "plan_type": "pro",
+        "source_type": "codex",
+    }]
+
+
 @pytest.mark.parametrize("invalid_count", (-1, True, 1.5, "200"))
 def test_ccload_channel_pagination_rejects_noncanonical_count(monkeypatch, invalid_count):
     class Session:

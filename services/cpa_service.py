@@ -57,6 +57,16 @@ def _clean_remote_text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _build_codex_import_value(payload: dict, access_token: str) -> str | dict:
+    """Keep account metadata that is not recoverable from an opaque token."""
+    item: dict[str, str] = {"access_token": access_token, "source_type": "codex"}
+    for field in ("plan_type", "type", "refresh_token", "id_token"):
+        value = _clean_remote_text(payload.get(field))
+        if value:
+            item[field] = value
+    return item if len(item) > 2 else access_token
+
+
 def _clean_public_text(value: object) -> str:
     text = _clean_remote_text(value)
     return text if len(text) <= _CPA_PUBLIC_TEXT_MAX_LENGTH else ""
@@ -492,7 +502,7 @@ def fetch_remote_access_token(
     file_name: str,
     *,
     deadline: float | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | dict | None, str | None]:
     base_url = str(pool.get("base_url") or "").strip()
     secret_key = str(pool.get("secret_key") or "").strip()
     file_name = file_name.strip() if isinstance(file_name, str) else ""
@@ -526,7 +536,32 @@ def fetch_remote_access_token(
     access_token = _clean_remote_text(payload.get("access_token"))
     if not access_token:
         return None, "missing access_token"
-    return access_token, None
+    return _build_codex_import_value(payload, access_token), None
+
+
+def _normalize_import_values(values: list[str | dict]) -> tuple[list[dict], list[str], bool]:
+    items: list[dict] = []
+    tokens: list[str] = []
+    has_metadata = False
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            token = value.strip()
+            items.append({"access_token": token, "source_type": "codex"})
+            tokens.append(token)
+        elif isinstance(value, dict):
+            token = _clean_remote_text(value.get("access_token"))
+            if not token:
+                continue
+            item = dict(value)
+            item["access_token"] = token
+            item.setdefault("source_type", "codex")
+            items.append(item)
+            tokens.append(token)
+            has_metadata = has_metadata or any(
+                _clean_remote_text(item.get(field))
+                for field in ("plan_type", "type", "refresh_token", "id_token")
+            )
+    return items, tokens, has_metadata
 
 
 class CPAImportService:
@@ -644,7 +679,7 @@ class CPAImportService:
             return
         deadline = time.monotonic() + CPA_IMPORT_TIMEOUT_SECS
 
-        tokens: list[str] = []
+        values: list[str | dict] = []
         current = self._config.get_import_job(pool_id) or {}
         if current.get("job_id") != job_id:
             return
@@ -672,7 +707,7 @@ class CPAImportService:
                         token, error = None, exception_log_message(exc)
 
                     if token:
-                        tokens.append(token)
+                        values.append(token)
                     else:
                         if not self._append_error(
                             pool_id,
@@ -732,6 +767,7 @@ class CPAImportService:
                     future.cancel()
                 raise
 
+        account_items, tokens, has_metadata = _normalize_import_values(values)
         if not tokens:
             current = self._config.get_import_job(pool_id) or {}
             if current.get("job_id") != job_id:
@@ -763,7 +799,11 @@ class CPAImportService:
                 )
                 return
             try:
-                add_result = account_service.add_accounts(tokens, source_type="codex")
+                add_result = (
+                    account_service.add_account_items(account_items)
+                    if has_metadata
+                    else account_service.add_accounts(tokens, source_type="codex")
+                )
                 if not isinstance(add_result, dict) or not add_result:
                     raise ValueError("invalid account import result")
                 added = _parse_nonnegative_int(add_result["added"])

@@ -519,6 +519,20 @@ def _extract_access_token(credentials: object) -> str:
     return ""
 
 
+def _build_codex_import_value(account: object, credentials: object, token: str) -> str | dict:
+    """Keep account metadata that is not recoverable from an opaque token."""
+    account = account if isinstance(account, dict) else {}
+    credentials = credentials if isinstance(credentials, dict) else {}
+    item: dict[str, str] = {"access_token": token, "source_type": "codex"}
+    for field in ("plan_type", "type", "refresh_token", "id_token"):
+        value = _clean_remote_text(credentials.get(field))
+        if not value:
+            value = _clean_remote_text(account.get(field))
+        if value:
+            item[field] = value
+    return item if len(item) > 2 else token
+
+
 def _unwrap_envelope(payload: object) -> object:
     """Peel sub2api's `{code, message, data}` envelope, returning the inner `data` field
     when present. Also handles unwrapped responses from older/alt versions."""
@@ -711,7 +725,7 @@ def _fetch_access_tokens_for_accounts(
         account_ids: list[str],
         *,
         deadline: float | None = None,
-) -> tuple[list[str], list[dict]]:
+) -> tuple[list[str | dict], list[dict]]:
     """Return exported access tokens and per-account errors from sub2api."""
     base_url = _clean(server.get("base_url"))
     if not isinstance(account_ids, list) or any(not isinstance(item, str) for item in account_ids):
@@ -746,7 +760,7 @@ def _fetch_access_tokens_for_accounts(
     if not isinstance(accounts, list):
         raise RuntimeError("invalid export payload")
 
-    tokens: list[str] = []
+    values: list[str | dict] = []
     errors: list[dict] = []
     for account in accounts:
         if not isinstance(account, dict):
@@ -758,7 +772,7 @@ def _fetch_access_tokens_for_accounts(
         credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
         token = _extract_access_token(credentials)
         if token:
-            tokens.append(token)
+            values.append(_build_codex_import_value(account, credentials, token))
         else:
             errors.append({"name": account_id, "error": "missing access_token"})
 
@@ -766,7 +780,32 @@ def _fetch_access_tokens_for_accounts(
     if missing_count:
         errors.append({"name": "Sub2API", "error": f"missing {missing_count} selected accounts"})
 
-    return tokens, errors
+    return values, errors
+
+
+def _normalize_import_values(values: list[str | dict]) -> tuple[list[dict], list[str], bool]:
+    items: list[dict] = []
+    tokens: list[str] = []
+    has_metadata = False
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            token = value.strip()
+            items.append({"access_token": token, "source_type": "codex"})
+            tokens.append(token)
+        elif isinstance(value, dict):
+            token = _clean_remote_text(value.get("access_token"))
+            if not token:
+                continue
+            item = dict(value)
+            item["access_token"] = token
+            item.setdefault("source_type", "codex")
+            items.append(item)
+            tokens.append(token)
+            has_metadata = has_metadata or any(
+                _clean_remote_text(item.get(field))
+                for field in ("plan_type", "type", "refresh_token", "id_token")
+            )
+    return items, tokens, has_metadata
 
 
 class Sub2APIImportService:
@@ -861,7 +900,7 @@ class Sub2APIImportService:
         failed_count = int(current.get("failed") or 0)
 
         try:
-            tokens, errors = _fetch_access_tokens_for_accounts(
+            values, errors = _fetch_access_tokens_for_accounts(
                 server,
                 account_ids,
                 deadline=deadline,
@@ -871,12 +910,13 @@ class Sub2APIImportService:
             for account_id in account_ids:
                 self._append_error(server_id, account_id, message)
                 failed_count += 1
-            tokens = []
+            values = []
         else:
             for error in errors:
                 self._append_error(server_id, _clean(error.get("name")), _clean(error.get("error")) or "unknown error")
                 failed_count += 1
 
+        account_items, tokens, has_metadata = _normalize_import_values(values)
         current = self._config.get_import_job(server_id) or {}
         total = int(current.get("total") or len(account_ids))
         failed_count = min(total, failed_count)
@@ -911,7 +951,11 @@ class Sub2APIImportService:
             return
 
         try:
-            add_result = account_service.add_accounts(tokens, source_type="codex")
+            add_result = (
+                account_service.add_account_items(account_items)
+                if has_metadata
+                else account_service.add_accounts(tokens, source_type="codex")
+            )
             if not isinstance(add_result, dict) or not add_result:
                 raise ValueError("invalid account import result")
             added = _parse_nonnegative_int(add_result["added"])
