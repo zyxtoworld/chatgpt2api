@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
 import html
 import logging
 import threading
@@ -45,8 +46,8 @@ _IMAGE_IO_THREAD_CAPACITY = 8
 _IMAGE_IO_THREAD_STATE = threading.local()
 _SYSTEM_MANAGEMENT_IO_THREAD_CAPACITY = 4
 _SYSTEM_MANAGEMENT_IO_THREAD_STATE = threading.local()
-_HEALTH_OVERALL_TIMEOUT_SECONDS = 2.0
-_HEALTH_SUBCHECK_TIMEOUT_SECONDS = 1.5
+_HEALTH_OVERALL_TIMEOUT_SECONDS = 0.5
+_HEALTH_SUBCHECK_TIMEOUT_SECONDS = 0.25
 _HEALTH_SHUTDOWN_TIMEOUT_SECONDS = 0.5
 _HEALTH_PROBE_STAGE_NAMES = (
     "account_stats",
@@ -55,12 +56,20 @@ _HEALTH_PROBE_STAGE_NAMES = (
     "backend_info",
     "proxy_status",
 )
+_HEALTH_PROBE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=len(_HEALTH_PROBE_STAGE_NAMES),
+    thread_name_prefix="health-probe",
+)
+_HEALTH_PROBE_GLOBAL_GUARDS = {
+    stage: threading.Lock() for stage in _HEALTH_PROBE_STAGE_NAMES
+}
 
 
 class _HealthProbeOwner:
     def __init__(self) -> None:
         self.guards = {stage: threading.Lock() for stage in _HEALTH_PROBE_STAGE_NAMES}
-        self.tasks: dict[str, asyncio.Task] = {}
+        self.tasks: dict[str, Future] = {}
+        self.tasks_lock = threading.Lock()
 
 
 _HEALTH_PROBE_OWNERS: weakref.WeakKeyDictionary[
@@ -83,9 +92,10 @@ def _health_probe_owner() -> _HealthProbeOwner:
         return owner
 
 
-def _consume_health_task_result(owner: _HealthProbeOwner, stage: str, task: asyncio.Task) -> None:
-    if owner.tasks.get(stage) is task:
-        del owner.tasks[stage]
+def _consume_health_task_result(owner: _HealthProbeOwner, stage: str, task: Future) -> None:
+    with owner.tasks_lock:
+        if owner.tasks.get(stage) is task:
+            del owner.tasks[stage]
     try:
         task.result()
     except BaseException:
@@ -96,17 +106,23 @@ async def wait_for_health_probe_tasks(timeout: float = _HEALTH_SHUTDOWN_TIMEOUT_
     """Wait briefly for this event loop's workers without abandoning them."""
     owner = _health_probe_owner()
     deadline = anyio.current_time() + timeout
-    while owner.tasks:
-        tasks = tuple(owner.tasks.values())
+    while True:
+        with owner.tasks_lock:
+            tasks = tuple(owner.tasks.items())
+        if not tasks:
+            break
+        for stage, task in tasks:
+            if task.done():
+                _consume_health_task_result(owner, stage, task)
+        with owner.tasks_lock:
+            pending_stages = tuple(owner.tasks)
+        if not pending_stages:
+            break
         remaining = max(0.0, deadline - anyio.current_time())
         if remaining <= 0:
-            logger.warning("health probe shutdown timed out", extra={"pending_stages": tuple(owner.tasks)})
+            logger.warning("health probe shutdown timed out", extra={"pending_stages": pending_stages})
             return False
-        _done, pending = await asyncio.wait(tasks, timeout=remaining)
-        if pending:
-            logger.warning("health probe workers remain tracked during shutdown", extra={"pending_stages": tuple(owner.tasks)})
-            return False
-        await asyncio.sleep(0)
+        await asyncio.sleep(min(0.01, remaining))
     return True
 
 
@@ -118,31 +134,47 @@ async def _bounded_health_io(
     deadline: float | None = None,
 ):
     owner = _health_probe_owner()
-    guard = owner.guards[stage]
+    # The worker may outlive the request and even its event loop.  A loop-local
+    # lock alone would let a new loop submit another copy of the same stuck
+    # probe, so admission is guarded by the process-wide stage owner too.
+    guard = _HEALTH_PROBE_GLOBAL_GUARDS[stage]
     if not guard.acquire(blocking=False):
         return None
 
-    async def run_probe():
-        try:
-            return await anyio.to_thread.run_sync(
-                partial(func, *args),
-                limiter=limiter,
-            )
-        finally:
-            guard.release()
-
-    task = asyncio.create_task(run_probe())
-    owner.tasks[stage] = task
-    task.add_done_callback(partial(_consume_health_task_result, owner, stage))
     timeout = _HEALTH_SUBCHECK_TIMEOUT_SECONDS
     if deadline is not None:
         timeout = min(timeout, max(0.0, deadline - anyio.current_time()))
     if timeout <= 0:
         return None
+
+    # Do not bind a late synchronous worker to the request's event loop.  The
+    # public liveness route has a hard deadline, while the synchronous probe
+    # may be inside an uninterruptible storage/proxy call.  A stage guard
+    # keeps one such late call from multiplying on every health request; the
+    # bounded executor keeps the total number of late calls finite.  The
+    # concurrent future remains in the loop-scoped owner's registry until the
+    # worker really finishes, so loop shutdown never has to drain it.
     try:
-        with anyio.fail_after(timeout):
-            return await asyncio.shield(task)
-    except TimeoutError:
+        future = _HEALTH_PROBE_EXECUTOR.submit(func, *args)
+    except BaseException:
+        guard.release()
+        raise
+    future.add_done_callback(lambda _future: guard.release())
+    with owner.tasks_lock:
+        owner.tasks[stage] = future
+    future.add_done_callback(partial(_consume_health_task_result, owner, stage))
+    try:
+        end = anyio.current_time() + timeout
+        while not future.done():
+            remaining = end - anyio.current_time()
+            if remaining <= 0:
+                return None
+            await asyncio.sleep(min(0.01, remaining))
+        return future.result()
+    except BaseException:
+        if future.done():
+            _consume_health_task_result(owner, stage, future)
+        raise
         return None
 
 
