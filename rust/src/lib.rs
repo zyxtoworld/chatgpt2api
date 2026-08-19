@@ -4,17 +4,20 @@ mod account_pool;
 mod config;
 mod errors;
 mod model_pool;
+mod shutdown;
 use account_pool::{
     AccountLease, AccountModelGroup, AccountRecord, AccountStore, CatalogAccountCandidate,
 };
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
 use model_pool::{ModelCatalog, ModelStore, PublicModel, project_remote_model_list};
+pub use shutdown::run;
+#[cfg(test)]
+use shutdown::{serve_state_with_bounded_shutdown, serve_with_bounded_shutdown};
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
-    future::Future,
     io::{self, Read},
     path::{Path, PathBuf},
     pin::Pin,
@@ -6087,80 +6090,6 @@ where
             }
         },
     )
-}
-
-pub async fn run(listener: tokio::net::TcpListener, state: AppState) -> Result<(), std::io::Error> {
-    serve_state_with_bounded_shutdown(listener, state, shutdown_signal(), Duration::from_secs(25))
-        .await
-}
-
-async fn serve_state_with_bounded_shutdown<F>(
-    listener: tokio::net::TcpListener,
-    state: AppState,
-    shutdown: F,
-    drain_timeout: Duration,
-) -> Result<(), std::io::Error>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let catalog = state.account_type_catalog.clone();
-    serve_with_bounded_shutdown(
-        listener,
-        state.router(),
-        async move {
-            shutdown.await;
-            catalog.shutdown().await;
-        },
-        drain_timeout,
-    )
-    .await
-}
-
-async fn serve_with_bounded_shutdown<F>(
-    listener: tokio::net::TcpListener,
-    router: Router,
-    shutdown: F,
-    drain_timeout: Duration,
-) -> Result<(), std::io::Error>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let mut drain = Box::pin(async move {
-        shutdown.await;
-        let _ = shutdown_tx.send(());
-        tokio::time::sleep(drain_timeout).await;
-    });
-    let server = axum::serve(listener, router).with_graceful_shutdown(async {
-        let _ = shutdown_rx.await;
-    });
-    let mut server = Box::pin(server.into_future());
-    let result = tokio::select! {
-        result = &mut server => result,
-        _ = &mut drain => Ok(()),
-    };
-    result
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {},
-                    _ = terminate.recv() => {},
-                }
-            }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 #[cfg(test)]
