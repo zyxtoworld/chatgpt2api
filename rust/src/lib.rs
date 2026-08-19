@@ -6,6 +6,7 @@ mod codex_upstream;
 mod config;
 mod errors;
 mod model_pool;
+mod native_pow;
 mod protocol_chat;
 mod protocol_codex_payload;
 mod protocol_responses;
@@ -18,15 +19,20 @@ use codex_sse::{
 };
 #[cfg(test)]
 use codex_upstream::parse_codex_client_version;
-use codex_upstream::{codex_client_version, codex_request_headers, native_codex_response_payload};
+use codex_upstream::{
+    NativeRequestContext, codex_client_version, codex_request_headers, native_browser_headers,
+    native_codex_response_payload,
+};
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
 use model_pool::{ModelCatalog, ModelStore, PublicModel, project_remote_model_list};
+#[cfg(test)]
+use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
+use native_pow::{NativePowResources, native_pow_config, parse_native_pow_resources};
 pub(crate) use protocol_chat::validate_chat_payload;
 use protocol_chat::{
-    NativePowResources, NativeRequestContext, native_browser_headers, native_completion_text,
-    native_conversation_payload, native_finish_frame, native_frame, native_role_frame,
-    native_usage, native_usage_for_prompt_tokens, native_usage_frame, parse_native_pow_resources,
+    native_completion_text, native_conversation_payload, native_finish_frame, native_frame,
+    native_role_frame, native_usage, native_usage_for_prompt_tokens, native_usage_frame,
 };
 use protocol_codex_payload::native_codex_responses_payload;
 use protocol_responses::validate_responses_payload;
@@ -1750,82 +1756,6 @@ struct NativeRequirements {
     so_token: Option<String>,
     proof_token: Option<String>,
     turnstile_token: Option<String>,
-}
-
-struct NativePowConfigInputs {
-    screen_sum: u64,
-    legacy_time: String,
-    random_value: f64,
-    navigator_key: String,
-    document_key: String,
-    window_key: String,
-    performance_ms: f64,
-    uuid: String,
-    cores: u64,
-    epoch_minus_performance_ms: f64,
-    edge_flag: u64,
-}
-
-fn native_pow_config_from_inputs(
-    user_agent: &str,
-    resources: &NativePowResources,
-    inputs: &NativePowConfigInputs,
-) -> Vec<Value> {
-    vec![
-        json!(inputs.screen_sum),
-        json!(inputs.legacy_time),
-        json!(4294705152u64),
-        json!(1),
-        json!(user_agent),
-        json!(
-            resources
-                .script_sources
-                .first()
-                .map(String::as_str)
-                .unwrap_or(DEFAULT_POW_SCRIPT)
-        ),
-        json!(resources.data_build),
-        json!("en-US"),
-        json!("en-US,es-US,en,es"),
-        json!(inputs.random_value),
-        json!(inputs.navigator_key),
-        json!(inputs.document_key),
-        json!(inputs.window_key),
-        json!(inputs.performance_ms),
-        json!(inputs.uuid),
-        json!(""),
-        json!(inputs.cores),
-        json!(inputs.epoch_minus_performance_ms),
-        json!(0),
-        json!(0),
-        json!(0),
-        json!(0),
-        json!(0),
-        json!(0),
-        json!(inputs.edge_flag),
-    ]
-}
-
-fn native_pow_config(user_agent: &str, resources: &NativePowResources) -> Vec<Value> {
-    native_pow_config_from_inputs(
-        user_agent,
-        resources,
-        &NativePowConfigInputs {
-            // These values make the isolated canary deterministic. They are not
-            // a claim of browser/runtime parity with Python's live random inputs.
-            screen_sum: 3000,
-            legacy_time: "Mon Jan 01 2024 00:00:00 GMT-0500 (Eastern Standard Time)".to_owned(),
-            random_value: 0.5,
-            navigator_key: "hardwareConcurrency−32".to_owned(),
-            document_key: "location".to_owned(),
-            window_key: "navigator".to_owned(),
-            performance_ms: 1234.0,
-            uuid: "00000000-0000-4000-8000-000000000001".to_owned(),
-            cores: 32,
-            epoch_minus_performance_ms: 1_700_000_000_000.0,
-            edge_flag: 0,
-        },
-    )
 }
 
 fn native_requirements_token(

@@ -3,7 +3,56 @@ use reqwest::RequestBuilder;
 use serde_json::{Map, Value, json};
 use std::env;
 
-use super::{ApiError, CODEX_RESPONSES_MODEL, is_semver};
+use super::{
+    ApiError, CODEX_RESPONSES_MODEL, NATIVE_CLIENT_BUILD_NUMBER, NATIVE_CLIENT_VERSION,
+    NATIVE_ORIGIN, NATIVE_SEC_CH_UA, NATIVE_USER_AGENT, is_semver, native_message_id,
+};
+
+#[derive(Clone)]
+pub(crate) struct NativeRequestContext {
+    pub(crate) device_id: String,
+    pub(crate) session_id: String,
+}
+
+impl NativeRequestContext {
+    pub(crate) fn new() -> Self {
+        Self {
+            device_id: native_message_id(),
+            session_id: native_message_id(),
+        }
+    }
+}
+
+pub(crate) fn native_browser_headers(
+    request: RequestBuilder,
+    context: &NativeRequestContext,
+) -> RequestBuilder {
+    request
+        .header(header::USER_AGENT, NATIVE_USER_AGENT)
+        .header("Origin", NATIVE_ORIGIN)
+        .header("Referer", "https://chatgpt.com/")
+        .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .header("Priority", "u=1, i")
+        .header("Sec-Ch-Ua", NATIVE_SEC_CH_UA)
+        .header("Sec-Ch-Ua-Arch", "\"x86\"")
+        .header("Sec-Ch-Ua-Bitness", "\"64\"")
+        .header("Sec-Ch-Ua-Full-Version", "\"143.0.3650.96\"")
+        .header(
+            "Sec-Ch-Ua-Full-Version-List",
+            "\"Microsoft Edge\";v=\"143.0.3650.96\", \"Chromium\";v=\"143.0.7499.147\", \"Not A(Brand\";v=\"24.0.0.0\"",
+        )
+        .header("Sec-Ch-Ua-Mobile", "?0")
+        .header("Sec-Ch-Ua-Model", "\"\"")
+        .header("Sec-Ch-Ua-Platform", "\"Windows\"")
+        .header("Sec-Ch-Ua-Platform-Version", "\"19.0.0\"")
+        .header("OAI-Device-Id", &context.device_id)
+        .header("OAI-Session-Id", &context.session_id)
+        .header("OAI-Language", "zh-CN")
+        .header("OAI-Client-Version", NATIVE_CLIENT_VERSION)
+        .header("OAI-Client-Build-Number", NATIVE_CLIENT_BUILD_NUMBER)
+}
 
 pub(super) fn codex_client_version() -> Option<String> {
     env::var("CODEX_MODELS_CLIENT_VERSION")
