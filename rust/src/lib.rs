@@ -3068,7 +3068,7 @@ fn native_proof_token_sync_for_config(
     let suffix_json = serde_json::to_string(&config[10..]).map_err(|_| ApiError::upstream())?;
     let suffix = format!(",{}", &suffix_json[1..]);
     for counter in 0..MAX_POW_ITERATIONS {
-        if counter % 1024 == 0 && (cancel.load(Ordering::Acquire) || Instant::now() >= deadline) {
+        if cancel.load(Ordering::Acquire) || Instant::now() >= deadline {
             return Err(ApiError::upstream());
         }
         let candidate = format!("{prefix}{counter}{middle}{}{suffix}", counter / 2);
