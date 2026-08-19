@@ -139,6 +139,15 @@ def test_container_runtime_uses_the_frozen_environment_without_syncing_dependenc
     assert 'CMD ["uv", "run", "--no-sync", "uvicorn"' in dockerfile
 
 
+def test_container_carries_the_pinned_codex_models_client_version() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")
+
+    assert "ARG CODEX_MODELS_CLIENT_VERSION" in dockerfile
+    assert "CODEX_MODELS_CLIENT_VERSION=${CODEX_MODELS_CLIENT_VERSION}" in dockerfile
+    assert "CODEX_MODELS_CLIENT_VERSION=0.147.0" in workflow
+
+
 def test_container_frontend_build_uses_the_bun_lock() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 

@@ -16,7 +16,11 @@ from services.model_service import (
     ModelCatalogService,
     ModelUnavailableError,
 )
-from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    CatalogConfigurationError,
+    InvalidAccessTokenError,
+    OpenAIBackendAPI,
+)
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import UpstreamHTTPError
 
@@ -1247,6 +1251,37 @@ class ModelCatalogServiceTests(unittest.TestCase):
             catalog.list_models()
 
         self.assertEqual(calls, ["canonical"])
+
+    def test_group_configuration_failure_does_not_retry_every_candidate(self) -> None:
+        class Accounts:
+            def refresh_access_token(self, token: str, **_kwargs: object) -> str:
+                return token
+
+            def _get_account_lease(self, token: str) -> tuple[str, dict[str, str]]:
+                return token, {"access_token": token, "type": "free", "status": "正常", "source_type": "codex"}
+
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_catalog_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                raise CatalogConfigurationError("codex models client version is required")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(Accounts(), backend_factory=Backend)
+        result = catalog._fetch_account_type_models(
+            "free",
+            tuple(f"token-{index}" for index in range(1494)),
+            time.monotonic() + 10,
+        )
+
+        self.assertIsNone(result.models)
+        self.assertEqual(calls, ["token-0"])
 
     def test_synchronous_failed_type_without_last_good_reopens_on_next_read(self) -> None:
         accounts = AccountService(

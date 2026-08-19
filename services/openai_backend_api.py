@@ -41,6 +41,10 @@ class InvalidAccessTokenError(RuntimeError):
         self.path = path
 
 
+class CatalogConfigurationError(RuntimeError):
+    """A catalog request cannot run until deployment configuration is fixed."""
+
+
 class ImageTaskError(RuntimeError):
     """图片生成异常基类，携带上游会话 ID 供调用方清理对话。"""
 
@@ -1002,7 +1006,7 @@ class OpenAIBackendAPI:
             )
         ).strip()
         if not _CODEX_CLIENT_VERSION_RE.fullmatch(raw_client_version):
-            raise RuntimeError("codex models client version is required")
+            raise CatalogConfigurationError("codex models client version is required")
         return raw_client_version
 
     def _codex_responses_headers(self) -> Dict[str, str]:

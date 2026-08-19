@@ -14,7 +14,11 @@ import anyio
 
 from services.account_service import AccountService, account_service
 from services.model_contract import parse_model_text
-from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
+from services.openai_backend_api import (
+    CatalogConfigurationError,
+    InvalidAccessTokenError,
+    OpenAIBackendAPI,
+)
 from services.protocol.error_response import PublicSafeErrorMarker
 from services.protocol.reasoning_effort import (
     canonical_conversation_effort,
@@ -294,6 +298,11 @@ class ModelCatalogService:
                 )
             except Exception as exc:  # noqa: BLE001 - try the bounded fallback
                 last_error = exc
+                if isinstance(exc, CatalogConfigurationError):
+                    # This is a deployment-wide preflight failure, not an
+                    # account-specific upstream failure.  Retrying interchangeable
+                    # tokens only creates a request storm.
+                    break
                 # The Codex models endpoint has an independent auth contract.
                 # A 401 there does not prove that the ChatGPT token is dead:
                 # the official Codex tracker documents releases where the
