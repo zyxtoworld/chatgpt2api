@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 import html
 import logging
+from queue import Empty, Full, Queue
 import threading
 import weakref
 from functools import partial
@@ -56,18 +57,63 @@ _HEALTH_PROBE_STAGE_NAMES = (
     "backend_info",
     "proxy_status",
 )
-_HEALTH_PROBE_EXECUTOR = ThreadPoolExecutor(
-    max_workers=len(_HEALTH_PROBE_STAGE_NAMES),
-    thread_name_prefix="health-probe",
-)
 _HEALTH_PROBE_GLOBAL_GUARDS = {
     stage: threading.Lock() for stage in _HEALTH_PROBE_STAGE_NAMES
 }
 
 
+class _DaemonHealthStage:
+    """One bounded daemon worker for one health-probe stage."""
+
+    def __init__(self, stage: str) -> None:
+        self._stage = stage
+        self._jobs: Queue[tuple[Future, object, tuple[object, ...]]] = Queue(maxsize=1)
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def submit(self, func, *args) -> Future:
+        future: Future = Future()
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name=f"health-probe-{self._stage}",
+                    daemon=True,
+                )
+                self._thread.start()
+            try:
+                self._jobs.put_nowait((future, func, args))
+            except Full:
+                raise RuntimeError(f"health probe stage {self._stage} queue is full") from None
+        return future
+
+    def _run(self) -> None:
+        while True:
+            try:
+                future, func, args = self._jobs.get(timeout=0.5)
+            except Empty:
+                with self._lock:
+                    if self._jobs.empty():
+                        self._thread = None
+                        return
+                continue
+            try:
+                if future.set_running_or_notify_cancel():
+                    try:
+                        future.set_result(func(*args))
+                    except BaseException as exc:
+                        future.set_exception(exc)
+            finally:
+                self._jobs.task_done()
+
+
+_HEALTH_PROBE_STAGES = {
+    stage: _DaemonHealthStage(stage) for stage in _HEALTH_PROBE_STAGE_NAMES
+}
+
+
 class _HealthProbeOwner:
     def __init__(self) -> None:
-        self.guards = {stage: threading.Lock() for stage in _HEALTH_PROBE_STAGE_NAMES}
         self.tasks: dict[str, Future] = {}
         self.tasks_lock = threading.Lock()
 
@@ -155,7 +201,7 @@ async def _bounded_health_io(
     # concurrent future remains in the loop-scoped owner's registry until the
     # worker really finishes, so loop shutdown never has to drain it.
     try:
-        future = _HEALTH_PROBE_EXECUTOR.submit(func, *args)
+        future = _HEALTH_PROBE_STAGES[stage].submit(func, *args)
     except BaseException:
         guard.release()
         raise
@@ -175,7 +221,6 @@ async def _bounded_health_io(
         if future.done():
             _consume_health_task_result(owner, stage, future)
         raise
-        return None
 
 
 async def _storage_health_async(storage, *, deadline: float | None = None) -> dict | None:

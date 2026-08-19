@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import subprocess
+import sys
 import threading
 import time
 import unittest
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -53,6 +56,53 @@ class _BlockingAfterFirst:
 
 
 class AIThreadPoolIsolationContractTests(unittest.TestCase):
+
+    def test_health_probe_blocker_cannot_hold_interpreter_shutdown(self) -> None:
+        child = r'''
+import asyncio
+import threading
+from types import SimpleNamespace
+
+import api.system as system_module
+
+entered = threading.Event()
+
+def blocked_stats():
+    entered.set()
+    threading.Event().wait()
+
+async def main():
+    task = asyncio.create_task(
+        system_module._account_stats_async(SimpleNamespace(get_stats=blocked_stats))
+    )
+    for _ in range(100):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set(), "health probe worker did not start"
+    await system_module.wait_for_health_probe_tasks(timeout=0.02)
+    await task
+
+asyncio.run(main())
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", child],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            self.fail(
+                "blocked health probe held interpreter shutdown: "
+                f"stdout={stdout[-1000:]!r} stderr={stderr[-1000:]!r}"
+            )
+        self.assertEqual(process.returncode, 0, stderr[-2000:])
+
     def test_blocked_remote_image_downloads_do_not_exhaust_default_threadpool(self) -> None:
         async def scenario() -> None:
             default_limiter = anyio.to_thread.current_default_thread_limiter()
