@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import webConfig from "@/constants/common-env";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { parseChangelog, type ReleaseInfo } from "@/lib/release";
-import { fetchReleaseText } from "@/lib/version-release-fetch";
+import { fetchReleaseBundle } from "@/lib/version-release-fetch";
 
 const latestVersionUrl =
   "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/VERSION";
@@ -90,10 +90,15 @@ export function useVersionCheck() {
       releaseAbortControllerRef.current = abortController;
       setChecking(true);
       try {
-        const [versionResponse, changelogResponse] = await Promise.all([
-          fetchReleaseText(latestVersionUrl, { maxBytes: VERSION_MAX_BYTES, signal: abortController.signal }),
-          fetchReleaseText(latestChangelogUrl, { maxBytes: CHANGELOG_MAX_BYTES, signal: abortController.signal }),
-        ]);
+        const [versionResponse, changelogResponse] = await fetchReleaseBundle(
+          latestVersionUrl,
+          latestChangelogUrl,
+          {
+            versionMaxBytes: VERSION_MAX_BYTES,
+            changelogMaxBytes: CHANGELOG_MAX_BYTES,
+            signal: abortController.signal,
+          },
+        );
         if (releaseCheckOwner.accepts(requestOwner)) {
           setLatestVersion(versionResponse.trim() || currentVersion);
           if (changelogResponse.trim()) setReleases(parseChangelog(changelogResponse));

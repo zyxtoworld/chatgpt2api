@@ -386,8 +386,8 @@ export async function refreshAccounts(accessTokens: string[]) {
   });
 }
 
-export async function fetchRefreshProgress(progressId: string) {
-  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`);
+export async function fetchRefreshProgress(progressId: string, signal?: AbortSignal) {
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`, { signal });
 }
 
 export async function reLoginAccounts(accessTokens: string[]) {
@@ -397,8 +397,8 @@ export async function reLoginAccounts(accessTokens: string[]) {
   });
 }
 
-export async function fetchReLoginProgress(progressId: string) {
-  return httpRequest<RefreshProgressResponse>(`/api/accounts/re-login/progress/${progressId}`);
+export async function fetchReLoginProgress(progressId: string, signal?: AbortSignal) {
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/re-login/progress/${progressId}`, { signal });
 }
 
 export async function updateAccount(
@@ -557,8 +557,8 @@ export async function syncImageStorage() {
   });
 }
 
-export async function fetchBackups() {
-  return httpRequest<{ items: BackupItem[]; state: BackupState; settings: BackupSettings }>("/api/backups");
+export async function fetchBackups(signal?: AbortSignal) {
+  return httpRequest<{ items: BackupItem[]; state: BackupState; settings: BackupSettings }>("/api/backups", { signal });
 }
 
 export async function runBackupNow() {
@@ -723,8 +723,8 @@ export type CPAImportJob = {
   errors: Array<{ name: string; error: string }>;
 };
 
-export async function fetchCPAPools() {
-  return httpRequest<{ pools: CPAPool[] }>("/api/cpa/pools");
+export async function fetchCPAPools(signal?: AbortSignal) {
+  return httpRequest<{ pools: CPAPool[] }>("/api/cpa/pools", { signal });
 }
 
 export async function createCPAPool(pool: { name: string; base_url: string; secret_key: string }) {
@@ -797,8 +797,8 @@ export type Sub2APIRemoteGroup = {
   active_account_count: number;
 };
 
-export async function fetchSub2APIServers() {
-  return httpRequest<{ servers: Sub2APIServer[] }>("/api/sub2api/servers");
+export async function fetchSub2APIServers(signal?: AbortSignal) {
+  return httpRequest<{ servers: Sub2APIServer[] }>("/api/sub2api/servers", { signal });
 }
 
 export async function createSub2APIServer(server: {
@@ -883,8 +883,8 @@ export type CCLoadChannel = {
 
 export type CCLoadChannelModels = Pick<CCLoadChannel, "id" | "plan_type" | "models" | "models_loaded">;
 
-export async function fetchCCLoadServers() {
-  return httpRequest<{ servers: CCLoadServer[] }>("/api/ccload/servers");
+export async function fetchCCLoadServers(signal?: AbortSignal) {
+  return httpRequest<{ servers: CCLoadServer[] }>("/api/ccload/servers", { signal });
 }
 
 export async function createCCLoadServer(server: { name: string; base_url: string; password: string }) {

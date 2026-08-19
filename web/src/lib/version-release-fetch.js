@@ -40,6 +40,12 @@ async function readBoundedText(response, maxBytes, signal) {
 
   let cancelled = Boolean(signal?.aborted);
   let cancelPromise;
+  let rejectAbort;
+  const abortPromise = signal
+    ? new Promise((_, reject) => {
+        rejectAbort = reject;
+      })
+    : null;
   const cancel = () => {
     cancelPromise ||= Promise.resolve(reader.cancel?.()).catch(() => undefined);
     return cancelPromise;
@@ -47,6 +53,7 @@ async function readBoundedText(response, maxBytes, signal) {
   const onAbort = () => {
     cancelled = true;
     void cancel();
+    rejectAbort?.(createAbortError());
   };
   signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -59,7 +66,9 @@ async function readBoundedText(response, maxBytes, signal) {
     let bytes = 0;
     let text = "";
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await (
+        abortPromise ? Promise.race([reader.read(), abortPromise]) : reader.read()
+      );
       if (cancelled || signal?.aborted) {
         await cancel();
         throw createAbortError();
@@ -94,10 +103,61 @@ export async function fetchReleaseText(url, { maxBytes, signal, fetchImpl = fetc
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
     throw new Error("version response limit is invalid");
   }
+  if (signal?.aborted) throw createAbortError();
   const response = await fetchImpl(url, { signal });
   if (!response?.ok) {
     await cancelResponseBody(response);
     throw new Error("version request failed");
   }
   return readBoundedText(response, maxBytes, signal);
+}
+
+/**
+ * Fetch the version and changelog as one cancellable operation. If either
+ * request fails, the sibling is cancelled before the original error escapes.
+ *
+ * @param {string} versionUrl
+ * @param {string} changelogUrl
+ * @param {{versionMaxBytes: number, changelogMaxBytes: number, signal?: AbortSignal, fetchImpl?: typeof fetch}} options
+ */
+export async function fetchReleaseBundle(
+  versionUrl,
+  changelogUrl,
+  { versionMaxBytes, changelogMaxBytes, signal, fetchImpl = fetch } = {},
+) {
+  const requestController = new AbortController();
+  if (signal?.aborted) throw createAbortError();
+
+  let rejectParentAbort;
+  const parentAbortPromise = signal
+    ? new Promise((_, reject) => {
+        rejectParentAbort = reject;
+      })
+    : null;
+  const forwardAbort = () => {
+    requestController.abort();
+    rejectParentAbort?.(createAbortError());
+  };
+  signal?.addEventListener("abort", forwardAbort, { once: true });
+
+  try {
+    const requests = Promise.all([
+      fetchReleaseText(versionUrl, {
+        maxBytes: versionMaxBytes,
+        signal: requestController.signal,
+        fetchImpl,
+      }),
+      fetchReleaseText(changelogUrl, {
+        maxBytes: changelogMaxBytes,
+        signal: requestController.signal,
+        fetchImpl,
+      }),
+    ]);
+    return await (parentAbortPromise ? Promise.race([requests, parentAbortPromise]) : requests);
+  } catch (error) {
+    requestController.abort();
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", forwardAbort);
+  }
 }

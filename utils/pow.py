@@ -25,6 +25,9 @@ class ScriptSrcParser(HTMLParser):
         self.data_build = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "html":
+            self.data_build = dict(attrs).get("data-build") or ""
+            return
         if tag != "script":
             return
         attrs_dict = dict(attrs)

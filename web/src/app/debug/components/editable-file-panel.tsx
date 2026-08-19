@@ -14,8 +14,9 @@ import { filenameFromUrl } from "@/lib/file-display";
 import { createLifecycleActionOwner, observeLifecycleAction } from "@/lib/lifecycle-action-owner";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { mergeDeletedEditableFileIds, resolveDeletedEditableFileIds } from "@/lib/editable-file-history-state";
+import { createEditableTaskPollingLifecycle } from "@/lib/editable-task-polling";
 import { httpRequest } from "@/lib/request";
-import { createSerialPoller } from "@/lib/serial-poll";
+import { createLinkedAbortController } from "@/lib/serial-poll";
 import { commitSynchronousSnapshot } from "@/lib/synchronous-snapshot";
 import { cn } from "@/lib/utils";
 import {
@@ -103,10 +104,13 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
   const [renamingId, setRenamingId] = useState("");
   const [renamingTitle, setRenamingTitle] = useState("");
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: "one"; id: string } | { type: "all"; ids: string[] } | null>(null);
+  const mountedRef = useRef(false);
   const taskFetchRequestRef = useRef(0);
   const submitOwnerRef = useRef(createLatestActionOwner());
   const imageReadOwnerRef = useRef(createLifecycleActionOwner());
   const historyPersistenceOwnerRef = useRef(createLifecycleActionOwner());
+  const taskFetchAbortControllerRef = useRef<AbortController | null>(null);
+  const taskPollingLifecycleRef = useRef<{ replace: (ids: string[]) => void; dispose: () => void } | null>(null);
   const pendingImageReadsRef = useRef(0);
   const draftsRef = useRef<Record<string, EditableFileDraft>>({});
   const deletedIdsRef = useRef<Set<string>>(new Set());
@@ -124,6 +128,7 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
   }, []);
 
   useEffect(() => {
+    mountedRef.current = true;
     const submitOwner = submitOwnerRef.current;
     const imageReadOwner = imageReadOwnerRef.current;
     const historyPersistenceOwner = historyPersistenceOwnerRef.current;
@@ -131,9 +136,14 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
     imageReadOwner.activate();
     historyPersistenceOwner.activate();
     return () => {
+      mountedRef.current = false;
       submitOwner.cancel();
       imageReadOwner.cancel();
       historyPersistenceOwner.cancel();
+      taskPollingLifecycleRef.current?.dispose();
+      taskPollingLifecycleRef.current = null;
+      taskFetchAbortControllerRef.current?.abort();
+      taskFetchAbortControllerRef.current = null;
     };
   }, []);
 
@@ -143,13 +153,16 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
     return isRunning(task) ? getElapsedSeconds(base, task.polled_at, now) : base;
   };
 
-  const fetchTasks = useCallback(async (ids: string[] = []) => {
+  const fetchTasks = useCallback(async (ids: string[] = [], parentSignal?: AbortSignal) => {
     const requestId = ++taskFetchRequestRef.current;
+    taskFetchAbortControllerRef.current?.abort();
+    const { controller: abortController, unlink: unlinkAbortSignal } = createLinkedAbortController(parentSignal);
+    taskFetchAbortControllerRef.current = abortController;
     const taskIds = Array.from(new Set(ids.filter(Boolean))).slice(0, MAX_HISTORY);
     setPolling(true);
     try {
       const path = taskIds.length ? `/v1/editable-file-tasks?ids=${taskIds.map(encodeURIComponent).join(",")}` : "/v1/editable-file-tasks";
-      const result = await httpRequest<{ items: EditableFileTask[]; missing_ids?: string[] }>(path);
+      const result = await httpRequest<{ items: EditableFileTask[]; missing_ids?: string[] }>(path, { signal: abortController.signal });
       const missingIds = result.missing_ids || [];
       const { ids: hidden, storageFailed } = await resolveDeletedEditableFileIds(
         deletedIdsRef.current,
@@ -161,11 +174,31 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
       setSelectedId((current) => missingIds.includes(current) ? "" : current);
     } catch (err) {
       if (requestId !== taskFetchRequestRef.current) return;
+      if (abortController.signal.aborted) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       if (requestId === taskFetchRequestRef.current) setPolling(false);
+      if (taskFetchAbortControllerRef.current === abortController) {
+        taskFetchAbortControllerRef.current = null;
+      }
+      unlinkAbortSignal();
     }
   }, [kind]);
+
+  useEffect(() => {
+    const lifecycle = createEditableTaskPollingLifecycle({
+      fetchTasks,
+      onError: () => undefined,
+      onPollingChange: (nextPolling: boolean) => {
+        if (mountedRef.current) setPolling(nextPolling);
+      },
+    });
+    taskPollingLifecycleRef.current = lifecycle;
+    return () => {
+      lifecycle.dispose();
+      if (taskPollingLifecycleRef.current === lifecycle) taskPollingLifecycleRef.current = null;
+    };
+  }, [fetchTasks]);
 
   useEffect(() => {
     let cancelled = false;
@@ -247,18 +280,12 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
 
   useEffect(() => {
     const ids = runningIds.split(",").filter(Boolean);
-    if (!ids.length) return;
-    const poller = createSerialPoller({
-      intervalMs: 5000,
-      initialDelayMs: 5000,
-      poll: () => fetchTasks(ids),
-      isDone: () => false,
-      onProgress: () => undefined,
-    });
-    void poller.start().catch(() => undefined);
+    const lifecycle = taskPollingLifecycleRef.current;
+    if (!lifecycle) return;
+    lifecycle.replace(ids);
     return () => {
       taskFetchRequestRef.current += 1;
-      poller.stop();
+      lifecycle.replace([]);
     };
   }, [fetchTasks, runningIds]);
 

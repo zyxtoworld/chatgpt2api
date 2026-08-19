@@ -384,7 +384,7 @@ type SettingsStore = {
   loadConfig: () => Promise<void>;
   cancelConfigOperations: () => void;
   saveConfig: () => Promise<boolean>;
-  loadBackups: (silent?: boolean) => Promise<void>;
+  loadBackups: (silent?: boolean, signal?: AbortSignal) => Promise<void>;
   invalidateBackupLoads: () => void;
   cancelBackupOperations: () => void;
   runBackup: () => Promise<void>;
@@ -422,7 +422,7 @@ type SettingsStore = {
   setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
   setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
 
-  loadPools: (silent?: boolean) => Promise<void>;
+  loadPools: (silent?: boolean, signal?: AbortSignal) => Promise<void>;
   invalidatePoolLoads: () => void;
   cancelPoolOperations: () => void;
   openAddDialog: () => void;
@@ -1017,7 +1017,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     });
   },
 
-  loadBackups: async (silent = false) => {
+  loadBackups: async (silent = false, signal?: AbortSignal) => {
     const invocationGeneration = backupOperationsGeneration;
     if (backupWriteGate.isMutationActive()) {
       const settled = backupWriteSettled;
@@ -1038,7 +1038,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       set({ isLoadingBackups: true });
     }
     try {
-      const data = await fetchBackups();
+      const data = await fetchBackups(signal);
       if (!backupRequestGate.acceptsQuery(queryOwner)) {
         return;
       }
@@ -1172,7 +1172,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     }
   },
 
-  loadPools: async (silent = false) => {
+  loadPools: async (silent = false, signal?: AbortSignal) => {
     const queryOwner = poolRequestGate.beginQuery("list");
     if (!queryOwner.allowed) {
       return;
@@ -1182,7 +1182,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       set({ isLoadingPools: true });
     }
     try {
-      const data = await fetchCPAPools();
+      const data = await fetchCPAPools(signal);
       if (!poolRequestGate.acceptsQuery(queryOwner)) {
         return;
       }

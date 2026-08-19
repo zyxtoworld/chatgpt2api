@@ -86,12 +86,12 @@ export function CCLoadConnections() {
 
   const listQueryRef = useRef<ReturnType<typeof createOwnedQueryLoader> | null>(null);
 
-  const requestServers = async () => {
+  const requestServers = async (signal?: AbortSignal) => {
     const gate = requestGateRef.current;
     const queryOwner = gate.beginQuery("list");
     if (!queryOwner.allowed) return null;
     try {
-      const data = await fetchCCLoadServers();
+      const data = await fetchCCLoadServers(signal);
       return { queryOwner, data };
     } catch (error) {
       if (!gate.acceptsQuery(queryOwner)) return null;

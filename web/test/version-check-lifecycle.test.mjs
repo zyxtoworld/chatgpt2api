@@ -5,6 +5,7 @@ import test from "node:test";
 import vm from "node:vm";
 
 import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import * as releaseFetch from "../src/lib/version-release-fetch.js";
 import { fetchReleaseText } from "../src/lib/version-release-fetch.js";
 
 const source = readFileSync(
@@ -36,7 +37,7 @@ test("version checks use one latest owner and cancel it on cleanup", () => {
   assert.match(source, /releaseCheckOwnerRef/);
   assert.match(source, /releaseCheckOwner\.cancel\(\)/);
   assert.match(source, /releaseCheckOwner\.accepts\(requestOwner\)/);
-  assert.match(source, /fetchReleaseText/);
+  assert.match(source, /fetchReleaseBundle/);
   assert.match(source, /new AbortController\(\)/);
   assert.match(source, /releaseAbortControllerRef\.current\?\.abort\(\)/);
 });
@@ -174,4 +175,168 @@ test("a reader failure still releases the response body", async () => {
     /stream failed/,
   );
   assert.equal(cancelled, true);
+});
+
+test("a failed release request cancels the sibling reader", async () => {
+  let siblingCancelled = false;
+  let releasePendingRead;
+  const siblingResponse = {
+    ok: true,
+    headers: { get: () => null },
+    body: {
+      async cancel() {
+        siblingCancelled = true;
+        releasePendingRead?.();
+      },
+      getReader() {
+        return {
+          read() {
+            return new Promise((resolve) => {
+              releasePendingRead = () => resolve({ done: true, value: undefined });
+            });
+          },
+          async cancel() {
+            siblingCancelled = true;
+            releasePendingRead?.();
+          },
+          releaseLock() {},
+        };
+      },
+    },
+  };
+  const failedResponse = {
+    ok: false,
+    body: {
+      async cancel() {},
+    },
+  };
+
+  await assert.rejects(
+    releaseFetch.fetchReleaseBundle("https://example.test/VERSION", "https://example.test/CHANGELOG", {
+      versionMaxBytes: 16,
+      changelogMaxBytes: 16,
+      fetchImpl: async (url) => (url.endsWith("VERSION") ? failedResponse : siblingResponse),
+    }),
+    /version request failed/,
+  );
+  assert.equal(siblingCancelled, true);
+});
+
+test("an already-aborted release check does not start either fetch", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let calls = 0;
+
+  await assert.rejects(
+    releaseFetch.fetchReleaseBundle("https://example.test/VERSION", "https://example.test/CHANGELOG", {
+      versionMaxBytes: 16,
+      changelogMaxBytes: 16,
+      signal: controller.signal,
+      fetchImpl: async () => {
+        calls += 1;
+        throw new Error("fetch must not start");
+      },
+    }),
+    (error) => error?.name === "AbortError",
+  );
+  assert.equal(calls, 0);
+});
+
+test("an already-aborted release text read does not start fetch", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let calls = 0;
+
+  await assert.rejects(
+    fetchReleaseText("https://example.test/CHANGELOG", {
+      maxBytes: 16,
+      signal: controller.signal,
+      fetchImpl: async () => {
+        calls += 1;
+        throw new Error("fetch must not start");
+      },
+    }),
+    (error) => error?.name === "AbortError",
+  );
+  assert.equal(calls, 0);
+});
+
+test("parent cancellation releases the bundle owner despite non-cooperative readers", async () => {
+  const controller = new AbortController();
+  let calls = 0;
+  const pendingResponse = {
+    ok: true,
+    headers: { get: () => null },
+    body: {
+      getReader() {
+        return {
+          read() {
+            return new Promise(() => {});
+          },
+          cancel() {
+            return Promise.resolve();
+          },
+          releaseLock() {},
+        };
+      },
+    },
+  };
+  const bundle = releaseFetch.fetchReleaseBundle(
+    "https://example.test/VERSION",
+    "https://example.test/CHANGELOG",
+    {
+      versionMaxBytes: 16,
+      changelogMaxBytes: 16,
+      signal: controller.signal,
+      fetchImpl: async () => {
+        calls += 1;
+        return pendingResponse;
+      },
+    },
+  );
+  controller.abort();
+
+  await assert.rejects(
+    Promise.race([
+      bundle,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("bundle cancellation timed out")), 100)),
+    ]),
+    (error) => error?.name === "AbortError",
+  );
+  assert.equal(calls, 2);
+});
+
+test("direct release text cancellation does not wait for a non-cooperative reader", async () => {
+  const controller = new AbortController();
+  const response = {
+    ok: true,
+    headers: { get: () => null },
+    body: {
+      getReader() {
+        return {
+          read() {
+            return new Promise(() => {});
+          },
+          cancel() {
+            return Promise.resolve();
+          },
+          releaseLock() {},
+        };
+      },
+    },
+  };
+  const read = fetchReleaseText("https://example.test/CHANGELOG", {
+    maxBytes: 16,
+    signal: controller.signal,
+    fetchImpl: async () => response,
+  });
+  controller.abort();
+
+  await assert.rejects(
+    Promise.race([
+      read,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("text cancellation timed out")), 100)),
+    ]),
+    (error) => error?.name === "AbortError",
+  );
 });

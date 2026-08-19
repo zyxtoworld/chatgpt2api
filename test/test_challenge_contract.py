@@ -8,6 +8,7 @@ import pytest
 
 import services.openai_backend_api as backend_module
 import utils.turnstile as turnstile_module
+from utils.pow import parse_pow_resources
 from services.openai_backend_api import OpenAIBackendAPI
 
 
@@ -42,6 +43,11 @@ def test_turnstile_solver_rejects_an_oversized_instruction_program() -> None:
 
     assert turnstile_module.solve_turnstile_token(encoded, source_p) is None
 
+
+def test_python_pow_resource_parser_accepts_single_quoted_data_build() -> None:
+    scripts, data_build = parse_pow_resources("<html data-build='build-single-quote'></html>")
+    assert scripts == ["https://chatgpt.com/backend-api/sentinel/sdk.js"]
+    assert data_build == "build-single-quote"
 
 def test_build_requirements_rejects_oversized_turnstile_dx_before_solving() -> None:
     backend = _backend_without_network()

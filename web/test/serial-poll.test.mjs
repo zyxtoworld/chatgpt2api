@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createCancelableProgress, createSerialPoller, isProgressTerminal } from "../src/lib/serial-poll.js";
+import { createEditableTaskPollingLifecycle } from "../src/lib/editable-task-polling.js";
 
 function deferred() {
   let resolve;
@@ -68,10 +69,14 @@ test("serial polling waits for settle before scheduling the next request", async
 
 test("stop during an in-flight request settles and suppresses the late result", async () => {
   const request = deferred();
+  let requestSignal;
   let progressCalls = 0;
   const runner = createSerialPoller({
     intervalMs: 10,
-    poll: () => request.promise,
+    poll: (signal) => {
+      requestSignal = signal;
+      return request.promise;
+    },
     isDone: () => false,
     onProgress: () => {
       progressCalls += 1;
@@ -80,11 +85,80 @@ test("stop during an in-flight request settles and suppresses the late result", 
 
   const result = runner.start();
   runner.stop();
+  assert.equal(requestSignal.aborted, true);
   assert.equal((await result).status, "stopped");
 
   request.resolve({ done: true });
   await Promise.resolve();
   assert.equal(progressCalls, 0);
+});
+
+test("poller stop aborts the pending request owner before a late result can publish", async () => {
+  const request = deferred();
+  let requestSignal;
+  let published = false;
+  const runner = createSerialPoller({
+    poll: (pollSignal) => {
+      requestSignal = pollSignal;
+      return request.promise.then((value) => {
+        if (!pollSignal.aborted) published = true;
+        return value;
+      });
+    },
+    isDone: () => false,
+    onProgress: () => { published = true; },
+  });
+
+  void runner.start();
+  await new Promise((resolve) => queueMicrotask(resolve));
+  assert.ok(requestSignal);
+  runner.stop();
+  request.resolve({ done: false });
+  await new Promise((resolve) => queueMicrotask(resolve));
+  assert.equal(requestSignal.aborted, true);
+  assert.equal(published, false);
+});
+
+test("editable task production lifecycle aborts pending fetchTasks on replace and dispose", async () => {
+  for (const cleanup of ["runningIds effect cleanup", "component root cleanup"]) {
+    let requestSignal;
+    const published = [];
+    const pollingStates = [];
+    const request = deferred();
+    const scheduled = [];
+    const lifecycle = createEditableTaskPollingLifecycle({
+      fetchTasks: (ids, signal) => {
+        requestSignal = signal;
+        return request.promise.then((value) => {
+          if (!signal.aborted) published.push({ ids, value });
+          return value;
+        });
+      },
+      onPollingChange: (nextPolling) => pollingStates.push(nextPolling),
+      schedule: (callback) => {
+        scheduled.push(callback);
+        return callback;
+      },
+      clear: (callback) => {
+        const index = scheduled.indexOf(callback);
+        if (index >= 0) scheduled.splice(index, 1);
+      },
+    });
+
+    lifecycle.replace(["running-task"]);
+    assert.equal(scheduled.length, 1, `${cleanup} schedules the production five-second poll`);
+    scheduled.shift()();
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.ok(requestSignal, `${cleanup} entered fetchTasks through the production lifecycle`);
+    if (cleanup === "runningIds effect cleanup") lifecycle.replace([]);
+    else lifecycle.dispose();
+    if (cleanup === "runningIds effect cleanup") assert.deepEqual(pollingStates, [true, false]);
+    else assert.deepEqual(pollingStates, [true]);
+    request.resolve({ done: false });
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.equal(requestSignal.aborted, true, `${cleanup} aborts the request signal`);
+    assert.deepEqual(published, [], `${cleanup} ignores the late request result`);
+  }
 });
 
 test("initial polling delay is cancellable", async () => {

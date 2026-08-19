@@ -115,12 +115,12 @@ export function Sub2APIConnections() {
     return () => groupsOwner.cancel();
   }, []);
 
-  const requestServers = async () => {
+  const requestServers = async (signal?: AbortSignal) => {
     const gate = requestGateRef.current;
     const queryOwner = gate.beginQuery("list");
     if (!queryOwner.allowed) return null;
     try {
-      const data = await fetchSub2APIServers();
+      const data = await fetchSub2APIServers(signal);
       return { queryOwner, data };
     } catch (error) {
       if (!gate.acceptsQuery(queryOwner)) return null;

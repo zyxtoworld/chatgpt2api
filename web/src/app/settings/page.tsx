@@ -70,8 +70,8 @@ function SettingsDataController() {
     const poller = createSerialPoller({
       intervalMs: 1500,
       initialDelayMs: 1500,
-      poll: async () => {
-        await loadPools(true);
+      poll: async (signal: AbortSignal) => {
+        await loadPools(true, signal);
       },
       isDone: () => false,
       onProgress: () => undefined,
@@ -90,8 +90,8 @@ function SettingsDataController() {
     const poller = createSerialPoller({
       intervalMs: 3000,
       initialDelayMs: 3000,
-      poll: async () => {
-        await loadBackups(true);
+      poll: async (signal: AbortSignal) => {
+        await loadBackups(true, signal);
       },
       isDone: () => false,
       onProgress: () => undefined,

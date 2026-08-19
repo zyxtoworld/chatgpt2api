@@ -500,7 +500,7 @@ function AccountsPageContent() {
       if (!acceptsAccountMutation(mutationOwner)) return;
       const poller = createSerialPoller({
         intervalMs: 300,
-        poll: () => fetchRefreshProgress(progress_id),
+        poll: (signal: AbortSignal) => fetchRefreshProgress(progress_id, signal),
         isDone: (p: RefreshProgressResponse) => p.done,
         onProgress: (p: RefreshProgressResponse) => {
           if (!acceptsAccountMutation(mutationOwner)) return;
@@ -627,7 +627,7 @@ function AccountsPageContent() {
   const pollRefreshProgress = (progressId: string) => {
     const poller = createSerialPoller({
       intervalMs: 500,
-      poll: () => fetchRefreshProgress(progressId),
+      poll: (signal: AbortSignal) => fetchRefreshProgress(progressId, signal),
       isDone: (p: RefreshProgressResponse) => p.done,
       onProgress: () => undefined,
     });
@@ -681,7 +681,7 @@ function AccountsPageContent() {
       // 轮询进度到完成
       const poller = createSerialPoller({
         intervalMs: 300,
-        poll: () => fetchReLoginProgress(progress_id),
+        poll: (signal: AbortSignal) => fetchReLoginProgress(progress_id, signal),
         isDone: (p: RefreshProgressResponse) => p.done,
         onProgress: (p: RefreshProgressResponse) => {
           if (!acceptsAccountMutation(mutationOwner)) return;

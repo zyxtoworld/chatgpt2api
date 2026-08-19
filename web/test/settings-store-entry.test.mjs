@@ -649,18 +649,25 @@ test("CPA browse drops a late response when the current list no longer contains 
 test("CPA silent poll drops a response invalidated by effect cleanup", async () => {
   const originalRequest = request.request;
   const pending = [];
-  request.request = () => new Promise((resolve) => pending.push(resolve));
+  let requestConfig;
+  request.request = (config) => new Promise((resolve) => {
+    requestConfig = config;
+    pending.push(resolve);
+  });
 
   try {
     const existing = pool("cleanup-old", "cleanup-old");
+    const pollController = new AbortController();
     useSettingsStore.getState().cancelPoolOperations();
     useSettingsStore.setState({ pools: [existing], isLoadingPools: false });
 
-    const load = useSettingsStore.getState().loadPools(true);
+    const load = useSettingsStore.getState().loadPools(true, pollController.signal);
     await new Promise((resolve) => queueMicrotask(resolve));
     assert.equal(pending.length, 1);
 
+    pollController.abort();
     useSettingsStore.getState().invalidatePoolLoads();
+    assert.equal(requestConfig.signal.aborted, true);
     pending[0]({ data: { pools: [pool("cleanup-late", "cleanup-late")] } });
     await load;
 
@@ -713,9 +720,14 @@ test("CPA silent poll drops a response superseded by a pool mutation", async () 
 test("backup silent poll drops a response invalidated by effect cleanup", async () => {
   const originalRequest = request.request;
   const pending = [];
-  request.request = () => new Promise((resolve) => pending.push(resolve));
+  let requestConfig;
+  request.request = (config) => new Promise((resolve) => {
+    requestConfig = config;
+    pending.push(resolve);
+  });
 
   try {
+    const pollController = new AbortController();
     useSettingsStore.getState().cancelBackupOperations();
     useSettingsStore.setState({
       backups: [{ key: "cleanup-old", size: 1, encrypted: false }],
@@ -723,11 +735,13 @@ test("backup silent poll drops a response invalidated by effect cleanup", async 
       isLoadingBackups: false,
     });
 
-    const load = useSettingsStore.getState().loadBackups(true);
+    const load = useSettingsStore.getState().loadBackups(true, pollController.signal);
     await new Promise((resolve) => queueMicrotask(resolve));
     assert.equal(pending.length, 1);
 
+    pollController.abort();
     useSettingsStore.getState().invalidateBackupLoads();
+    assert.equal(requestConfig.signal.aborted, true);
     pending[0]({ data: { items: [{ key: "cleanup-late", size: 2, encrypted: false }], state: { running: false } } });
     await load;
 

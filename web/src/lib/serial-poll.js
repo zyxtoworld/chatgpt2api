@@ -1,3 +1,20 @@
+export function linkAbortSignal(parentSignal, childController) {
+  if (!parentSignal) return () => {};
+  const forwardAbort = () => childController.abort();
+  if (parentSignal.aborted) {
+    childController.abort();
+  } else {
+    parentSignal.addEventListener("abort", forwardAbort, { once: true });
+  }
+  return () => parentSignal.removeEventListener("abort", forwardAbort);
+}
+
+export function createLinkedAbortController(parentSignal) {
+  const controller = new AbortController();
+  const unlink = linkAbortSignal(parentSignal, controller);
+  return { controller, unlink };
+}
+
 export function createSerialPoller({
   poll,
   isDone,
@@ -12,6 +29,7 @@ export function createSerialPoller({
   let settled = false;
   let timer = null;
   let inFlight = false;
+  let activeController = null;
   let resolveResult;
   let rejectResult;
 
@@ -42,9 +60,11 @@ export function createSerialPoller({
     if (stopped || settled || inFlight) return;
 
     inFlight = true;
+    const controller = new AbortController();
+    activeController = controller;
     let scheduleNext = false;
     try {
-      const value = await poll();
+      const value = await poll(controller.signal);
       if (stopped || settled) return;
       if (isDone(value)) {
         settleDone(value);
@@ -58,6 +78,9 @@ export function createSerialPoller({
       }
     } finally {
       inFlight = false;
+      if (activeController === controller) {
+        activeController = null;
+      }
       if (scheduleNext && !stopped && !settled) {
         timer = schedule(() => {
           timer = null;
@@ -85,6 +108,8 @@ export function createSerialPoller({
     stop() {
       if (stopped || settled) return;
       stopped = true;
+      activeController?.abort();
+      activeController = null;
       if (timer !== null) {
         clear(timer);
         timer = null;

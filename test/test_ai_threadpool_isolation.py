@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import weakref
+from queue import Empty, Queue
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -78,6 +79,7 @@ async def main():
     assert result is None
     assert entered.is_set(), "health probe worker did not start"
     await system_module.wait_for_health_probe_tasks(timeout=0.02)
+    print("HEALTH_PROBE_READY", flush=True)
 
 asyncio.run(main())
 '''
@@ -88,15 +90,39 @@ asyncio.run(main())
             stderr=subprocess.PIPE,
             text=True,
         )
+        output = Queue()
+
+        def read_stdout() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                output.put(line)
+
+        reader = threading.Thread(target=read_stdout, daemon=True)
+        reader.start()
         try:
-            stdout, stderr = process.communicate(timeout=2.0)
+            ready = False
+            startup_deadline = time.monotonic() + 10.0
+            while time.monotonic() < startup_deadline:
+                try:
+                    if output.get(timeout=0.05).strip() == "HEALTH_PROBE_READY":
+                        ready = True
+                        break
+                except Empty:
+                    if process.poll() is not None:
+                        break
+            self.assertTrue(ready, "health probe child did not reach the shutdown checkpoint")
+            process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:
             process.kill()
-            stdout, stderr = process.communicate()
+            _stdout, stderr = process.communicate()
             self.fail(
                 "blocked health probe held interpreter shutdown: "
-                f"stdout={stdout[-1000:]!r} stderr={stderr[-1000:]!r}"
+                f"stderr={stderr[-2000:]!r}"
             )
+        finally:
+            if process.poll() is None:
+                process.kill()
+            _stdout, stderr = process.communicate()
         self.assertEqual(process.returncode, 0, stderr[-2000:])
 
     def test_blocked_remote_image_downloads_do_not_exhaust_default_threadpool(self) -> None:
@@ -763,7 +789,9 @@ asyncio.run(main())
                 app = create_app()
                 transport = httpx.ASGITransport(app=app)
                 async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-                    return await client.get("/health?format=json")
+                    started = time.monotonic()
+                    response = await client.get("/health?format=json")
+                    return response, time.monotonic() - started
 
             try:
                 with (
@@ -782,9 +810,7 @@ asyncio.run(main())
                         },
                     ),
                 ):
-                    started = time.monotonic()
-                    response = anyio.run(scenario)
-                    elapsed = time.monotonic() - started
+                    response, elapsed = anyio.run(scenario)
                 self.assertLess(elapsed, 2.0, f"{stage} health subcheck exceeded its bound")
                 self.assertEqual(response.status_code, 200, response.text)
                 if stage != "proxy":
