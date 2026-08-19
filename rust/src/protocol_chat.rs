@@ -146,6 +146,81 @@ pub(crate) fn native_message_text(message: &Value) -> Result<String, ApiError> {
     }
 }
 
+pub(crate) fn native_token_count(
+    bpe: &tiktoken_rs::CoreBPE,
+    text: &str,
+) -> Result<usize, ApiError> {
+    bpe.count(text, &std::collections::HashSet::new())
+        .map_err(|_| ApiError::upstream())
+}
+
+pub(crate) fn native_usage(object: &Map<String, Value>, output: &str) -> Result<Value, ApiError> {
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let bpe =
+        tiktoken_rs::bpe_for_model(model).unwrap_or_else(|_| tiktoken_rs::o200k_base_singleton());
+    let mut prompt_tokens = 0usize;
+    if let Some(Value::Array(messages)) = object.get("messages")
+        && !messages.is_empty()
+    {
+        for message in messages {
+            let object = message.as_object().ok_or_else(ApiError::invalid_request)?;
+            prompt_tokens = prompt_tokens
+                .checked_add(3)
+                .ok_or_else(ApiError::upstream)?;
+            if let Some(role) = object.get("role").and_then(Value::as_str) {
+                prompt_tokens = prompt_tokens
+                    .checked_add(native_token_count(bpe, role)?)
+                    .ok_or_else(ApiError::upstream)?;
+            }
+            prompt_tokens = prompt_tokens
+                .checked_add(native_token_count(bpe, &native_message_text(message)?)?)
+                .ok_or_else(ApiError::upstream)?;
+        }
+    } else if let Some(prompt) = object.get("prompt").and_then(Value::as_str) {
+        prompt_tokens = 3usize
+            .checked_add(native_token_count(bpe, "user")?)
+            .and_then(|value| value.checked_add(native_token_count(bpe, prompt.trim()).ok()?))
+            .ok_or_else(ApiError::upstream)?;
+    } else {
+        return Err(ApiError::invalid_request());
+    }
+    prompt_tokens = prompt_tokens
+        .checked_add(3)
+        .ok_or_else(ApiError::upstream)?;
+    native_usage_for_prompt_tokens(model, prompt_tokens, output)
+}
+
+pub(crate) fn native_usage_for_prompt_tokens(
+    model: &str,
+    prompt_tokens: usize,
+    output: &str,
+) -> Result<Value, ApiError> {
+    let bpe =
+        tiktoken_rs::bpe_for_model(model).unwrap_or_else(|_| tiktoken_rs::o200k_base_singleton());
+    let completion_tokens = native_token_count(bpe, output)?;
+    let total_tokens = prompt_tokens
+        .checked_add(completion_tokens)
+        .ok_or_else(ApiError::upstream)?;
+    Ok(json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "prompt_tokens_details": {
+            "text_tokens": prompt_tokens,
+            "image_tokens": 0,
+            "cached_tokens": 0,
+        },
+        "completion_tokens_details": {
+            "text_tokens": completion_tokens,
+            "image_tokens": 0,
+            "reasoning_tokens": 0,
+        },
+    }))
+}
+
 fn valid_chat_content(value: &Value, role: &str) -> bool {
     match value {
         Value::String(_) => true,
