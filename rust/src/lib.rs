@@ -8256,7 +8256,7 @@ mod tests {
                 async move {
                     Json(json!({
                         "prepare_token":"prepare-token",
-                        "proofofwork":{"required":true,"seed":"permit-release-test-seed","difficulty":difficulty}
+                        "proofofwork":{"required":true,"seed":"runtime-nonblocking-test-seed","difficulty":difficulty}
                     }))
                     .into_response()
                 }
