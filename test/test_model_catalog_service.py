@@ -357,6 +357,10 @@ class ModelCatalogServiceTests(unittest.TestCase):
                         getattr(self, "_catalog_account_id", None),
                     )
                 )
+                if self.access_token and not AccountService.is_web_backend_compatible(
+                    accounts.get_account(self.access_token)
+                ):
+                    raise RuntimeError("web catalog requires a Web-compatible representative")
                 return model_list(
                     "authenticated-pro-model"
                     if self.access_token
@@ -376,11 +380,11 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         self.assertEqual(
             [token for token, _source, _account_id in calls if token],
-            ["codex-pro"],
+            ["web-pro"],
         )
         self.assertEqual(
             [(token, source) for token, source, _account_id in calls if token],
-            [("codex-pro", "web")],
+            [("web-pro", "web")],
         )
         self.assertEqual(
             [
@@ -388,7 +392,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
                 for token, source, account_id in calls
                 if token
             ],
-            [("codex-pro", "web", "codex-account")],
+            [("web-pro", "web", None)],
         )
         self.assertEqual(
             catalog.route_for_model("authenticated-pro-model").access_tokens,

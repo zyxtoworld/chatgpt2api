@@ -145,17 +145,32 @@ class ModelCatalogService:
         return models
 
     def _active_accounts_by_group(self) -> dict[str, list[str]]:
-        groups: dict[AccountModelGroup, list[str]] = {}
+        groups: dict[AccountModelGroup, list[tuple[int, str]]] = {}
         for account in self._accounts.list_accounts():
             if not isinstance(account, dict) or not self._accounts._is_text_account_available(account):
                 continue
             access_token = str(account.get("access_token") or "").strip()
             account_type = self._accounts._normalize_account_type(account.get("type"))
             if access_token and account_type:
-                groups.setdefault(account_type, []).append(access_token)
-        for access_tokens in groups.values():
-            access_tokens[:] = sorted(dict.fromkeys(access_tokens))
-        return groups
+                # Web-compatible credentials must be the representative when
+                # a type mixes Web and Codex accounts.  The catalog Web
+                # endpoint is guarded at transport level; choosing a Codex
+                # token first only creates a guaranteed failed attempt and can
+                # leave a cold catalog pending even though a valid Web token
+                # exists.  Keep Codex candidates as bounded fallback for
+                # all-Codex types or after Web candidates fail.
+                priority = 0 if AccountService.is_web_backend_compatible(account) else 1
+                groups.setdefault(account_type, []).append((priority, access_token))
+        return {
+            account_type: [
+                token
+                for _priority, token in sorted(
+                    dict.fromkeys(candidates),
+                    key=lambda item: (item[0], item[1]),
+                )
+            ]
+            for account_type, candidates in groups.items()
+        }
 
     @staticmethod
     def _signature(groups: dict[AccountModelGroup, list[str]]) -> AccountGroupSignature:
