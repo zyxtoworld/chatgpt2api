@@ -4,6 +4,7 @@ mod account_pool;
 mod config;
 mod errors;
 mod model_pool;
+mod protocol_responses;
 mod shutdown;
 use account_pool::{
     AccountLease, AccountModelGroup, AccountRecord, AccountStore, CatalogAccountCandidate,
@@ -11,6 +12,7 @@ use account_pool::{
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
 use model_pool::{ModelCatalog, ModelStore, PublicModel, project_remote_model_list};
+use protocol_responses::{native_responses_text_input, validate_responses_payload};
 pub use shutdown::run;
 #[cfg(test)]
 use shutdown::{serve_state_with_bounded_shutdown, serve_with_bounded_shutdown};
@@ -4982,117 +4984,6 @@ async fn responses(
     body: Body,
 ) -> Result<Response, ApiError> {
     responses_with_timeout(state, headers, body, NATIVE_UPSTREAM_TIMEOUT).await
-}
-
-fn validate_responses_payload(payload: Value) -> Result<Map<String, Value>, ApiError> {
-    let Value::Object(object) = payload else {
-        return Err(ApiError::validation());
-    };
-    if object
-        .get("model")
-        .is_some_and(|value| !value.is_null() && value.as_str().is_none())
-        || object
-            .get("instructions")
-            .is_some_and(|value| !value.is_null() && value.as_str().is_none())
-        || object
-            .get("stream")
-            .is_some_and(|value| !value.is_null() && !value.is_boolean())
-    {
-        return Err(ApiError::validation());
-    }
-    if let Some(input) = object.get("input")
-        && !input.is_null()
-        && !input.is_string()
-        && !input.is_object()
-        && !(input.is_array()
-            && input
-                .as_array()
-                .is_some_and(|items| items.iter().all(Value::is_object)))
-    {
-        return Err(ApiError::validation());
-    }
-    let model = object
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(ApiError::invalid_request)?
-        .to_owned();
-    if object.get("input").is_none_or(|value| value.is_null()) {
-        return Err(ApiError::invalid_request());
-    }
-    let mut object = object;
-    object.insert("model".to_owned(), Value::String(model));
-    Ok(object)
-}
-
-fn native_responses_text_input(value: &Value) -> Result<Value, ApiError> {
-    match value {
-        Value::String(text) => Ok(Value::String(text.clone())),
-        Value::Array(items) => {
-            let mut normalized = Vec::with_capacity(items.len());
-            for item in items {
-                let Some(object) = item.as_object() else {
-                    return Err(ApiError::invalid_request());
-                };
-                let role = object
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .ok_or_else(ApiError::invalid_request)?;
-                if !matches!(role, "user" | "assistant" | "developer") {
-                    return Err(ApiError::invalid_request());
-                }
-                let content = object
-                    .get("content")
-                    .ok_or_else(ApiError::invalid_request)?;
-                let content = match content {
-                    Value::String(text) => Value::String(text.clone()),
-                    Value::Array(parts) => {
-                        let mut normalized_parts = Vec::with_capacity(parts.len());
-                        for part in parts {
-                            let Some(part) = part.as_object() else {
-                                return Err(ApiError::invalid_request());
-                            };
-                            if part.keys().any(|key| key != "type" && key != "text")
-                                || !matches!(
-                                    part.get("type").and_then(Value::as_str),
-                                    Some("input_text" | "output_text" | "text")
-                                )
-                            {
-                                return Err(ApiError::invalid_request());
-                            }
-                            let text = part
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .ok_or_else(ApiError::invalid_request)?;
-                            normalized_parts.push(json!({
-                                "type": "input_text",
-                                "text": text,
-                            }));
-                        }
-                        Value::Array(normalized_parts)
-                    }
-                    _ => return Err(ApiError::invalid_request()),
-                };
-                if object.keys().any(|key| {
-                    key != "type"
-                        && key != "id"
-                        && key != "role"
-                        && key != "content"
-                        && key != "status"
-                }) {
-                    return Err(ApiError::invalid_request());
-                }
-                normalized.push(json!({
-                    "type": "message",
-                    "role": role,
-                    "content": content,
-                }));
-            }
-            Ok(Value::Array(normalized))
-        }
-        _ => Err(ApiError::invalid_request()),
-    }
 }
 
 fn native_codex_tool(value: &Value) -> Result<Value, ApiError> {
