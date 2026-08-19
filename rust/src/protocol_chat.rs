@@ -1,6 +1,7 @@
-use super::{ApiError, Map, Value, native_message_id};
+use super::{ApiError, Map, Value, native_message_id, sse_delimiter};
 use base64::Engine;
 use serde_json::json;
+use std::io;
 
 pub(crate) fn native_message(message: &Value) -> Result<Value, ApiError> {
     let object = message.as_object().ok_or_else(ApiError::invalid_request)?;
@@ -219,6 +220,349 @@ pub(crate) fn native_usage_for_prompt_tokens(
             "reasoning_tokens": 0,
         },
     }))
+}
+
+const MAX_NATIVE_PATCH_DEPTH: usize = 32;
+
+fn native_text_candidate(value: &Value) -> Result<Option<String>, io::Error> {
+    let message = value
+        .get("message")
+        .or_else(|| value.get("v").and_then(|value| value.get("message")));
+    let Some(message) = message else {
+        return Ok(None);
+    };
+    let Some(message) = message.as_object() else {
+        return Err(io::Error::other("malformed upstream event"));
+    };
+    let role = message
+        .get("author")
+        .and_then(Value::as_object)
+        .and_then(|author| author.get("role"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("malformed upstream event"))?;
+    let metadata = match message.get("metadata") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(metadata)) => Some(metadata),
+        _ => return Err(io::Error::other("malformed upstream event")),
+    };
+    let hidden = metadata.and_then(|metadata| metadata.get("is_visually_hidden_from_conversation"));
+    if hidden.is_some_and(|value| !value.is_boolean()) {
+        return Err(io::Error::other("malformed upstream event"));
+    }
+    let optional_text = |key: &str| -> Result<Option<&str>, io::Error> {
+        match message.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value.as_str())),
+            _ => Err(io::Error::other("malformed upstream event")),
+        }
+    };
+    let recipient = optional_text("recipient")?;
+    let channel = optional_text("channel")?;
+    let visible = role.trim().eq_ignore_ascii_case("assistant")
+        && hidden.is_none_or(|hidden| hidden.as_bool() != Some(true))
+        && recipient
+            .is_none_or(|recipient| recipient.trim().is_empty() || recipient.trim() == "all")
+        && channel.is_none_or(|channel| channel.trim().is_empty() || channel.trim() == "final");
+    if !visible {
+        return Ok(None);
+    }
+    let content = match message.get("content") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(content)) => content,
+        Some(_) => return Err(io::Error::other("malformed upstream event")),
+    };
+    if let Some(parts) = content.get("parts") {
+        let parts = parts
+            .as_array()
+            .ok_or_else(|| io::Error::other("malformed upstream event"))?;
+        let mut text = String::new();
+        for part in parts {
+            text.push_str(
+                part.as_str()
+                    .ok_or_else(|| io::Error::other("malformed upstream event"))?,
+            );
+        }
+        if !text.is_empty() {
+            return Ok(Some(text));
+        }
+    }
+    if let Some(text) = content.get("text") {
+        let text = text
+            .as_str()
+            .ok_or_else(|| io::Error::other("malformed upstream event"))?;
+        return Ok((!text.is_empty()).then(|| text.to_owned()));
+    }
+    Err(io::Error::other("malformed upstream event"))
+}
+
+fn native_patch_candidate(
+    value: &Value,
+    current_text: &str,
+    depth: usize,
+) -> Result<Option<String>, io::Error> {
+    if depth > MAX_NATIVE_PATCH_DEPTH {
+        return Err(io::Error::other("malformed upstream event"));
+    }
+    let Some(object) = value.as_object() else {
+        return Ok(None);
+    };
+    let path = object.get("p").and_then(Value::as_str);
+    let operation = object.get("o").and_then(Value::as_str);
+    let raw_value = object.get("v");
+
+    if path == Some("/message/content/parts/0") {
+        let text = raw_value
+            .and_then(Value::as_str)
+            .ok_or_else(|| io::Error::other("malformed upstream event"))?;
+        return match operation {
+            Some("append") => Ok(Some(format!("{current_text}{text}"))),
+            Some("replace") => Err(io::Error::other("unsupported upstream text replacement")),
+            Some(_) | None => Ok(None),
+        };
+    }
+
+    if path.is_none() && operation.is_none() {
+        if current_text.is_empty() {
+            return Ok(None);
+        }
+        if let Some(text) = raw_value.and_then(Value::as_str) {
+            return Ok(Some(format!("{current_text}{text}")));
+        }
+    }
+
+    let Some(items) = raw_value.and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut next_text = current_text.to_owned();
+    for item in items {
+        if let Some(candidate) = native_patch_candidate(item, &next_text, depth + 1)? {
+            next_text = candidate;
+        }
+    }
+    if next_text == current_text {
+        Ok(None)
+    } else {
+        Ok(Some(next_text))
+    }
+}
+
+fn native_is_internal_annotation_part(part: &str) -> bool {
+    let value = part.trim();
+    if value.is_empty() {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("source") {
+        return true;
+    }
+    lower.starts_with("turn")
+}
+
+fn native_annotation_text(payload: &str) -> String {
+    let mut parts = payload.split('\u{e202}').map(str::trim);
+    let kind = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let data = parts.collect::<Vec<_>>();
+    if kind == "url" {
+        let label = data.first().copied().unwrap_or_default();
+        let url = data.get(1).copied().unwrap_or_default();
+        if !label.is_empty() && (url.starts_with("http://") || url.starts_with("https://")) {
+            return format!("{label} ({url})");
+        }
+        return if !label.is_empty() {
+            label.to_owned()
+        } else {
+            url.to_owned()
+        };
+    }
+    data.into_iter()
+        .find(|part| !native_is_internal_annotation_part(part))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+pub(crate) fn native_sanitize_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut remainder = text;
+    loop {
+        let Some(start) = remainder.find('\u{e200}') else {
+            output.push_str(remainder);
+            break;
+        };
+        output.push_str(&remainder[..start]);
+        let after_start = &remainder[start + '\u{e200}'.len_utf8()..];
+        let Some(end) = after_start.find('\u{e201}') else {
+            break;
+        };
+        let payload = &after_start[..end];
+        let replacement = native_annotation_text(payload);
+        let after_end = &after_start[end + '\u{e201}'.len_utf8()..];
+        if replacement.is_empty()
+            && after_end
+                .chars()
+                .next()
+                .is_some_and(|character| ".,;:!?".contains(character))
+        {
+            while output
+                .chars()
+                .last()
+                .is_some_and(|character| matches!(character, ' ' | '\t'))
+            {
+                output.pop();
+            }
+        }
+        output.push_str(&replacement);
+        remainder = after_end;
+    }
+    output
+}
+
+pub(crate) fn native_frame(
+    payload: &[u8],
+    current_text: &mut String,
+    completion_id: &str,
+    model: &str,
+    created: i64,
+    include_usage: bool,
+) -> Result<Option<Vec<u8>>, io::Error> {
+    let text =
+        std::str::from_utf8(payload).map_err(|_| io::Error::other("malformed upstream event"))?;
+    let data = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if data.is_empty() {
+        return Ok(None);
+    }
+    if data == "[DONE]" {
+        return Ok(Some(b"data: [DONE]\n\n".to_vec()));
+    }
+    let value: Value =
+        serde_json::from_str(&data).map_err(|_| io::Error::other("malformed upstream event"))?;
+    let candidate = native_text_candidate(&value)?;
+    let candidate = candidate.or(native_patch_candidate(&value, current_text, 0)?);
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let current_visible = native_sanitize_text(current_text);
+    let candidate_visible = native_sanitize_text(&candidate);
+    let delta = if candidate_visible.starts_with(current_visible.as_str()) {
+        candidate_visible[current_visible.len()..].to_owned()
+    } else if current_visible.is_empty() {
+        candidate_visible.clone()
+    } else {
+        return Err(io::Error::other("malformed upstream event"));
+    };
+    *current_text = candidate;
+    if delta.is_empty() {
+        return Ok(None);
+    }
+    let mut frame = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}],
+    });
+    if include_usage {
+        frame["usage"] = Value::Null;
+    }
+    let mut output = serde_json::to_vec(&frame).map_err(|_| io::Error::other("upstream error"))?;
+    output.extend_from_slice(b"\n\n");
+    let mut framed = b"data: ".to_vec();
+    framed.extend(output);
+    Ok(Some(framed))
+}
+
+pub(crate) fn native_finish_frame(
+    completion_id: &str,
+    model: &str,
+    created: i64,
+    include_usage: bool,
+) -> Vec<u8> {
+    let mut frame = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    });
+    if include_usage {
+        frame["usage"] = Value::Null;
+    }
+    let mut framed = b"data: ".to_vec();
+    framed.extend(serde_json::to_vec(&frame).expect("static completion frame"));
+    framed.extend_from_slice(b"\n\n");
+    framed
+}
+
+pub(crate) fn native_role_frame(
+    completion_id: &str,
+    model: &str,
+    created: i64,
+    include_usage: bool,
+) -> Vec<u8> {
+    let mut frame = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": ""},
+            "finish_reason": null,
+        }],
+    });
+    if include_usage {
+        frame["usage"] = Value::Null;
+    }
+    let mut framed = b"data: ".to_vec();
+    framed.extend(serde_json::to_vec(&frame).expect("static role frame"));
+    framed.extend_from_slice(b"\n\n");
+    framed
+}
+
+pub(crate) fn native_usage_frame(
+    completion_id: &str,
+    model: &str,
+    created: i64,
+    usage: Value,
+) -> Vec<u8> {
+    let frame = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    });
+    let mut framed = b"data: ".to_vec();
+    framed.extend(serde_json::to_vec(&frame).expect("static usage frame"));
+    framed.extend_from_slice(b"\n\n");
+    framed
+}
+
+pub(crate) fn native_completion_text(body: &[u8]) -> Result<String, ApiError> {
+    let mut text = String::new();
+    let mut terminated = false;
+    let mut buffer = body.to_vec();
+    while let Some((position, delimiter_length)) = sse_delimiter(&buffer) {
+        let event = buffer.drain(..position).collect::<Vec<_>>();
+        buffer.drain(..delimiter_length);
+        if let Some(frame) =
+            native_frame(&event, &mut text, "chatcmpl-rust-canary", "auto", 0, false)
+                .map_err(|_| ApiError::upstream())?
+            && frame == b"data: [DONE]\n\n"
+        {
+            terminated = true;
+            break;
+        }
+    }
+    if !terminated {
+        return Err(ApiError::upstream());
+    }
+    Ok(native_sanitize_text(&text))
 }
 
 fn valid_chat_content(value: &Value, role: &str) -> bool {
