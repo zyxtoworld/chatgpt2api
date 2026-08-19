@@ -587,12 +587,13 @@ export function getBackupDownloadUrl(key: string) {
   return `/api/backups/download?${params.toString()}`;
 }
 
-export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }) {
+export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }, signal?: AbortSignal) {
   const params = new URLSearchParams();
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
   return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }> }>(
     `/api/images${params.toString() ? `?${params.toString()}` : ""}`,
+    { signal },
   );
 }
 
@@ -618,8 +619,8 @@ export async function downloadSingleImage(path: string, isActive?: () => boolean
   return true;
 }
 
-export async function fetchImageTags() {
-  return httpRequest<{ tags: string[] }>("/api/images/tags");
+export async function fetchImageTags(signal?: AbortSignal) {
+  return httpRequest<{ tags: string[] }>("/api/images/tags", { signal });
 }
 
 export async function setImageTags(path: string, tags: string[]) {
@@ -640,8 +641,8 @@ export type ImageStorageStats = {
   image_count: number; image_size_mb: number; image_size_bytes: number;
 };
 
-export async function fetchImageStorage() {
-  return httpRequest<ImageStorageStats>("/api/images/storage");
+export async function fetchImageStorage(signal?: AbortSignal) {
+  return httpRequest<ImageStorageStats>("/api/images/storage", { signal });
 }
 
 export async function compressAllImages() {

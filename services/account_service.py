@@ -2065,7 +2065,15 @@ class AccountService:
         """
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
+        remote_check_error: Exception | None = None
         for _attempt in range(max_attempts):
+            if not self._list_ready_candidate_tokens(
+                excluded_tokens=attempted_tokens,
+                plan_type=plan_type,
+                source_type=source_type,
+                plan_types=plan_types,
+            ):
+                break
             access_token = self._acquire_next_candidate_token(
                 excluded_tokens=attempted_tokens,
                 plan_type=plan_type,
@@ -2075,7 +2083,11 @@ class AccountService:
             attempted_tokens.add(access_token)
             try:
                 account = self.fetch_remote_info(access_token, "get_available_access_token")
-            except Exception:
+            except Exception as exc:
+                # A failed remote check is not evidence that all local quota
+                # is exhausted.  Keep the public error classification stable
+                # and do not expose the upstream exception text.
+                remote_check_error = exc
                 self.release_image_slot(access_token)
                 continue
             # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
@@ -2091,6 +2103,11 @@ class AccountService:
             ):
                 return str((account or {}).get("access_token") or access_token)
             self.release_image_slot(access_token)
+        if remote_check_error is not None:
+            # Keep the public/logged exception bounded.  The upstream cause
+            # can contain response text, URLs, or credentials; only the
+            # classification is needed here.
+            raise RuntimeError("image account remote check failed") from None
         raise RuntimeError(
             f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"

@@ -99,6 +99,8 @@ function ImageManagerContent() {
   const imageQueryRef = useRef({ startDate: "", endDate: "" });
   const imageRequestGateRef = useRef(createRequestGate(imageQueryKey("", "")));
   const storageRequestRef = useRef(0);
+  const imageQueryAbortControllerRef = useRef<AbortController | null>(null);
+  const storageAbortControllerRef = useRef<AbortController | null>(null);
 
   const updateImageQuery = useCallback((nextStartDate: string, nextEndDate: string) => {
     imageQueryRef.current = { startDate: nextStartDate, endDate: nextEndDate };
@@ -111,13 +113,19 @@ function ImageManagerContent() {
     const queryOwner = imageMutationGateRef.current.beginQuery("storage");
     if (!queryOwner.allowed) return;
     const requestId = ++storageRequestRef.current;
+    storageAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    storageAbortControllerRef.current = abortController;
     try {
-      const data = await fetchImageStorage();
+      const data = await fetchImageStorage(abortController.signal);
       if (!imageMutationGateRef.current.acceptsQuery(queryOwner) || requestId !== storageRequestRef.current) return;
       setStorage(data);
     } catch { /* ignore */ }
     finally {
       if (imageMutationGateRef.current.acceptsQuery(queryOwner) && requestId === storageRequestRef.current) setStorageLoading(false);
+      if (storageAbortControllerRef.current === abortController) {
+        storageAbortControllerRef.current = null;
+      }
     }
   }, []);
 
@@ -160,6 +168,10 @@ function ImageManagerContent() {
     downloadAbortRegistry.activate();
     return () => {
       mutationGate.cancel();
+      imageQueryAbortControllerRef.current?.abort();
+      imageQueryAbortControllerRef.current = null;
+      storageAbortControllerRef.current?.abort();
+      storageAbortControllerRef.current = null;
       downloadOwner.cancel();
       downloadAbortRegistry.cancel();
       cleanupTimer.cancel();
@@ -192,12 +204,16 @@ function ImageManagerContent() {
     if (!queryOwner.allowed) return;
     const request = imageRequestGateRef.current.begin(imageQueryKey(query.startDate, query.endDate));
     if (request.sequence === null) return;
+    imageQueryAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    imageQueryAbortControllerRef.current = abortController;
     setIsLoading(true);
     const accepts = () => imageMutationGateRef.current.acceptsQuery(queryOwner) && imageRequestGateRef.current.isCurrent(request);
     try {
       const { data, tags } = await loadManagedImagesWithTags(
-        () => fetchManagedImages({ start_date: query.startDate, end_date: query.endDate }),
-        () => fetchImageTags(),
+        (signal: AbortSignal) => fetchManagedImages({ start_date: query.startDate, end_date: query.endDate }, signal),
+        (signal: AbortSignal) => fetchImageTags(signal),
+        abortController.signal,
       );
       if (!accepts()) return;
       setItems(data.items);
@@ -209,6 +225,9 @@ function ImageManagerContent() {
       toast.error(error instanceof Error ? error.message : "加载图片失败");
     } finally {
       if (accepts()) setIsLoading(false);
+      if (imageQueryAbortControllerRef.current === abortController) {
+        imageQueryAbortControllerRef.current = null;
+      }
     }
   }, []);
 
@@ -218,6 +237,10 @@ function ImageManagerContent() {
       toast.error("已有图片操作正在进行");
       return null;
     }
+    imageQueryAbortControllerRef.current?.abort();
+    imageQueryAbortControllerRef.current = null;
+    storageAbortControllerRef.current?.abort();
+    storageAbortControllerRef.current = null;
     setIsMutating(true);
     return owner;
   }, []);

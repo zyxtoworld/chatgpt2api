@@ -712,6 +712,21 @@ class AccountCapabilityTests(unittest.TestCase):
             self.assertEqual(plus_token, "token-plus")
             self.assertEqual(pro_token, "token-pro")
 
+    def test_remote_account_check_failure_is_not_reported_as_quota_exhaustion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = AccountService(JSONStorageBackend(Path(tmp_dir) / "accounts.json"))
+            service.add_account_items([
+                {"access_token": "remote-check-token", "type": "Plus", "status": "正常", "quota": 3},
+            ])
+            service.fetch_remote_info = Mock(
+                side_effect=TimeoutError("upstream timeout with secret payload")
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "image account remote check failed") as raised:
+                service.get_available_access_token(plan_type="plus")
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertNotIn("secret payload", repr(raised.exception))
+
     def test_refresh_accounts_can_remove_invalid_token_without_confirmation_delay(self) -> None:
         original_value = config.data.get("auto_remove_invalid_accounts")
         config.data["auto_remove_invalid_accounts"] = True

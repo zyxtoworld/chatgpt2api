@@ -19,6 +19,11 @@ test("image manager routes writes through one mutation owner and cancels it on u
   assert.match(pageSource, /const mutationGate = imageMutationGateRef\.current;[\s\S]*?mutationGate\.cancel\(\)/);
   assert.match(pageSource, /finishMutationAndRefresh/);
   assert.match(pageSource, /createReplaceableTimeout/);
+  assert.match(pageSource, /imageQueryAbortControllerRef/);
+  assert.match(pageSource, /storageAbortControllerRef/);
+  assert.match(pageSource, /fetchManagedImages\([\s\S]*?abortController\.signal/);
+  assert.match(pageSource, /fetchImageStorage\(abortController\.signal\)/);
+  assert.match(pageSource, /fetchImageTags\(signal\)/);
   assert.match(pageSource, /onClick=\{\(\) => void handleCompress\(\)\}/);
   assert.match(pageSource, /onSubmit=\{\(event\) => \{ event\.preventDefault\(\); void handleDeleteToTarget\(\); \}\}/);
   assert.match(pageSource, /onClick=\{\(\) => void handleDeleteByDate\(\)\}/);
