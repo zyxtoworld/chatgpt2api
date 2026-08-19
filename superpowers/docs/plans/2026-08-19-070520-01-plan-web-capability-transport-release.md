@@ -1,11 +1,11 @@
 # Web capability transport release
 
-**Goal:** 发布已验证的 Web backend 来源隔离与 transport identity fence，避免 Codex/未知来源账号进入 ChatGPT Web 端点。
+**Goal:** 发布已验证的来源能力隔离与 transport identity fence，避免 Codex/未知来源账号进入 ChatGPT Web 端点，并保持目录按账号类型选择单一兼容代表。
 **Why planning is required:** 这是需要提交、推送、构建并更新 ai-arm 的生产发布操作。
 **Acceptance:** 目标 commit 的离线门禁和 Actions 多架构镜像成功；ai-arm 仅替换 chatgpt2api，健康、模型接口、唯一容器和回滚证据满足门槛。
 
 ### Outcome 1: Scope and verification
-- Work: 仅纳入本批 `AccountService` 来源能力校验、Web transport/bootstrap 防线、相关 Chat/Responses/Search/Anthropic/Editable caller 与测试；保留 Rust、Web、storage 和其他用户改动不变。
+- Work: 仅纳入本批 `AccountService` 来源能力校验、按归一化账号类型选择单一代表、匿名目录一次、认证代表访问其兼容目录端点、Web transport/bootstrap 防线及相关 caller 测试；保留 Rust、Web、storage 和其他用户改动不变。
 - Verify: `pytest` 离线全量、focused caller/transport 回归、`py_compile`、`git diff --check`。
 
 ### Outcome 2: Repository delivery

@@ -488,6 +488,13 @@ class AccountService:
         migrated_items: list[dict] = []
         seen_access_tokens: set[str] = set()
         migration_needed = False
+        # Legacy OAuth source normalization is an on-disk migration only for
+        # backends that expose snapshot/CAS persistence.  Structural fakes and
+        # read-only health fixtures must still be load-only; the in-memory
+        # normalized account remains the executable capability value there.
+        durable_source_migration = bool(
+            getattr(self.storage, "supports_cumulative_snapshot", False)
+        )
         for item in accounts:
             if not isinstance(item, dict):
                 raise StorageDataError()
@@ -504,6 +511,19 @@ class AccountService:
                 raise StorageDataError()
             seen_access_tokens.add(access_token)
             migrated_item = dict(item)
+            if (
+                durable_source_migration
+                and migrated_item.get("source_type") != normalized.get("source_type")
+            ):
+                migrated_item["source_type"] = normalized["source_type"]
+                migration_needed = True
+            if (
+                durable_source_migration
+                and normalized.get("login_source")
+                and migrated_item.get("login_source") != normalized["login_source"]
+            ):
+                migrated_item["login_source"] = normalized["login_source"]
+                migration_needed = True
             safe_invalid_error = normalized.get("last_refresh_error")
             if migrated_item.get("last_refresh_error") != safe_invalid_error:
                 migrated_item["last_refresh_error"] = safe_invalid_error
@@ -768,6 +788,7 @@ class AccountService:
             "password",
             "refresh_token",
             "id_token",
+            "login_source",
         ):
             value = item.get(field)
             if value is not None and not isinstance(value, str):
@@ -786,7 +807,14 @@ class AccountService:
         source_type = normalized.get("source_type")
         if not source_type and str(normalized.get("export_type") or "").strip().lower() == "codex":
             source_type = "codex"
-        normalized["source_type"] = self._normalize_source_type(source_type)
+        source_type = self._normalize_source_type(source_type)
+        if source_type == "oauth_login":
+            # OAuth login uses the platform/API audience.  Keep the login
+            # provenance for audit, but make the executable route capability
+            # explicit so old records cannot enter the Web backend by name.
+            normalized["login_source"] = "oauth_login"
+            source_type = "codex"
+        normalized["source_type"] = source_type
         limits_progress = self._normalize_limits_progress_snapshot(normalized.get("limits_progress"))
         if limits_progress is _INVALID_LIMITS_PROGRESS:
             return None

@@ -211,11 +211,12 @@ class ModelCatalogService:
                 catalog_account_id = raw_account_id.strip()
         setattr(backend, "_catalog_account_id", catalog_account_id)
         if access_token:
-            # The historical authenticated catalog contract is the Web models
-            # endpoint for every account type.  The representative may also
-            # expose the dedicated Codex catalog; list_catalog_models keeps
-            # those two upstream sources independent and merges them once.
-            setattr(backend, "_catalog_source_type", "web")
+            account_source = (
+                AccountService._normalize_source_type(
+                    account.get("source_type") if isinstance(account, dict) else source_type
+                )
+            )
+            setattr(backend, "_catalog_source_type", account_source)
         elif source_type:
             setattr(backend, "_catalog_source_type", source_type)
         try:
@@ -293,7 +294,21 @@ class ModelCatalogService:
                 )
             except Exception as exc:  # noqa: BLE001 - try the bounded fallback
                 last_error = exc
-                if isinstance(exc, InvalidAccessTokenError) and expected_account is not None:
+                # The Codex models endpoint has an independent auth contract.
+                # A 401 there does not prove that the ChatGPT token is dead:
+                # the official Codex tracker documents releases where the
+                # same fresh token still works for core Responses.  Only a
+                # token-invalid response from a general/account endpoint may
+                # trigger the destructive invalid-account transition.
+                invalidates_account = not (
+                    isinstance(exc, InvalidAccessTokenError)
+                    and getattr(exc, "path", "") == "/backend-api/codex/models"
+                )
+                if (
+                    isinstance(exc, InvalidAccessTokenError)
+                    and invalidates_account
+                    and expected_account is not None
+                ):
                     try:
                         self._accounts.remove_invalid_token(
                             resolved_token,

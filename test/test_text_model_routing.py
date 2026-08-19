@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import tempfile
 import threading
 import unittest
@@ -1010,28 +1011,32 @@ class TextProtocolRoutingTests(unittest.TestCase):
         backend_factory.assert_called_once_with(access_token="")
 
     def test_anthropic_messages_does_not_pass_unknown_source_to_web_backend(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            service = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
-            service.add_account_items([
-                {
-                    "access_token": "future-only",
-                    "type": "Pro",
-                    "source_type": "future-incompatible",
-                    "status": "正常",
-                },
-            ])
-            service.refresh_access_token = lambda token, **_kwargs: token
-            with (
-                mock.patch.object(anthropic_v1_messages, "account_service", service),
-                mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend_factory,
-            ):
-                request = anthropic_v1_messages.message_request({
-                    "model": "auto",
-                    "messages": [{"role": "user", "content": "unknown source"}],
-                })
+        for source_type, token in (
+            ("future-incompatible", "future-only"),
+            ("oauth_login", "oauth-only"),
+        ):
+            with self.subTest(source_type=source_type), tempfile.TemporaryDirectory() as directory:
+                service = AccountService(JSONStorageBackend(Path(directory) / "accounts.json"))
+                service.add_account_items([
+                    {
+                        "access_token": token,
+                        "type": "Pro",
+                        "source_type": source_type,
+                        "status": "正常",
+                    },
+                ])
+                service.refresh_access_token = lambda value, **_kwargs: value
+                with (
+                    mock.patch.object(anthropic_v1_messages, "account_service", service),
+                    mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend_factory,
+                ):
+                    request = anthropic_v1_messages.message_request({
+                        "model": "auto",
+                        "messages": [{"role": "user", "content": "unknown source"}],
+                    })
 
-        self.assertIsNotNone(request.backend)
-        backend_factory.assert_called_once_with(access_token="")
+            self.assertIsNotNone(request.backend)
+            backend_factory.assert_called_once_with(access_token="")
 
     def test_web_backend_capability_accepts_legacy_account_sources(self) -> None:
         for source_type in ("web", "password", "password-oauth"):
@@ -1045,6 +1050,45 @@ class TextProtocolRoutingTests(unittest.TestCase):
                     service.get_text_access_token(model="auto", backend_capability="web"),
                     source_type,
                 )
+
+    def test_oauth_login_source_is_migrated_to_codex_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            service = AccountService(JSONStorageBackend(Path(directory) / "oauth-capability.json"))
+            service.add_account_items([
+                {
+                    "access_token": "oauth-token",
+                    "type": "Pro",
+                    "source_type": "oauth_login",
+                    "status": "正常",
+                },
+            ])
+
+            account = service.get_account("oauth-token")
+
+        self.assertEqual(account["source_type"], "codex")
+        self.assertEqual(account["login_source"], "oauth_login")
+        self.assertFalse(AccountService.is_web_backend_compatible(account))
+
+    def test_legacy_oauth_login_record_is_rewritten_as_codex_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy-oauth.json"
+            path.write_text(
+                json.dumps([
+                    {
+                        "access_token": "legacy-oauth",
+                        "type": "Pro",
+                        "source_type": "oauth_login",
+                        "status": "正常",
+                    },
+                ]),
+                encoding="utf-8",
+            )
+            service = AccountService(JSONStorageBackend(path))
+            self.assertEqual(service.get_account("legacy-oauth")["source_type"], "codex")
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(persisted[0]["source_type"], "codex")
+        self.assertEqual(persisted[0]["login_source"], "oauth_login")
 
     def test_web_backend_capability_rechecks_source_after_refresh(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

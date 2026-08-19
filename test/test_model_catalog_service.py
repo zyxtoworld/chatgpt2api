@@ -16,16 +16,15 @@ from services.model_service import (
     ModelCatalogService,
     ModelUnavailableError,
 )
-from services.openai_backend_api import InvalidAccessTokenError
+from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import UpstreamHTTPError
 
 # Contract provenance: upstream/main at dc105e51 (services/openai_backend_api.py)
 # uses one anonymous endpoint (/backend-anon/models?iim=false&is_gizmo=false)
 # and one authenticated Web endpoint (/backend-api/models?history_and_training_disabled=false).
-# This fork additionally merges the dedicated Codex catalog when the selected
-# representative has a Codex source/account identity; the key remains the
-# normalized account type and a type still has one representative.
+# Codex/API credentials use the dedicated Codex catalog and Web credentials
+# use the authenticated Web catalog; source capability is not a plan group.
 
 
 def model_list(*model_ids: str) -> dict:
@@ -243,14 +242,13 @@ class ModelCatalogServiceTests(unittest.TestCase):
                 self.access_token = access_token
 
             def list_models(self, **_kwargs: object) -> dict:
+                if self.access_token:
+                    calls["catalog"] += 1
+                    if isinstance(catalog_outcome, Exception):
+                        raise catalog_outcome
+                    return catalog_outcome
                 calls["anonymous"] += 1
                 return model_list("anon-v1")
-
-            def list_catalog_models(self, **_kwargs: object) -> dict:
-                calls["catalog"] += 1
-                if isinstance(catalog_outcome, Exception):
-                    raise catalog_outcome
-                return catalog_outcome
 
             def close(self) -> None:
                 pass
@@ -403,7 +401,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
             {"anonymous-model", "authenticated-pro-model"},
         )
 
-    def test_catalog_uses_one_dual_source_representative_per_account_type(self) -> None:
+    def test_catalog_uses_one_source_compatible_representative_per_account_type(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "dual-source-catalog-accounts.json")
         )
@@ -412,23 +410,17 @@ class ModelCatalogServiceTests(unittest.TestCase):
             {"access_token": "pro-b", "type": "Pro", "status": "正常"},
         ])
         calls: list[tuple[str, str]] = []
-        endpoint_calls: list[tuple[str, str]] = []
 
         class Backend:
             def __init__(self, access_token: str = "") -> None:
                 self.access_token = access_token
 
             def list_models(self, **_kwargs: object) -> dict:
+                if self.access_token:
+                    calls.append(("authenticated", self.access_token))
+                    return model_list("web-model")
                 calls.append(("anonymous", self.access_token))
                 return model_list("anonymous-model")
-
-            def list_catalog_models(self, **_kwargs: object) -> dict:
-                calls.append(("authenticated-dual", self.access_token))
-                endpoint_calls.extend([
-                    ("web", self.access_token),
-                    ("codex", self.access_token),
-                ])
-                return model_list("web-model", "codex-model", "shared-model")
 
             def close(self) -> None:
                 pass
@@ -441,12 +433,8 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         catalog.list_models()
 
-        self.assertCountEqual(calls, [("anonymous", ""), ("authenticated-dual", "pro-a")])
-        self.assertEqual(
-            endpoint_calls,
-            [("web", "pro-a"), ("codex", "pro-a")],
-        )
-        route = catalog.route_for_model("shared-model")
+        self.assertCountEqual(calls, [("anonymous", ""), ("authenticated", "pro-a")])
+        route = catalog.route_for_model("web-model")
         self.assertEqual(route.access_tokens, frozenset({"pro-a", "pro-b"}))
 
     def test_codex_group_tries_next_representative_after_first_failure(self) -> None:
@@ -577,6 +565,54 @@ class ModelCatalogServiceTests(unittest.TestCase):
             catalog.route_for_model("free-live-model").access_tokens,
             frozenset({"free-live"}),
         )
+
+    def test_codex_catalog_401_does_not_invalidate_live_account(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "codex-catalog-401-accounts.json")
+        )
+        accounts.add_account_items([
+            {
+                "access_token": "codex-catalog-401",
+                "type": "Pro",
+                "source_type": "codex",
+                "status": "正常",
+            }
+        ])
+        accounts.refresh_access_token = lambda token, **_kwargs: token
+        response = mock.Mock(status_code=401, headers={})
+        with self.assertRaises(InvalidAccessTokenError) as raised:
+            OpenAIBackendAPI._raise_on_error(
+                object.__new__(OpenAIBackendAPI),
+                response,
+                "/backend-api/codex/models",
+            )
+        catalog_error = raised.exception
+
+        class CodexCatalog401Backend:
+            def __init__(self, access_token: str) -> None:
+                self.access_token = access_token
+
+            def list_catalog_models(self, **_kwargs: object) -> dict:
+                raise catalog_error
+
+            def close(self) -> None:
+                return None
+
+        remove_invalid = mock.Mock(wraps=accounts.remove_invalid_token)
+        with mock.patch.object(accounts, "remove_invalid_token", remove_invalid):
+            catalog = ModelCatalogService(
+                accounts,
+                backend_factory=CodexCatalog401Backend,
+            )
+            result = catalog._fetch_account_type_models(
+                "Pro",
+                ("codex-catalog-401",),
+                time.monotonic() + 5,
+            )
+
+        self.assertIsNone(result.models)
+        remove_invalid.assert_not_called()
+        self.assertEqual(accounts.get_account("codex-catalog-401").get("status"), "正常")
 
     def test_invalid_group_removal_does_not_freeze_remaining_catalog_refresh(self) -> None:
         accounts = AccountService(

@@ -802,6 +802,39 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
                 self.assertTrue(response.closed)
                 self.assertFalse(response.iterated)
 
+    def test_catalog_dispatches_only_to_the_account_source_endpoint(self) -> None:
+        for source_type in ("web", "password", "password-oauth", "codex"):
+            with self.subTest(source_type=source_type):
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.access_token = "source-token"
+                backend.account = {"source_type": source_type}
+                backend._catalog_source_type = source_type
+                backend.list_models = mock.Mock(
+                    return_value={"object": "list", "data": [{"id": "model"}]}
+                )
+
+                result = OpenAIBackendAPI.list_catalog_models(backend)
+
+                self.assertEqual(result["data"][0]["id"], "model")
+                backend.list_models.assert_called_once_with(
+                    timeout_secs=30.0,
+                    deadline=None,
+                )
+
+    def test_catalog_rejects_oauth_and_unknown_sources_before_any_transport(self) -> None:
+        for source_type in ("oauth_login", "future-incompatible"):
+            with self.subTest(source_type=source_type):
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.access_token = "source-token"
+                backend.account = {"source_type": source_type}
+                backend._catalog_source_type = source_type
+                backend.list_models = mock.Mock()
+
+                with self.assertRaisesRegex(RuntimeError, "catalog endpoint"):
+                    OpenAIBackendAPI.list_catalog_models(backend)
+
+                backend.list_models.assert_not_called()
+
     def test_blob_puts_are_streamed_and_closed(self) -> None:
         class JSONResponse:
             status_code = 200

@@ -36,7 +36,9 @@ from utils.turnstile import solve_turnstile_token
 
 
 class InvalidAccessTokenError(RuntimeError):
-    pass
+    def __init__(self, message: str = "", *, path: str = "") -> None:
+        super().__init__(message)
+        self.path = path
 
 
 class ImageTaskError(RuntimeError):
@@ -617,7 +619,10 @@ class OpenAIBackendAPI:
 
     def _raise_on_error(self, response: Any, path: str) -> None:
         if response.status_code == 401:
-            raise InvalidAccessTokenError(f"token invalidated ({path})")
+            raise InvalidAccessTokenError(
+                f"token invalidated ({path})",
+                path=path,
+            )
         headers = getattr(response, "headers", None)
         retry_after_value = headers.get("Retry-After") if headers is not None else None
         retry_after = (
@@ -3748,213 +3753,25 @@ class OpenAIBackendAPI:
         timeout_secs: float = 30.0,
         deadline: float | None = None,
     ) -> Dict[str, Any]:
-        """Fetch both authenticated catalog sources for one representative.
+        """Fetch the catalog endpoint supported by this account source.
 
-        A representative account owns one logical catalog.  The two upstream
-        sources are independent: one successful source is publishable, while
-        both failing is returned to the type-level retry/failover owner.
+        Catalog discovery is source-capability bound.  A Web credential must
+        never be sent to the Codex endpoint, and a Codex credential must never
+        be sent through the Web bootstrap.  The model service owns the
+        account-type representative selection; this method only dispatches to
+        the one endpoint that the representative is allowed to use.
         """
         if not self.access_token:
             return self.list_models(timeout_secs=timeout_secs, deadline=deadline)
-
         account = getattr(self, "account", {})
-        owner_deadline = (
-            deadline
-            if deadline is not None
-            else time.monotonic() + self._search_remaining(None, timeout_secs)
-        )
-        web_path = "/backend-api/models?history_and_training_disabled=false"
-        web_route = "/backend-api/models"
-        account_id = _safe_upstream_text(
-            getattr(self, "_catalog_account_id", None)
-            or (account.get("account_id") if isinstance(account, dict) else None)
-            or (account.get("chatgpt_account_id") if isinstance(account, dict) else None),
-            max_length=256,
-        )
-        futures: dict[Any, str] = {}
-        pending: set[Any] = set()
-        endpoint_state_lock = threading.Lock()
-        endpoint_state: dict[str, Any] = {
-            "cancelled": False,
-            "codex_session": None,
-            "codex_closed": False,
-            "web_closed": False,
-        }
-
-        def endpoint_cancelled() -> bool:
-            with endpoint_state_lock:
-                return bool(endpoint_state["cancelled"])
-
-        def close_codex_session() -> None:
-            with endpoint_state_lock:
-                session = endpoint_state["codex_session"]
-                if session is None or endpoint_state["codex_closed"]:
-                    return
-                endpoint_state["codex_closed"] = True
-            _close_codex_resource(session, "models_session")
-
-        def close_web_session() -> None:
-            with endpoint_state_lock:
-                if endpoint_state["web_closed"]:
-                    return
-                endpoint_state["web_closed"] = True
-            _close_codex_resource(self.session, "models_web_session")
-
-        def cancel_pending_endpoints() -> None:
-            with endpoint_state_lock:
-                endpoint_state["cancelled"] = True
-            for future in pending:
-                future.cancel()
-            close_codex_session()
-            if any(futures.get(future) == "web" for future in pending):
-                close_web_session()
-
-        def fetch_web() -> dict[str, dict[str, Any]]:
-            if endpoint_cancelled():
-                raise SearchTimeoutError("web model catalog timed out")
-            self._bootstrap(
-                timeout_secs=self._search_remaining(owner_deadline, timeout_secs),
-                deadline=owner_deadline,
-            )
-            web_headers = self._headers(web_route)
-            if account_id:
-                web_headers["ChatGPT-Account-ID"] = account_id
-            return self._fetch_model_catalog_endpoint(
-                self.session,
-                web_path,
-                web_route,
-                web_headers,
-                is_codex=False,
-                timeout_secs=timeout_secs,
-                deadline=owner_deadline,
-            )
-
-        def fetch_codex() -> dict[str, dict[str, Any]]:
-            if endpoint_cancelled():
-                raise SearchTimeoutError("codex model catalog timed out")
-            client_version = self._codex_client_version()
-            codex_session = self._codex_session()
-            with endpoint_state_lock:
-                endpoint_state["codex_session"] = codex_session
-                cancelled = bool(endpoint_state["cancelled"])
-            if cancelled:
-                close_codex_session()
-                raise SearchTimeoutError("codex model catalog timed out")
-            result: dict[str, dict[str, Any]] = {}
-            try:
-                result = self._fetch_model_catalog_endpoint(
-                    codex_session,
-                    f"/backend-api/codex/models?client_version={quote(client_version, safe='')}",
-                    "/backend-api/codex/models",
-                    self._codex_models_headers(client_version),
-                    is_codex=True,
-                    timeout_secs=timeout_secs,
-                    deadline=owner_deadline,
-                )
-            finally:
-                close_codex_session()
-            return result
-
-        web_models: dict[str, dict[str, Any]] = {}
-        codex_models: dict[str, dict[str, Any]] = {}
-        web_error: BaseException | None = None
-        codex_error: BaseException | None = None
-        try:
-            endpoint_functions = (("web", fetch_web), ("codex", fetch_codex))
-            reserved_slots = 0
-            try:
-                # Reserve the complete pair before submitting either endpoint.
-                # This prevents two callers from each owning one slot while
-                # waiting forever for the other half of their dual-source
-                # catalog.
-                with _MODEL_CATALOG_ENDPOINT_ADMISSION_LOCK:
-                    for _source, _function in endpoint_functions:
-                        remaining = owner_deadline - time.monotonic()
-                        if remaining <= 0 or not _MODEL_CATALOG_ENDPOINT_SLOTS.acquire(
-                            timeout=remaining
-                        ):
-                            raise SearchTimeoutError(
-                                "model catalog endpoint admission timed out"
-                            )
-                        reserved_slots += 1
-
-                def run_endpoint(function: Callable[[], dict[str, dict[str, Any]]]):
-                    try:
-                        return function()
-                    finally:
-                        _MODEL_CATALOG_ENDPOINT_SLOTS.release()
-
-                for source, function in endpoint_functions:
-                    future = _MODEL_CATALOG_ENDPOINT_EXECUTOR.submit(
-                        run_endpoint,
-                        function,
-                    )
-                    reserved_slots -= 1
-                    future.add_done_callback(
-                        lambda done, _slots=_MODEL_CATALOG_ENDPOINT_SLOTS: (
-                            _slots.release() if done.cancelled() else None
-                        )
-                    )
-                    futures[future] = source
-            except BaseException:
-                for _ in range(reserved_slots):
-                    _MODEL_CATALOG_ENDPOINT_SLOTS.release()
-                raise
-
-            remaining = max(0.0, owner_deadline - time.monotonic())
-            done, pending = wait(futures, timeout=remaining)
-            pending_errors: dict[str, BaseException] = {}
-            for future in pending:
-                source = futures[future]
-                pending_errors[source] = SearchTimeoutError(
-                    f"{source} model catalog timed out"
-                )
-                future.cancel()
-
-            for future in done:
-                source = futures[future]
-                try:
-                    models = future.result()
-                except BaseException as exc:
-                    if source == "web":
-                        web_error = exc
-                    else:
-                        codex_error = exc
-                else:
-                    if source == "web":
-                        web_models = models
-                    else:
-                        codex_models = models
-
-            web_error = pending_errors.get("web", web_error)
-            codex_error = pending_errors.get("codex", codex_error)
-        finally:
-            unfinished = {future for future in futures if not future.done()}
-            if unfinished:
-                pending = unfinished
-                cancel_pending_endpoints()
-
-        merged = {}
-        self._merge_model_items(merged, web_models)
-        self._merge_model_items(merged, codex_models)
-        if not merged:
-            errors = [error for error in (web_error, codex_error) if error is not None]
-            pending_errors = [
-                error
-                for error in errors
-                if isinstance(error, SearchTimeoutError)
-            ]
-            primary_error = (pending_errors or errors or [RuntimeError(
-                "upstream model catalog is empty"
-            )])[0]
-            cause = next(
-                (error for error in errors if error is not primary_error),
-                None,
-            )
-            if cause is not None:
-                raise primary_error from cause
-            raise primary_error
-        return {"object": "list", "data": [merged[key] for key in sorted(merged)]}
+        source_type = str(
+            getattr(self, "_catalog_source_type", "")
+            or (account.get("source_type") if isinstance(account, dict) else "")
+            or "web"
+        ).strip().lower() or "web"
+        if source_type not in {"web", "password", "password-oauth", "codex"}:
+            raise RuntimeError("catalog endpoint is not supported for this account source")
+        return self.list_models(timeout_secs=timeout_secs, deadline=deadline)
 
     def list_models(
             self,

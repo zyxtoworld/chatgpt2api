@@ -786,7 +786,8 @@ def create_router() -> APIRouter:
             "access_token": tokens["access_token"],
             "refresh_token": tokens["refresh_token"],
             "id_token": tokens["id_token"],
-            "source_type": "oauth_login",
+            "source_type": "codex",
+            "login_source": "oauth_login",
         }
         try:
             add_result = await run_management_io(account_service.add_account_items, [payload])

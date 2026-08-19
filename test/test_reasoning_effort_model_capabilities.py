@@ -5,12 +5,8 @@ import os
 import subprocess
 import sys
 import tempfile
-import threading
-import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Condition, Event, Lock
 from unittest import mock
 
 from services.account_service import AccountService
@@ -248,13 +244,7 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         self.assertEqual(codex_session.close_calls, 1)
         backend._bootstrap.assert_not_called()
 
-    def test_catalog_model_list_unions_web_and_codex_endpoints(self) -> None:
-        web_response = _stream_response({
-            "models": [
-                {"slug": "shared-model", "supported_reasoning_levels": [{"effort": "low"}]},
-                {"slug": "web-only"},
-            ]
-        })
+    def test_catalog_model_list_uses_codex_endpoint_without_web_bootstrap(self) -> None:
         codex_response = _stream_response({
             "models": [
                 {"slug": "shared-model", "supported_in_api": True, "supported_reasoning_levels": [{"effort": "high"}]},
@@ -268,9 +258,8 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         backend.base_url = "https://chatgpt.com"
         backend.codex_client_version = "0.147.0"
         backend.fp = {"impersonate": "chrome110"}
-        web_session = _HeaderObservingSession(web_response)
         codex_session = _HeaderObservingSession(codex_response)
-        backend.session = web_session
+        backend.session = mock.Mock()
         backend._bootstrap = mock.Mock()
         backend._headers = mock.Mock(return_value={})
 
@@ -282,30 +271,21 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
 
         self.assertEqual(
             [item["id"] for item in result["data"]],
-            ["codex-only", "shared-model", "web-only"],
+            ["codex-only", "shared-model"],
         )
-        shared = next(item for item in result["data"] if item["id"] == "shared-model")
-        self.assertEqual(shared["supported_reasoning_efforts"], ["low", "high"])
-        self.assertEqual(web_session.get_calls, 1)
+        backend._bootstrap.assert_not_called()
+        backend._headers.assert_not_called()
         self.assertEqual(codex_session.get_calls, 1)
-        self.assertEqual(
-            web_session.urls,
-            ["https://chatgpt.com/backend-api/models?history_and_training_disabled=false"],
-        )
         self.assertEqual(
             codex_session.urls,
             ["https://chatgpt.com/backend-api/codex/models?client_version=0.147.0"],
-        )
-        self.assertEqual(
-            web_session.effective_headers["ChatGPT-Account-ID"],
-            "acct-codex",
         )
         codex_headers = codex_session.effective_headers
         self.assertIsNotNone(codex_headers)
         assert codex_headers is not None
         self.assertEqual(codex_headers["ChatGPT-Account-ID"], "acct-codex")
 
-    def test_catalog_model_list_queries_both_endpoints_for_every_authenticated_source(self) -> None:
+    def test_catalog_model_list_uses_web_endpoint_for_web_and_missing_source(self) -> None:
         for source_type in ("web", ""):
             with self.subTest(source_type=source_type or "missing"):
                 backend = object.__new__(OpenAIBackendAPI)
@@ -315,43 +295,24 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
                     "account_id": "acct-representative",
                 }
                 backend.base_url = "https://chatgpt.com"
-                backend.codex_client_version = "0.147.0"
-                backend.fp = {"impersonate": "chrome110"}
                 backend.session = _HeaderObservingSession(
                     _stream_response({"models": [{"slug": "web-model"}]})
                 )
-                codex_session = _HeaderObservingSession(
-                    _stream_response({
-                        "models": [{"slug": "codex-model", "supported_in_api": True}]
-                    })
-                )
                 backend._bootstrap = mock.Mock()
                 backend._headers = mock.Mock(return_value={})
-                backend._codex_session = mock.Mock(return_value=codex_session)
-                backend._codex_client_version = mock.Mock(return_value="0.147.0")
 
-                with mock.patch(
-                    "services.openai_backend_api.requests.Session",
-                    return_value=codex_session,
-                ):
-                    result = backend.list_catalog_models()
+                result = backend.list_catalog_models()
 
                 self.assertEqual(
                     [item["id"] for item in result["data"]],
-                    ["codex-model", "web-model"],
+                    ["web-model"],
                 )
                 self.assertEqual(backend.session.get_calls, 1)
-                self.assertEqual(codex_session.get_calls, 1)
+                backend._bootstrap.assert_called_once()
                 self.assertEqual(
                     backend.session.urls,
                     [
                         "https://chatgpt.com/backend-api/models?history_and_training_disabled=false"
-                    ],
-                )
-                self.assertEqual(
-                    codex_session.urls,
-                    [
-                        "https://chatgpt.com/backend-api/codex/models?client_version=0.147.0"
                     ],
                 )
 
@@ -380,287 +341,77 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in result["data"]], ["codex-model"])
         self.assertEqual(backend._fetch_model_catalog_endpoint.call_count, 1)
 
-    def _dual_catalog_backend(self) -> OpenAIBackendAPI:
+    def test_catalog_model_list_failure_is_bounded_for_web_source(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
-        backend.access_token = "codex-token"
-        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
-        backend.base_url = "https://chatgpt.com"
+        backend.access_token = "web-token"
+        backend.account = {"source_type": "web"}
         backend.session = mock.Mock()
-        backend.session.headers = {}
         backend._bootstrap = mock.Mock()
         backend._headers = mock.Mock(return_value={})
-        backend._codex_client_version = mock.Mock(return_value="0.147.0")
-        codex_session = mock.Mock()
-        backend._codex_session = mock.Mock(return_value=codex_session)
-        backend._codex_models_headers = mock.Mock(return_value={})
-        return backend
-
-    def test_dual_catalog_web_hang_does_not_starve_codex_success(self) -> None:
-        backend = self._dual_catalog_backend()
-        web_release = Event()
-        deadlines: list[float | None] = []
-
-        def fetch(_session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
-            deadlines.append(_kwargs["deadline"])
-            if "/codex/" in path:
-                return {"codex-model": {"id": "codex-model"}}
-            web_release.wait(timeout=1.0)
-            return {"web-model": {"id": "web-model"}}
-
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
-        started = time.monotonic()
-        result = backend.list_catalog_models(timeout_secs=0.1)
-        elapsed = time.monotonic() - started
-        web_release.set()
-
-        self.assertLess(elapsed, 0.7)
-        self.assertEqual([item["id"] for item in result["data"]], ["codex-model"])
-        self.assertEqual(len(deadlines), 2)
-        self.assertEqual(deadlines[0], deadlines[1])
-
-    def test_dual_catalog_codex_hang_does_not_starve_web_success(self) -> None:
-        backend = self._dual_catalog_backend()
-        codex_release = Event()
-
-        def fetch(_session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
-            if "/codex/" in path:
-                codex_release.wait(timeout=1.0)
-                return {"codex-model": {"id": "codex-model"}}
-            return {"web-model": {"id": "web-model"}}
-
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
-        started = time.monotonic()
-        result = backend.list_catalog_models(timeout_secs=0.1)
-        elapsed = time.monotonic() - started
-        codex_release.set()
-
-        self.assertLess(elapsed, 0.7)
-        self.assertEqual([item["id"] for item in result["data"]], ["web-model"])
-
-    def test_dual_catalog_both_hang_fail_within_owner_deadline(self) -> None:
-        backend = self._dual_catalog_backend()
-        release = Event()
-        codex_closed = Event()
-        backend._codex_session.return_value.close.side_effect = codex_closed.set
-
-        def fetch(_session: object, _path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
-            release.wait(timeout=1.0)
-            return {}
-
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
-        started = time.monotonic()
-        with self.assertRaises(SearchTimeoutError) as caught:
-            backend.list_catalog_models(timeout_secs=0.1)
-        elapsed = time.monotonic() - started
-        release.set()
-
-        self.assertLess(elapsed, 0.7)
-        self.assertTrue(codex_closed.wait(timeout=1.0))
-        self.assertIsNot(caught.exception.__cause__, caught.exception)
-
-    def test_repeated_dual_timeouts_do_not_starve_the_next_catalog_owner(self) -> None:
-        backend = self._dual_catalog_backend()
-        release = Event()
-        created_sessions: list[mock.Mock] = []
-
-        def new_codex_session() -> mock.Mock:
-            session = mock.Mock()
-            created_sessions.append(session)
-            return session
-
-        def blocked_fetch(
-            _session: object,
-            _path: str,
-            _route: str,
-            _headers: dict[str, str],
-            **_kwargs: object,
-        ) -> dict[str, dict[str, str]]:
-            release.wait(timeout=1.0)
-            return {}
-
-        backend._codex_session = mock.Mock(side_effect=new_codex_session)
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=blocked_fetch)
-        for _ in range(5):
-            with self.assertRaises(SearchTimeoutError):
-                backend.list_catalog_models(timeout_secs=0.03)
-        release.set()
-
-        def fast_fetch(
-            _session: object,
-            path: str,
-            _route: str,
-            _headers: dict[str, str],
-            **_kwargs: object,
-        ) -> dict[str, dict[str, str]]:
-            if "/codex/" in path:
-                return {"codex-model": {"id": "codex-model"}}
-            return {"web-model": {"id": "web-model"}}
-
-        backend._fetch_model_catalog_endpoint.side_effect = fast_fetch
-        result = backend.list_catalog_models(timeout_secs=0.2)
-
-        self.assertEqual(
-            [item["id"] for item in result["data"]],
-            ["codex-model", "web-model"],
-        )
-        self.assertTrue(
-            all(session.close.called for session in created_sessions),
-            "timed-out Codex sessions were not closed",
+        backend._fetch_model_catalog_endpoint = mock.Mock(
+            side_effect=SearchTimeoutError("web catalog timed out")
         )
 
-    def test_dual_catalog_timeouts_do_not_create_unbounded_endpoint_threads(self) -> None:
-        backend = self._dual_catalog_backend()
-        release = Event()
-        started_condition = Condition(Lock())
-        started = 0
-        finished = 0
-
-        def blocked_fetch(
-            _session: object,
-            _path: str,
-            _route: str,
-            _headers: dict[str, str],
-            **_kwargs: object,
-        ) -> dict[str, dict[str, str]]:
-            nonlocal started, finished
-            with started_condition:
-                started += 1
-                started_condition.notify_all()
-            try:
-                release.wait(timeout=2.0)
-                return {}
-            finally:
-                with started_condition:
-                    finished += 1
-                    started_condition.notify_all()
-
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=blocked_fetch)
-        callers = ThreadPoolExecutor(max_workers=1)
-        try:
-            for _ in range(6):
-                request = callers.submit(
-                    backend.list_catalog_models,
-                    deadline=time.monotonic() + 0.05,
-                )
-                with started_condition:
-                    started_condition.wait_for(
-                        lambda: started >= 2 or request.done(),
-                        timeout=1.0,
-                    )
-                with self.assertRaises(SearchTimeoutError):
-                    request.result(timeout=1.0)
-
-            endpoint_threads = [
-                thread
-                for thread in threading.enumerate()
-                if thread.name.startswith("model-catalog-endpoint")
-            ]
-            self.assertLessEqual(
-                len(endpoint_threads),
-                2,
-                "timed-out catalog calls accumulated endpoint workers",
-            )
-        finally:
-            release.set()
-            with started_condition:
-                self.assertTrue(
-                    started_condition.wait_for(
-                        lambda: finished == started,
-                        timeout=2.0,
-                    )
-                )
-            callers.shutdown(wait=True)
-
-    def test_dual_catalog_timeout_closes_pending_web_transport(self) -> None:
-        backend = self._dual_catalog_backend()
-        web_release = Event()
-        web_closed = Event()
-        backend.session.close.side_effect = web_closed.set
-
-        def fetch(
-            _session: object,
-            path: str,
-            _route: str,
-            _headers: dict[str, str],
-            **_kwargs: object,
-        ) -> dict[str, dict[str, str]]:
-            if "/codex/" in path:
-                web_release.wait(timeout=1.0)
-            else:
-                web_release.wait(timeout=1.0)
-            return {}
-
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
         with self.assertRaises(SearchTimeoutError):
             backend.list_catalog_models(timeout_secs=0.05)
 
-        self.assertTrue(web_closed.wait(timeout=1.0))
-        web_release.set()
+        backend._bootstrap.assert_called_once()
+        backend._fetch_model_catalog_endpoint.assert_called_once()
 
-    def test_dual_catalog_pending_side_reports_timeout_after_other_side_fails(self) -> None:
-        backend = self._dual_catalog_backend()
-        codex_release = Event()
-
-        def fetch(_session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
-            if "/codex/" in path:
-                codex_release.wait(timeout=1.0)
-                return {}
-            raise RuntimeError("web catalog unavailable")
-
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
-        with self.assertRaises(SearchTimeoutError) as caught:
-            backend.list_catalog_models(timeout_secs=0.1)
-        codex_release.set()
-
-        self.assertIsNot(caught.exception.__cause__, caught.exception)
-
-    def test_catalog_model_list_keeps_one_success_when_other_endpoint_fails(self) -> None:
-        backend = object.__new__(OpenAIBackendAPI)
-        backend.access_token = "account-token"
-        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
-        backend.base_url = "https://chatgpt.com"
-        backend.codex_client_version = "0.147.0"
-        backend.session = mock.Mock()
-        backend.session.headers = {}
-        backend._bootstrap = mock.Mock()
-        backend._headers = mock.Mock(return_value={})
-        backend._codex_session = mock.Mock(return_value=mock.Mock())
-        backend._codex_models_headers = mock.Mock(return_value={})
-        def fetch(_session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
-            if "/codex/" in path:
-                raise RuntimeError("codex endpoint unavailable")
-            return {"web-model": {"id": "web-model"}}
-
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
-
-        result = backend.list_catalog_models()
-
-        self.assertEqual([item["id"] for item in result["data"]], ["web-model"])
-        self.assertEqual(backend._fetch_model_catalog_endpoint.call_count, 2)
-
-    def test_catalog_model_list_keeps_codex_source_when_web_endpoint_fails(self) -> None:
+    def test_catalog_model_list_failure_is_bounded_for_codex_source(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "codex-token"
-        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
-        backend.base_url = "https://chatgpt.com"
-        backend.codex_client_version = "0.147.0"
+        backend.account = {"source_type": "codex"}
         backend.session = mock.Mock()
-        backend.session.headers = {}
         backend._bootstrap = mock.Mock()
-        backend._headers = mock.Mock(return_value={})
-        backend._codex_session = mock.Mock(return_value=mock.Mock())
+        backend._codex_client_version = mock.Mock(return_value="0.147.0")
         backend._codex_models_headers = mock.Mock(return_value={})
-        def fetch(_session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
-            if "/codex/" in path:
-                return {"codex-model": {"id": "codex-model"}}
-            raise RuntimeError("web catalog unavailable")
+        codex_session = mock.Mock()
+        backend._codex_session = mock.Mock(return_value=codex_session)
+        backend._fetch_model_catalog_endpoint = mock.Mock(
+            side_effect=SearchTimeoutError("codex catalog timed out")
+        )
 
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
+        with self.assertRaises(SearchTimeoutError):
+            backend.list_catalog_models(timeout_secs=0.05)
 
-        result = backend.list_catalog_models()
+        backend._bootstrap.assert_not_called()
+        backend._fetch_model_catalog_endpoint.assert_called_once()
+        codex_session.close.assert_called_once()
 
-        self.assertEqual([item["id"] for item in result["data"]], ["codex-model"])
-        self.assertEqual(backend._fetch_model_catalog_endpoint.call_count, 2)
+    def test_catalog_endpoint_source_selection_is_not_cross_contaminated(self) -> None:
+        for source_type, expected_path, expects_bootstrap in (
+            ("web", "/backend-api/models?history_and_training_disabled=false", True),
+            ("password", "/backend-api/models?history_and_training_disabled=false", True),
+            ("password-oauth", "/backend-api/models?history_and_training_disabled=false", True),
+            ("codex", "/backend-api/codex/models?client_version=0.147.0", False),
+        ):
+            with self.subTest(source_type=source_type):
+                backend = object.__new__(OpenAIBackendAPI)
+                backend.access_token = "source-token"
+                backend.account = {"source_type": source_type}
+                backend.session = mock.Mock()
+                backend._bootstrap = mock.Mock()
+                backend._headers = mock.Mock(return_value={})
+                backend._codex_client_version = mock.Mock(return_value="0.147.0")
+                backend._codex_models_headers = mock.Mock(return_value={})
+                codex_session = mock.Mock()
+                backend._codex_session = mock.Mock(return_value=codex_session)
+                observed: list[tuple[object, str]] = []
+
+                def fetch(session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
+                    observed.append((session, path))
+                    return {"model": {"id": "model"}}
+
+                backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
+                result = backend.list_catalog_models()
+
+                self.assertEqual([item["id"] for item in result["data"]], ["model"])
+                self.assertEqual(len(observed), 1)
+                self.assertEqual(observed[0][1], expected_path)
+                self.assertEqual(backend._bootstrap.called, expects_bootstrap)
+                if not expects_bootstrap:
+                    codex_session.close.assert_called_once()
 
     def test_codex_model_list_rejects_invalid_client_version_before_request(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)

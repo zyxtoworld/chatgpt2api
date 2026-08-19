@@ -432,6 +432,9 @@ class OAuthPublicContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertNotIn("session-1", service._sessions)
         add_items.assert_called_once()
+        persisted = add_items.call_args.args[0]
+        self.assertEqual(persisted[0]["source_type"], "codex")
+        self.assertEqual(persisted[0]["login_source"], "oauth_login")
         refresh_accounts.assert_called_once_with(["access-token"])
         self.assertEqual(commit_finish.call_count, 1)
         self.assertTrue(commit_finish.call_args.args[2])
