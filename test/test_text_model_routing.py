@@ -1169,7 +1169,10 @@ class TextProtocolRoutingTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 400)
 
     def test_anthropic_message_rejects_non_object_message_container(self) -> None:
-        with mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend:
+        with (
+            mock.patch.object(anthropic_v1_messages.account_service, "get_text_access_token", return_value="fixture-token"),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend,
+        ):
             with self.assertRaises(HTTPException) as raised:
                 anthropic_v1_messages.message_request({
                     "model": "auto",
@@ -1650,6 +1653,7 @@ class TextProtocolRoutingTests(unittest.TestCase):
         rendered = anthropic_v1_messages._preprocess_block(
             {
                 "type": "tool_use",
+                "id": "toolu_delimiter",
                 "name": name,
                 "input": {"query": value},
             },
@@ -1661,6 +1665,116 @@ class TextProtocolRoutingTests(unittest.TestCase):
             anthropic_v1_messages.parse_tool_calls(rendered),
             [(name, {"query": value})],
         )
+
+    def test_anthropic_tool_use_preserves_public_tool_use_id(self) -> None:
+        rendered = anthropic_v1_messages._preprocess_block(
+            {
+                "type": "tool_use",
+                "id": "toolu_canary",
+                "name": "lookup",
+                "input": {"query": "value"},
+            },
+            lambda text: text,
+        )["text"]
+
+        self.assertIn("<tool_use_id>toolu_canary</tool_use_id>", rendered)
+        content, stop_reason = anthropic_v1_messages.content_blocks(
+            "<tool_calls><tool_call><tool_use_id>toolu_canary</tool_use_id><tool_name>lookup</tool_name><parameters>{\"query\": \"value\"}</parameters></tool_call></tool_calls>",
+            [{"name": "lookup"}],
+        )
+        self.assertEqual(stop_reason, "tool_use")
+        self.assertEqual(content[0]["id"], "toolu_canary")
+
+        with self.assertRaisesRegex(HTTPException, "tool use id"):
+            anthropic_v1_messages._preprocess_block(
+                {"type": "tool_use", "name": "lookup", "input": {}},
+                lambda text: text,
+            )
+
+    def test_anthropic_tool_id_survives_request_and_stream_response_adapters(self) -> None:
+        backend = mock.Mock()
+        with (
+            mock.patch.object(
+                anthropic_v1_messages.account_service,
+                "get_text_access_token",
+                return_value="fixture-token",
+            ),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI", return_value=backend),
+        ):
+            request = anthropic_v1_messages.message_request({
+                "model": "auto",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_roundtrip",
+                            "name": "lookup",
+                            "input": {"query": "value"},
+                        }],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_roundtrip",
+                            "content": "result",
+                        }],
+                    },
+                ],
+            })
+
+        rendered = "\n".join(str(message["content"]) for message in request.messages)
+        self.assertGreaterEqual(rendered.count("toolu_roundtrip"), 2)
+
+        upstream = [
+            {
+                "choices": [{
+                    "delta": {
+                        "content": "<tool_calls><tool_call><tool_use_id>toolu_roundtrip</tool_use_id><tool_name>lookup</tool_name><parameters>{\"query\": \"value\"}</parameters></tool_call></tool_calls>",
+                    },
+                    "finish_reason": None,
+                }],
+            },
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        events = list(anthropic_v1_messages.stream_events(
+            upstream,
+            "auto",
+            1,
+            lambda text: len(text),
+            [{"name": "lookup"}],
+            backend,
+        ))
+        tool_starts = [
+            event for event in events
+            if event.get("type") == "content_block_start"
+            and event.get("content_block", {}).get("type") == "tool_use"
+        ]
+        self.assertEqual(tool_starts[0]["content_block"]["id"], "toolu_roundtrip")
+
+        with (
+            mock.patch.object(
+                anthropic_v1_messages.account_service,
+                "get_text_access_token",
+                return_value="fixture-token",
+            ),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI", return_value=backend),
+            mock.patch.object(
+                anthropic_v1_messages,
+                "stream_text_chat_completion",
+                return_value=iter((
+                    {"choices": [{"delta": {"content": "<tool_calls><tool_call><tool_use_id>toolu_roundtrip</tool_use_id><tool_name>lookup</tool_name><parameters>{}</parameters></tool_call></tool_calls>"}}]},
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                )),
+            ),
+        ):
+            response = anthropic_v1_messages.handle({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "call lookup"}],
+                "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+            })
+        self.assertEqual(response["content"][0]["id"], "toolu_roundtrip")
 
     def test_anthropic_tool_result_escapes_xml_delimiters(self) -> None:
         rendered = anthropic_v1_messages._preprocess_block(
@@ -1676,11 +1790,74 @@ class TextProtocolRoutingTests(unittest.TestCase):
         self.assertNotIn("</tool_result><tool_call>", rendered)
         self.assertIn("&lt;/tool_result&gt;", rendered)
 
+    def test_anthropic_tool_result_error_flag_is_preserved_and_typed(self) -> None:
+        common = {"type": "tool_result", "tool_use_id": "toolu_error", "content": "failed"}
+        normal = anthropic_v1_messages._preprocess_block(common, lambda text: text)["text"]
+        explicit_false = anthropic_v1_messages._preprocess_block(
+            {**common, "is_error": False}, lambda text: text
+        )["text"]
+        error = anthropic_v1_messages._preprocess_block(
+            {**common, "is_error": True}, lambda text: text
+        )["text"]
+
+        self.assertEqual(normal, explicit_false)
+        self.assertIn("Tool result", normal)
+        self.assertIn("Tool error", error)
+        self.assertNotEqual(normal, error)
+        with self.assertRaisesRegex(HTTPException, "is_error"):
+            anthropic_v1_messages._preprocess_block(
+                {**common, "is_error": "true"}, lambda text: text
+            )
+
+    def test_anthropic_nested_unknown_fields_fail_closed_before_account_selection(self) -> None:
+        cases = (
+            {
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello", "future_message": True}],
+            },
+            {
+                "model": "auto",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "hello", "future_block": True}],
+                }],
+            },
+            {
+                "model": "auto",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_future",
+                        "content": "failed",
+                        "future_result": True,
+                    }],
+                }],
+            },
+        )
+        for body in cases:
+            with self.subTest(body=body), mock.patch.object(
+                anthropic_v1_messages, "OpenAIBackendAPI"
+            ) as backend:
+                with self.assertRaisesRegex(HTTPException, "field"):
+                    anthropic_v1_messages.message_request(body)
+            backend.assert_not_called()
+
     def test_anthropic_unimplemented_generation_controls_are_rejected(self) -> None:
         for field, value in (
-            ("max_tokens", 256),
+            ("cache_control", {"type": "ephemeral"}),
+            ("container", "container-fixture"),
+            ("inference_geo", "global"),
+            ("metadata", {"user_id": "fixture"}),
+            ("output_config", {"format": {"type": "text"}}),
+            ("service_tier", "standard_only"),
             ("stop_sequences", ["END"]),
             ("temperature", 0.2),
+            ("thinking", {"type": "enabled", "budget_tokens": 1024}),
+            ("tool_choice", "auto"),
+            ("top_k", 40),
+            ("top_p", 0.9),
+            ("user_profile_id", "profile-fixture"),
         ):
             with self.subTest(field=field):
                 with mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend_factory:
@@ -1692,6 +1869,419 @@ class TextProtocolRoutingTests(unittest.TestCase):
                         })
                 self.assertEqual(raised.exception.status_code, 400)
                 backend_factory.assert_not_called()
+
+    def test_anthropic_known_unsupported_fields_are_capability_errors(self) -> None:
+        with mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI"):
+            request = anthropic_v1_messages.message_request({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 256,
+            })
+        self.assertEqual(request.max_tokens, 256)
+
+        with self.assertRaises(HTTPException) as raised:
+            anthropic_v1_messages.message_request({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hello"}],
+                "future_parameter": True,
+            })
+
+        self.assertNotIn("future_parameter", str(raised.exception.detail))
+        self.assertIn("message parameter is not supported", str(raised.exception.detail))
+
+    def test_anthropic_max_tokens_bounds_nonstream_and_closes_once(self) -> None:
+        class ClosableChunks:
+            def __init__(self, chunks):
+                self.chunks = iter(chunks)
+                self.close_calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self.chunks)
+
+            def close(self):
+                self.close_calls += 1
+
+        source = ClosableChunks([
+            {"choices": [{"delta": {"content": "hello world"}, "finish_reason": "stop"}]},
+        ])
+        backend = mock.Mock()
+        with (
+            mock.patch.object(anthropic_v1_messages.account_service, "get_text_access_token", return_value="fixture-token"),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI", return_value=backend),
+            mock.patch.object(anthropic_v1_messages, "stream_text_chat_completion", return_value=source),
+        ):
+            response = anthropic_v1_messages.handle({
+                "model": "auto",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+
+        text = response["content"][0]["text"]
+        self.assertLessEqual(anthropic_v1_messages.count_text_tokens(text, "auto"), 1)
+        self.assertEqual(response["stop_reason"], "max_tokens")
+        self.assertEqual(source.close_calls, 1)
+        backend.close.assert_called_once_with()
+
+    def test_anthropic_max_tokens_stream_utf8_and_tool_prefix_are_fail_closed(self) -> None:
+        class ClosableChunks:
+            def __init__(self, chunks):
+                self.chunks = iter(chunks)
+                self.close_calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self.chunks)
+
+            def close(self):
+                self.close_calls += 1
+
+        utf8_source = ClosableChunks([
+            {"choices": [{"delta": {"content": "\U0001fae0x"}, "finish_reason": None}]},
+        ])
+        backend = mock.Mock()
+        with (
+            mock.patch.object(anthropic_v1_messages.account_service, "get_text_access_token", return_value="fixture-token"),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI", return_value=backend),
+            mock.patch.object(anthropic_v1_messages, "stream_text_chat_completion", return_value=utf8_source),
+        ):
+            events = list(anthropic_v1_messages.handle({
+                "model": "auto",
+                "max_tokens": 1,
+                "stream": True,
+                "messages": [{"role": "user", "content": "hello"}],
+            }))
+
+        self.assertEqual(
+            next(event["delta"]["stop_reason"] for event in events if event.get("type") == "message_delta"),
+            "max_tokens",
+        )
+        public_text = "".join(
+            event.get("delta", {}).get("text", "")
+            for event in events
+            if event.get("type") == "content_block_delta"
+        )
+        self.assertNotIn("\ufffd", public_text)
+        self.assertEqual(public_text, "")
+        self.assertLessEqual(anthropic_v1_messages.count_text_tokens(public_text, "auto"), 1)
+        self.assertEqual(utf8_source.close_calls, 1)
+        backend.close.assert_called_once_with()
+
+        encoding = anthropic_v1_messages.encoding_for_model("auto")
+        strict_prefix = anthropic_v1_messages._strict_token_prefix(encoding, [3013])
+        self.assertEqual(strict_prefix, "")
+        self.assertLessEqual(len(encoding.encode(strict_prefix)), 1)
+
+        tool_source = ClosableChunks([
+            {"choices": [{"delta": {"content": "<tool_"}, "finish_reason": None}]},
+            {"choices": [{"delta": {"content": "calls><tool_call><tool_name>lookup</tool_name></tool_call></tool_calls>"}, "finish_reason": "stop"}]},
+        ])
+        tool_backend = mock.Mock()
+        with (
+            mock.patch.object(anthropic_v1_messages.account_service, "get_text_access_token", return_value="fixture-token"),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI", return_value=tool_backend),
+            mock.patch.object(anthropic_v1_messages, "stream_text_chat_completion", return_value=tool_source),
+        ):
+            tool_events = list(anthropic_v1_messages.handle({
+                "model": "auto",
+                "max_tokens": 1,
+                "stream": True,
+                "messages": [{"role": "user", "content": "call"}],
+                "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+            }))
+
+        self.assertFalse(any("<tool_" in json.dumps(event) for event in tool_events))
+        self.assertFalse(any(event.get("content_block", {}).get("type") == "tool_use" for event in tool_events))
+        self.assertEqual(tool_source.close_calls, 1)
+        tool_backend.close.assert_called_once_with()
+
+    def test_anthropic_max_tokens_owner_closes_on_upstream_error_and_consumer_cancel(self) -> None:
+        class FailingChunks:
+            def __init__(self):
+                self.close_calls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise RuntimeError("upstream fixture failure")
+
+            def close(self):
+                self.close_calls += 1
+
+        failing = FailingChunks()
+        backend = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, "fixture failure"):
+            list(anthropic_v1_messages.stream_events(
+                anthropic_v1_messages._MaxTokensStream(failing, "auto", 1),
+                "auto",
+                1,
+                lambda text: len(text),
+                None,
+                backend,
+            ))
+        self.assertEqual(failing.close_calls, 1)
+        backend.close.assert_called_once_with()
+
+        pending = FailingChunks()
+        cancel_backend = mock.Mock()
+        events = anthropic_v1_messages.stream_events(
+            anthropic_v1_messages._MaxTokensStream(pending, "auto", 1),
+            "auto",
+            1,
+            lambda text: len(text),
+            None,
+            cancel_backend,
+        )
+        next(events)
+        next(events)
+        events.close()
+        self.assertEqual(pending.close_calls, 1)
+        cancel_backend.close.assert_called_once_with()
+
+    def test_anthropic_max_tokens_exact_natural_end_is_not_marked_as_truncation(self) -> None:
+        source = iter([
+            {"choices": [{"delta": {"content": "中"}, "finish_reason": "stop"}]},
+        ])
+        backend = mock.Mock()
+        with (
+            mock.patch.object(anthropic_v1_messages.account_service, "get_text_access_token", return_value="fixture-token"),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI", return_value=backend),
+            mock.patch.object(anthropic_v1_messages, "stream_text_chat_completion", return_value=source),
+        ):
+            response = anthropic_v1_messages.handle({
+                "model": "auto",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+        self.assertEqual(response["stop_reason"], "end_turn")
+
+    def test_anthropic_builtin_web_search_maps_to_internal_search_and_citations(self) -> None:
+        search_result = {
+            "answer": "A concise answer",
+            "sources": [{"url": "https://example.com/a", "title": "Example", "snippet": "A cited result"}],
+        }
+        body = {
+            "model": "auto",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "search query"}],
+            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+        }
+        with (
+            mock.patch.object(anthropic_v1_messages, "run_web_search", return_value=search_result) as search,
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend,
+        ):
+            response = anthropic_v1_messages.handle(body)
+
+        search.assert_called_once_with("search query")
+        backend.assert_not_called()
+        self.assertEqual([block["type"] for block in response["content"]], ["server_tool_use", "web_search_tool_result", "text"])
+        self.assertEqual(response["content"][0]["id"], response["content"][1]["tool_use_id"])
+        self.assertEqual(response["content"][2]["citations"][0]["type"], "web_search_result_location")
+        self.assertTrue(response["content"][1]["content"][0]["encrypted_content"].startswith("chatgpt2api-search-v1:"))
+        self.assertEqual(response["usage"]["server_tool_use"], {"web_search_requests": 1})
+        with mock.patch.object(anthropic_v1_messages, "run_web_search", return_value=search_result):
+            events = list(anthropic_v1_messages.handle({**body, "stream": True}))
+        starts = [event for event in events if event.get("type") == "content_block_start"]
+        self.assertEqual([event["content_block"]["type"] for event in starts], ["server_tool_use", "web_search_tool_result", "text"])
+        self.assertEqual(starts[0]["content_block"]["id"], starts[1]["content_block"]["tool_use_id"])
+        self.assertEqual(starts[2]["content_block"]["citations"], [])
+        citation_deltas = [
+            event["delta"]["citation"]
+            for event in events
+            if event.get("type") == "content_block_delta" and event.get("delta", {}).get("type") == "citations_delta"
+        ]
+        self.assertEqual([citation["url"] for citation in citation_deltas], ["https://example.com/a"])
+        self.assertEqual(next(event["delta"]["stop_reason"] for event in events if event.get("type") == "message_delta"), "end_turn")
+
+        def reduce_stream(content_events):
+            blocks = {}
+            for event in content_events:
+                event_type = event.get("type")
+                index = event.get("index")
+                if event_type == "content_block_start":
+                    blocks[index] = dict(event["content_block"])
+                elif event_type == "content_block_delta":
+                    block = blocks[index]
+                    delta = event["delta"]
+                    delta_type = delta["type"]
+                    if delta_type == "input_json_delta":
+                        block["input"] = json.loads(delta["partial_json"])
+                    elif delta_type == "text_delta":
+                        block["text"] = block.get("text", "") + delta["text"]
+                    elif delta_type == "citations_delta":
+                        block.setdefault("citations", []).append(delta["citation"])
+                    else:
+                        raise AssertionError(f"unexpected delta type: {delta_type}")
+                elif event_type == "content_block_stop":
+                    self.assertIn(index, blocks)
+            return [blocks[index] for index in sorted(blocks)]
+
+        streamed_content = reduce_stream(events)
+
+        def canonicalize_ids(content):
+            canonical = []
+            id_map = {}
+            for block in content:
+                item = dict(block)
+                if item.get("type") == "server_tool_use":
+                    id_map[item["id"]] = "toolu_search"
+                    item["id"] = "toolu_search"
+                elif item.get("type") == "web_search_tool_result":
+                    item["tool_use_id"] = id_map.get(item["tool_use_id"], "toolu_search")
+                canonical.append(item)
+            return canonical
+
+        self.assertEqual(canonicalize_ids(streamed_content), canonicalize_ids(response["content"]))
+        with (
+            mock.patch.object(anthropic_v1_messages.account_service, "get_text_access_token", return_value="fixture-token"),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend,
+        ):
+            replay = anthropic_v1_messages.message_request({
+                "model": "auto",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "assistant", "content": response["content"]},
+                    {"role": "user", "content": "follow up"},
+                ],
+            })
+        replay_text = "\n".join(str(message["content"]) for message in replay.messages)
+        self.assertIn("Web search results", replay_text)
+        self.assertNotIn("chatgpt2api-search-v1:", replay_text)
+        self.assertNotIn("<tool_", replay_text)
+        backend.assert_called_once()
+        with (
+            mock.patch.object(anthropic_v1_messages.account_service, "get_text_access_token", return_value="fixture-token"),
+            mock.patch.object(anthropic_v1_messages, "OpenAIBackendAPI") as backend,
+        ):
+            stream_replay = anthropic_v1_messages.message_request({
+                "model": "auto",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "assistant", "content": streamed_content},
+                    {"role": "user", "content": "follow up"},
+                ],
+            })
+        stream_replay_text = "\n".join(str(message["content"]) for message in stream_replay.messages)
+        self.assertIn("Web search results", stream_replay_text)
+        self.assertNotIn("chatgpt2api-search-v1:", stream_replay_text)
+        self.assertNotIn("<tool_", stream_replay_text)
+        backend.assert_called_once()
+        limited_body = {**body, "max_tokens": 1}
+        with mock.patch.object(anthropic_v1_messages, "run_web_search", return_value={**search_result, "answer": "one two three"}):
+            limited = anthropic_v1_messages.handle(limited_body)
+        self.assertEqual([block["type"] for block in limited["content"]], ["server_tool_use", "web_search_tool_result", "text"])
+        self.assertEqual(limited["stop_reason"], "max_tokens")
+        self.assertLessEqual(anthropic_v1_messages.count_text_tokens(limited["content"][2]["text"], "auto"), 1)
+
+        with self.assertRaisesRegex(HTTPException, "filtering"):
+            anthropic_v1_messages.message_request({
+                **body,
+                "tools": [{
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "allowed_domains": ["example.com"],
+                }],
+            })
+
+        with (
+            mock.patch.object(anthropic_v1_messages, "run_web_search") as search,
+            self.assertRaisesRegex(HTTPException, "field"),
+        ):
+            anthropic_v1_messages.message_request({
+                **body,
+                "tools": [{
+                    "type": "web_search_20250305",
+                    "name": "web_search",
+                    "max_uses": 1,
+                    "future_search": True,
+                }],
+            })
+        search.assert_not_called()
+
+        with self.assertRaisesRegex(HTTPException, "tool function"):
+            anthropic_v1_messages.message_request({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "lookup"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                        "future_fn": True,
+                    },
+                }],
+            })
+
+        with self.assertRaisesRegex(HTTPException, "version"):
+            anthropic_v1_messages.message_request({
+                **body,
+                "tools": [{"type": "web_search_20260209", "name": "web_search"}],
+            })
+
+        with self.assertRaisesRegex(HTTPException, "combined"):
+            anthropic_v1_messages.message_request({
+                **body,
+                "tools": [
+                    {"type": "web_search_20250305", "name": "web_search"},
+                    {"name": "lookup", "input_schema": {"type": "object"}},
+                ],
+            })
+
+    def test_anthropic_tool_stream_buffers_complete_and_split_openers(self) -> None:
+        tool = [{"name": "lookup", "input_schema": {"type": "object"}}]
+        complete = "<tool_calls><tool_call><tool_use_id>toolu_1</tool_use_id><tool_name>lookup</tool_name><parameters>{}</parameters></tool_call></tool_calls>"
+        cases = (
+            (complete,),
+            ("<tool_", "calls><tool_call><tool_use_id>toolu_1</tool_use_id><tool_name>lookup</tool_name><parameters>{}</parameters></tool_call></tool_calls>"),
+            ("prose ", complete),
+        )
+        for chunks in cases:
+            with self.subTest(chunks=chunks):
+                events = list(anthropic_v1_messages.stream_events(
+                    [
+                        {"choices": [{"delta": {"content": part}, "finish_reason": None}]}
+                        for part in chunks
+                    ] + [{"choices": [{"delta": {}, "finish_reason": "stop"}]}],
+                    "auto",
+                    1,
+                    lambda text: len(text),
+                    tool,
+                    mock.Mock(),
+                ))
+                text_deltas = [
+                    event["delta"]["text"]
+                    for event in events
+                    if event.get("type") == "content_block_delta" and event.get("delta", {}).get("type") == "text_delta"
+                ]
+                self.assertNotIn("<tool_", "".join(text_deltas))
+                self.assertEqual(
+                    sum(event.get("content_block", {}).get("type") == "tool_use" for event in events if event.get("type") == "content_block_start"),
+                    1,
+                )
+                if chunks == ("prose ", complete):
+                    self.assertEqual("".join(text_deltas), "prose ")
+
+        ordinary = list(anthropic_v1_messages.stream_events(
+            [
+                {"choices": [{"delta": {"content": "a <today>"}, "finish_reason": None}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+            ],
+            "auto",
+            1,
+            lambda text: len(text),
+            tool,
+            mock.Mock(),
+        ))
+        self.assertIn("a <today>", "".join(
+            event["delta"]["text"]
+            for event in ordinary
+            if event.get("type") == "content_block_delta" and event.get("delta", {}).get("type") == "text_delta"
+        ))
 
     def test_chat_text_block_rejects_container_text(self) -> None:
         with self.assertRaises(HTTPException) as raised:

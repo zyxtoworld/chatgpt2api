@@ -669,7 +669,137 @@ class RequestValidationContractTests(unittest.TestCase):
                 self.assertNotIn("fixture-token", response.text)
                 self.assertNotIn("message-container-canary", response.text)
                 selector.assert_not_called()
-                backend.assert_not_called()
+        backend.assert_not_called()
+
+    def test_anthropic_route_rejects_known_unsupported_field_before_account_selection(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+        app.include_router(ai_module.create_router())
+
+        async def invoke(_call, handler, payload, **_kwargs):
+            return handler(payload)
+
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "user-1", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+            mock.patch.object(
+                ai_module.anthropic_v1_messages.account_service,
+                "get_text_access_token",
+                return_value="fixture-token",
+            ) as selector,
+            mock.patch.object(ai_module.anthropic_v1_messages, "OpenAIBackendAPI") as backend,
+        ):
+            response = TestClient(app).post(
+                "/v1/messages",
+                headers={"x-api-key": "fixture-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "auto",
+                    "temperature": 0.2,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("temperature", response.text)
+        selector.assert_not_called()
+        backend.assert_not_called()
+
+    def test_anthropic_route_forwards_extra_body_to_adapter_without_pydantic_drop(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+        app.include_router(ai_module.create_router())
+
+        async def invoke(_call, _handler, payload, **_kwargs):
+            return {"forwarded": payload}
+
+        body = {
+            "model": "auto",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {"type": "object"},
+            }],
+            "metadata": {"user_id": "fixture-user"},
+        }
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "user-1", "role": "user"}),
+            ) as require_identity,
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+        ):
+            response = TestClient(app).post(
+                "/v1/messages",
+                headers={"x-api-key": "fixture-key", "anthropic-version": "2023-06-01"},
+                json=body,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()["forwarded"]
+        self.assertEqual(payload["max_tokens"], 32)
+        self.assertEqual(payload["tools"], body["tools"])
+        self.assertEqual(payload["metadata"], body["metadata"])
+        require_identity.assert_awaited_once_with("Bearer fixture-key")
+
+    def test_anthropic_route_accepts_sdk_shape_through_adapter(self) -> None:
+        app = FastAPI()
+        install_exception_handlers(app)
+        app.include_router(ai_module.create_router())
+
+        async def invoke(_call, handler, payload, **_kwargs):
+            return handler(payload)
+
+        backend = mock.Mock()
+        with (
+            mock.patch.object(
+                ai_module,
+                "require_identity_async",
+                new=mock.AsyncMock(return_value={"id": "user-1", "role": "user"}),
+            ),
+            mock.patch.object(ai_module, "filter_or_log", new=mock.AsyncMock()),
+            mock.patch.object(ai_module.LoggedCall, "run", new=invoke),
+            mock.patch.object(
+                ai_module.anthropic_v1_messages.account_service,
+                "get_text_access_token",
+                return_value="fixture-token",
+            ),
+            mock.patch.object(ai_module.anthropic_v1_messages, "OpenAIBackendAPI", return_value=backend),
+            mock.patch.object(
+                ai_module.anthropic_v1_messages,
+                "stream_text_chat_completion",
+                return_value=iter(({"choices": [{"delta": {"content": "hello"}, "finish_reason": "stop"}]},)),
+            ),
+        ):
+            response = TestClient(app).post(
+                "/v1/messages",
+                headers={"x-api-key": "fixture-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "auto",
+                    "max_tokens": 32,
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [{
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "input_schema": {"type": "object"},
+                    }],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["type"], "message")
+        self.assertEqual(payload["content"], [{"type": "text", "text": "hello"}])
+        self.assertEqual(payload["stop_reason"], "end_turn")
+        backend.close.assert_called_once_with()
 
     def test_anthropic_route_rejects_malformed_image_block_before_backend(self) -> None:
         app = FastAPI()
