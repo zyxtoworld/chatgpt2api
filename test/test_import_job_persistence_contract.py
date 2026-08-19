@@ -712,13 +712,28 @@ def test_cpa_import_preserves_plan_metadata_and_refreshes_only_tokens(
     if use_metadata:
         add_account_items.assert_called_once_with(expected_items)
         add_accounts.assert_not_called()
+        prepared = [cpa_module.account_service._prepare_account_payload(item) for item in expected_items]
+        normalized = [cpa_module.account_service._normalize_account(item) for item in prepared]
+        assert all(isinstance(item, dict) for item in normalized)
+        assert [item["type"] for item in normalized] == [
+            "Pro" if isinstance(value, dict) else "free"
+            for value, _error in outcomes.values()
+        ]
     else:
         add_accounts.assert_called_once_with(["token-free"], source_type="codex")
         add_account_items.assert_not_called()
+        prepared = cpa_module.account_service._prepare_account_payload(
+            {"access_token": "token-free", "source_type": "codex"}
+        )
+        assert prepared is not None
+        normalized = cpa_module.account_service._normalize_account(prepared)
+        assert normalized is not None
+        assert normalized["type"] == "free"
     assert refresh_tokens == [
         item["access_token"] if isinstance(item, dict) else item
         for item, _error in outcomes.values()
     ]
+    assert all(isinstance(token, str) for token in refresh_tokens)
 
 
 def test_cpa_impossible_add_counts_terminate_job_without_refresh(tmp_path) -> None:
@@ -1106,10 +1121,25 @@ def test_sub2api_import_preserves_plan_metadata_and_refreshes_only_tokens(
     if use_metadata:
         add_account_items.assert_called_once_with(expected_items)
         add_accounts.assert_not_called()
+        prepared = [sub2api_module.account_service._prepare_account_payload(item) for item in expected_items]
+        normalized = [sub2api_module.account_service._normalize_account(item) for item in prepared]
+        assert all(isinstance(item, dict) for item in normalized)
+        assert [item["type"] for item in normalized] == [
+            "Pro" if isinstance(value, dict) else "free"
+            for value in values
+        ]
     else:
         add_accounts.assert_called_once_with(["token-free"], source_type="codex")
         add_account_items.assert_not_called()
+        prepared = sub2api_module.account_service._prepare_account_payload(
+            {"access_token": "token-free", "source_type": "codex"}
+        )
+        assert prepared is not None
+        normalized = sub2api_module.account_service._normalize_account(prepared)
+        assert normalized is not None
+        assert normalized["type"] == "free"
     assert refresh_tokens == [item["access_token"] if isinstance(item, dict) else item for item in values]
+    assert all(isinstance(token, str) for token in refresh_tokens)
 
 
 @pytest.mark.parametrize("module", (cpa_module, sub2api_module))
