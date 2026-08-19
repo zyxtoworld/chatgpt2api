@@ -24,9 +24,9 @@ use errors::ApiError;
 use model_pool::{ModelCatalog, ModelStore, PublicModel, project_remote_model_list};
 pub(crate) use protocol_chat::validate_chat_payload;
 use protocol_chat::{
-    NativeRequestContext, native_browser_headers, native_completion_text,
+    NativePowResources, NativeRequestContext, native_browser_headers, native_completion_text,
     native_conversation_payload, native_finish_frame, native_frame, native_role_frame,
-    native_usage, native_usage_for_prompt_tokens, native_usage_frame,
+    native_usage, native_usage_for_prompt_tokens, native_usage_frame, parse_native_pow_resources,
 };
 use protocol_codex_payload::native_codex_responses_payload;
 use protocol_responses::validate_responses_payload;
@@ -1745,132 +1745,11 @@ pub(crate) fn sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-#[derive(Clone, Default)]
-struct NativePowResources {
-    script_sources: Vec<String>,
-    data_build: String,
-}
-
 struct NativeRequirements {
     token: String,
     so_token: Option<String>,
     proof_token: Option<String>,
     turnstile_token: Option<String>,
-}
-
-fn html_attribute(tag: &str, name: &str) -> Option<String> {
-    let bytes = tag.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        while index < bytes.len()
-            && (bytes[index].is_ascii_whitespace() || matches!(bytes[index], b'<' | b'/' | b'>'))
-        {
-            index += 1;
-        }
-        let name_start = index;
-        while index < bytes.len()
-            && !bytes[index].is_ascii_whitespace()
-            && !matches!(bytes[index], b'=' | b'/' | b'>')
-        {
-            index += 1;
-        }
-        if name_start == index {
-            index = index.saturating_add(1);
-            continue;
-        }
-        let attribute_name = &tag[name_start..index];
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() || bytes[index] != b'=' {
-            continue;
-        }
-        index += 1;
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        let value = if index < bytes.len() && matches!(bytes[index], b'"' | b'\'') {
-            let quote = bytes[index];
-            index += 1;
-            let value_start = index;
-            while index < bytes.len() && bytes[index] != quote {
-                index += 1;
-            }
-            let value = tag[value_start..index].to_owned();
-            if index < bytes.len() {
-                index += 1;
-            }
-            value
-        } else {
-            let value_start = index;
-            while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b'>'
-            {
-                index += 1;
-            }
-            tag[value_start..index].to_owned()
-        };
-        if attribute_name.eq_ignore_ascii_case(name) {
-            return Some(value);
-        }
-    }
-    None
-}
-
-fn pow_data_build_from_source(source: &str) -> Option<String> {
-    let start = source.find("c/")?;
-    let suffix = &source[start + 2..];
-    let component_end = suffix.find("/_")?;
-    Some(source[start..start + 2 + component_end + 2].to_owned())
-}
-
-fn parse_native_pow_resources(body: &[u8]) -> NativePowResources {
-    let html = String::from_utf8_lossy(body);
-    let lowercase_html = html.to_ascii_lowercase();
-    let mut script_sources = Vec::new();
-    let mut cursor = 0usize;
-    while script_sources.len() < MAX_POW_SCRIPT_SOURCES {
-        let Some(relative_start) = lowercase_html[cursor..].find("<script") else {
-            break;
-        };
-        let start = cursor + relative_start;
-        let has_script_tag_boundary = lowercase_html
-            .as_bytes()
-            .get(start + "<script".len())
-            .is_none_or(|byte| byte.is_ascii_whitespace() || matches!(*byte, b'/' | b'>'));
-        if !has_script_tag_boundary {
-            cursor = start + "<script".len();
-            continue;
-        }
-        let Some(relative_end) = html[start..].find('>') else {
-            break;
-        };
-        let end = start + relative_end;
-        if let Some(source) = html_attribute(&html[start..=end], "src")
-            && !source.is_empty()
-            && source.chars().count() <= 4096
-        {
-            script_sources.push(source);
-        }
-        cursor = end + 1;
-    }
-    if script_sources.is_empty() {
-        script_sources.push(DEFAULT_POW_SCRIPT.to_owned());
-    }
-    let data_build = script_sources
-        .iter()
-        .find_map(|source| pow_data_build_from_source(source))
-        .or_else(|| {
-            html.find("<html")
-                .or_else(|| lowercase_html.find("<html"))
-                .and_then(|start| html[start..].find('>').map(|end| &html[start..start + end]))
-                .and_then(|tag| html_attribute(tag, "data-build"))
-                .filter(|value| !value.is_empty() && value.chars().count() <= 4096)
-        })
-        .unwrap_or_default();
-    NativePowResources {
-        script_sources,
-        data_build,
-    }
 }
 
 struct NativePowConfigInputs {
