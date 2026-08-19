@@ -1,5 +1,150 @@
-use super::{ApiError, Map, Value};
+use super::{ApiError, Map, Value, native_message_id};
 use base64::Engine;
+use serde_json::json;
+
+pub(crate) fn native_message(message: &Value) -> Result<Value, ApiError> {
+    let object = message.as_object().ok_or_else(ApiError::invalid_request)?;
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(ApiError::invalid_request)?;
+    if matches!(role, "tool" | "developer")
+        || object
+            .get("tool_calls")
+            .is_some_and(|value| !value.is_null())
+    {
+        // Python routes developer messages and tool history to Codex
+        // Responses. The native canary has no Codex translation, so reject
+        // them instead of sending a different backend contract to ChatGPT.
+        return Err(ApiError::unavailable());
+    }
+    let content = object
+        .get("content")
+        .and_then(|value| match value {
+            Value::Null if role == "assistant" => Some(vec![String::new()]),
+            Value::String(text) => Some(vec![text.clone()]),
+            Value::Array(parts) => {
+                let mut text_parts = Vec::new();
+                for part in parts {
+                    let part = part.as_object()?;
+                    let kind = part.get("type")?.as_str()?;
+                    if !matches!(kind, "text" | "input_text" | "output_text") {
+                        return None;
+                    }
+                    text_parts.push(part.get("text")?.as_str()?.to_owned());
+                }
+                if text_parts.is_empty() {
+                    text_parts.push(String::new());
+                }
+                Some(text_parts)
+            }
+            _ => None,
+        })
+        .ok_or_else(ApiError::unavailable)?;
+    Ok(json!({
+        "id": native_message_id(),
+        "author": {"role": role},
+        "content": {"content_type": "text", "parts": content},
+    }))
+}
+
+pub(crate) fn native_conversation_payload(object: &Map<String, Value>) -> Result<Value, ApiError> {
+    if object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(ApiError::unavailable());
+    }
+    let mut messages = Vec::new();
+    if let Some(Value::Array(items)) = object.get("messages")
+        && !items.is_empty()
+    {
+        for item in items {
+            messages.push(native_message(item)?);
+        }
+    } else if let Some(prompt) = object.get("prompt").and_then(Value::as_str) {
+        messages.push(json!({
+            "id": native_message_id(),
+            "author": {"role": "user"},
+            "content": {"content_type": "text", "parts": [prompt.trim()]},
+        }));
+    }
+    if messages.is_empty() {
+        return Err(ApiError::invalid_request());
+    }
+    let thinking_effort = object
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("thinking_effort").and_then(Value::as_str))
+        .or_else(|| {
+            object
+                .get("reasoning")
+                .and_then(Value::as_object)
+                .and_then(|reasoning| reasoning.get("effort"))
+                .and_then(Value::as_str)
+        })
+        .filter(|effort| !effort.is_empty());
+    let mut payload = json!({
+        "action": "next",
+        "messages": messages,
+        "model": object.get("model").cloned().unwrap_or_else(|| json!("auto")),
+        "parent_message_id": native_message_id(),
+        "conversation_mode": {"kind": "primary_assistant"},
+        "conversation_origin": Value::Null,
+        "force_paragen": false,
+        "force_paragen_model_slug": "",
+        "force_rate_limit": false,
+        "force_use_sse": true,
+        "history_and_training_disabled": true,
+        "reset_rate_limits": false,
+        "suggestions": [],
+        "supported_encodings": [],
+        "system_hints": [],
+        "timezone": "Asia/Shanghai",
+        "timezone_offset_min": -480,
+        "variant_purpose": "comparison_implicit",
+        "websocket_request_id": native_message_id(),
+        "client_contextual_info": {
+            "is_dark_mode": false,
+            "time_since_loaded": 120,
+            "page_height": 900,
+            "page_width": 1400,
+            "pixel_ratio": 2,
+            "screen_height": 1440,
+            "screen_width": 2560,
+        },
+    });
+    if let Some(effort) = thinking_effort {
+        payload["thinking_effort"] = Value::String(effort.to_owned());
+    }
+    Ok(payload)
+}
+
+pub(crate) fn native_message_text(message: &Value) -> Result<String, ApiError> {
+    let object = message.as_object().ok_or_else(ApiError::invalid_request)?;
+    let content = object
+        .get("content")
+        .ok_or_else(ApiError::invalid_request)?;
+    let role = object.get("role").and_then(Value::as_str);
+    match content {
+        Value::Null if role == Some("assistant") => Ok(String::new()),
+        Value::String(text) => Ok(text.clone()),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            for part in parts {
+                let part = part.as_object().ok_or_else(ApiError::invalid_request)?;
+                text.push_str(
+                    part.get("text")
+                        .and_then(Value::as_str)
+                        .ok_or_else(ApiError::invalid_request)?,
+                );
+            }
+            Ok(text)
+        }
+        _ => Err(ApiError::invalid_request()),
+    }
+}
 
 fn valid_chat_content(value: &Value, role: &str) -> bool {
     match value {
