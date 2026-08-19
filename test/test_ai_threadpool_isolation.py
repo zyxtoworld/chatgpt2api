@@ -72,16 +72,12 @@ def blocked_stats():
     threading.Event().wait()
 
 async def main():
-    task = asyncio.create_task(
-        system_module._account_stats_async(SimpleNamespace(get_stats=blocked_stats))
+    result = await system_module._account_stats_async(
+        SimpleNamespace(get_stats=blocked_stats)
     )
-    for _ in range(100):
-        if entered.is_set():
-            break
-        await asyncio.sleep(0.01)
+    assert result is None
     assert entered.is_set(), "health probe worker did not start"
     await system_module.wait_for_health_probe_tasks(timeout=0.02)
-    await task
 
 asyncio.run(main())
 '''
@@ -910,6 +906,25 @@ asyncio.run(main())
         anyio.run(scenario)
         gc.collect()
         self.assertTrue(all(reference() is None for reference in owner_refs))
+
+    def test_expired_health_probe_deadline_does_not_leak_stage_guard(self) -> None:
+        async def scenario() -> None:
+            service = SimpleNamespace(get_stats=lambda: {"active": 1})
+            self.assertIsNone(
+                await system_module._account_stats_async(
+                    service,
+                    deadline=anyio.current_time() - 1,
+                )
+            )
+            self.assertEqual(
+                await system_module._account_stats_async(
+                    service,
+                    deadline=anyio.current_time() + 1,
+                ),
+                {"active": 1},
+            )
+
+        anyio.run(scenario)
 
     def test_public_image_reads_and_thumbnail_generation_do_not_run_on_the_asgi_event_loop(self) -> None:
         def image_response(_path: str):

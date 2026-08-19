@@ -179,6 +179,12 @@ async def _bounded_health_io(
     *args,
     deadline: float | None = None,
 ):
+    timeout = _HEALTH_SUBCHECK_TIMEOUT_SECONDS
+    if deadline is not None:
+        timeout = min(timeout, max(0.0, deadline - anyio.current_time()))
+    if timeout <= 0:
+        return None
+
     owner = _health_probe_owner()
     # The worker may outlive the request and even its event loop.  A loop-local
     # lock alone would let a new loop submit another copy of the same stuck
@@ -187,17 +193,11 @@ async def _bounded_health_io(
     if not guard.acquire(blocking=False):
         return None
 
-    timeout = _HEALTH_SUBCHECK_TIMEOUT_SECONDS
-    if deadline is not None:
-        timeout = min(timeout, max(0.0, deadline - anyio.current_time()))
-    if timeout <= 0:
-        return None
-
     # Do not bind a late synchronous worker to the request's event loop.  The
     # public liveness route has a hard deadline, while the synchronous probe
     # may be inside an uninterruptible storage/proxy call.  A stage guard
     # keeps one such late call from multiplying on every health request; the
-    # bounded executor keeps the total number of late calls finite.  The
+    # bounded stage worker keeps the total number of late calls finite.  The
     # concurrent future remains in the loop-scoped owner's registry until the
     # worker really finishes, so loop shutdown never has to drain it.
     try:
