@@ -82,7 +82,7 @@ use tokio::sync::{Mutex, Semaphore};
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 #[cfg(test)]
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 
 pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -888,6 +888,24 @@ impl AccountTypeCatalog {
     }
 
     async fn refresh_inner_with_budget(&self, budget: Duration) {
+        self.refresh_inner_with_deadline_signal(budget, None).await;
+    }
+
+    #[cfg(test)]
+    async fn refresh_inner_with_test_deadline_signal(
+        &self,
+        budget: Duration,
+        deadline_signal: Arc<Notify>,
+    ) {
+        self.refresh_inner_with_deadline_signal(budget, Some(deadline_signal))
+            .await;
+    }
+
+    async fn refresh_inner_with_deadline_signal(
+        &self,
+        budget: Duration,
+        deadline_signal: Option<Arc<tokio::sync::Notify>>,
+    ) {
         if !self.enabled() || self.shutdown_requested.load(Ordering::Acquire) {
             return;
         }
@@ -958,11 +976,20 @@ impl AccountTypeCatalog {
         }
 
         while !active.is_empty() {
-            let result =
+            let result = if let Some(deadline_signal) = deadline_signal.as_ref() {
+                tokio::select! {
+                    _ = deadline_signal.notified() => None,
+                    result = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        active.next(),
+                    ) => result.ok().flatten(),
+                }
+            } else {
                 tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), active.next())
                     .await
                     .ok()
-                    .flatten();
+                    .flatten()
+            };
             let Some(CatalogFetchResult {
                 job,
                 models,
@@ -13737,9 +13764,9 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn cold_catalog_refresh_has_one_deadline_and_bounded_type_concurrency() {
+    async fn cold_catalog_refresh_limits_concurrent_type_jobs() {
         let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-account-type-deadline-{}-{}.json",
+            "chatgpt2api-rust-account-type-concurrency-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -13756,12 +13783,10 @@ data: [DONE]
         .expect("account snapshot");
 
         let started_count = Arc::new(AtomicUsize::new(0));
-        let started = Arc::new(Notify::new());
-        let retry_started = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
+        let started_barrier = Arc::new(Barrier::new(5));
+        let release = Arc::new(Semaphore::new(0));
         let started_for_upstream = started_count.clone();
-        let notify_for_upstream = started.clone();
-        let retry_for_upstream = retry_started.clone();
+        let barrier_for_upstream = started_barrier.clone();
         let release_for_upstream = release.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -13770,17 +13795,15 @@ data: [DONE]
         let upstream_task = tokio::spawn(async move {
             async fn upstream(
                 started_count: Arc<AtomicUsize>,
-                started: Arc<Notify>,
-                retry_started: Arc<Notify>,
-                release: Arc<Notify>,
+                started_barrier: Arc<Barrier>,
+                release: Arc<Semaphore>,
             ) -> Response {
                 let call_number = started_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if call_number > 4 {
-                    retry_started.notify_one();
+                if call_number <= 4 {
+                    started_barrier.wait().await;
                 }
-                started.notify_one();
-                release.notified().await;
-                Json(json!({"object":"list","data":[{"id":"blocked-model"}]})).into_response()
+                release.acquire().await.expect("release permit").forget();
+                Json(json!({"object":"list","data":[{"id":"bounded-model"}]})).into_response()
             }
             axum::serve(
                 listener,
@@ -13789,8 +13812,7 @@ data: [DONE]
                     get(move || {
                         upstream(
                             started_for_upstream.clone(),
-                            notify_for_upstream.clone(),
-                            retry_for_upstream.clone(),
+                            barrier_for_upstream.clone(),
                             release_for_upstream.clone(),
                         )
                     }),
@@ -13813,51 +13835,141 @@ data: [DONE]
         })
         .expect("state");
         let catalog = state.account_type_catalog.clone();
-        let refresh_catalog = catalog.clone();
         let refresh_task = tokio::spawn(async move {
-            refresh_catalog
-                .refresh_inner_with_budget(Duration::from_millis(80))
+            catalog
+                .refresh_inner_with_budget(Duration::from_secs(5))
                 .await;
         });
 
-        tokio::time::timeout(Duration::from_millis(250), async {
-            loop {
-                if started_count.load(Ordering::Acquire) >= 4 {
-                    break;
-                }
-                started.notified().await;
-            }
-        })
-        .await
-        .expect("bounded refresh admitted its fixed number of jobs");
-
-        tokio::time::timeout(Duration::from_secs(2), refresh_task)
+        tokio::time::timeout(Duration::from_secs(5), started_barrier.wait())
             .await
-            .expect("catalog-level deadline")
+            .expect("the fixed concurrency window opened");
+        assert_eq!(
+            started_count.load(Ordering::Acquire),
+            4,
+            "the refresh must admit exactly four jobs before any queued job"
+        );
+
+        release.add_permits(16);
+        tokio::time::timeout(Duration::from_secs(5), refresh_task)
+            .await
+            .expect("bounded refresh completes")
             .expect("refresh task");
+        assert!(
+            started_count.load(Ordering::Acquire) >= 5,
+            "queued jobs may run only after an admitted job completes"
+        );
+
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        fs::remove_file(account_path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn cold_catalog_refresh_shared_deadline_sets_backoff() {
+        let account_path = std::env::temp_dir().join(format!(
+            "chatgpt2api-rust-account-type-deadline-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"free-a","status":"正常","type":"free"},
+                {"access_token":"plus-a","status":"正常","type":"plus"},
+                {"access_token":"team-a","status":"正常","type":"team"},
+                {"access_token":"pro-a","status":"正常","type":"pro"},
+                {"access_token":"enterprise-a","status":"正常","type":"enterprise"}
+            ]"#,
+        )
+        .expect("account snapshot");
+
+        let started_count = Arc::new(AtomicUsize::new(0));
+        let started_barrier = Arc::new(Barrier::new(5));
+        let release = Arc::new(Semaphore::new(0));
+        let started_for_upstream = started_count.clone();
+        let barrier_for_upstream = started_barrier.clone();
+        let release_for_upstream = release.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            async fn upstream(
+                started_count: Arc<AtomicUsize>,
+                started_barrier: Arc<Barrier>,
+                release: Arc<Semaphore>,
+            ) -> Response {
+                let call_number = started_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if call_number <= 4 {
+                    started_barrier.wait().await;
+                    release.acquire().await.expect("release permit").forget();
+                }
+                Json(json!({"object":"list","data":[{"id":"blocked-model"}]})).into_response()
+            }
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/models",
+                    get(move || {
+                        upstream(
+                            started_for_upstream.clone(),
+                            barrier_for_upstream.clone(),
+                            release_for_upstream.clone(),
+                        )
+                    }),
+                ),
+            )
+            .await
+            .expect("upstream server");
+        });
+
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let catalog = state.account_type_catalog.clone();
+        let deadline_signal = Arc::new(Notify::new());
+        let deadline_signal_for_refresh = deadline_signal.clone();
+        let refresh_catalog = catalog.clone();
+        let refresh_task = tokio::spawn(async move {
+            refresh_catalog
+                .refresh_inner_with_test_deadline_signal(
+                    Duration::from_millis(80),
+                    deadline_signal_for_refresh,
+                )
+                .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), started_barrier.wait())
+            .await
+            .expect("the fixed concurrency window opened");
+        deadline_signal.notify_one();
+
+        refresh_task.await.expect("refresh task");
         assert_eq!(
             started_count.load(Ordering::Acquire),
             4,
             "no queued type may start after the shared deadline"
         );
 
-        release.notify_waiters();
         catalog
             .refresh_inner_with_budget(Duration::from_millis(80))
             .await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), retry_started.notified())
-                .await
-                .is_err(),
-            "queued types must inherit the catalog deadline backoff"
-        );
         assert_eq!(
             started_count.load(Ordering::Acquire),
             4,
             "the backoff must suppress an immediate second refresh"
         );
 
-        release.notify_waiters();
         fs::write(
             &account_path,
             r#"[
@@ -13886,7 +13998,7 @@ data: [DONE]
             "a failed new identity must still respect its retry backoff"
         );
 
-        release.notify_waiters();
+        release.add_permits(16);
         upstream_task.abort();
         let _ = upstream_task.await;
         fs::remove_file(account_path).expect("cleanup");
