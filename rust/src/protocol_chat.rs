@@ -805,7 +805,14 @@ fn validate_chat_message(message: &Value) -> bool {
         return false;
     }
     match object.get("content") {
-        Some(Value::Null) if role == "assistant" => true,
+        Some(Value::Null) => true,
+        Some(content) if role == "tool" => match content {
+            Value::Array(_) | Value::String(_) | Value::Null => valid_chat_content(content, role),
+            // Tool output is an application value.  The Python authority
+            // compact-serializes JSON objects, numbers, and booleans for the
+            // Codex Responses input instead of rejecting them here.
+            Value::Object(_) | Value::Number(_) | Value::Bool(_) => true,
+        },
         Some(content) => valid_chat_content(content, role),
         None => role == "assistant" && object.contains_key("tool_calls"),
     }

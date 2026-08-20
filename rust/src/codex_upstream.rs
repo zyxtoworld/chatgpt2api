@@ -1,7 +1,7 @@
 use axum::http::header;
+use base64::Engine;
 use reqwest::RequestBuilder;
 use serde_json::{Map, Value, json};
-use std::collections::HashSet;
 use std::env;
 
 use super::protocol_codex_payload::native_codex_tool;
@@ -92,11 +92,14 @@ pub(super) fn native_codex_message(message: &Value) -> Result<Vec<Value>, ApiErr
     let original_role = object
         .get("role")
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
         .ok_or_else(ApiError::invalid_request)?;
     if original_role == "tool" {
         let call_id = object
             .get("tool_call_id")
             .and_then(Value::as_str)
+            .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(ApiError::invalid_request)?;
         let output = native_tool_output(object.get("content"))?;
@@ -112,71 +115,52 @@ pub(super) fn native_codex_message(message: &Value) -> Result<Vec<Value>, ApiErr
         original_role
     };
     if !matches!(role, "developer" | "user" | "assistant") {
-        return Err(ApiError::unavailable());
+        return Err(ApiError::invalid_request());
     }
-    let content = object
-        .get("content")
-        .and_then(|value| match value {
-            Value::String(text) => Some(vec![json!({"type":"input_text","text":text})]),
-            Value::Array(parts) => {
-                let mut result = Vec::new();
-                for part in parts {
-                    let part = part.as_object()?;
-                    let kind = part.get("type")?.as_str()?;
-                    if !matches!(kind, "text" | "input_text" | "output_text") {
-                        return None;
-                    }
-                    let text = part.get("text")?.as_str()?;
-                    result.push(json!({"type":"input_text","text":text}));
-                }
-                Some(result)
-            }
-            Value::Null if role == "assistant" => Some(Vec::new()),
-            _ => None,
-        })
-        .ok_or_else(ApiError::unavailable)?;
+    let content = native_codex_content_parts(object.get("content"), role)?;
     let tool_calls = object
         .get("tool_calls")
         .filter(|value| !value.is_null())
         .map(|value| value.as_array().ok_or_else(ApiError::invalid_request))
         .transpose()?;
     let mut result = Vec::new();
-    if tool_calls.as_ref().is_none_or(|calls| calls.is_empty()) || !content.is_empty() {
+    if !content.is_empty() {
         result.push(json!({"type":"message","role":role,"content":content}));
     }
     if let Some(tool_calls) = tool_calls {
         for call in tool_calls {
             let call = call.as_object().ok_or_else(ApiError::invalid_request)?;
-            if call.get("type").and_then(Value::as_str) != Some("function") {
+            if call.len() != 3 || call.get("type").and_then(Value::as_str) != Some("function") {
                 return Err(ApiError::invalid_request());
             }
             let id = call
                 .get("id")
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(ApiError::invalid_request)?;
             let function = call
                 .get("function")
                 .and_then(Value::as_object)
                 .ok_or_else(ApiError::invalid_request)?;
+            if function.len() != 2
+                || !function.contains_key("name")
+                || !function.contains_key("arguments")
+            {
+                return Err(ApiError::invalid_request());
+            }
             let name = function
                 .get("name")
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(ApiError::invalid_request)?;
             let arguments = function
                 .get("arguments")
                 .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
                 .ok_or_else(ApiError::invalid_request)?;
-            let parsed: Value =
-                serde_json::from_str(arguments).map_err(|_| ApiError::invalid_request())?;
-            if !parsed.is_object() {
-                return Err(ApiError::invalid_request());
-            }
             result.push(json!({
                 "type":"function_call",
-                "id":id,
                 "call_id":id,
                 "name":name,
                 "arguments":arguments
@@ -189,19 +173,145 @@ pub(super) fn native_codex_message(message: &Value) -> Result<Vec<Value>, ApiErr
     Ok(result)
 }
 
+fn native_codex_content_parts(content: Option<&Value>, role: &str) -> Result<Vec<Value>, ApiError> {
+    let Some(content) = content else {
+        return Ok(Vec::new());
+    };
+    match content {
+        Value::String(text) => Ok(vec![json!({
+            "type": if role == "assistant" { "output_text" } else { "input_text" },
+            "text": text,
+        })]),
+        Value::Null => Ok(Vec::new()),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|part| {
+                let part = part.as_object().ok_or_else(ApiError::invalid_request)?;
+                let kind = part
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(ApiError::invalid_request)?;
+                let mapped = match kind {
+                    "text" | "input_text" | "output_text" => {
+                        if part.keys().any(|key| {
+                            !matches!(key.as_str(), "type" | "text" | "prompt_cache_breakpoint")
+                        }) || part
+                            .get("prompt_cache_breakpoint")
+                            .is_some_and(|value| !value.is_null())
+                        {
+                            return Err(ApiError::invalid_request());
+                        }
+                        let text = part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(ApiError::invalid_request)?;
+                        json!({
+                            "type": if role == "assistant" { "output_text" } else { "input_text" },
+                            "text": text,
+                        })
+                    }
+                    "image_url" | "input_image" if role == "user" => {
+                        if part.keys().any(|key| {
+                            !matches!(
+                                key.as_str(),
+                                "type" | "image_url" | "prompt_cache_breakpoint"
+                            )
+                        }) || part
+                            .get("prompt_cache_breakpoint")
+                            .is_some_and(|value| !value.is_null())
+                        {
+                            return Err(ApiError::invalid_request());
+                        }
+                        let image = part
+                            .get("image_url")
+                            .ok_or_else(ApiError::invalid_request)?;
+                        let (url, detail) = if let Some(url) = image.as_str() {
+                            (url.to_owned(), None)
+                        } else {
+                            let image = image.as_object().ok_or_else(ApiError::invalid_request)?;
+                            if image.keys().any(|key| key != "url" && key != "detail") {
+                                return Err(ApiError::invalid_request());
+                            }
+                            let url = image
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .filter(|url| !url.trim().is_empty())
+                                .ok_or_else(ApiError::invalid_request)?
+                                .to_owned();
+                            let detail = image.get("detail").cloned();
+                            if detail.as_ref().is_some_and(|value| {
+                                !matches!(value.as_str(), Some("auto" | "low" | "high"))
+                            }) {
+                                return Err(ApiError::invalid_request());
+                            }
+                            (url, detail)
+                        };
+                        if url.trim().is_empty() {
+                            return Err(ApiError::invalid_request());
+                        }
+                        let mut value = json!({"type":"input_image","image_url":url});
+                        if let Some(detail) = detail.filter(|value| !value.is_null()) {
+                            value["detail"] = detail;
+                        }
+                        value
+                    }
+                    "input_audio" if role == "user" => {
+                        if part.keys().any(|key| {
+                            !matches!(
+                                key.as_str(),
+                                "type" | "input_audio" | "prompt_cache_breakpoint"
+                            )
+                        }) || part
+                            .get("prompt_cache_breakpoint")
+                            .is_some_and(|value| !value.is_null())
+                        {
+                            return Err(ApiError::invalid_request());
+                        }
+                        let audio = part
+                            .get("input_audio")
+                            .and_then(Value::as_object)
+                            .ok_or_else(ApiError::invalid_request)?;
+                        if audio.len() != 2 {
+                            return Err(ApiError::invalid_request());
+                        }
+                        let data = audio
+                            .get("data")
+                            .and_then(Value::as_str)
+                            .filter(|data| !data.is_empty())
+                            .ok_or_else(ApiError::invalid_request)?;
+                        let format = audio
+                            .get("format")
+                            .and_then(Value::as_str)
+                            .filter(|format| matches!(*format, "wav" | "mp3"))
+                            .ok_or_else(ApiError::invalid_request)?;
+                        let decoded = base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .map_err(|_| ApiError::invalid_request())?;
+                        let _ = decoded;
+                        json!({
+                            "type":"input_audio",
+                            "audio_url":format!(
+                                "data:audio/{};base64,{data}",
+                                if format == "wav" { "wav" } else { "mpeg" }
+                            ),
+                        })
+                    }
+                    _ => return Err(ApiError::invalid_request()),
+                };
+                Ok(mapped)
+            })
+            .collect(),
+        _ => Err(ApiError::invalid_request()),
+    }
+}
+
 fn native_tool_output(content: Option<&Value>) -> Result<String, ApiError> {
     match content {
         Some(Value::String(text)) => Ok(text.clone()),
-        Some(Value::Array(parts)) => {
+        Some(Value::Array(_)) => {
+            let parts = native_codex_content_parts(content, "tool")?;
             let mut output = String::new();
             for part in parts {
-                let part = part.as_object().ok_or_else(ApiError::invalid_request)?;
-                if !matches!(
-                    part.get("type").and_then(Value::as_str),
-                    Some("text") | Some("input_text") | Some("output_text")
-                ) {
-                    return Err(ApiError::invalid_request());
-                }
                 output.push_str(
                     part.get("text")
                         .and_then(Value::as_str)
@@ -211,7 +321,7 @@ fn native_tool_output(content: Option<&Value>) -> Result<String, ApiError> {
             Ok(output)
         }
         Some(Value::Null) | None => Ok(String::new()),
-        Some(_) => Err(ApiError::invalid_request()),
+        Some(value) => serde_json::to_string(value).map_err(|_| ApiError::invalid_request()),
     }
 }
 
@@ -219,29 +329,9 @@ pub(super) fn native_codex_response_payload(
     object: &Map<String, Value>,
 ) -> Result<Value, ApiError> {
     let mut input = Vec::new();
-    let mut function_call_ids = HashSet::new();
     if let Some(messages) = object.get("messages").and_then(Value::as_array) {
         for message in messages {
             for item in native_codex_message(message)? {
-                match item.get("type").and_then(Value::as_str) {
-                    Some("function_call") => {
-                        let call_id = item
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .ok_or_else(ApiError::invalid_request)?;
-                        function_call_ids.insert(call_id.to_owned());
-                    }
-                    Some("function_call_output") => {
-                        let call_id = item
-                            .get("call_id")
-                            .and_then(Value::as_str)
-                            .ok_or_else(ApiError::invalid_request)?;
-                        if !function_call_ids.contains(call_id) {
-                            return Err(ApiError::invalid_request());
-                        }
-                    }
-                    _ => {}
-                }
                 input.push(item);
             }
         }

@@ -163,6 +163,41 @@ impl AccountStore {
         allowed_groups: Option<&HashSet<AccountModelGroup>>,
         required_source_type: Option<&str>,
     ) -> Option<AccountLease> {
+        self.acquire_filtered(
+            model,
+            excluded_tokens,
+            allowed_groups,
+            required_source_type,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn acquire_excluding_with_type_and_capability_filter(
+        &self,
+        model: &str,
+        excluded_tokens: &HashSet<String>,
+        allowed_groups: Option<&HashSet<AccountModelGroup>>,
+        required_capability: Option<&str>,
+    ) -> Option<AccountLease> {
+        self.acquire_filtered(
+            model,
+            excluded_tokens,
+            allowed_groups,
+            None,
+            required_capability,
+        )
+        .await
+    }
+
+    async fn acquire_filtered(
+        &self,
+        model: &str,
+        excluded_tokens: &HashSet<String>,
+        allowed_groups: Option<&HashSet<AccountModelGroup>>,
+        required_source_type: Option<&str>,
+        required_capability: Option<&str>,
+    ) -> Option<AccountLease> {
         if !self.reload().await {
             return None;
         }
@@ -176,6 +211,17 @@ impl AccountStore {
             let slot = accounts[(start.wrapping_add(offset)) % accounts.len()].clone();
             if excluded_tokens.contains(&slot.record.token)
                 || required_source_type.is_some_and(|source| slot.record.source_type != source)
+                || required_capability.is_some_and(|capability| {
+                    let matches_capability = match capability {
+                        "codex" => slot.record.source_type == "codex",
+                        "web" => matches!(
+                            slot.record.source_type.as_str(),
+                            "web" | "password" | "password-oauth"
+                        ),
+                        _ => false,
+                    };
+                    !matches_capability
+                })
                 || matches!(slot.record.status.as_str(), "禁用" | "限流" | "异常")
             {
                 continue;

@@ -4252,26 +4252,12 @@ async fn chat_completions_with_timeout(
     if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
         let chat_payload = native_conversation_payload(&object);
         let codex_payload = native_codex_response_payload(&object);
-        if chat_payload.is_err() && codex_payload.is_err() {
-            return Err(ApiError::unavailable());
-        }
-        if chat_payload.is_err()
-            && state
-                .account_store
-                .acquire_excluding_with_type_and_source_filter(
-                    object
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .unwrap_or("auto"),
-                    &HashSet::new(),
-                    None,
-                    Some("codex"),
-                )
-                .await
-                .is_none()
-        {
-            return Err(ApiError::unavailable());
-        }
+        let required_capability = match (chat_payload.is_ok(), codex_payload.is_ok()) {
+            (true, true) => None,
+            (true, false) => Some("web"),
+            (false, true) => Some("codex"),
+            (false, false) => return Err(ApiError::invalid_request()),
+        };
         let model = object
             .get("model")
             .and_then(Value::as_str)
@@ -4334,18 +4320,40 @@ async fn chat_completions_with_timeout(
         } else {
             HashSet::new()
         };
-        let required_source_type = (source_types.len() == 1)
+        if let Some(capability) = required_capability
+            && !source_types.is_empty()
+            && !source_types.iter().any(|source| match capability {
+                "codex" => source == "codex",
+                "web" => matches!(source.as_str(), "web" | "password" | "password-oauth"),
+                _ => false,
+            })
+        {
+            return Err(ApiError::model_unavailable());
+        }
+        let required_source_type = (required_capability.is_none() && source_types.len() == 1)
             .then(|| source_types.into_iter().next().expect("source type"));
-        let mut lease = state
-            .account_store
-            .acquire_excluding_with_type_and_source_filter(
-                model,
-                &HashSet::new(),
-                allowed_account_types.as_ref(),
-                required_source_type.as_deref(),
-            )
-            .await;
-        if lease.is_none() && !allows_anonymous {
+        let mut lease = if let Some(capability) = required_capability {
+            state
+                .account_store
+                .acquire_excluding_with_type_and_capability_filter(
+                    model,
+                    &HashSet::new(),
+                    allowed_account_types.as_ref(),
+                    Some(capability),
+                )
+                .await
+        } else {
+            state
+                .account_store
+                .acquire_excluding_with_type_and_source_filter(
+                    model,
+                    &HashSet::new(),
+                    allowed_account_types.as_ref(),
+                    required_source_type.as_deref(),
+                )
+                .await
+        };
+        if lease.is_none() && (required_capability == Some("codex") || !allows_anonymous) {
             return Err(ApiError::unavailable());
         }
         let mut transient_failover_used = false;
@@ -4380,15 +4388,27 @@ async fn chat_completions_with_timeout(
                 Err((error, retryable)) if retryable && !transient_failover_used => {
                     transient_failover_used = true;
                     drop(lease);
-                    lease = state
-                        .account_store
-                        .acquire_excluding_with_type_and_source_filter(
-                            model,
-                            &attempted_tokens,
-                            allowed_account_types.as_ref(),
-                            required_source_type.as_deref(),
-                        )
-                        .await;
+                    lease = if let Some(capability) = required_capability {
+                        state
+                            .account_store
+                            .acquire_excluding_with_type_and_capability_filter(
+                                model,
+                                &attempted_tokens,
+                                allowed_account_types.as_ref(),
+                                Some(capability),
+                            )
+                            .await
+                    } else {
+                        state
+                            .account_store
+                            .acquire_excluding_with_type_and_source_filter(
+                                model,
+                                &attempted_tokens,
+                                allowed_account_types.as_ref(),
+                                required_source_type.as_deref(),
+                            )
+                            .await
+                    };
                     if lease.is_none() {
                         return Err(error);
                     }
@@ -6997,6 +7017,68 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn account_store_capability_filter_is_source_safe_and_fail_closed() {
+        let path = std::env::temp_dir().join(format!(
+            "chatgpt2api-rust-capability-filter-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &path,
+            r#"{"items":[
+                {"access_token":"web-token","status":"正常","source_type":"web"},
+                {"access_token":"password-token","status":"正常","source_type":"password"},
+                {"access_token":"password-oauth-token","status":"正常","source_type":"password-oauth"},
+                {"access_token":"codex-token","status":"正常","source_type":"codex"}
+            ]}"#,
+        )
+        .expect("capability fixture");
+        let store = AccountStore::load(Some(&path)).expect("account store");
+
+        let codex = store
+            .acquire_excluding_with_type_and_capability_filter(
+                "auto",
+                &HashSet::new(),
+                None,
+                Some("codex"),
+            )
+            .await
+            .expect("codex candidate");
+        assert_eq!(codex.source_type(), "codex");
+        drop(codex);
+
+        for _ in 0..3 {
+            let web = store
+                .acquire_excluding_with_type_and_capability_filter(
+                    "auto",
+                    &HashSet::new(),
+                    None,
+                    Some("web"),
+                )
+                .await
+                .expect("web-compatible candidate");
+            assert!(matches!(
+                web.source_type(),
+                "web" | "password" | "password-oauth"
+            ));
+            drop(web);
+        }
+        assert!(
+            store
+                .acquire_excluding_with_type_and_capability_filter(
+                    "auto",
+                    &HashSet::new(),
+                    None,
+                    Some("future-capability"),
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(store.inflight(), 0);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
     async fn account_snapshot_rejects_explicit_invalid_statuses_and_defaults_missing_status() {
         let path = std::env::temp_dir().join(format!(
             "chatgpt2api-rust-accounts-status-{}-{}.json",
@@ -8313,7 +8395,7 @@ data: [DONE]
             .await
             .expect("tool-call response");
         assert_eq!(dropped_tool_call.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(call_log.lock().await.is_empty());
+        assert_eq!(*call_log.lock().await, vec!["bootstrap"]);
         assert_eq!(state.account_store.inflight(), 0);
 
         let response = state
@@ -9014,6 +9096,62 @@ data: [DONE]
     }
 
     #[test]
+    fn native_codex_chat_payload_matches_python_tool_and_multimodal_contract() {
+        let payload = validate_chat_payload(json!({
+            "model": "auto",
+            "messages": [
+                {"role":"user","content":[
+                    {"type":"image_url","image_url":{"url":"https://example.test/a.png","detail":"high"}},
+                    {"type":"input_audio","input_audio":{"data":"aGVsbG8=","format":"wav"}}
+                ]},
+                {"role":"assistant","content":"answer","tool_calls":[{
+                    "id":" call-1 ","type":"function",
+                    "function":{"name":" lookup ","arguments":""}
+                }]},
+                {"role":"tool","tool_call_id":" call-1 ","content":{"ok":true}}
+            ]
+        }))
+        .expect("validated multimodal tool payload");
+        let converted = native_codex_response_payload(&payload).expect("Python-compatible payload");
+        assert_eq!(converted["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(converted["input"][0]["content"][0]["detail"], "high");
+        assert_eq!(converted["input"][0]["content"][1]["type"], "input_audio");
+        assert_eq!(converted["input"][1]["content"][0]["type"], "output_text");
+        assert_eq!(converted["input"][2]["type"], "function_call");
+        assert_eq!(converted["input"][2]["call_id"], "call-1");
+        assert!(converted["input"][2].get("id").is_none());
+        assert_eq!(converted["input"][2]["name"], "lookup");
+        assert_eq!(converted["input"][2]["arguments"], "");
+        assert_eq!(converted["input"][3]["output"], "{\"ok\":true}");
+
+        let omitted_content = validate_chat_payload(json!({
+            "model":"auto",
+            "messages":[{"role":"assistant","tool_calls":[{
+                "id":"call-2","type":"function",
+                "function":{"name":"lookup","arguments":""}
+            }]}]
+        }))
+        .expect("assistant tool calls may omit content");
+        let omitted_content = native_codex_response_payload(&omitted_content)
+            .expect("omitted assistant content remains convertible");
+        assert_eq!(omitted_content["input"][0]["type"], "function_call");
+
+        for arguments in ["{malformed", "[]"] {
+            let payload = validate_chat_payload(json!({
+                "model":"auto",
+                "messages":[{"role":"assistant","content":null,"tool_calls":[{
+                    "id":"call-1","type":"function",
+                    "function":{"name":"lookup","arguments":arguments}
+                }]}]
+            }))
+            .expect("validated string arguments");
+            let converted =
+                native_codex_response_payload(&payload).expect("arguments remain opaque strings");
+            assert_eq!(converted["input"][0]["arguments"], arguments);
+        }
+    }
+
+    #[test]
     fn native_payload_rejects_developer_messages_without_codex_route() {
         let payload = validate_chat_payload(json!({
             "model": "auto",
@@ -9174,9 +9312,9 @@ data: [DONE]
     #[test]
     fn native_codex_sse_ignores_done_sentinel_before_explicit_completion() {
         let body = concat!(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"item_id\":\"msg-1\",\"delta\":\"ok\",\"logprobs\":[],\"output_index\":0,\"sequence_number\":0}\n\n",
             "data: [DONE]\n\n",
-            "data: {\"type\":\"response.completed\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-1\",\"output\":[{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[]}]}]}}\n\n",
         );
         assert_eq!(
             native_codex_text(body.as_bytes()).expect("Codex stream"),
@@ -10643,9 +10781,9 @@ data: [DONE]
                                 (
                                     [(header::CONTENT_TYPE, "text/event-stream")],
                                     Body::from(
-                                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"codex ok\"}\n\n\
+                                        "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"item_id\":\"msg-1\",\"delta\":\"codex ok\",\"logprobs\":[],\"output_index\":0,\"sequence_number\":0}\n\n\
                                          data: [DONE]\n\n\
-                                         data: {\"type\":\"response.completed\"}\n\n",
+                                         data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-codex\",\"output\":[{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"codex ok\",\"annotations\":[]}]}]}}\n\n",
                                     ),
                                 )
                                     .into_response()
@@ -13971,13 +14109,15 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_chat_binds_codex_lease_to_codex_endpoint_for_static_model_collision() {
+    async fn native_chat_tool_history_forces_codex_when_model_supports_web_and_codex() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
         let address = listener.local_addr().expect("address");
         let codex_calls = Arc::new(AtomicUsize::new(0));
         let codex_calls_for_upstream = codex_calls.clone();
+        let web_calls = Arc::new(AtomicUsize::new(0));
+        let web_calls_for_upstream = web_calls.clone();
         let upstream_ready = Arc::new(Notify::new());
         let upstream_ready_for_task = upstream_ready.clone();
         let codex = post(move |request: axum::extract::Request| {
@@ -14001,21 +14141,29 @@ data: [DONE]
                 (
                     [(header::CONTENT_TYPE, "text/event-stream")],
                     Body::from(
-                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n\
-                     data: {\"type\":\"response.completed\"}\n\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"item_id\":\"msg-1\",\"delta\":\"ok\",\"logprobs\":[],\"output_index\":0,\"sequence_number\":0}\n\n\
+                     data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-chat\",\"output\":[{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[]}]}]}}\n\n",
                     ),
                 )
                     .into_response()
             }
         });
-        let web = get(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        let web = post(move || {
+            let web_calls = web_calls_for_upstream.clone();
+            async move {
+                web_calls.fetch_add(1, Ordering::SeqCst);
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        });
+        let root = get(|| async { StatusCode::OK });
         let upstream = tokio::spawn(async move {
             upstream_ready_for_task.notify_one();
             axum::serve(
                 listener,
                 Router::new()
                     .route("/backend-api/codex/responses", codex)
-                    .route("/", web),
+                    .route("/backend-api/conversation", web)
+                    .route("/", root),
             )
             .await
             .expect("upstream server");
@@ -14075,35 +14223,50 @@ data: [DONE]
                     models: Arc::new(vec![catalog_model]),
                     model_sources: HashMap::from([(
                         "collision-model".to_owned(),
-                        HashSet::from(["codex".to_owned()]),
+                        HashSet::from(["web".to_owned(), "codex".to_owned()]),
                     )]),
                     ready: true,
-                    tokens: vec!["codex-token".to_owned()],
+                    tokens: vec!["web-token".to_owned(), "codex-token".to_owned()],
                     owners: CatalogOwners::with_model_sources(
-                        vec![CatalogAccountCandidate {
-                            token: "codex-token".to_owned(),
-                            source_type: "codex".to_owned(),
-                            chatgpt_account_id: Some("codex-account".to_owned()),
-                        }],
+                        vec![
+                            CatalogAccountCandidate {
+                                token: "web-token".to_owned(),
+                                source_type: "web".to_owned(),
+                                chatgpt_account_id: None,
+                            },
+                            CatalogAccountCandidate {
+                                token: "codex-token".to_owned(),
+                                source_type: "codex".to_owned(),
+                                chatgpt_account_id: Some("codex-account".to_owned()),
+                            },
+                        ],
                         HashMap::from([(
                             "collision-model".to_owned(),
-                            HashSet::from(["codex".to_owned()]),
+                            HashSet::from(["web".to_owned(), "codex".to_owned()]),
                         )]),
                     ),
                     expires_at: Instant::now() + Duration::from_secs(60),
                     retry_at: Instant::now(),
                 },
             );
-            catalog
-                .live_tokens
-                .insert(catalog_group, vec!["codex-token".to_owned()]);
+            catalog.live_tokens.insert(
+                catalog_group,
+                vec!["web-token".to_owned(), "codex-token".to_owned()],
+            );
             catalog.live_candidates.insert(
                 "pro".to_owned(),
-                vec![CatalogAccountCandidate {
-                    token: "codex-token".to_owned(),
-                    source_type: "codex".to_owned(),
-                    chatgpt_account_id: Some("codex-account".to_owned()),
-                }],
+                vec![
+                    CatalogAccountCandidate {
+                        token: "web-token".to_owned(),
+                        source_type: "web".to_owned(),
+                        chatgpt_account_id: None,
+                    },
+                    CatalogAccountCandidate {
+                        token: "codex-token".to_owned(),
+                        source_type: "codex".to_owned(),
+                        chatgpt_account_id: Some("codex-account".to_owned()),
+                    },
+                ],
             );
         }
         let response = state
@@ -14115,7 +14278,7 @@ data: [DONE]
                     .header(header::AUTHORIZATION, "Bearer client")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"model":"collision-model","messages":[{"role":"user","content":"hi"}]}"#,
+                        r#"{"model":"collision-model","messages":[{"role":"user","content":"look up"},{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":""}}]},{"role":"tool","tool_call_id":"call-1","content":{"ok":true}}]}"#,
                     ))
                     .expect("request"),
             )
@@ -14132,6 +14295,7 @@ data: [DONE]
         assert_eq!(value["choices"][0]["message"]["content"], "ok");
         assert_eq!(state.account_store.inflight(), 0);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 0);
 
         let unknown = state
             .router()
@@ -14270,7 +14434,7 @@ data: [DONE]
                     if error_next.swap(false, Ordering::SeqCst) {
                         let chunks = stream::iter(vec![
                             Ok::<Bytes, std::io::Error>(Bytes::from(
-                                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-error\"}}\n\n",
+                                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-error\"},\"sequence_number\":0}\n\n",
                             )),
                             Err(std::io::Error::other("upstream body error")),
                         ]);
@@ -14283,7 +14447,7 @@ data: [DONE]
                     if hang_next.swap(false, Ordering::SeqCst) {
                         let first = stream::once(async {
                             Ok::<Bytes, std::convert::Infallible>(Bytes::from(
-                                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-pending\"}}\n\n",
+                                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-pending\"},\"sequence_number\":0}\n\n",
                             ))
                         });
                         let rest = stream::pending::<Result<Bytes, std::convert::Infallible>>();
@@ -14296,10 +14460,10 @@ data: [DONE]
                     (
                         [(header::CONTENT_TYPE, "text/event-stream")],
                         Body::from(
-                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-test\",\"model\":\"gpt-test\",\"status\":\"in_progress\"}}\n\n\
-                             data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n\
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-test\",\"model\":\"gpt-test\",\"status\":\"in_progress\"},\"sequence_number\":0}\n\n\
+                             data: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"item_id\":\"msg-1\",\"delta\":\"hello\",\"logprobs\":[],\"output_index\":0,\"sequence_number\":1}\n\n\
                              data: [DONE]\n\n\
-                             data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-test\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\",\"annotations\":[]}]}]}}\n\n",
+                             data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp-test\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\",\"annotations\":[]}]}]}}\n\n",
                         ),
                     )
                         .into_response()
@@ -14587,13 +14751,13 @@ data: [DONE]
                     captured.lock().await.push(payload.clone());
                     let is_search = payload["tools"][0]["type"] == "web_search";
                     let body = if is_search {
-                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-search\"}}\n\n\
-                         data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}}}\n\n\
-                         data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-1\",\"delta\":\"Rust answer\"}\n\n\
-                         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-search\",\"usage\":{\"output_tokens\":4},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Rust answer\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\",\"start_index\":0,\"end_index\":4}]}]}]}}\n\n"
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-search\"},\"sequence_number\":0}\n\n\
+                         data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"sequence_number\":1,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}}}\n\n\
+                         data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-1\",\"content_index\":0,\"output_index\":1,\"delta\":\"Rust answer\",\"logprobs\":[],\"sequence_number\":2}\n\n\
+                         data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp-search\",\"usage\":{\"output_tokens\":4},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}},{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Rust answer\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\",\"start_index\":0,\"end_index\":4}]}]}]}}\n\n"
                     } else {
-                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-function\"}}\n\n\
-                         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-function\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-1\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"rust\\\"}\"}]}}\n\n"
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-function\"},\"sequence_number\":0}\n\n\
+                         data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-function\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-1\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"rust\\\"}\"}]}}\n\n"
                     };
                     (
                         [(header::CONTENT_TYPE, "text/event-stream")],
@@ -14918,11 +15082,11 @@ data: [DONE]
         assert_eq!(payload["tools"][0]["name"], "lookup");
         assert_eq!(payload["tools"][0]["strict"], true);
 
-        let completed = br#"data: {"type":"response.created","response":{"id":"resp-1"}}
+        let completed = br#"data: {"type":"response.created","response":{"id":"resp-1"},"sequence_number":0}
 
-data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{\"q\":\"rust\"}"}}
+data: {"type":"response.output_item.done","output_index":0,"sequence_number":1,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{\"q\":\"rust\"}"}}
 
-data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{\"q\":\"rust\"}"}]}}
+data: {"type":"response.completed","sequence_number":2,"response":{"id":"resp-1","output":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{\"q\":\"rust\"}"}]}}
 
 "#;
         let response = native_codex_responses_json(completed, "gpt-test").expect("response");
@@ -14946,9 +15110,9 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"
         let payload = native_codex_responses_payload(&object).expect("search payload");
         assert_eq!(payload["tools"][0]["type"], "web_search");
         assert_eq!(payload["tools"][0]["search_context_size"], "high");
-        let completed = br#"data: {"type":"response.created","response":{"id":"resp-search"}}
+        let completed = br#"data: {"type":"response.created","response":{"id":"resp-search"},"sequence_number":0}
 
-data: {"type":"response.completed","response":{"id":"resp-search","output":[{"type":"web_search_call","id":"ws-1","status":"completed","action":{"type":"search","query":"latest news"}},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":6}]}]}]}}
+data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp-search","output":[{"type":"web_search_call","id":"ws-1","status":"completed","action":{"type":"search","query":"latest news"}},{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Answer","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":6}]}]}]}}
 
 "#;
         let response = native_codex_responses_json(completed, "gpt-test").expect("response");
@@ -15032,21 +15196,289 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}
 
     #[test]
     fn native_responses_known_lifecycle_events_are_not_unknown() {
-        let body = br#"data: {"type":"response.created","response":{"id":"resp-1"}}
+        let body = br#"data: {"type":"response.created","response":{"id":"resp-1"},"sequence_number":0}
 
-data: {"type":"response.content_part.added","item_id":"msg-1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}
+data: {"type":"response.content_part.added","item_id":"msg-1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""},"sequence_number":1}
 
-data: {"type":"response.content_part.done","item_id":"msg-1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hello"}}
+data: {"type":"response.content_part.done","item_id":"msg-1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hello"},"sequence_number":2}
 
-data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}}
+data: {"type":"response.output_item.done","output_index":1,"sequence_number":3,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}}
 
-data: {"type":"response.function_call_arguments.done","item_id":"fc-1","output_index":1,"arguments":"{}"}
+data: {"type":"response.function_call_arguments.done","item_id":"fc-1","output_index":1,"name":"lookup","arguments":"{}","sequence_number":4}
 
-data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}]},{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}]}}
+data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp-1","output":[{"type":"message","id":"msg-1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"hello","annotations":[]}]},{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}]}}
 
 "#;
         native_codex_responses_json(body, "gpt-test")
             .expect("known Responses lifecycle must be accepted");
+    }
+
+    #[test]
+    fn native_responses_official_lifecycle_and_metadata_events_are_projected_or_dropped() {
+        let body = br#"data: {"type":"response.created","response":{"id":"resp-1"},"sequence_number":0}
+
+data: {"type":"response.metadata","secret":"must-not-leak"}
+
+data: {"type":"codex.response.metadata","secret":"must-not-leak"}
+
+data: {"type":"responsesapi.websocket_timing","private":true}
+
+data: {"type":"response.web_search_call.in_progress","item_id":"search-1","output_index":0,"sequence_number":1}
+
+data: {"type":"response.web_search_call.searching","item_id":"search-1","output_index":0,"sequence_number":2}
+
+data: {"type":"response.web_search_call.completed","item_id":"search-1","output_index":0,"sequence_number":3}
+
+data: {"type":"response.reasoning_summary_part.added","item_id":"reason-1","output_index":1,"summary_index":0,"part":{},"sequence_number":4}
+
+data: {"type":"response.reasoning_summary_part.done","item_id":"reason-1","output_index":1,"summary_index":0,"part":{},"sequence_number":5}
+
+data: {"type":"response.reasoning_summary_text.delta","item_id":"reason-1","output_index":1,"summary_index":0,"delta":"private reasoning","sequence_number":6}
+
+data: {"type":"response.reasoning_summary_text.done","item_id":"reason-1","output_index":1,"summary_index":0,"text":"private reasoning","sequence_number":7}
+
+data: {"type":"response.reasoning_text.delta","item_id":"reason-1","output_index":1,"content_index":0,"delta":"private reasoning","sequence_number":8}
+
+data: {"type":"response.reasoning_text.done","item_id":"reason-1","output_index":1,"content_index":0,"text":"private reasoning","sequence_number":9}
+
+data: {"type":"response.refusal.delta","item_id":"msg-1","output_index":0,"content_index":0,"delta":"refusal","sequence_number":10}
+
+data: {"type":"response.refusal.done","item_id":"msg-1","output_index":0,"content_index":0,"refusal":"refusal","sequence_number":11}
+
+data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://example.test"},"annotation_index":0,"content_index":0,"item_id":"msg-1","output_index":0,"sequence_number":12}
+
+data: {"type":"response.completed","sequence_number":13,"response":{"id":"resp-1","output":[]}}
+
+"#;
+        let response = native_codex_responses_json(body, "gpt-test")
+            .expect("official known lifecycle events are accepted");
+        let rendered = serde_json::to_string(&response).expect("response JSON");
+        assert!(!rendered.contains("must-not-leak"));
+        assert!(!rendered.contains("private reasoning"));
+    }
+
+    #[test]
+    fn native_responses_function_arguments_remain_opaque_strings() {
+        for arguments in ["", "[]", "{malformed"] {
+            let frame = |value: Value| {
+                format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&value).expect("frame JSON")
+                )
+            };
+            let body = [
+                frame(json!({"type":"response.created","response":{"id":"resp-1"},"sequence_number":0})),
+                frame(json!({
+                    "type":"response.function_call_arguments.done",
+                    "item_id":"fc-1","output_index":0,"name":"lookup","arguments":arguments,"sequence_number":1
+                })),
+                frame(json!({
+                    "type":"response.completed","response":{
+                        "id":"resp-1","output":[{
+                            "type":"function_call","id":"fc-1","call_id":"call-1",
+                            "name":"lookup","arguments":arguments
+                        }]
+                    },"sequence_number":2
+                })),
+            ]
+            .concat();
+            let response = native_codex_responses_json(body.as_bytes(), "gpt-test")
+                .expect("arguments are opaque strings");
+            assert_eq!(response["output"][0]["arguments"], arguments);
+            let chat = native_codex_response_to_chat(&response, "gpt-test")
+                .expect("chat projection preserves arguments");
+            assert_eq!(
+                chat["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+                arguments
+            );
+        }
+    }
+
+    #[test]
+    fn native_responses_extended_event_families_require_their_schema_fields() {
+        let frame = |value: Value| {
+            format!(
+                "data: {}\n\n",
+                serde_json::to_string(&value).expect("frame JSON")
+            )
+        };
+        let mut events = vec![
+            json!({"type":"response.created","response":{"id":"resp-1"},"sequence_number":0}),
+            json!({"type":"response.queued","response":{"id":"resp-1"},"sequence_number":1}),
+            json!({"type":"response.image_generation_call.partial_image","item_id":"img-1","output_index":0,"partial_image_b64":"aGVsbG8=","partial_image_index":0,"sequence_number":2}),
+            json!({"type":"response.mcp_call_arguments.delta","item_id":"mcp-1","output_index":1,"delta":"{","sequence_number":3}),
+            json!({"type":"response.mcp_call_arguments.done","item_id":"mcp-1","output_index":1,"arguments":"{}","sequence_number":4}),
+            json!({"type":"response.mcp_call.failed","item_id":"mcp-1","output_index":1,"sequence_number":5}),
+            json!({"type":"response.mcp_list_tools.in_progress","item_id":"mcp-list-1","output_index":2,"sequence_number":6}),
+            json!({"type":"response.mcp_list_tools.completed","item_id":"mcp-list-1","output_index":2,"sequence_number":7}),
+            json!({"type":"response.mcp_list_tools.failed","item_id":"mcp-list-1","output_index":2,"sequence_number":8}),
+            json!({"type":"response.code_interpreter_call_code.delta","item_id":"code-1","output_index":3,"delta":"print(1)","sequence_number":9}),
+            json!({"type":"response.code_interpreter_call_code.done","item_id":"code-1","output_index":3,"code":"print(1)","sequence_number":10}),
+            json!({"type":"response.audio.transcript.delta","delta":"hello","sequence_number":11}),
+            json!({"type":"response.audio.transcript.done","sequence_number":12}),
+            json!({"type":"response.shell_call_command.added","command":"echo hi","command_index":0,"output_index":4,"sequence_number":13}),
+            json!({"type":"response.shell_call_command.delta","delta":"!","command_index":0,"output_index":4,"sequence_number":14}),
+            json!({"type":"response.shell_call_command.done","command":"echo hi","command_index":0,"output_index":4,"sequence_number":15}),
+            json!({"type":"response.shell_call_output_content.delta","delta":{"stdout":"hi"},"item_id":"shell-output-1","command_index":0,"output_index":4,"sequence_number":16}),
+            json!({"type":"response.shell_call_output_content.done","item_id":"shell-output-1","command_index":0,"output":[],"output_index":4,"sequence_number":17}),
+            json!({"type":"response.completed","sequence_number":18,"response":{"id":"resp-1","output":[]}}),
+        ];
+        let body = events.drain(..).map(frame).collect::<String>();
+        native_codex_responses_json(body.as_bytes(), "gpt-test")
+            .expect("valid official event families");
+
+        for invalid in [
+            json!({"type":"response.queued","response":{"id":"resp-1"}}),
+            json!({"type":"response.mcp_call_arguments.delta","item_id":"mcp-1","output_index":1,"sequence_number":1}),
+            json!({"type":"response.shell_call_command.added","command":"echo","output_index":1,"sequence_number":1}),
+        ] {
+            let body = [
+                frame(json!({"type":"response.created","response":{"id":"resp-1"},"sequence_number":0})),
+                frame(invalid),
+                frame(json!({"type":"response.completed","sequence_number":99,"response":{"id":"resp-1","output":[]}})),
+            ]
+            .concat();
+            assert!(
+                native_codex_responses_json(body.as_bytes(), "gpt-test").is_err(),
+                "missing required event fields must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn native_responses_known_non_chat_output_items_are_validated_and_dropped() {
+        let frame = |value: Value| {
+            format!(
+                "data: {}\n\n",
+                serde_json::to_string(&value).expect("frame JSON")
+            )
+        };
+        for item_type in [
+            "file_search_call",
+            "image_generation_call",
+            "mcp_call",
+            "mcp_list_tools",
+            "code_interpreter_call",
+            "custom_tool_call",
+            "shell_call",
+        ] {
+            let item = match item_type {
+                "file_search_call" => {
+                    json!({"type":item_type,"id":"item-1","queries":[],"status":"completed"})
+                }
+                "image_generation_call" => {
+                    json!({"type":item_type,"id":"item-1","result":"","status":"completed"})
+                }
+                "mcp_call" => {
+                    json!({"type":item_type,"id":"item-1","arguments":"{}","name":"lookup","server_label":"server"})
+                }
+                "mcp_list_tools" => {
+                    json!({"type":item_type,"id":"item-1","server_label":"server","tools":[]})
+                }
+                "code_interpreter_call" => {
+                    json!({"type":item_type,"id":"item-1","code":"","container_id":"container-1","outputs":[],"status":"completed"})
+                }
+                "custom_tool_call" => {
+                    json!({"type":item_type,"call_id":"call-1","input":"{}","name":"lookup"})
+                }
+                "shell_call" => {
+                    json!({"type":item_type,"id":"item-1","action":{},"call_id":"call-1","environment":{},"status":"completed"})
+                }
+                _ => unreachable!(),
+            };
+            let body = [
+                frame(json!({"type":"response.created","response":{"id":"resp-1"},"sequence_number":0})),
+                frame(json!({
+                    "type":"response.output_item.done",
+                    "output_index":0,
+                    "sequence_number":1,
+                    "item":item
+                })),
+                frame(json!({"type":"response.completed","sequence_number":2,"response":{"id":"resp-1","output":[]}})),
+            ]
+            .concat();
+            native_codex_responses_json(body.as_bytes(), "gpt-test")
+                .expect("known non-Chat output item");
+        }
+        let malformed = [
+            frame(json!({"type":"response.created","response":{"id":"resp-1"},"sequence_number":0})),
+            frame(json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"file_search_call","id":7}
+            })),
+            frame(json!({"type":"response.completed","sequence_number":2,"response":{"id":"resp-1","output":[]}})),
+        ]
+        .concat();
+        assert!(native_codex_responses_json(malformed.as_bytes(), "gpt-test").is_err());
+    }
+
+    #[test]
+    fn native_responses_validates_the_complete_output_item_union() {
+        let items = vec![
+            json!({"type":"message","id":"msg-1","content":[],"role":"assistant","status":"completed"}),
+            json!({"type":"file_search_call","id":"file-1","queries":[],"status":"completed"}),
+            json!({"type":"function_call","arguments":"{}","call_id":"call-1","name":"lookup"}),
+            json!({"type":"function_call_output","id":"out-1","output":"ok","status":"completed"}),
+            json!({"type":"web_search_call","id":"web-1","action":{},"status":"completed"}),
+            json!({"type":"computer_call","id":"computer-1","call_id":"call-2","pending_safety_checks":[],"status":"completed"}),
+            json!({"type":"computer_call_output","id":"computer-out-1","call_id":"call-2","output":{},"status":"completed"}),
+            json!({"type":"reasoning","id":"reason-1","summary":[]}),
+            json!({"type":"program","id":"program-1","call_id":"call-3","code":"","fingerprint":"fingerprint"}),
+            json!({"type":"program_output","id":"program-out-1","call_id":"call-3","result":"ok","status":"completed"}),
+            json!({"type":"tool_search_call","id":"tool-search-1","arguments":{},"call_id":"call-4","execution":"server","status":"completed"}),
+            json!({"type":"tool_search_output","id":"tool-search-out-1","call_id":"call-4","execution":"server","status":"completed","tools":[]}),
+            json!({"type":"additional_tools","id":"additional-1","role":"assistant","tools":[]}),
+            json!({"type":"compaction","id":"compaction-1","encrypted_content":"opaque"}),
+            json!({"type":"image_generation_call","id":"image-1","result":"","status":"completed"}),
+            json!({"type":"code_interpreter_call","id":"code-1","code":"","container_id":"container-1","outputs":[],"status":"completed"}),
+            json!({"type":"local_shell_call","id":"local-shell-1","action":{},"call_id":"call-5","status":"completed"}),
+            json!({"type":"local_shell_call_output","id":"local-shell-out-1","output":"ok"}),
+            json!({"type":"shell_call","id":"shell-1","action":{},"call_id":"call-6","environment":{},"status":"completed"}),
+            json!({"type":"shell_call_output","id":"shell-out-1","call_id":"call-6","max_output_length":1024,"output":[],"status":"completed"}),
+            json!({"type":"apply_patch_call","id":"patch-1","call_id":"call-7","operation":{},"status":"completed"}),
+            json!({"type":"apply_patch_call_output","id":"patch-out-1","call_id":"call-7","status":"completed"}),
+            json!({"type":"mcp_call","id":"mcp-1","arguments":"{}","name":"lookup","server_label":"server"}),
+            json!({"type":"mcp_list_tools","id":"mcp-list-1","server_label":"server","tools":[]}),
+            json!({"type":"mcp_approval_request","id":"mcp-request-1","arguments":"{}","name":"lookup","server_label":"server"}),
+            json!({"type":"mcp_approval_response","id":"mcp-response-1","approval_request_id":"mcp-request-1","approve":true}),
+            json!({"type":"custom_tool_call","call_id":"call-8","input":"{}","name":"lookup"}),
+            json!({"type":"custom_tool_call_output","id":"custom-out-1","call_id":"call-8","output":"ok","status":"completed"}),
+        ];
+        for (index, item) in items.into_iter().enumerate() {
+            let body = [
+                json!({"type":"response.created","response":{"id":"resp-1"},"sequence_number":0}),
+                json!({"type":"response.output_item.done","output_index":0,"sequence_number":1,"item":item}),
+                json!({"type":"response.completed","sequence_number":2,"response":{"id":"resp-1","output":[]}}),
+            ]
+            .into_iter()
+            .map(|value| format!("data: {}\n\n", serde_json::to_string(&value).expect("event JSON")))
+            .collect::<String>();
+            native_codex_responses_json(body.as_bytes(), "gpt-test")
+                .unwrap_or_else(|_| panic!("official output item variant {index} must validate"));
+        }
+        let valid_prefix = |event: Value| {
+            format!(
+                "data: {}\n\n",
+                serde_json::to_string(&event).expect("event JSON")
+            )
+        };
+        let error = [
+            valid_prefix(json!({"type":"response.created","response":{"id":"resp-1"},"sequence_number":0})),
+            valid_prefix(json!({"type":"error","code":"upstream_error","message":"failed","param":"input","sequence_number":1})),
+        ]
+        .concat();
+        assert!(native_codex_responses_json(error.as_bytes(), "gpt-test").is_err());
+        let missing_completed_response = [
+            valid_prefix(
+                json!({"type":"response.created","response":{"id":"resp-1"},"sequence_number":0}),
+            ),
+            valid_prefix(json!({"type":"response.completed","sequence_number":1})),
+        ]
+        .concat();
+        assert!(
+            native_codex_responses_json(missing_completed_response.as_bytes(), "gpt-test").is_err()
+        );
     }
 
     #[test]
