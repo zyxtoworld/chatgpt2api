@@ -802,7 +802,7 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
                 self.assertTrue(response.closed)
                 self.assertFalse(response.iterated)
 
-    def test_catalog_dispatches_both_endpoints_for_one_account_source(self) -> None:
+    def test_catalog_dispatches_source_compatible_endpoint_for_one_account_source(self) -> None:
         for source_type in ("web", "password", "password-oauth", "codex"):
             with self.subTest(source_type=source_type):
                 backend = object.__new__(OpenAIBackendAPI)
@@ -827,16 +827,57 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
                 result = OpenAIBackendAPI.list_catalog_models(backend)
 
                 self.assertEqual(result["data"][0]["id"], "model")
-                self.assertEqual(len(observed), 2)
-                self.assertEqual(
-                    {path for _session, path in observed},
-                    {
-                        "/backend-api/models?history_and_training_disabled=false",
-                        "/backend-api/codex/models?client_version=0.147.0",
-                    },
+                self.assertTrue(result["catalog_complete"])
+                expected_path = (
+                    "/backend-api/codex/models?client_version=0.147.0"
+                    if source_type == "codex"
+                    else "/backend-api/models?history_and_training_disabled=false"
                 )
-                backend._bootstrap.assert_called_once()
-                codex_session.close.assert_called_once()
+                self.assertEqual(len(observed), 1)
+                self.assertEqual(observed[0][1], expected_path)
+                if source_type == "codex":
+                    backend._bootstrap.assert_not_called()
+                    codex_session.close.assert_called_once()
+                else:
+                    backend._bootstrap.assert_called_once()
+                    codex_session.close.assert_not_called()
+
+    def test_codex_catalog_never_sends_web_request_or_bootstrap(self) -> None:
+        backend = object.__new__(OpenAIBackendAPI)
+        backend.access_token = "codex-token"
+        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
+        backend._catalog_source_type = "codex"
+        backend.session = mock.Mock()
+        backend._bootstrap = mock.Mock()
+        backend._headers = mock.Mock(return_value={})
+        backend._codex_client_version = mock.Mock(return_value="0.147.0")
+        backend._codex_models_headers = mock.Mock(return_value={})
+        codex_session = mock.Mock()
+        backend._codex_session = mock.Mock(return_value=codex_session)
+
+        def fetch(
+            _session: object,
+            path: str,
+            _route: str,
+            _headers: dict[str, str],
+            **_kwargs: object,
+        ) -> dict[str, dict[str, str]]:
+            self.assertEqual(
+                path,
+                "/backend-api/codex/models?client_version=0.147.0",
+            )
+            return {"codex-model": {"id": "codex-model"}}
+
+        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
+
+        result = OpenAIBackendAPI.list_catalog_models(backend)
+
+        self.assertEqual([item["id"] for item in result["data"]], ["codex-model"])
+        self.assertTrue(result["catalog_complete"])
+        backend._bootstrap.assert_not_called()
+        backend._headers.assert_not_called()
+        backend._fetch_model_catalog_endpoint.assert_called_once()
+        codex_session.close.assert_called_once()
 
     def test_catalog_rejects_oauth_and_unknown_sources_before_any_transport(self) -> None:
         for source_type in ("oauth_login", "future-incompatible"):
