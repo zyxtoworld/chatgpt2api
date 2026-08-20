@@ -17,6 +17,11 @@ pub(super) struct ApiError {
 }
 
 impl ApiError {
+    #[cfg(test)]
+    pub(super) fn code(&self) -> &'static str {
+        self.code
+    }
+
     pub(super) fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -32,6 +37,15 @@ impl ApiError {
             kind: "invalid_request_error",
             code: "bad_request",
             message: "request validation failed",
+            retry_after: None,
+        }
+    }
+    pub(super) fn unsupported_capability() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "unsupported_capability",
+            message: "The requested capability is not supported.",
             retry_after: None,
         }
     }
@@ -79,6 +93,23 @@ impl ApiError {
             message: "The model catalog is still warming up. Please try again shortly.",
             retry_after: Some("5"),
         }
+    }
+
+    pub(super) fn into_anthropic_response(self) -> Response {
+        let mut response = (
+            self.status,
+            Json(json!({
+                "type": "error",
+                "error": {"type": self.kind, "message": self.message, "code": self.code}
+            })),
+        )
+            .into_response();
+        if let Some(retry_after) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static(retry_after));
+        }
+        response
     }
 }
 

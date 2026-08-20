@@ -18,6 +18,7 @@ from services.model_service import (
 )
 from services.openai_backend_api import (
     CatalogConfigurationError,
+    CatalogIncompleteError,
     InvalidAccessTokenError,
     OpenAIBackendAPI,
 )
@@ -274,6 +275,60 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertIn("pro-v1", ids)
         self.assertIn("anon-v1", ids)
         self.assertEqual(calls["catalog"], 2)
+
+    def test_partial_dual_catalog_is_not_published_ready_and_recovers(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "partial-dual-catalog.json")
+        )
+        accounts.add_account_items([
+            {
+                "access_token": "codex-pro",
+                "type": "Pro",
+                "source_type": "codex",
+                "status": "正常",
+            },
+        ])
+        now = [1000.0]
+        catalog_complete = [False]
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                return model_list("anonymous-v1")
+
+            def list_catalog_models(self, **_kwargs: object) -> dict:
+                if catalog_complete[0]:
+                    return model_list("pro-v1") | {"catalog_complete": True}
+                return model_list("pro-web-only") | {
+                    "catalog_complete": False,
+                    "catalog_failed_endpoints": ["codex"],
+                }
+
+            def close(self) -> None:
+                pass
+
+        service = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            cache_ttl_seconds=1,
+            clock=lambda: now[0],
+        )
+        with self.assertRaises(ModelCatalogPendingError):
+            service.list_models()
+        partial = service.list_models(wait_for_cold=False)
+        self.assertEqual(
+            {item["id"] for item in partial["data"]},
+            {"anonymous-v1"},
+        )
+        self.assertNotIn("Pro", service._ready_account_groups)
+
+        catalog_complete[0] = True
+        now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
+        result = service.list_models()
+        self.assertIn("pro-v1", {item["id"] for item in result["data"]})
+        self.assertIn("Pro", service._ready_account_groups)
 
     def test_catalog_unions_anonymous_and_each_active_account_type(self) -> None:
         result = self.catalog.list_models()

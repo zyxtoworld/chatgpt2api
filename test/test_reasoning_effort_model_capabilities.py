@@ -244,7 +244,10 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         self.assertEqual(codex_session.close_calls, 1)
         backend._bootstrap.assert_not_called()
 
-    def test_catalog_model_list_uses_codex_endpoint_without_web_bootstrap(self) -> None:
+    def test_catalog_model_list_queries_both_catalog_endpoints_for_codex_representative(self) -> None:
+        web_response = _stream_response({
+            "models": [{"slug": "web-only"}],
+        })
         codex_response = _stream_response({
             "models": [
                 {"slug": "shared-model", "supported_in_api": True, "supported_reasoning_levels": [{"effort": "high"}]},
@@ -258,34 +261,32 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         backend.base_url = "https://chatgpt.com"
         backend.codex_client_version = "0.147.0"
         backend.fp = {"impersonate": "chrome110"}
+        web_session = _HeaderObservingSession(web_response)
         codex_session = _HeaderObservingSession(codex_response)
-        backend.session = mock.Mock()
+        backend.session = web_session
         backend._bootstrap = mock.Mock()
         backend._headers = mock.Mock(return_value={})
+        backend._codex_models_headers = mock.Mock(return_value={})
+        backend._codex_session = mock.Mock(return_value=codex_session)
 
-        with mock.patch(
-            "services.openai_backend_api.requests.Session",
-            return_value=codex_session,
-        ):
-            result = backend.list_catalog_models()
+        result = backend.list_catalog_models()
 
         self.assertEqual(
             [item["id"] for item in result["data"]],
-            ["codex-only", "shared-model"],
+            ["codex-only", "shared-model", "web-only"],
         )
-        backend._bootstrap.assert_not_called()
-        backend._headers.assert_not_called()
+        backend._bootstrap.assert_called_once()
+        backend._headers.assert_called_once_with("/backend-api/models")
+        backend._codex_session.assert_called_once()
+        backend._codex_models_headers.assert_called_once_with("0.147.0")
+        self.assertEqual(web_session.get_calls, 1)
         self.assertEqual(codex_session.get_calls, 1)
         self.assertEqual(
-            codex_session.urls,
-            ["https://chatgpt.com/backend-api/codex/models?client_version=0.147.0"],
+            set(codex_session.urls),
+            {"https://chatgpt.com/backend-api/codex/models?client_version=0.147.0"},
         )
-        codex_headers = codex_session.effective_headers
-        self.assertIsNotNone(codex_headers)
-        assert codex_headers is not None
-        self.assertEqual(codex_headers["ChatGPT-Account-ID"], "acct-codex")
 
-    def test_catalog_model_list_uses_web_endpoint_for_web_and_missing_source(self) -> None:
+    def test_catalog_model_list_queries_both_catalog_endpoints_for_web_and_missing_source(self) -> None:
         for source_type in ("web", ""):
             with self.subTest(source_type=source_type or "missing"):
                 backend = object.__new__(OpenAIBackendAPI)
@@ -298,23 +299,40 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
                 backend.session = _HeaderObservingSession(
                     _stream_response({"models": [{"slug": "web-model"}]})
                 )
+                codex_session = _HeaderObservingSession(
+                    _stream_response({
+                        "models": [{"slug": "codex-model", "supported_in_api": True}]
+                    })
+                )
                 backend._bootstrap = mock.Mock()
                 backend._headers = mock.Mock(return_value={})
+                backend._codex_client_version = mock.Mock(return_value="0.147.0")
+                backend._codex_models_headers = mock.Mock(return_value={})
+                backend._codex_session = mock.Mock(return_value=codex_session)
+                observed: list[str] = []
+
+                def fetch(_session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
+                    observed.append(path)
+                    return {
+                        "web-model": {"id": "web-model"}
+                    } if "/codex/" not in path else {
+                        "codex-model": {"id": "codex-model"}
+                    }
+
+                backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
 
                 result = backend.list_catalog_models()
 
                 self.assertEqual(
                     [item["id"] for item in result["data"]],
-                    ["web-model"],
+                    ["codex-model", "web-model"],
                 )
-                self.assertEqual(backend.session.get_calls, 1)
+                self.assertEqual(len(observed), 2)
                 backend._bootstrap.assert_called_once()
-                self.assertEqual(
-                    backend.session.urls,
-                    [
-                        "https://chatgpt.com/backend-api/models?history_and_training_disabled=false"
-                    ],
-                )
+                self.assertEqual({path.split("?", 1)[0] for path in observed}, {
+                    "/backend-api/models", "/backend-api/codex/models",
+                })
+                self.assertEqual(codex_session.close_calls, 1)
 
     def test_catalog_codex_representative_without_account_id_still_uses_codex_endpoint(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
@@ -322,7 +340,7 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         backend.account = {"source_type": "codex"}
         backend.base_url = "https://chatgpt.com"
         backend.session = mock.Mock()
-        backend._bootstrap = mock.Mock(side_effect=RuntimeError("web unavailable"))
+        backend._bootstrap = mock.Mock()
         backend._headers = mock.Mock(return_value={})
         backend._codex_client_version = mock.Mock(return_value="0.147.0")
         codex_session = mock.Mock()
@@ -339,7 +357,9 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         result = backend.list_catalog_models()
 
         self.assertEqual([item["id"] for item in result["data"]], ["codex-model"])
-        self.assertEqual(backend._fetch_model_catalog_endpoint.call_count, 1)
+        backend._bootstrap.assert_called_once()
+        self.assertEqual(backend._fetch_model_catalog_endpoint.call_count, 2)
+        codex_session.close.assert_called_once()
 
     def test_catalog_model_list_failure_is_bounded_for_web_source(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
@@ -348,6 +368,10 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         backend.session = mock.Mock()
         backend._bootstrap = mock.Mock()
         backend._headers = mock.Mock(return_value={})
+        backend._codex_client_version = mock.Mock(return_value="0.147.0")
+        backend._codex_models_headers = mock.Mock(return_value={})
+        codex_session = mock.Mock()
+        backend._codex_session = mock.Mock(return_value=codex_session)
         backend._fetch_model_catalog_endpoint = mock.Mock(
             side_effect=SearchTimeoutError("web catalog timed out")
         )
@@ -356,7 +380,8 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
             backend.list_catalog_models(timeout_secs=0.05)
 
         backend._bootstrap.assert_called_once()
-        backend._fetch_model_catalog_endpoint.assert_called_once()
+        self.assertEqual(backend._fetch_model_catalog_endpoint.call_count, 2)
+        codex_session.close.assert_called_once()
 
     def test_catalog_model_list_failure_is_bounded_for_codex_source(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
@@ -364,6 +389,7 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         backend.account = {"source_type": "codex"}
         backend.session = mock.Mock()
         backend._bootstrap = mock.Mock()
+        backend._headers = mock.Mock(return_value={})
         backend._codex_client_version = mock.Mock(return_value="0.147.0")
         backend._codex_models_headers = mock.Mock(return_value={})
         codex_session = mock.Mock()
@@ -375,17 +401,12 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
         with self.assertRaises(SearchTimeoutError):
             backend.list_catalog_models(timeout_secs=0.05)
 
-        backend._bootstrap.assert_not_called()
-        backend._fetch_model_catalog_endpoint.assert_called_once()
+        backend._bootstrap.assert_called_once()
+        self.assertEqual(backend._fetch_model_catalog_endpoint.call_count, 2)
         codex_session.close.assert_called_once()
 
-    def test_catalog_endpoint_source_selection_is_not_cross_contaminated(self) -> None:
-        for source_type, expected_path, expects_bootstrap in (
-            ("web", "/backend-api/models?history_and_training_disabled=false", True),
-            ("password", "/backend-api/models?history_and_training_disabled=false", True),
-            ("password-oauth", "/backend-api/models?history_and_training_disabled=false", True),
-            ("codex", "/backend-api/codex/models?client_version=0.147.0", False),
-        ):
+    def test_catalog_endpoint_source_selection_queries_both_without_cross_contamination(self) -> None:
+        for source_type in ("web", "password", "password-oauth", "codex"):
             with self.subTest(source_type=source_type):
                 backend = object.__new__(OpenAIBackendAPI)
                 backend.access_token = "source-token"
@@ -407,11 +428,16 @@ class UpstreamModelEffortContractTests(unittest.TestCase):
                 result = backend.list_catalog_models()
 
                 self.assertEqual([item["id"] for item in result["data"]], ["model"])
-                self.assertEqual(len(observed), 1)
-                self.assertEqual(observed[0][1], expected_path)
-                self.assertEqual(backend._bootstrap.called, expects_bootstrap)
-                if not expects_bootstrap:
-                    codex_session.close.assert_called_once()
+                self.assertEqual(len(observed), 2)
+                self.assertEqual(
+                    {path.split("?", 1)[0] for _session, path in observed},
+                    {
+                        "/backend-api/models",
+                        "/backend-api/codex/models",
+                    },
+                )
+                backend._bootstrap.assert_called_once()
+                codex_session.close.assert_called_once()
 
     def test_codex_model_list_rejects_invalid_client_version_before_request(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)

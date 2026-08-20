@@ -7,6 +7,7 @@ mod config;
 mod errors;
 mod model_pool;
 mod native_pow;
+mod protocol_anthropic;
 mod protocol_chat;
 mod protocol_codex_payload;
 mod protocol_responses;
@@ -14,8 +15,11 @@ mod shutdown;
 use account_pool::{
     AccountLease, AccountModelGroup, AccountRecord, AccountStore, CatalogAccountCandidate,
 };
+#[cfg(test)]
+use codex_sse::native_codex_text;
 use codex_sse::{
-    codex_sse_data, native_codex_delta_frame, native_codex_responses_json, native_codex_text,
+    codex_sse_data, native_codex_delta_frame, native_codex_response_to_chat,
+    native_codex_responses_json,
 };
 #[cfg(test)]
 use codex_upstream::parse_codex_client_version;
@@ -29,6 +33,12 @@ use model_pool::{ModelCatalog, ModelStore, PublicModel, project_remote_model_lis
 #[cfg(test)]
 use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
 use native_pow::{NativePowResources, native_pow_config, parse_native_pow_resources};
+use protocol_anthropic::{
+    anthropic_stream_responses_response, from_chat_response, from_responses_response,
+    stream_body_response as anthropic_stream_body_response,
+    stream_response as anthropic_stream_response, stream_responses_body_response, to_chat_payload,
+    to_responses_payload, validate_message_request,
+};
 pub(crate) use protocol_chat::validate_chat_payload;
 use protocol_chat::{
     native_completion_text, native_conversation_payload, native_finish_frame, native_frame,
@@ -507,6 +517,7 @@ impl AppState {
             .route("/v1/models", get(models))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/responses", post(responses))
+            .route("/v1/messages", post(messages))
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
             .with_state(self.clone())
     }
@@ -570,11 +581,53 @@ const ACCOUNT_TYPE_REFRESH_CONCURRENCY: usize = 4;
 // retained on each candidate for the actual conversation/Responses protocol;
 // it must not split or duplicate the catalog.
 #[derive(Clone)]
+struct CatalogOwners {
+    web: Option<CatalogAccountCandidate>,
+    codex: Option<CatalogAccountCandidate>,
+}
+
+impl CatalogOwners {
+    fn first(candidates: &[CatalogAccountCandidate]) -> Self {
+        Self {
+            web: candidates.first().cloned(),
+            codex: candidates.first().cloned(),
+        }
+    }
+
+    fn from_endpoints(
+        web: Option<CatalogAccountCandidate>,
+        codex: Option<CatalogAccountCandidate>,
+    ) -> Self {
+        Self { web, codex }
+    }
+
+    fn is_current(&self, candidates: &[CatalogAccountCandidate]) -> bool {
+        self.web
+            .as_ref()
+            .is_none_or(|owner| candidates.iter().any(|candidate| candidate == owner))
+            && self
+                .codex
+                .as_ref()
+                .is_none_or(|owner| candidates.iter().any(|candidate| candidate == owner))
+    }
+
+    fn any_current(&self, candidates: &[CatalogAccountCandidate]) -> bool {
+        self.web
+            .as_ref()
+            .is_some_and(|owner| candidates.iter().any(|candidate| candidate == owner))
+            || self
+                .codex
+                .as_ref()
+                .is_some_and(|owner| candidates.iter().any(|candidate| candidate == owner))
+    }
+}
+
+#[derive(Clone)]
 struct AccountTypeCatalogEntry {
     models: Arc<Vec<PublicModel>>,
     ready: bool,
     tokens: Vec<String>,
-    owner: Option<CatalogAccountCandidate>,
+    owners: CatalogOwners,
     expires_at: Instant,
     retry_at: Instant,
 }
@@ -612,7 +665,8 @@ enum CatalogFetchJob {
 struct CatalogFetchResult {
     job: CatalogFetchJob,
     models: Option<Vec<PublicModel>>,
-    owner: Option<CatalogAccountCandidate>,
+    owners: Option<CatalogOwners>,
+    complete: bool,
 }
 
 impl CatalogFetchJob {
@@ -780,10 +834,7 @@ impl AccountTypeCatalog {
                     anonymous_ready
                         || candidate_groups.iter().any(|(account_group, candidates)| {
                             snapshot.entries.get(account_group).is_some_and(|entry| {
-                                entry
-                                    .owner
-                                    .as_ref()
-                                    .is_some_and(|owner| candidates.contains(owner))
+                                entry.owners.is_current(candidates)
                                     && entry.ready
                                     && entry.models.iter().any(|candidate| candidate.id == model)
                             })
@@ -793,11 +844,7 @@ impl AccountTypeCatalog {
                     snapshot.anonymous_ready
                         || candidate_groups.iter().any(|(account_group, candidates)| {
                             snapshot.entries.get(account_group).is_some_and(|entry| {
-                                entry.ready
-                                    && entry
-                                        .owner
-                                        .as_ref()
-                                        .is_some_and(|owner| candidates.contains(owner))
+                                entry.ready && entry.owners.is_current(candidates)
                             })
                         })
                 }
@@ -881,9 +928,7 @@ impl AccountTypeCatalog {
                     .filter_map(|(account_group, candidates)| {
                         let needs_refresh =
                             snapshot.entries.get(account_group).is_none_or(|entry| {
-                                let owner_invalid = entry.owner.as_ref().is_some_and(|owner| {
-                                    !candidates.iter().any(|candidate| candidate == owner)
-                                });
+                                let owner_invalid = !entry.owners.is_current(candidates);
                                 owner_invalid
                                     || ((!entry.ready || now >= entry.expires_at)
                                         && now >= entry.retry_at)
@@ -920,7 +965,13 @@ impl AccountTypeCatalog {
                     .await
                     .ok()
                     .flatten();
-            let Some(CatalogFetchResult { job, models, owner }) = result else {
+            let Some(CatalogFetchResult {
+                job,
+                models,
+                owners,
+                complete,
+            }) = result
+            else {
                 break;
             };
             in_flight.remove(&job.key());
@@ -948,15 +999,17 @@ impl AccountTypeCatalog {
                     expected_candidates,
                     ..
                 } => {
-                    let owner_is_current = current.as_ref().and_then(|(_, current_groups)| {
+                    let owners_is_current = current.as_ref().and_then(|(_, current_groups)| {
                         let candidates = current_groups.get(&account_group)?;
-                        let owner = owner.as_ref()?;
-                        candidates
-                            .iter()
-                            .find(|candidate| *candidate == owner)
-                            .cloned()
+                        let owners = owners.as_ref()?;
+                        let valid = if complete {
+                            owners.is_current(candidates)
+                        } else {
+                            owners.any_current(candidates)
+                        };
+                        valid.then(|| owners.clone())
                     });
-                    if let Some(owner) = owner_is_current {
+                    if let Some(owners) = owners_is_current {
                         snapshot.generation = snapshot.generation.saturating_add(1);
                         let current_tokens = current
                             .as_ref()
@@ -966,22 +1019,46 @@ impl AccountTypeCatalog {
                             .map(|candidate| candidate.token.clone())
                             .collect();
                         match models {
-                            Some(models) => {
+                            Some(models) if complete => {
                                 snapshot.entries.insert(
                                     account_group,
                                     AccountTypeCatalogEntry {
                                         models: Arc::new(models),
                                         ready: true,
                                         tokens: current_tokens,
-                                        owner: Some(owner),
+                                        owners,
                                         expires_at: now + ACCOUNT_TYPE_MODEL_TTL,
                                         retry_at: now,
                                     },
                                 );
                             }
+                            Some(models) => {
+                                if let Some(entry) = snapshot.entries.get_mut(&account_group) {
+                                    entry.tokens = current_tokens;
+                                    entry.owners = owners;
+                                    entry.retry_at = now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF;
+                                    if entry.models.is_empty() {
+                                        entry.models = Arc::new(models);
+                                        entry.ready = false;
+                                    }
+                                } else {
+                                    snapshot.entries.insert(
+                                        account_group,
+                                        AccountTypeCatalogEntry {
+                                            models: Arc::new(models),
+                                            ready: false,
+                                            tokens: current_tokens,
+                                            owners,
+                                            expires_at: now,
+                                            retry_at: now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF,
+                                        },
+                                    );
+                                }
+                            }
                             None => {
                                 if let Some(entry) = snapshot.entries.get_mut(&account_group) {
                                     entry.tokens = current_tokens;
+                                    entry.owners = owners;
                                     entry.retry_at = now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF;
                                 } else {
                                     snapshot.entries.insert(
@@ -990,7 +1067,7 @@ impl AccountTypeCatalog {
                                             models: Arc::new(Vec::new()),
                                             ready: false,
                                             tokens: current_tokens,
-                                            owner: Some(owner),
+                                            owners,
                                             expires_at: now,
                                             retry_at: now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF,
                                         },
@@ -1004,7 +1081,7 @@ impl AccountTypeCatalog {
                                 .iter()
                                 .map(|candidate| candidate.token.clone())
                                 .collect();
-                            let retry_at = if owner.is_some() {
+                            let retry_at = if owners.is_some() {
                                 now
                             } else {
                                 now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF
@@ -1012,12 +1089,7 @@ impl AccountTypeCatalog {
                             let previous_owner_is_current = snapshot
                                 .entries
                                 .get(&account_group)
-                                .and_then(|entry| entry.owner.as_ref())
-                                .is_some_and(|previous_owner| {
-                                    current_candidates
-                                        .iter()
-                                        .any(|candidate| candidate == previous_owner)
-                                });
+                                .is_some_and(|entry| entry.owners.any_current(current_candidates));
                             if previous_owner_is_current {
                                 if let Some(entry) = snapshot.entries.get_mut(&account_group) {
                                     entry.tokens = current_tokens;
@@ -1030,7 +1102,7 @@ impl AccountTypeCatalog {
                                         models: Arc::new(Vec::new()),
                                         ready: false,
                                         tokens: current_tokens,
-                                        owner: current_candidates.first().cloned(),
+                                        owners: CatalogOwners::first(current_candidates),
                                         expires_at: now,
                                         retry_at,
                                     },
@@ -1071,7 +1143,7 @@ impl AccountTypeCatalog {
                             .collect();
                         if let Some(entry) = snapshot.entries.get_mut(&account_group) {
                             entry.tokens = expected_tokens;
-                            entry.owner = expected_candidates.first().cloned();
+                            entry.owners = CatalogOwners::first(&expected_candidates);
                             entry.retry_at = now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF;
                         } else {
                             snapshot.entries.insert(
@@ -1080,7 +1152,7 @@ impl AccountTypeCatalog {
                                     models: Arc::new(Vec::new()),
                                     ready: false,
                                     tokens: expected_tokens,
-                                    owner: expected_candidates.first().cloned(),
+                                    owners: CatalogOwners::first(&expected_candidates),
                                     expires_at: now,
                                     retry_at: now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF,
                                 },
@@ -1118,8 +1190,12 @@ impl AccountTypeCatalog {
         job: CatalogFetchJob,
         deadline: Instant,
     ) -> CatalogFetchResult {
-        let (models, owner) = match &job {
-            CatalogFetchJob::Anonymous => (self.fetch_anonymous_models(deadline).await, None),
+        let (models, owners, complete) = match &job {
+            CatalogFetchJob::Anonymous => {
+                let models = self.fetch_anonymous_models(deadline).await;
+                let complete = models.is_some();
+                (models, None, complete)
+            }
             CatalogFetchJob::AccountType {
                 account_group,
                 candidate_accounts,
@@ -1129,12 +1205,17 @@ impl AccountTypeCatalog {
                     .fetch_account_type_models(account_group, candidate_accounts, deadline)
                     .await
                 {
-                    Some((models, owner)) => (Some(models), Some(owner)),
-                    None => (None, None),
+                    Some((models, owners, complete)) => (Some(models), Some(owners), complete),
+                    None => (None, None, false),
                 }
             }
         };
-        CatalogFetchResult { job, models, owner }
+        CatalogFetchResult {
+            job,
+            models,
+            owners,
+            complete,
+        }
     }
 
     async fn fetch_account_type_models(
@@ -1142,36 +1223,54 @@ impl AccountTypeCatalog {
         account_group: &AccountModelGroup,
         candidate_accounts: &[CatalogAccountCandidate],
         deadline: Instant,
-    ) -> Option<(Vec<PublicModel>, CatalogAccountCandidate)> {
+    ) -> Option<(Vec<PublicModel>, CatalogOwners, bool)> {
         if self.protocol == UpstreamProtocol::ChatGpt {
-            for candidate in candidate_accounts {
-                let Some(models) = (match candidate.source_type.as_str() {
-                    "web" | "password" | "password-oauth" => {
-                        self.fetch_native_models(
+            let web = async {
+                for candidate in candidate_accounts {
+                    if let Some(models) = self
+                        .fetch_native_models(
                             &candidate.token,
                             Some(account_group),
                             candidate.chatgpt_account_id.as_deref(),
                             deadline,
                         )
                         .await
+                    {
+                        return Some((models, candidate.clone()));
                     }
-                    "codex" => {
-                        self.fetch_codex_models(
-                            &candidate.token,
-                            Some(account_group),
-                            candidate.chatgpt_account_id.as_deref(),
-                            deadline,
-                        )
-                        .await
-                    }
-                    // Unknown sources have no catalog capability contract.
-                    _ => None,
-                }) else {
-                    continue;
-                };
-                if !models.is_empty() {
-                    return Some((models, candidate.clone()));
                 }
+                None
+            };
+            let codex = async {
+                for candidate in candidate_accounts {
+                    if let Some(models) = self
+                        .fetch_codex_models(
+                            &candidate.token,
+                            Some(account_group),
+                            candidate.chatgpt_account_id.as_deref(),
+                            deadline,
+                        )
+                        .await
+                    {
+                        return Some((models, candidate.clone()));
+                    }
+                }
+                None
+            };
+            let (web_result, codex_result) = tokio::join!(web, codex);
+            let (web_models, web_owner) = web_result.map_or_else(
+                || (Vec::new(), None),
+                |(models, owner)| (models, Some(owner)),
+            );
+            let (codex_models, codex_owner) = codex_result.map_or_else(
+                || (Vec::new(), None),
+                |(models, owner)| (models, Some(owner)),
+            );
+            let models = Self::merge_catalog_models(web_models, codex_models);
+            if !models.is_empty() {
+                let complete = web_owner.is_some() && codex_owner.is_some();
+                let owners = CatalogOwners::from_endpoints(web_owner, codex_owner);
+                return Some((models, owners, complete));
             }
             return None;
         }
@@ -1217,9 +1316,42 @@ impl AccountTypeCatalog {
                 false,
                 false,
             )
-            .map(|models| (models, candidate.clone()));
+            .map(|models| {
+                (
+                    models,
+                    CatalogOwners::from_endpoints(Some(candidate.clone()), Some(candidate.clone())),
+                    true,
+                )
+            });
         }
         None
+    }
+
+    fn merge_catalog_models(
+        mut first: Vec<PublicModel>,
+        second: Vec<PublicModel>,
+    ) -> Vec<PublicModel> {
+        let mut merged = HashMap::<String, PublicModel>::new();
+        for model in first.drain(..).chain(second) {
+            if let Some(existing) = merged.get_mut(&model.id) {
+                existing.allow_anonymous |= model.allow_anonymous;
+                for account_type in model.supported_account_types {
+                    if !existing.supported_account_types.contains(&account_type) {
+                        existing.supported_account_types.push(account_type);
+                    }
+                }
+                for effort in model.supported_reasoning_efforts {
+                    if !existing.supported_reasoning_efforts.contains(&effort) {
+                        existing.supported_reasoning_efforts.push(effort);
+                    }
+                }
+            } else {
+                merged.insert(model.id.clone(), model);
+            }
+        }
+        let mut models = merged.into_values().collect::<Vec<_>>();
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+        models
     }
 
     async fn fetch_native_models(
@@ -1408,12 +1540,7 @@ impl AccountTypeCatalog {
                 || !snapshot
                     .live_candidates
                     .get(account_group)
-                    .is_some_and(|candidates| {
-                        entry
-                            .owner
-                            .as_ref()
-                            .is_some_and(|owner| candidates.contains(owner))
-                    })
+                    .is_some_and(|candidates| entry.owners.is_current(candidates))
             {
                 continue;
             }
@@ -1451,12 +1578,7 @@ impl AccountTypeCatalog {
                 && snapshot
                     .live_candidates
                     .get(account_group)
-                    .is_some_and(|candidates| {
-                        entry
-                            .owner
-                            .as_ref()
-                            .is_some_and(|owner| candidates.contains(owner))
-                    })
+                    .is_some_and(|candidates| entry.owners.is_current(candidates))
                 && (!entry.models.is_empty()
                     && (model_is_auto
                         || entry.models.iter().any(|candidate| candidate.id == model)))
@@ -1490,12 +1612,7 @@ impl AccountTypeCatalog {
                     && snapshot
                         .live_candidates
                         .get(account_group)
-                        .is_some_and(|candidates| {
-                            entry
-                                .owner
-                                .as_ref()
-                                .is_some_and(|owner| candidates.contains(owner))
-                        })
+                        .is_some_and(|candidates| entry.owners.is_current(candidates))
             }) {
                 return false;
             }
@@ -1506,12 +1623,7 @@ impl AccountTypeCatalog {
                         && snapshot
                             .live_candidates
                             .get(account_group)
-                            .is_some_and(|candidates| {
-                                entry
-                                    .owner
-                                    .as_ref()
-                                    .is_some_and(|owner| candidates.contains(owner))
-                            })
+                            .is_some_and(|candidates| entry.owners.is_current(candidates))
                 })
             }) || !snapshot.anonymous_ready;
         }
@@ -1528,12 +1640,7 @@ impl AccountTypeCatalog {
                 && snapshot
                     .live_candidates
                     .get(account_group)
-                    .is_some_and(|candidates| {
-                        entry
-                            .owner
-                            .as_ref()
-                            .is_some_and(|owner| candidates.contains(owner))
-                    })
+                    .is_some_and(|candidates| entry.owners.is_current(candidates))
                 && entry.ready
                 && entry.models.iter().any(|candidate| candidate.id == model)
         }) {
@@ -1546,12 +1653,7 @@ impl AccountTypeCatalog {
                         && snapshot
                             .live_candidates
                             .get(account_group)
-                            .is_some_and(|candidates| {
-                                entry
-                                    .owner
-                                    .as_ref()
-                                    .is_some_and(|owner| candidates.contains(owner))
-                            })
+                            .is_some_and(|candidates| entry.owners.is_current(candidates))
                 })
             })
     }
@@ -3551,6 +3653,224 @@ async fn responses(
     responses_with_timeout(state, headers, body, NATIVE_UPSTREAM_TIMEOUT).await
 }
 
+async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+    match messages_inner(State(state), headers, body).await {
+        Ok(response) => response,
+        Err(error) => error.into_anthropic_response(),
+    }
+}
+
+async fn messages_inner(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(ApiError::unauthorized)?;
+    if headers
+        .get("anthropic-version")
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(ApiError::invalid_request());
+    }
+    let bearer = format!("Bearer {api_key}");
+    let mut auth_headers = headers.clone();
+    auth_headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&bearer).map_err(|_| ApiError::unauthorized())?,
+    );
+    authenticated(&auth_headers, &state).await?;
+    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::validation())?;
+    let request = validate_message_request(
+        serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?,
+    )?;
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(ApiError::invalid_request)?
+        .to_owned();
+    let wants_stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let requires_responses = anthropic_request_requires_responses(&request);
+    if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
+        if requires_responses {
+            let responses_payload = to_responses_payload(&request)?;
+            let internal_body =
+                serde_json::to_vec(&responses_payload).map_err(|_| ApiError::invalid_request())?;
+            let routed = responses_with_timeout(
+                State(state.clone()),
+                auth_headers,
+                Body::from(internal_body),
+                NATIVE_UPSTREAM_TIMEOUT,
+            )
+            .await?;
+            if wants_stream {
+                return Ok(stream_responses_body_response(
+                    routed.into_body(),
+                    model,
+                    Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
+                ));
+            }
+            let body = to_bytes(routed.into_body(), MAX_REQUEST_BODY_BYTES)
+                .await
+                .map_err(|_| ApiError::upstream())?;
+            return Ok((
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                Json(from_responses_response(&body, &model)?),
+            )
+                .into_response());
+        }
+        let payload = to_chat_payload(&request)?;
+        let internal_body =
+            serde_json::to_vec(&payload).map_err(|_| ApiError::invalid_request())?;
+        let routed = chat_completions_with_timeout(
+            State(state.clone()),
+            auth_headers,
+            Body::from(internal_body),
+            NATIVE_UPSTREAM_TIMEOUT,
+        )
+        .await?;
+        if wants_stream {
+            return Ok(anthropic_stream_body_response(
+                routed.into_body(),
+                model,
+                Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
+            ));
+        }
+        let body = to_bytes(routed.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .map_err(|_| ApiError::upstream())?;
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(from_chat_response(&body, &model)?),
+        )
+            .into_response());
+    }
+    if state.config.upstream_protocol != UpstreamProtocol::OpenAi {
+        return Err(ApiError::unavailable());
+    }
+    if requires_responses {
+        let payload = to_responses_payload(&request)?;
+        let base_url = state
+            .config
+            .upstream_base_url
+            .as_deref()
+            .ok_or_else(ApiError::unavailable)?;
+        let url = format!("{}/v1/responses", base_url.trim_end_matches('/'));
+        let mut upstream_request = state.client.post(url).json(&payload);
+        if let Some(auth) = state.config.upstream_auth.as_deref() {
+            upstream_request = upstream_request.header(header::AUTHORIZATION, auth);
+        }
+        let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
+        let upstream = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            upstream_request.send(),
+        )
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
+        if !upstream.status().is_success() || upstream_declares_oversize(&upstream) {
+            return Err(ApiError::upstream());
+        }
+        if wants_stream {
+            return Ok(anthropic_stream_responses_response(
+                upstream, model, deadline,
+            ));
+        }
+        let body = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            bounded_response_body(upstream),
+        )
+        .await
+        .map_err(|_| ApiError::upstream())??;
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(from_responses_response(&body, &model)?),
+        )
+            .into_response());
+    }
+    let payload = to_chat_payload(&request)?;
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(ApiError::unavailable)?;
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let mut upstream_request = state.client.post(url).json(&payload);
+    if let Some(auth) = state.config.upstream_auth.as_deref() {
+        upstream_request = upstream_request.header(header::AUTHORIZATION, auth);
+    }
+    let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
+    let upstream = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        upstream_request.send(),
+    )
+    .await
+    .map_err(|_| ApiError::upstream())?
+    .map_err(|_| ApiError::upstream())?;
+    if !upstream.status().is_success() || upstream_declares_oversize(&upstream) {
+        return Err(ApiError::upstream());
+    }
+    if wants_stream {
+        return Ok(anthropic_stream_response(upstream, model, deadline));
+    }
+    let body = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        bounded_response_body(upstream),
+    )
+    .await
+    .map_err(|_| ApiError::upstream())??;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(from_chat_response(&body, &model)?),
+    )
+        .into_response())
+}
+
+fn anthropic_request_requires_responses(request: &Map<String, Value>) -> bool {
+    request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                matches!(
+                    tool.get("type").and_then(Value::as_str),
+                    Some("web_search_20250305")
+                )
+            })
+        })
+        || request
+            .get("messages")
+            .and_then(Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().any(|item| {
+                                matches!(
+                                    item.get("type").and_then(Value::as_str),
+                                    Some("image" | "image_url" | "input_image")
+                                )
+                            })
+                        })
+                })
+            })
+}
+
 fn native_codex_responses_stream_response(
     response: reqwest::Response,
     lease: AccountLease,
@@ -3999,11 +4319,13 @@ async fn chat_completions_with_timeout(
         let body = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, bounded_response_body(upstream))
             .await
             .map_err(|_| ApiError::upstream())??;
-        let text = if is_codex {
-            native_codex_text(&body)?
-        } else {
-            native_completion_text(&body)?
-        };
+        if is_codex {
+            let response = native_codex_responses_json(&body, model)?;
+            let chat = native_codex_response_to_chat(&response, model)?;
+            drop(lease);
+            return Ok(Json(chat).into_response());
+        }
+        let text = native_completion_text(&body)?;
         let usage = native_usage(&object, &text)?;
         drop(lease);
         return Ok(Json(json!({
@@ -4195,6 +4517,738 @@ mod tests {
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("client")
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_route_converts_standard_request_and_response() {
+        let upstream = post(|Json(payload): Json<Value>| async move {
+            assert_eq!(payload["model"], "gpt-test");
+            assert_eq!(payload["messages"][0]["role"], "system");
+            assert_eq!(payload["messages"][1]["role"], "user");
+            assert_eq!(payload["messages"][1]["content"], "hello");
+            assert_eq!(payload["max_tokens"], 8);
+            Json(json!({
+                "id":"chatcmpl-anthropic",
+                "choices":[{"message":{"role":"assistant","content":"world"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":2}
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(upstream)),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: vec!["gpt-test".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "secret")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","max_tokens":8,"system":"be brief","messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("message response");
+        assert_eq!(value["type"], "message");
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["content"][0], json!({"type":"text","text":"world"}));
+        assert_eq!(value["stop_reason"], "end_turn");
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_route_preserves_tool_use_and_tool_result_ids() {
+        let upstream = post(|Json(payload): Json<Value>| async move {
+            assert_eq!(payload["messages"][0]["tool_calls"][0]["id"], "toolu_1");
+            assert_eq!(payload["messages"][1]["role"], "user");
+            assert_eq!(payload["messages"][1]["content"], "before");
+            assert_eq!(payload["messages"][2]["role"], "tool");
+            assert_eq!(payload["messages"][2]["tool_call_id"], "toolu_1");
+            assert_eq!(payload["messages"][2]["content"], "done");
+            assert_eq!(payload["messages"][3]["role"], "user");
+            assert_eq!(payload["messages"][3]["content"], "between");
+            assert_eq!(payload["messages"][4]["role"], "tool");
+            assert_eq!(payload["messages"][4]["tool_call_id"], "toolu_2");
+            assert_eq!(payload["messages"][4]["content"], "tool_error: tool failed");
+            assert_eq!(payload["tools"][0]["function"]["name"], "lookup");
+            assert_eq!(
+                payload["tools"][0]["function"]["parameters"],
+                json!({"type":"object"})
+            );
+            assert_eq!(
+                payload["tool_choice"],
+                json!({"type":"function","function":{"name":"lookup"}})
+            );
+            assert_eq!(payload["parallel_tool_calls"], false);
+            Json(json!({
+                "id":"chatcmpl-tool",
+                "choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"toolu_2","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"next\"}"}}]},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":5,"completion_tokens":4}
+            }))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(upstream)),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: vec!["gpt-test".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "secret")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","max_tokens":8,"tools":[{"name":"lookup","description":"look up","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"lookup","disable_parallel_tool_use":true},"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"first"}}]},{"role":"user","content":[{"type":"text","text":"before"},{"type":"tool_result","tool_use_id":"toolu_1","content":"done"},{"type":"text","text":"between"},{"type":"tool_result","tool_use_id":"toolu_2","content":[{"type":"text","text":"tool failed"}],"is_error":true}]}]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("message response");
+        assert_eq!(value["stop_reason"], "tool_use");
+        assert_eq!(value["content"][0]["type"], "tool_use");
+        assert_eq!(value["content"][0]["id"], "toolu_2");
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_route_projects_stream_events() {
+        let upstream = post(|| async {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Body::from(
+                    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\n"
+                        .to_owned()
+                        + "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                ),
+            )
+                .into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(upstream)),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: vec!["gpt-test".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "secret")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("sse");
+        let start = text.find("event: message_start").expect("message start");
+        let block_start = text
+            .find("event: content_block_start")
+            .expect("block start");
+        let delta = text.find("event: content_block_delta").expect("text delta");
+        let block_stop = text.find("event: content_block_stop").expect("block stop");
+        let message_delta = text.find("event: message_delta").expect("message delta");
+        let message_stop = text.find("event: message_stop").expect("message stop");
+        assert!(start < block_start && block_start < delta && delta < block_stop);
+        assert!(block_stop < message_delta && message_delta < message_stop);
+        assert!(text.contains("text_delta"));
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_route_projects_tool_stream_and_rejects_early_done() {
+        let upstream = post(|| async {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Body::from(
+                    r##"data: {"choices":[{"delta":{"role":"assistant","content":"lead","tool_calls":[{"index":0,"id":"toolu_stream","type":"function","function":{"name":"lookup","arguments":"{\"q\":\""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"rust\"}"}},{"index":1,"id":"toolu_second","type":"function","function":{"name":"lookup2","arguments":"{\"x\":\""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"y\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+"##,
+                ),
+            )
+                .into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(upstream)),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: vec!["gpt-test".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "secret")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","max_tokens":8,"stream":true,"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"auto"},"messages":[{"role":"user","content":"lookup"}]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("tool stream body")
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("sse");
+        let mut started = HashSet::new();
+        let mut stopped = HashSet::new();
+        let mut saw_text = false;
+        let mut saw_tools = HashSet::new();
+        let mut saw_message_delta = false;
+        for frame in text.split("\n\n").filter(|frame| !frame.is_empty()) {
+            let (event, data) = frame.split_once("\ndata: ").expect("event/data frame");
+            let value: Value = serde_json::from_str(data).expect("event json");
+            match event.strip_prefix("event: ").expect("event name") {
+                "message_start" => assert!(started.is_empty()),
+                "content_block_start" => {
+                    let index = value["index"].as_u64().expect("block index");
+                    assert!(started.insert(index));
+                    assert!(!stopped.contains(&index));
+                    match value["content_block"]["type"].as_str() {
+                        Some("text") => saw_text = true,
+                        Some("tool_use") => {
+                            saw_tools.insert(index);
+                        }
+                        other => panic!("unexpected content block: {other:?}"),
+                    }
+                }
+                "content_block_delta" => {
+                    let index = value["index"].as_u64().expect("delta index");
+                    assert!(started.contains(&index));
+                    assert!(!stopped.contains(&index));
+                }
+                "content_block_stop" => {
+                    let index = value["index"].as_u64().expect("stop index");
+                    assert!(started.contains(&index));
+                    assert!(stopped.insert(index));
+                }
+                "message_delta" => {
+                    assert_eq!(started, stopped);
+                    assert_eq!(value["delta"]["stop_reason"], "tool_use");
+                    saw_message_delta = true;
+                }
+                "message_stop" => {
+                    assert!(saw_message_delta);
+                    assert_eq!(started, stopped);
+                }
+                other => panic!("unexpected event: {other}"),
+            }
+        }
+        assert!(saw_text);
+        assert_eq!(saw_tools.len(), 2);
+        assert_eq!(started.len(), 3);
+        assert!(text.contains("text_delta"));
+        upstream_task.abort();
+
+        let early_done = post(|| async {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                Body::from("data: [DONE]\n\n"),
+            )
+                .into_response()
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/v1/chat/completions", post(early_done)),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: vec!["gpt-test".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "secret")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"lookup"}]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert!(response.into_body().collect().await.is_err());
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_fails_closed_on_malformed_frame_and_incomplete_tool_json() {
+        let malformed = anthropic_stream_body_response(
+            Body::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+                 data: {not-json}\n\n\
+                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+            "gpt-test".to_owned(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(malformed.into_body().collect().await.is_err());
+
+        let incomplete_tool = anthropic_stream_body_response(
+            Body::from(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"toolu_bad\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\\\"q\\\\\":\"}}]},\"finish_reason\":null}]}\n\n\
+                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            ),
+            "gpt-test".to_owned(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(incomplete_tool.into_body().collect().await.is_err());
+
+        let unknown = stream_responses_body_response(
+            Body::from(
+                "data: {\"type\":\"response.created\"}\n\n\
+                 data: {\"type\":\"response.future_event\"}\n\n",
+            ),
+            "gpt-test".to_owned(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(unknown.into_body().collect().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_requires_finish_reason_to_match_tool_blocks() {
+        let text_then_tool_finish = anthropic_stream_body_response(
+            Body::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"text\"},\"finish_reason\":null}]}\n\n\
+                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            ),
+            "gpt-test".to_owned(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(text_then_tool_finish.into_body().collect().await.is_err());
+
+        let tool_then_stop = anthropic_stream_body_response(
+            Body::from(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"toolu_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            ),
+            "gpt-test".to_owned(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(tool_then_stop.into_body().collect().await.is_err());
+    }
+
+    #[test]
+    fn anthropic_conversion_preserves_mixed_text_and_tool_calls_and_validates_finish() {
+        let request = validate_message_request(json!({
+            "model":"gpt-test",
+            "max_tokens":8,
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"text","text":"before"},
+                    {"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"rust"}}
+                ]}
+            ]
+        }))
+        .expect("request");
+        let payload = to_chat_payload(&request).expect("payload");
+        assert_eq!(payload["messages"][0]["content"], "before");
+        assert_eq!(payload["messages"][0]["tool_calls"][0]["id"], "toolu_1");
+
+        let valid = from_chat_response(
+            br#"{"choices":[{"message":{"role":"assistant","content":"before","tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"rust\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "gpt-test",
+        )
+        .expect("valid mixed response");
+        assert_eq!(valid["content"][0]["text"], "before");
+        assert_eq!(valid["content"][1]["input"]["q"], "rust");
+        assert_eq!(valid["stop_reason"], "tool_use");
+
+        let no_tool_finish = br#"{"choices":[{"message":{"role":"assistant","content":"text"},"finish_reason":"tool_calls"}]}"#;
+        assert!(from_chat_response(no_tool_finish, "gpt-test").is_err());
+        let wrong_finish = br#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":"stop"}]}"#;
+        assert!(from_chat_response(wrong_finish, "gpt-test").is_err());
+        let non_object = br#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"lookup","arguments":"[]"}}]},"finish_reason":"tool_calls"}]}"#;
+        assert!(from_chat_response(non_object, "gpt-test").is_err());
+    }
+
+    #[test]
+    fn anthropic_standard_images_and_web_search_convert_to_responses_payload() {
+        let request = validate_message_request(json!({
+            "model":"gpt-test",
+            "max_tokens":8,
+            "tools":[{"type":"web_search_20250305","name":"web_search"}],
+            "messages":[{"role":"user","content":[
+                {"type":"text","text":"find this"},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AQI="}}
+            ]}]
+        }))
+        .expect("standard image/search request");
+        let payload = to_responses_payload(&request).expect("responses payload");
+        assert_eq!(payload["max_output_tokens"], 8);
+        assert_eq!(payload["tools"][0]["type"], "web_search_preview");
+        assert_eq!(payload["input"][0]["type"], "message");
+        assert_eq!(payload["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(payload["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            payload["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,AQI="
+        );
+
+        let unsupported_scope = validate_message_request(json!({
+            "model":"gpt-test",
+            "max_tokens":8,
+            "tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],
+            "messages":[{"role":"user","content":"find this"}]
+        }))
+        .expect_err("max_uses must not be silently dropped");
+        assert_eq!(unsupported_scope.code(), "unsupported_capability");
+
+        for (field, value) in [
+            ("temperature", json!(0.2)),
+            ("top_p", json!(0.8)),
+            ("top_k", json!(20)),
+            ("stop_sequences", json!(["END"])),
+            ("metadata", json!({"request_id":"test"})),
+        ] {
+            let mut payload = json!({
+                "model":"gpt-test",
+                "max_tokens":8,
+                "messages":[{"role":"user","content":"hello"}]
+            });
+            payload[field] = value;
+            let error =
+                validate_message_request(payload).expect_err("unsupported field must fail closed");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.code(), "unsupported_capability", "field={field}");
+        }
+    }
+
+    #[test]
+    fn anthropic_responses_projection_preserves_tool_error_semantics() {
+        let request = validate_message_request(json!({
+            "model":"gpt-test",
+            "max_tokens":8,
+            "messages":[{
+                "role":"user",
+                "content":[{
+                    "type":"tool_result",
+                    "tool_use_id":"toolu-error",
+                    "content":"permission denied",
+                    "is_error":true
+                }]
+            }]
+        }))
+        .expect("valid Anthropic request");
+        let payload = to_responses_payload(&request).expect("Responses payload");
+        assert_eq!(
+            payload["input"][0]["output"],
+            "tool_error: permission denied"
+        );
+    }
+
+    #[test]
+    fn anthropic_responses_search_preserves_standard_results_citations_and_usage() {
+        let body = br#"{
+            "id":"resp-search",
+            "usage":{"input_tokens":11,"output_tokens":7},
+            "output":[
+                {"type":"web_search_call","id":"ws-1","action":{"type":"search","query":"latest news"}},
+                {"type":"message","role":"assistant","content":[
+                    {"type":"output_text","text":"Answer from Example","annotations":[
+                        {"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":6,"encrypted_index":"opaque-index"}
+                    ]}
+                ]}
+            ]
+        }"#;
+        let response = from_responses_response(body, "gpt-test").expect("Anthropic response");
+        assert_eq!(response["content"][0]["type"], "server_tool_use");
+        assert_eq!(response["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(response["content"][1]["tool_use_id"], "ws-1");
+        assert_eq!(
+            response["content"][1]["content"].as_array().unwrap().len(),
+            1
+        );
+        assert!(
+            response["content"][1]["content"][0]["encrypted_content"]
+                .as_str()
+                .unwrap()
+                .starts_with("chatgpt2api-search-v1:")
+        );
+        assert_eq!(response["content"][2]["type"], "text");
+        assert_eq!(
+            response["content"][2]["citations"][0]["type"],
+            "web_search_result_location"
+        );
+        assert_eq!(
+            response["content"][2]["citations"][0]["cited_text"],
+            "Answer"
+        );
+        assert!(
+            response["content"][2]["citations"][0]["encrypted_index"]
+                .as_str()
+                .unwrap()
+                .starts_with("chatgpt2api-search-v1:")
+        );
+        assert_eq!(response["usage"]["input_tokens"], 11);
+        assert_eq!(response["usage"]["output_tokens"], 7);
+
+        let replay = validate_message_request(json!({
+            "model":"gpt-test",
+            "max_tokens":8,
+            "messages":[{"role":"assistant","content":response["content"].clone()}]
+        }))
+        .expect("generated search response must be replayable");
+        let replay_payload = to_responses_payload(&replay).expect("replay payload");
+        let replay_text = serde_json::to_string(&replay_payload).expect("replay JSON");
+        assert!(!replay_text.contains("<tool_") && !replay_text.contains("chatgpt2api-search-v1:"));
+        assert!(
+            replay_payload["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| {
+                    item["content"].as_array().unwrap().iter().any(|block| {
+                        block["type"] == "input_text"
+                            && block["text"].as_str().unwrap().contains("Web search")
+                    })
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_route_returns_anthropic_error_envelope() {
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: vec!["gpt-test".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","max_tokens":8,"messages":[{"role":"user","content":"hello"}]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert!(value["error"]["message"].is_string());
+    }
+
+    #[test]
+    fn anthropic_nonstream_rejects_unknown_upstream_finish_reason() {
+        let body = br#"{"choices":[{"message":{"role":"assistant","content":"hello"},"finish_reason":"vendor_new_reason"}]}"#;
+        assert!(from_chat_response(body, "gpt-test").is_err());
+    }
+
+    #[test]
+    fn anthropic_tool_choice_uses_standard_object_shapes() {
+        let mut none = validate_message_request(json!({
+            "model":"gpt-test",
+            "max_tokens":4,
+            "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+            "tool_choice":{"type":"none"},
+            "messages":[{"role":"user","content":"hello"}]
+        }))
+        .expect("none choice");
+        assert_eq!(
+            to_chat_payload(&none).expect("none payload")["tool_choice"],
+            "none"
+        );
+
+        let invalid = validate_message_request(json!({
+            "model":"gpt-test",
+            "max_tokens":4,
+            "tool_choice":"auto",
+            "messages":[{"role":"user","content":"hello"}]
+        }));
+        assert!(invalid.is_err());
+
+        none["tool_choice"] = json!({"type":"auto","disable_parallel_tool_use":true});
+        assert_eq!(
+            to_chat_payload(&none).expect("parallel payload")["parallel_tool_calls"],
+            false
+        );
+    }
+
+    #[test]
+    fn anthropic_capability_split_keeps_function_tools_on_chat_path() {
+        let function_request = validate_message_request(json!({
+            "model": "gpt-test",
+            "max_tokens": 8,
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+            "messages": [{"role": "user", "content": "lookup"}]
+        }))
+        .expect("function request");
+        assert!(!anthropic_request_requires_responses(&function_request));
+
+        let search_request = validate_message_request(json!({
+            "model": "gpt-test",
+            "max_tokens": 8,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": "search"}]
+        }))
+        .expect("search request");
+        assert!(anthropic_request_requires_responses(&search_request));
     }
 
     #[tokio::test]
@@ -7071,6 +8125,10 @@ mod tests {
                     .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
                     .route("/backend-api/models", authenticated_models)
                     .route(
+                        "/backend-api/codex/models",
+                        get(|| async { Json(json!({"models": [{"slug": "catalog-model"}]})) }),
+                    )
+                    .route(
                         "/backend-anon/sentinel/chat-requirements/prepare",
                         anonymous_prepare,
                     )
@@ -7107,6 +8165,9 @@ mod tests {
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
 
         let dropped_tool_call = state
             .router()
@@ -7448,6 +8509,132 @@ mod tests {
         drop(response);
         assert_eq!(state.account_store.inflight(), 0);
 
+        fs::remove_file(account_path).expect("cleanup");
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn anthropic_messages_uses_native_dispatcher_and_releases_lease() {
+        let request_log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = request_log.clone();
+        let bootstrap = get(move || {
+            let log = log.clone();
+            async move {
+                log.lock().await.push("bootstrap".to_owned());
+                (
+                    StatusCode::OK,
+                    Body::from(
+                        r#"<html data-build="c/test/_build"><script src="https://chatgpt.com/c/test/_sdk.js"></script></html>"#,
+                    ),
+                )
+                    .into_response()
+            }
+        });
+        let models = get(|| async { Json(json!({"models":[{"slug":"gpt-test"}]})) });
+        let prepare = post(|| async {
+            Json(json!({"prepare_token":"prepare-token","proofofwork":{"required":false}}))
+        });
+        let finalize = post(|| async { Json(json!({"token":"requirements-token"})) });
+        let log = request_log.clone();
+        let conversation = post(move |Json(payload): Json<Value>| {
+            let log = log.clone();
+            async move {
+                log.lock().await.push("conversation".to_owned());
+                assert_eq!(
+                    payload["messages"][0]["content"]["parts"][0],
+                    "anthropic native"
+                );
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    Body::from(
+                        "data: {\"message\":{\"author\":{\"role\":\"assistant\"},\"content\":{\"parts\":[\"native answer\"]}}}\n\n\
+                         data: [DONE]\n\n",
+                    ),
+                )
+                    .into_response()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", bootstrap)
+                    .route("/backend-api/models", models)
+                    .route(
+                        "/backend-api/codex/models",
+                        get(|| async { Json(json!({"models": [{"slug": "gpt-test"}]})) }),
+                    )
+                    .route("/backend-api/sentinel/chat-requirements/prepare", prepare)
+                    .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
+                    .route("/backend-api/conversation", conversation),
+            )
+            .await
+            .expect("native server");
+        });
+        let account_path = std::env::temp_dir().join(format!(
+            "chatgpt2api-rust-anthropic-native-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &account_path,
+            r#"{"items":[{"access_token":"account-token","status":"正常","type":"free","source_type":"web","models":["gpt-test"]}]}"#,
+        )
+        .expect("accounts");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-test".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "client")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r##"{"model":"gpt-test","max_tokens":8,"messages":[{"role":"user","content":"anthropic native"}]}"##,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).expect("message");
+        assert_eq!(value["content"][0]["text"], "native answer");
+        assert!(
+            request_log
+                .lock()
+                .await
+                .iter()
+                .any(|entry| entry == "conversation")
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+        state.account_type_catalog.shutdown().await;
         fs::remove_file(account_path).expect("cleanup");
         upstream_task.abort();
     }
@@ -8124,6 +9311,10 @@ data: [DONE]
                     .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
                     .route("/backend-api/models", authenticated_models)
                     .route(
+                        "/backend-api/codex/models",
+                        get(|| async { Json(json!({"models": [{"slug": "catalog-model"}]})) }),
+                    )
+                    .route(
                         "/backend-anon/sentinel/chat-requirements/prepare",
                         anonymous_prepare,
                     )
@@ -8166,6 +9357,9 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
 
         let response = state
             .router()
@@ -8290,6 +9484,10 @@ data: [DONE]
                     .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
                     .route("/backend-api/models", authenticated_models)
                     .route(
+                        "/backend-api/codex/models",
+                        get(|| async { Json(json!({"models": [{"slug": "catalog-model"}]})) }),
+                    )
+                    .route(
                         "/backend-anon/sentinel/chat-requirements/prepare",
                         post(|| async { Json(json!({"prepare_token":"anonymous-prepare-token"})) }),
                     )
@@ -8332,6 +9530,9 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
         let response = state
             .router()
             .oneshot(
@@ -8396,6 +9597,10 @@ data: [DONE]
                         finalize.clone(),
                     )
                     .route("/backend-api/models", models.clone())
+                    .route(
+                        "/backend-api/codex/models",
+                        get(|| async { Json(json!({"models": [{"slug": "known-model"}]})) }),
+                    )
                     .route("/backend-anon/sentinel/chat-requirements/prepare", prepare)
                     .route(
                         "/backend-anon/sentinel/chat-requirements/finalize",
@@ -8419,6 +9624,9 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
         let response = state
             .router()
             .oneshot(
@@ -8998,7 +10206,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_models_catalog_uses_one_source_compatible_representative_per_type() {
+    async fn native_models_catalog_uses_one_representative_per_type_with_dual_catalogs() {
         let account_path = std::env::temp_dir().join(format!(
             "chatgpt2api-rust-native-models-{}-{}.json",
             std::process::id(),
@@ -9127,10 +10335,14 @@ data: [DONE]
                                     .expect("auth model calls lock")
                                     .push(authorization.clone().expect("authorization"));
                                 record(request, paths).await;
-                                let models = json!({"models":[
-                                    {"slug":"web-only-model","owned_by":"chatgpt"},
-                                    {"slug":"collision-model","owned_by":"chatgpt"}
-                                ]});
+                                let models = if authorization.as_deref() == Some("Bearer web-token") {
+                                    json!({"models":[
+                                        {"slug":"web-only-model","owned_by":"chatgpt"},
+                                        {"slug":"collision-model","owned_by":"chatgpt"}
+                                    ]})
+                                } else {
+                                    json!({"models":[{"slug":"plus-auth-model","owned_by":"chatgpt"}]})
+                                };
                                 Json(models).into_response()
                             }
                         }),
@@ -9147,7 +10359,9 @@ data: [DONE]
                                     .get(header::AUTHORIZATION)
                                     .and_then(|value| value.to_str().ok())
                                     .map(str::to_owned);
-                                assert_eq!(authorization.as_deref(), Some("Bearer codex-no-id"));
+                                let Some(authorization) = authorization.as_deref() else {
+                                    return StatusCode::BAD_REQUEST.into_response();
+                                };
                                 assert_eq!(
                                     request
                                         .headers()
@@ -9162,7 +10376,7 @@ data: [DONE]
                                         .and_then(|value| value.to_str().ok()),
                                     Some("codex_cli_rs")
                                 );
-                                if authorization.as_deref() == Some("Bearer codex-token") {
+                                if authorization == "Bearer codex-token" {
                                     assert_eq!(
                                         request
                                             .headers()
@@ -9170,7 +10384,10 @@ data: [DONE]
                                             .and_then(|value| value.to_str().ok()),
                                         Some("codex-account")
                                     );
+                                } else if authorization == "Bearer web-token" {
+                                    assert!(request.headers().get("ChatGPT-Account-ID").is_none());
                                 } else {
+                                    assert_eq!(authorization, "Bearer codex-no-id");
                                     assert!(request.headers().get("ChatGPT-Account-ID").is_none());
                                 }
                                 assert!(request
@@ -9178,9 +10395,16 @@ data: [DONE]
                                     .query()
                                     .is_some_and(|query| query.starts_with("client_version=")));
                                 record(request, paths).await;
+                                let slug = if authorization == "Bearer web-token" {
+                                    "codex-only-model"
+                                } else if authorization == "Bearer codex-token" {
+                                    "codex-token-model"
+                                } else {
+                                    "plus-only-model"
+                                };
                                 Json(json!({
                                     "models":[{
-                                        "slug":"plus-only-model",
+                                        "slug":slug,
                                         "visibility":"list",
                                         "supported_in_api":true
                                     }]
@@ -9322,7 +10546,15 @@ data: [DONE]
             .lock()
             .expect("auth model calls lock")
             .clone();
-        assert_eq!(auth_model_calls, vec!["Bearer web-token"]);
+        let mut auth_model_calls = auth_model_calls;
+        auth_model_calls.sort();
+        assert_eq!(
+            auth_model_calls,
+            vec![
+                "Bearer codex-no-id".to_owned(),
+                "Bearer web-token".to_owned()
+            ]
+        );
         state
             .account_type_catalog
             .refresh_inner_with_budget(Duration::from_secs(1))
@@ -9356,6 +10588,7 @@ data: [DONE]
         assert!(ids.contains("web-only-model"));
         assert!(ids.contains("collision-model"));
         assert!(ids.contains("plus-only-model"));
+        assert!(ids.contains("codex-only-model"));
         assert_eq!(
             state
                 .account_type_catalog
@@ -9377,14 +10610,14 @@ data: [DONE]
                 .expect("plus group"),
             HashSet::from(["plus".to_owned()])
         );
-        assert_eq!(codex_model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(codex_model_calls.load(Ordering::SeqCst), 2);
         let codex_paths = paths
             .lock()
             .expect("path lock")
             .iter()
             .filter(|path| path.starts_with("/backend-api/codex/models?"))
             .count();
-        assert_eq!(codex_paths, 1);
+        assert_eq!(codex_paths, 2);
         assert_eq!(
             state
                 .account_type_catalog
@@ -9509,7 +10742,7 @@ data: [DONE]
                 .iter()
                 .filter(|path| path.starts_with("/backend-api/codex/models?client_version="))
                 .count(),
-            1
+            2
         );
         assert!(paths.contains(&"/backend-anon/models?iim=false&is_gizmo=false".to_owned()));
         assert!(
@@ -9524,7 +10757,7 @@ data: [DONE]
         fs::remove_file(account_path).expect("cleanup");
     }
 
-    async fn assert_web_catalog_uses_only_web_endpoint() {
+    async fn assert_catalog_queries_both_endpoints_concurrently() {
         let account_path = std::env::temp_dir().join(format!(
             "chatgpt2api-rust-dual-source-merge-{}-{}.json",
             std::process::id(),
@@ -9643,6 +10876,9 @@ data: [DONE]
                 .await
         });
         delayed_started.notified().await;
+        tokio::time::timeout(Duration::from_millis(500), fast_finished.notified())
+            .await
+            .expect("fast Codex endpoint must run before slow Web release");
         release_delayed.notify_one();
         let result = fetch.await.expect("fetch task").expect("catalog result");
         let ids = result
@@ -9650,8 +10886,9 @@ data: [DONE]
             .iter()
             .map(|model| model.id.as_str())
             .collect::<HashSet<_>>();
-        let expected = HashSet::from(["web-delayed-model"]);
+        let expected = HashSet::from(["web-delayed-model", "codex-fast-model"]);
         assert_eq!(ids, expected);
+        assert!(result.2);
 
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -9660,8 +10897,107 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_catalog_web_representative_uses_only_web_endpoint() {
-        assert_web_catalog_uses_only_web_endpoint().await;
+    async fn native_catalog_representative_merges_web_and_codex_endpoints() {
+        assert_catalog_queries_both_endpoints_concurrently().await;
+    }
+
+    #[tokio::test]
+    async fn native_catalog_codex_slow_does_not_block_fast_web() {
+        let account_path = std::env::temp_dir().join(format!(
+            "chatgpt2api-rust-dual-source-reverse-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &account_path,
+            r#"[{"access_token":"representative","status":"正常","type":"Pro"}]"#,
+        )
+        .expect("account snapshot");
+        let web_finished = Arc::new(Notify::new());
+        let codex_started = Arc::new(Notify::new());
+        let release_codex = Arc::new(Notify::new());
+        let web_finished_for_upstream = web_finished.clone();
+        let codex_started_for_upstream = codex_started.clone();
+        let release_codex_for_upstream = release_codex.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", get(|| async { Html("<html></html>") }))
+                    .route("/backend-api/models", get(move || {
+                        let finished = web_finished_for_upstream.clone();
+                        async move {
+                            finished.notify_one();
+                            Json(json!({"models":[{"slug":"web-fast-model"}]}))
+                        }
+                    }))
+                    .route("/backend-api/codex/models", get(move || {
+                        let started = codex_started_for_upstream.clone();
+                        let release = release_codex_for_upstream.clone();
+                        async move {
+                            started.notify_one();
+                            release.notified().await;
+                            Json(json!({"models":[{"slug":"codex-slow-model","supported_in_api":true}]}))
+                        }
+                    })),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+        let candidates = vec![CatalogAccountCandidate {
+            token: "representative".to_owned(),
+            source_type: "web".to_owned(),
+            chatgpt_account_id: None,
+        }];
+        let catalog = state.account_type_catalog.clone();
+        let fetch = tokio::spawn(async move {
+            catalog
+                .fetch_account_type_models(
+                    &"pro".to_owned(),
+                    &candidates,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_millis(500), web_finished.notified())
+            .await
+            .expect("Web must finish while Codex is pending");
+        codex_started.notified().await;
+        assert!(!fetch.is_finished());
+        release_codex.notify_one();
+        let result = fetch.await.expect("fetch task").expect("catalog result");
+        assert_eq!(
+            result
+                .0
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<HashSet<_>>(),
+            HashSet::from(["web-fast-model".to_owned(), "codex-slow-model".to_owned()])
+        );
+        assert!(result.2);
+        state.account_type_catalog.shutdown().await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        fs::remove_file(account_path).expect("cleanup");
     }
 
     #[tokio::test]
@@ -9698,7 +11034,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_catalog_codex_source_does_not_call_web_endpoint() {
+    async fn native_catalog_partial_endpoint_marks_incomplete() {
         let account_path = std::env::temp_dir().join(format!(
             "chatgpt2api-rust-dual-source-timeout-{}-{}.json",
             std::process::id(),
@@ -9796,16 +11132,277 @@ data: [DONE]
                 .await
         });
         codex_started.notified().await;
+        tokio::time::timeout(Duration::from_millis(500), web_finished.notified())
+            .await
+            .expect("fast Web endpoint must finish while Codex is pending");
         let result = tokio::time::timeout(Duration::from_secs(1), fetch)
             .await
             .expect("catalog deadline")
             .expect("fetch task");
-        assert!(result.is_none());
+        let result = result.expect("web partial catalog remains usable");
+        assert_eq!(
+            result
+                .0
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web-survives-timeout"]
+        );
+        assert!(!result.2, "a missing endpoint cannot be complete");
 
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
         fs::remove_file(account_path).expect("cleanup");
+    }
+
+    async fn catalog_endpoint_status_case(
+        web_status: StatusCode,
+        codex_status: StatusCode,
+    ) -> (Option<(HashSet<String>, bool)>, usize, usize) {
+        let account_path = std::env::temp_dir().join(format!(
+            "chatgpt2api-rust-dual-source-status-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &account_path,
+            r#"[{"access_token":"representative","status":"正常","type":"Pro"}]"#,
+        )
+        .expect("account snapshot");
+        let web_calls = Arc::new(AtomicUsize::new(0));
+        let codex_calls = Arc::new(AtomicUsize::new(0));
+        let web_calls_for_upstream = web_calls.clone();
+        let codex_calls_for_upstream = codex_calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", get(|| async { Html("<html></html>") }))
+                    .route(
+                        "/backend-api/models",
+                        get(move || {
+                            let calls = web_calls_for_upstream.clone();
+                            async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                if !web_status.is_success() {
+                                    return web_status.into_response();
+                                }
+                                Json(json!({"models":[{"slug":"web-model"}]})).into_response()
+                            }
+                        }),
+                    )
+                    .route(
+                        "/backend-api/codex/models",
+                        get(move || {
+                            let calls = codex_calls_for_upstream.clone();
+                            async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                if !codex_status.is_success() {
+                                    return codex_status.into_response();
+                                }
+                                Json(json!({"models":[{"slug":"codex-model","supported_in_api":true}]})).into_response()
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+        let candidates = vec![CatalogAccountCandidate {
+            token: "representative".to_owned(),
+            source_type: "web".to_owned(),
+            chatgpt_account_id: None,
+        }];
+        let result = state
+            .account_type_catalog
+            .fetch_account_type_models(
+                &"pro".to_owned(),
+                &candidates,
+                Instant::now() + Duration::from_millis(500),
+            )
+            .await
+            .map(|(models, _, complete)| {
+                (models.into_iter().map(|model| model.id).collect(), complete)
+            });
+        let counts = (
+            web_calls.load(Ordering::SeqCst),
+            codex_calls.load(Ordering::SeqCst),
+        );
+        state.account_type_catalog.shutdown().await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        fs::remove_file(account_path).expect("cleanup");
+        (result, counts.0, counts.1)
+    }
+
+    #[tokio::test]
+    async fn native_catalog_web_failure_keeps_codex_partial_and_incomplete() {
+        let (result, web_calls, codex_calls) =
+            catalog_endpoint_status_case(StatusCode::BAD_GATEWAY, StatusCode::OK).await;
+        let (models, complete) = result.expect("Codex partial catalog remains usable");
+        assert_eq!(models, HashSet::from(["codex-model".to_owned()]));
+        assert!(!complete);
+        assert_eq!((web_calls, codex_calls), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn native_catalog_both_endpoint_failures_are_not_ready() {
+        let (result, web_calls, codex_calls) =
+            catalog_endpoint_status_case(StatusCode::BAD_GATEWAY, StatusCode::UNAUTHORIZED).await;
+        assert!(result.is_none());
+        assert_eq!((web_calls, codex_calls), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn native_catalog_each_endpoint_falls_back_to_next_same_type_candidate() {
+        let web_calls = Arc::new(AtomicUsize::new(0));
+        let codex_calls = Arc::new(AtomicUsize::new(0));
+        let web_calls_for_upstream = web_calls.clone();
+        let codex_calls_for_upstream = codex_calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", get(|| async { Html("<html></html>") }))
+                    .route(
+                        "/backend-api/models",
+                        get(move |headers: HeaderMap| {
+                            let calls = web_calls_for_upstream.clone();
+                            async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                let token = headers
+                                    .get(header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or_default();
+                                if token.ends_with("first") {
+                                    return StatusCode::BAD_GATEWAY.into_response();
+                                }
+                                Json(json!({
+                                    "models": [{"slug": "web-second-candidate"}]
+                                }))
+                                .into_response()
+                            }
+                        }),
+                    )
+                    .route(
+                        "/backend-api/codex/models",
+                        get(move |headers: HeaderMap| {
+                            let calls = codex_calls_for_upstream.clone();
+                            async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                let token = headers
+                                    .get(header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or_default();
+                                assert!(token.ends_with("first"));
+                                Json(json!({
+                                    "models": [{
+                                        "slug": "codex-first-candidate",
+                                        "supported_in_api": true
+                                    }]
+                                }))
+                                .into_response()
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .expect("upstream server");
+        });
+
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+        let candidates = vec![
+            CatalogAccountCandidate {
+                token: "first".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            },
+            CatalogAccountCandidate {
+                token: "second".to_owned(),
+                source_type: "codex".to_owned(),
+                chatgpt_account_id: None,
+            },
+        ];
+        let result = state
+            .account_type_catalog
+            .fetch_account_type_models(
+                &"pro".to_owned(),
+                &candidates,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("partial endpoint fallback remains usable");
+        let owners = result.1.clone();
+        assert_eq!(
+            owners.web.as_ref().map(|owner| owner.token.as_str()),
+            Some("second")
+        );
+        assert_eq!(
+            owners.codex.as_ref().map(|owner| owner.token.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            result
+                .0
+                .into_iter()
+                .map(|model| model.id)
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "web-second-candidate".to_owned(),
+                "codex-first-candidate".to_owned()
+            ])
+        );
+        assert!(result.2, "both endpoint representatives succeeded");
+        assert_eq!(
+            (
+                web_calls.load(Ordering::SeqCst),
+                codex_calls.load(Ordering::SeqCst)
+            ),
+            (2, 1),
+            "each endpoint must stop after its first successful candidate"
+        );
+
+        state.account_type_catalog.shutdown().await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
     }
 
     #[tokio::test]
@@ -10102,6 +11699,10 @@ data: [DONE]
                         finalize.clone(),
                     )
                     .route("/backend-api/models", plus_models)
+                    .route(
+                        "/backend-api/codex/models",
+                        get(|| async { Json(json!({"models": [{"slug":"plus-model"}]})) }),
+                    )
                     .route("/backend-anon/sentinel/chat-requirements/prepare", prepare)
                     .route(
                         "/backend-anon/sentinel/chat-requirements/finalize",
@@ -10126,6 +11727,9 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
         state
             .account_type_catalog
             .refresh_inner_with_budget(Duration::from_millis(500))
@@ -12297,11 +13901,14 @@ data: [DONE]
                     models: Arc::new(vec![catalog_model]),
                     ready: true,
                     tokens: vec!["codex-token".to_owned()],
-                    owner: Some(CatalogAccountCandidate {
-                        token: "codex-token".to_owned(),
-                        source_type: "codex".to_owned(),
-                        chatgpt_account_id: Some("codex-account".to_owned()),
-                    }),
+                    owners: CatalogOwners {
+                        web: None,
+                        codex: Some(CatalogAccountCandidate {
+                            token: "codex-token".to_owned(),
+                            source_type: "codex".to_owned(),
+                            chatgpt_account_id: Some("codex-account".to_owned()),
+                        }),
+                    },
                     expires_at: Instant::now() + Duration::from_secs(60),
                     retry_at: Instant::now(),
                 },
@@ -12446,14 +14053,30 @@ data: [DONE]
         let address = listener.local_addr().expect("address");
         let response_calls = Arc::new(AtomicUsize::new(0));
         let response_calls_for_upstream = response_calls.clone();
+        let captured_payloads = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_payloads_for_upstream = captured_payloads.clone();
+        let hang_next = Arc::new(AtomicBool::new(false));
+        let hang_next_for_upstream = hang_next.clone();
+        let error_next = Arc::new(AtomicBool::new(false));
+        let error_next_for_upstream = error_next.clone();
         let upstream = tokio::spawn(async move {
+            let bootstrap = get(|| async {
+                Html(
+                    r#"<html data-build="c/test/_build"><script src="https://chatgpt.com/c/test/_sdk.js"></script></html>"#,
+                )
+            });
+            let prepare = post(|| async { Json(json!({"prepare_token":"prepare-token"})) });
+            let finalize = post(|| async { Json(json!({"token":"requirements-token"})) });
             let models = get(|| async {
                 Json(json!({
                     "models": [{"slug":"gpt-test","supported_in_api":true}]
                 }))
             });
-            let responses = post(move |headers: HeaderMap| {
+            let responses = post(move |headers: HeaderMap, Json(payload): Json<Value>| {
                 let response_calls = response_calls_for_upstream.clone();
+                let captured_payloads = captured_payloads_for_upstream.clone();
+                let hang_next = hang_next_for_upstream.clone();
+                let error_next = error_next_for_upstream.clone();
                 async move {
                     assert_eq!(
                         headers
@@ -12462,6 +14085,33 @@ data: [DONE]
                         Some("Bearer codex-token")
                     );
                     response_calls.fetch_add(1, Ordering::SeqCst);
+                    captured_payloads.lock().await.push(payload);
+                    if error_next.swap(false, Ordering::SeqCst) {
+                        let chunks = stream::iter(vec![
+                            Ok::<Bytes, std::io::Error>(Bytes::from(
+                                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-error\"}}\n\n",
+                            )),
+                            Err(std::io::Error::other("upstream body error")),
+                        ]);
+                        return (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(chunks),
+                        )
+                            .into_response();
+                    }
+                    if hang_next.swap(false, Ordering::SeqCst) {
+                        let first = stream::once(async {
+                            Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-pending\"}}\n\n",
+                            ))
+                        });
+                        let rest = stream::pending::<Result<Bytes, std::convert::Infallible>>();
+                        return (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(first.chain(rest)),
+                        )
+                            .into_response();
+                    }
                     (
                         [(header::CONTENT_TYPE, "text/event-stream")],
                         Body::from(
@@ -12477,6 +14127,17 @@ data: [DONE]
             axum::serve(
                 listener,
                 Router::new()
+                    .route("/", bootstrap)
+                    .route("/backend-api/sentinel/chat-requirements/prepare", prepare)
+                    .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
+                    .route(
+                        "/backend-api/models",
+                        get(|| async {
+                            Json(json!({
+                                "models": [{"slug":"gpt-test","supported_in_api":true}]
+                            }))
+                        }),
+                    )
                     .route("/backend-api/codex/models", models)
                     .route("/backend-api/codex/responses", responses),
             )
@@ -12535,6 +14196,56 @@ data: [DONE]
         assert_eq!(value["output"][0]["content"][0]["text"], "hello");
         assert_eq!(state.account_store.inflight(), 0);
 
+        error_next.store(true, Ordering::SeqCst);
+        let response_error = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","input":"error","stream":true}"#,
+                    ))
+                    .expect("error request"),
+            )
+            .await
+            .expect("error response");
+        assert_eq!(response_error.status(), StatusCode::BAD_GATEWAY);
+        let response_error_body = response_error
+            .into_body()
+            .collect()
+            .await
+            .expect("Responses error envelope")
+            .to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response_error_body).expect("Responses error JSON")["error"]
+                ["type"],
+            "server_error"
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+
+        hang_next.store(true, Ordering::SeqCst);
+        let pending = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","input":"cancel","stream":true}"#,
+                    ))
+                    .expect("pending request"),
+            )
+            .await
+            .expect("pending response");
+        assert_eq!(pending.status(), StatusCode::OK);
+        drop(pending);
+        assert_eq!(state.account_store.inflight(), 0);
+
         let stream = state
             .router()
             .oneshot(
@@ -12562,7 +14273,105 @@ data: [DONE]
         assert!(text.contains("response.output_text.delta"));
         assert!(text.contains("response.completed"));
         assert_eq!(state.account_store.inflight(), 0);
-        assert_eq!(response_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(response_calls.load(Ordering::SeqCst), 4);
+        let payloads = captured_payloads.lock().await;
+        assert_eq!(payloads.len(), 4);
+        assert_eq!(payloads[0]["model"], "gpt-test");
+        assert_eq!(payloads[0]["input"], "hello");
+        assert_eq!(payloads[1]["input"], "error");
+        assert_eq!(payloads[2]["input"], "cancel");
+        assert_eq!(payloads[3]["input"], "hello");
+        for payload in payloads.iter().skip(1) {
+            assert_eq!(payload["stream"], true);
+        }
+        drop(payloads);
+
+        error_next.store(true, Ordering::SeqCst);
+        let anthropic_error = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "client")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r##"{"model":"gpt-test","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"error"}]}"##,
+                    ))
+                    .expect("Anthropic error request"),
+        )
+            .await
+            .expect("Anthropic error response");
+        assert_eq!(anthropic_error.status(), StatusCode::BAD_GATEWAY);
+        let anthropic_error_body = anthropic_error
+            .into_body()
+            .collect()
+            .await
+            .expect("Anthropic error envelope")
+            .to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&anthropic_error_body).expect("Anthropic error JSON")["error"]
+                ["type"],
+            "server_error"
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+
+        hang_next.store(true, Ordering::SeqCst);
+        let anthropic_pending = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "client")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r##"{"model":"gpt-test","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"cancel"}]}"##,
+                    ))
+                    .expect("pending Anthropic request"),
+            )
+            .await
+            .expect("pending Anthropic response");
+        assert_eq!(anthropic_pending.status(), StatusCode::OK);
+        drop(anthropic_pending);
+        assert_eq!(state.account_store.inflight(), 0);
+
+        let anthropic = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "client")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r##"{"model":"gpt-test","max_tokens":8,"stream":true,"messages":[{"role":"user","content":"hello"}]}"##,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(anthropic.status(), StatusCode::OK);
+        let body = anthropic
+            .into_body()
+            .collect()
+            .await
+            .expect("Anthropic body")
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("Anthropic SSE");
+        assert!(text.contains("content_block_start"));
+        assert!(text.contains("text_delta"));
+        assert!(text.contains("message_stop"));
+        assert_eq!(state.account_store.inflight(), 0);
+        assert_eq!(response_calls.load(Ordering::SeqCst), 7);
+        let payloads = captured_payloads.lock().await;
+        assert_eq!(payloads.len(), 7);
+        assert_eq!(payloads[4]["input"][0]["content"][0]["text"], "error");
+        assert_eq!(payloads[5]["input"][0]["content"][0]["text"], "cancel");
+        assert_eq!(payloads[6]["input"][0]["content"][0]["text"], "hello");
 
         state.account_type_catalog.shutdown().await;
         upstream.abort();
@@ -12579,6 +14388,13 @@ data: [DONE]
         let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
         let captured_for_upstream = captured.clone();
         let upstream = tokio::spawn(async move {
+            let bootstrap = get(|| async {
+                Html(
+                    r#"<html data-build="c/test/_build"><script src="https://chatgpt.com/c/test/_sdk.js"></script></html>"#,
+                )
+            });
+            let prepare = post(|| async { Json(json!({"prepare_token":"prepare-token"})) });
+            let finalize = post(|| async { Json(json!({"token":"requirements-token"})) });
             let models = get(|| async {
                 Json(json!({
                     "models": [{"slug":"gpt-test","supported_in_api":true}]
@@ -12593,7 +14409,7 @@ data: [DONE]
                         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-search\"}}\n\n\
                          data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}}}\n\n\
                          data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-1\",\"delta\":\"Rust answer\"}\n\n\
-                         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-search\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Rust answer\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\",\"start_index\":0,\"end_index\":4}]}]}]}}\n\n"
+                         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-search\",\"usage\":{\"output_tokens\":4},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Rust answer\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\",\"start_index\":0,\"end_index\":4}]}]}]}}\n\n"
                     } else {
                         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-function\"}}\n\n\
                          data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-function\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-1\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"rust\\\"}\"}]}}\n\n"
@@ -12608,6 +14424,17 @@ data: [DONE]
             axum::serve(
                 listener,
                 Router::new()
+                    .route("/", bootstrap)
+                    .route("/backend-api/sentinel/chat-requirements/prepare", prepare)
+                    .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
+                    .route(
+                        "/backend-api/models",
+                        get(|| async {
+                            Json(json!({
+                                "models": [{"slug":"gpt-test","supported_in_api":true}]
+                            }))
+                        }),
+                    )
                     .route("/backend-api/codex/models", models)
                     .route("/backend-api/codex/responses", responses),
             )
@@ -12641,6 +14468,20 @@ data: [DONE]
             .account_type_catalog
             .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
 
+        let anthropic_request = validate_message_request(json!({
+            "model": "gpt-test",
+            "max_tokens": 8,
+            "messages": [{"role":"user","content":"lookup rust"}],
+            "tools": [{"name":"lookup","input_schema":{"type":"object"}}],
+            "tool_choice": {"type":"auto"}
+        }))
+        .expect("Anthropic tool request fixture");
+        let chat_payload = to_chat_payload(&anthropic_request).expect("Chat tool payload");
+        assert!(
+            native_codex_response_payload(chat_payload.as_object().expect("object")).is_ok(),
+            "Codex payload rejected Chat projection: {chat_payload}"
+        );
+
         let function_response = state
             .router()
             .oneshot(
@@ -12666,6 +14507,42 @@ data: [DONE]
         let function_value: Value = serde_json::from_slice(&function_body).expect("function json");
         assert_eq!(function_value["output"][0]["id"], "fc-1");
         assert_eq!(function_value["output"][0]["call_id"], "call-1");
+        assert_eq!(state.account_store.inflight(), 0);
+
+        let anthropic_function = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "client")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","max_tokens":8,"messages":[{"role":"user","content":"lookup rust"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"tool_choice":{"type":"auto"}}"#,
+                    ))
+                    .expect("Anthropic function request"),
+            )
+            .await
+            .expect("Anthropic function response");
+        let anthropic_status = anthropic_function.status();
+        let body = anthropic_function
+            .into_body()
+            .collect()
+            .await
+            .expect("Anthropic function body")
+            .to_bytes();
+        assert_eq!(
+            anthropic_status,
+            StatusCode::OK,
+            "Anthropic function body: {}; captured={}",
+            String::from_utf8_lossy(&body),
+            serde_json::to_string(&*captured.lock().await).unwrap_or_default()
+        );
+        let value: Value = serde_json::from_slice(&body).expect("Anthropic function json");
+        assert_eq!(value["content"][0]["type"], "tool_use");
+        assert_eq!(value["content"][0]["name"], "lookup");
+        assert_eq!(value["stop_reason"], "tool_use");
         assert_eq!(state.account_store.inflight(), 0);
 
         let search_response = state
@@ -12696,11 +14573,143 @@ data: [DONE]
         assert!(search_text.contains("url_citation"));
         assert_eq!(state.account_store.inflight(), 0);
 
+        let anthropic_search = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "client")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-test","max_tokens":8,"stream":true,"tools":[{"type":"web_search_20250305","name":"web_search"}],"messages":[{"role":"user","content":"rust news"}]}"#,
+                    ))
+                    .expect("Anthropic search request"),
+            )
+            .await
+            .expect("Anthropic search response");
+        assert_eq!(anthropic_search.status(), StatusCode::OK);
+        let anthropic_search_body = anthropic_search
+            .into_body()
+            .collect()
+            .await
+            .expect("Anthropic search body")
+            .to_bytes();
+        let anthropic_search_text =
+            String::from_utf8(anthropic_search_body.to_vec()).expect("Anthropic search SSE");
+        assert!(anthropic_search_text.contains("server_tool_use"));
+        assert!(anthropic_search_text.contains("web_search_tool_result"));
+        assert!(anthropic_search_text.contains("citations_delta"));
+        assert!(anthropic_search_text.contains("web_search_requests"));
+        assert!(anthropic_search_text.contains(r#""output_tokens":4"#));
+        assert!(anthropic_search_text.contains(r#""stop_reason":"end_turn""#));
+        let mut replay_blocks = Vec::<Option<Value>>::new();
+        for frame in anthropic_search_text
+            .split("\n\n")
+            .filter(|frame| !frame.is_empty())
+        {
+            let Some((event, data)) = frame.split_once("\ndata: ") else {
+                continue;
+            };
+            let event = event.strip_prefix("event: ").unwrap_or_default();
+            let value: Value = serde_json::from_str(data).expect("Anthropic SSE JSON");
+            if event == "event: content_block_start" || event == "content_block_start" {
+                let index = value["index"].as_u64().expect("content block index") as usize;
+                if replay_blocks.len() <= index {
+                    replay_blocks.resize_with(index + 1, || None);
+                }
+                replay_blocks[index] = Some(value["content_block"].clone());
+            } else if event == "content_block_delta" {
+                let index = value["index"].as_u64().expect("delta index") as usize;
+                let block = replay_blocks[index].as_mut().expect("started block");
+                match value["delta"]["type"].as_str() {
+                    Some("text_delta") => {
+                        let text = block["text"].as_str().unwrap_or_default().to_owned();
+                        block["text"] = json!(format!("{text}{}", value["delta"]["text"]));
+                    }
+                    Some("citations_delta") => {
+                        let mut citations =
+                            block["citations"].as_array().cloned().unwrap_or_default();
+                        citations.push(value["delta"]["citation"].clone());
+                        block["citations"] = Value::Array(citations);
+                    }
+                    Some("input_json_delta") => {}
+                    other => panic!("unexpected Anthropic delta: {other:?}"),
+                }
+            }
+        }
+        let replay_content = replay_blocks
+            .into_iter()
+            .map(|block| block.expect("every replay block started"))
+            .collect::<Vec<_>>();
+        assert_eq!(replay_content[0]["type"], "server_tool_use");
+        assert_eq!(replay_content[1]["type"], "web_search_tool_result");
+        assert!(!replay_content[1]["content"].as_array().unwrap().is_empty());
+        assert_eq!(replay_content[2]["type"], "text");
+        assert!(
+            !replay_content[2]["citations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let replay_request = serde_json::to_vec(&json!({
+            "model":"gpt-test",
+            "max_tokens":8,
+            "stream":true,
+            "tools":[{"type":"web_search_20250305","name":"web_search"}],
+            "messages":[{"role":"assistant","content":replay_content}]
+        }))
+        .expect("replay request");
+        let replay_response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("x-api-key", "client")
+                    .header("anthropic-version", "2023-06-01")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(replay_request))
+                    .expect("replay request builder"),
+            )
+            .await
+            .expect("replay response");
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let _ = replay_response
+            .into_body()
+            .collect()
+            .await
+            .expect("replay body");
+        let replay_payload = captured
+            .lock()
+            .await
+            .last()
+            .cloned()
+            .expect("replay payload");
+        let replay_payload_text =
+            serde_json::to_string(&replay_payload).expect("replay payload JSON");
+        assert!(!replay_payload_text.contains("chatgpt2api-search-v1:"));
+        assert!(!replay_payload_text.contains("<tool_"));
+        assert_eq!(state.account_store.inflight(), 0);
+
         let payloads = captured.lock().await;
-        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads.len(), 5);
         assert_eq!(payloads[0]["tools"][0]["type"], "function");
         assert_eq!(payloads[0]["tools"][0]["name"], "lookup");
-        assert_eq!(payloads[1]["tools"][0]["type"], "web_search");
+        assert_eq!(payloads[1]["tools"][0]["type"], "function");
+        assert_eq!(payloads[1]["max_output_tokens"], 8);
+        assert_eq!(payloads[2]["tools"][0]["type"], "web_search");
+        assert_eq!(payloads[3]["tools"][0]["type"], "web_search");
+        assert!(payloads[4]["input"].as_array().unwrap().iter().any(|item| {
+            item["content"].as_array().unwrap().iter().any(|block| {
+                block["type"] == "input_text"
+                    && block["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Web search")
+            })
+        }));
         state.account_type_catalog.shutdown().await;
         upstream.abort();
         let _ = upstream.await;

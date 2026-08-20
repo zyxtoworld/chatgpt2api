@@ -16,6 +16,7 @@ from services.account_service import AccountService, account_service
 from services.model_contract import parse_model_text
 from services.openai_backend_api import (
     CatalogConfigurationError,
+    CatalogIncompleteError,
     InvalidAccessTokenError,
     OpenAIBackendAPI,
 )
@@ -230,6 +231,13 @@ class ModelCatalogService:
                 if access_token and callable(list_catalog)
                 else backend.list_models(deadline=deadline)
             )
+            if (
+                access_token
+                and callable(list_catalog)
+                and isinstance(raw_models, dict)
+                and raw_models.get("catalog_complete") is False
+            ):
+                raise CatalogIncompleteError("authenticated model catalog is incomplete")
             models = self._model_map(raw_models)
             if not models:
                 # A successful HTTP response with no usable model is not a

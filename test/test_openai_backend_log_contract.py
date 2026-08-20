@@ -802,24 +802,41 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
                 self.assertTrue(response.closed)
                 self.assertFalse(response.iterated)
 
-    def test_catalog_dispatches_only_to_the_account_source_endpoint(self) -> None:
+    def test_catalog_dispatches_both_endpoints_for_one_account_source(self) -> None:
         for source_type in ("web", "password", "password-oauth", "codex"):
             with self.subTest(source_type=source_type):
                 backend = object.__new__(OpenAIBackendAPI)
                 backend.access_token = "source-token"
                 backend.account = {"source_type": source_type}
                 backend._catalog_source_type = source_type
-                backend.list_models = mock.Mock(
-                    return_value={"object": "list", "data": [{"id": "model"}]}
-                )
+                backend.session = mock.Mock()
+                backend._bootstrap = mock.Mock()
+                backend._headers = mock.Mock(return_value={})
+                backend._codex_client_version = mock.Mock(return_value="0.147.0")
+                backend._codex_models_headers = mock.Mock(return_value={})
+                codex_session = mock.Mock()
+                backend._codex_session = mock.Mock(return_value=codex_session)
+                observed: list[tuple[object, str]] = []
+
+                def fetch(session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
+                    observed.append((session, path))
+                    return {"model": {"id": "model"}}
+
+                backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
 
                 result = OpenAIBackendAPI.list_catalog_models(backend)
 
                 self.assertEqual(result["data"][0]["id"], "model")
-                backend.list_models.assert_called_once_with(
-                    timeout_secs=30.0,
-                    deadline=None,
+                self.assertEqual(len(observed), 2)
+                self.assertEqual(
+                    {path for _session, path in observed},
+                    {
+                        "/backend-api/models?history_and_training_disabled=false",
+                        "/backend-api/codex/models?client_version=0.147.0",
+                    },
                 )
+                backend._bootstrap.assert_called_once()
+                codex_session.close.assert_called_once()
 
     def test_catalog_rejects_oauth_and_unknown_sources_before_any_transport(self) -> None:
         for source_type in ("oauth_login", "future-incompatible"):

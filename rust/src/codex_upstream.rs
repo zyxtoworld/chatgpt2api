@@ -3,6 +3,7 @@ use reqwest::RequestBuilder;
 use serde_json::{Map, Value, json};
 use std::env;
 
+use super::protocol_codex_payload::native_codex_tool;
 use super::{
     ApiError, CODEX_RESPONSES_MODEL, NATIVE_CLIENT_BUILD_NUMBER, NATIVE_CLIENT_VERSION,
     NATIVE_ORIGIN, NATIVE_SEC_CH_UA, NATIVE_USER_AGENT, is_semver, native_message_id,
@@ -126,16 +127,6 @@ pub(super) fn native_codex_message(message: &Value) -> Result<Value, ApiError> {
 pub(super) fn native_codex_response_payload(
     object: &Map<String, Value>,
 ) -> Result<Value, ApiError> {
-    if object
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| !tools.is_empty())
-        || object
-            .get("tool_choice")
-            .is_some_and(|choice| !choice.is_null())
-    {
-        return Err(ApiError::unavailable());
-    }
     let mut input = Vec::new();
     if let Some(messages) = object.get("messages").and_then(Value::as_array) {
         for message in messages {
@@ -160,7 +151,33 @@ pub(super) fn native_codex_response_payload(
         "input": input,
         "store": false,
         "stream": object.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        "tool_choice": "auto",
+        "parallel_tool_calls": object
+            .get("parallel_tool_calls")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
     });
+    if let Some(max_tokens) = object.get("max_tokens").filter(|value| !value.is_null()) {
+        payload["max_output_tokens"] = max_tokens.clone();
+    }
+    if let Some(tools) = object.get("tools").filter(|value| !value.is_null()) {
+        let tools = tools.as_array().ok_or_else(ApiError::invalid_request)?;
+        payload["tools"] = Value::Array(
+            tools
+                .iter()
+                .map(native_codex_tool)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    if let Some(choice) = object.get("tool_choice").filter(|value| !value.is_null()) {
+        let valid_choice = matches!(choice.as_str(), Some("auto"))
+            || matches!(choice.as_object(), Some(choice)
+                if choice.len() == 1
+                    && choice.get("type").and_then(Value::as_str) == Some("auto"));
+        if !valid_choice {
+            return Err(ApiError::invalid_request());
+        }
+    }
     if let Some(effort) = object
         .get("reasoning_effort")
         .and_then(Value::as_str)

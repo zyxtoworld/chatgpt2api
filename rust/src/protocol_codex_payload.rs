@@ -4,6 +4,26 @@ use serde_json::{Map, Value, json};
 
 pub(crate) fn native_codex_tool(value: &Value) -> Result<Value, ApiError> {
     let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let wrapper = object.get("function").is_some();
+    let normalized_wrapper = if wrapper {
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "type" | "function"))
+            || object.get("type").and_then(Value::as_str) != Some("function")
+        {
+            return Err(ApiError::invalid_request());
+        }
+        let function = object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(ApiError::invalid_request)?;
+        let mut normalized = function.clone();
+        normalized.insert("type".to_owned(), json!("function"));
+        Some(normalized)
+    } else {
+        None
+    };
+    let object = normalized_wrapper.as_ref().unwrap_or(object);
     let tool_type = object
         .get("type")
         .and_then(Value::as_str)
@@ -243,6 +263,7 @@ pub(crate) fn native_codex_responses_payload(
         "input",
         "instructions",
         "stream",
+        "max_output_tokens",
         "store",
         "parallel_tool_calls",
         "tool_choice",
@@ -255,6 +276,13 @@ pub(crate) fn native_codex_responses_payload(
     {
         return Err(ApiError::invalid_request());
     }
+    if object.get("max_output_tokens").is_some_and(|value| {
+        value
+            .as_u64()
+            .is_none_or(|tokens| tokens == 0 || tokens > 1_000_000)
+    }) {
+        return Err(ApiError::invalid_request());
+    }
     if object
         .get("store")
         .is_some_and(|value| !value.is_null() && value != &Value::Bool(false))
@@ -264,10 +292,17 @@ pub(crate) fn native_codex_responses_payload(
     {
         return Err(ApiError::invalid_request());
     }
-    if object
-        .get("tool_choice")
-        .is_some_and(|value| !value.is_null() && value.as_str() != Some("auto"))
-    {
+    if object.get("tool_choice").is_some_and(|value| {
+        !value.is_null()
+            && !matches!(
+                value,
+                Value::String(choice) if choice == "auto"
+            )
+            && !matches!(
+                value,
+                Value::Object(choice) if choice.len() == 1 && choice.get("type").and_then(Value::as_str) == Some("auto")
+            )
+    }) {
         return Err(ApiError::invalid_request());
     }
     if object.get("reasoning").is_some_and(|value| {
@@ -292,6 +327,10 @@ pub(crate) fn native_codex_responses_payload(
         "input": input,
         "instructions": object.get("instructions").cloned().unwrap_or(Value::Null),
         "stream": object.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        "max_output_tokens": object
+            .get("max_output_tokens")
+            .cloned()
+            .unwrap_or(Value::Null),
         "store": false,
         "tool_choice": "auto",
         "parallel_tool_calls": object

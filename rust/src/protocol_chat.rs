@@ -815,6 +815,7 @@ fn validate_chat_options(object: &Map<String, Value>) -> Result<(), ApiError> {
     const ALLOWED_FIELDS: &[&str] = &[
         "messages",
         "modalities",
+        "max_tokens",
         "model",
         "n",
         "parallel_tool_calls",
