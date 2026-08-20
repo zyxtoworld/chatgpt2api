@@ -1009,10 +1009,11 @@ pub(super) fn from_responses_response(body: &[u8], model: &str) -> Result<Value,
         merged.extend(content);
         content = merged;
     }
-    let stop_reason = if content
-        .iter()
-        .any(|item| item["type"] == "tool_use" || item["type"] == "server_tool_use")
-    {
+    // `server_tool_use` is the completed web-search side channel.  It is
+    // reported as content, but it is not a client tool call that asks the
+    // caller for a tool result; Python's Anthropic adapter therefore ends a
+    // successful search turn normally.
+    let stop_reason = if content.iter().any(|item| item["type"] == "tool_use") {
         "tool_use"
     } else {
         "end_turn"

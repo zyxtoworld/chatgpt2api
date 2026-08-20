@@ -5234,6 +5234,10 @@ data: [DONE]
         );
         assert_eq!(response["usage"]["input_tokens"], 11);
         assert_eq!(response["usage"]["output_tokens"], 7);
+        assert_eq!(
+            response["stop_reason"], "end_turn",
+            "a completed server web search is not an assistant tool call"
+        );
 
         let replay = validate_message_request(json!({
             "model":"gpt-test",
