@@ -140,6 +140,7 @@ impl AccountStore {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn acquire_excluding_with_type_filter(
         &self,
         model: &str,

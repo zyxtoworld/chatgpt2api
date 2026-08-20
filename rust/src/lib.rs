@@ -577,54 +577,52 @@ const ACCOUNT_TYPE_MODEL_TTL: Duration = Duration::from_secs(300);
 const ACCOUNT_TYPE_MODEL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const ACCOUNT_TYPE_MODEL_REFRESH_DEADLINE: Duration = Duration::from_secs(90);
 const ACCOUNT_TYPE_REFRESH_CONCURRENCY: usize = 4;
-// Model discovery is shared by normalized account type.  Source metadata is
-// retained on each candidate for the actual conversation/Responses protocol;
-// it must not split or duplicate the catalog.
+// Model discovery is published by normalized account type, but each source
+// capability owns its own representative and endpoint.  A credential is
+// never sent to an endpoint that belongs to another source capability.
 #[derive(Clone)]
 struct CatalogOwners {
-    web: Option<CatalogAccountCandidate>,
-    codex: Option<CatalogAccountCandidate>,
+    candidates: Vec<CatalogAccountCandidate>,
+    model_sources: HashMap<String, HashSet<String>>,
 }
 
 impl CatalogOwners {
     fn first(candidates: &[CatalogAccountCandidate]) -> Self {
         Self {
-            web: candidates.first().cloned(),
-            codex: candidates.first().cloned(),
+            candidates: candidates.first().cloned().into_iter().collect(),
+            model_sources: HashMap::new(),
         }
     }
 
-    fn from_endpoints(
-        web: Option<CatalogAccountCandidate>,
-        codex: Option<CatalogAccountCandidate>,
+    fn with_model_sources(
+        candidates: Vec<CatalogAccountCandidate>,
+        model_sources: HashMap<String, HashSet<String>>,
     ) -> Self {
-        Self { web, codex }
+        Self {
+            candidates,
+            model_sources,
+        }
     }
 
     fn is_current(&self, candidates: &[CatalogAccountCandidate]) -> bool {
-        self.web
-            .as_ref()
-            .is_none_or(|owner| candidates.iter().any(|candidate| candidate == owner))
+        !self.candidates.is_empty()
             && self
-                .codex
-                .as_ref()
-                .is_none_or(|owner| candidates.iter().any(|candidate| candidate == owner))
+                .candidates
+                .iter()
+                .all(|owner| candidates.iter().any(|candidate| candidate == owner))
     }
 
     fn any_current(&self, candidates: &[CatalogAccountCandidate]) -> bool {
-        self.web
-            .as_ref()
-            .is_some_and(|owner| candidates.iter().any(|candidate| candidate == owner))
-            || self
-                .codex
-                .as_ref()
-                .is_some_and(|owner| candidates.iter().any(|candidate| candidate == owner))
+        self.candidates
+            .iter()
+            .any(|owner| candidates.iter().any(|candidate| candidate == owner))
     }
 }
 
 #[derive(Clone)]
 struct AccountTypeCatalogEntry {
     models: Arc<Vec<PublicModel>>,
+    model_sources: HashMap<String, HashSet<String>>,
     ready: bool,
     tokens: Vec<String>,
     owners: CatalogOwners,
@@ -1024,6 +1022,7 @@ impl AccountTypeCatalog {
                                     account_group,
                                     AccountTypeCatalogEntry {
                                         models: Arc::new(models),
+                                        model_sources: owners.model_sources.clone(),
                                         ready: true,
                                         tokens: current_tokens,
                                         owners,
@@ -1035,7 +1034,9 @@ impl AccountTypeCatalog {
                             Some(models) => {
                                 if let Some(entry) = snapshot.entries.get_mut(&account_group) {
                                     entry.tokens = current_tokens;
+                                    let model_sources = owners.model_sources.clone();
                                     entry.owners = owners;
+                                    entry.model_sources = model_sources;
                                     entry.retry_at = now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF;
                                     if entry.models.is_empty() {
                                         entry.models = Arc::new(models);
@@ -1046,6 +1047,7 @@ impl AccountTypeCatalog {
                                         account_group,
                                         AccountTypeCatalogEntry {
                                             models: Arc::new(models),
+                                            model_sources: owners.model_sources.clone(),
                                             ready: false,
                                             tokens: current_tokens,
                                             owners,
@@ -1058,13 +1060,16 @@ impl AccountTypeCatalog {
                             None => {
                                 if let Some(entry) = snapshot.entries.get_mut(&account_group) {
                                     entry.tokens = current_tokens;
+                                    let model_sources = owners.model_sources.clone();
                                     entry.owners = owners;
+                                    entry.model_sources = model_sources;
                                     entry.retry_at = now + ACCOUNT_TYPE_MODEL_RETRY_BACKOFF;
                                 } else {
                                     snapshot.entries.insert(
                                         account_group,
                                         AccountTypeCatalogEntry {
                                             models: Arc::new(Vec::new()),
+                                            model_sources: owners.model_sources.clone(),
                                             ready: false,
                                             tokens: current_tokens,
                                             owners,
@@ -1100,6 +1105,7 @@ impl AccountTypeCatalog {
                                     account_group,
                                     AccountTypeCatalogEntry {
                                         models: Arc::new(Vec::new()),
+                                        model_sources: HashMap::new(),
                                         ready: false,
                                         tokens: current_tokens,
                                         owners: CatalogOwners::first(current_candidates),
@@ -1150,6 +1156,7 @@ impl AccountTypeCatalog {
                                 account_group,
                                 AccountTypeCatalogEntry {
                                     models: Arc::new(Vec::new()),
+                                    model_sources: HashMap::new(),
                                     ready: false,
                                     tokens: expected_tokens,
                                     owners: CatalogOwners::first(&expected_candidates),
@@ -1225,52 +1232,104 @@ impl AccountTypeCatalog {
         deadline: Instant,
     ) -> Option<(Vec<PublicModel>, CatalogOwners, bool)> {
         if self.protocol == UpstreamProtocol::ChatGpt {
-            let web = async {
-                for candidate in candidate_accounts {
-                    if let Some(models) = self
-                        .fetch_native_models(
-                            &candidate.token,
-                            Some(account_group),
-                            candidate.chatgpt_account_id.as_deref(),
-                            deadline,
-                        )
-                        .await
-                    {
-                        return Some((models, candidate.clone()));
-                    }
+            let mut source_groups = Vec::<(String, Vec<CatalogAccountCandidate>)>::new();
+            for candidate in candidate_accounts {
+                if let Some((_, candidates)) = source_groups
+                    .iter_mut()
+                    .find(|(source, _)| source == &candidate.source_type)
+                {
+                    candidates.push(candidate.clone());
+                } else {
+                    source_groups.push((candidate.source_type.clone(), vec![candidate.clone()]));
                 }
-                None
-            };
-            let codex = async {
-                for candidate in candidate_accounts {
-                    if let Some(models) = self
-                        .fetch_codex_models(
-                            &candidate.token,
-                            Some(account_group),
-                            candidate.chatgpt_account_id.as_deref(),
-                            deadline,
-                        )
-                        .await
-                    {
-                        return Some((models, candidate.clone()));
-                    }
+            }
+
+            // Each source capability gets one independent representative
+            // search.  In particular, a Web credential is never probed via
+            // the Codex endpoint and vice versa.  The futures are still
+            // concurrent so one slow capability cannot starve another.
+            let mut source_fetches = FuturesUnordered::new();
+            let mut expected_source_count = 0usize;
+            let mut complete = !source_groups.is_empty();
+            for (source_type, candidates) in source_groups {
+                let source_supported = matches!(
+                    source_type.as_str(),
+                    "web" | "password" | "password-oauth" | "codex"
+                );
+                if !source_supported {
+                    complete = false;
+                    continue;
                 }
-                None
-            };
-            let (web_result, codex_result) = tokio::join!(web, codex);
-            let (web_models, web_owner) = web_result.map_or_else(
-                || (Vec::new(), None),
-                |(models, owner)| (models, Some(owner)),
-            );
-            let (codex_models, codex_owner) = codex_result.map_or_else(
-                || (Vec::new(), None),
-                |(models, owner)| (models, Some(owner)),
-            );
-            let models = Self::merge_catalog_models(web_models, codex_models);
+                expected_source_count += 1;
+                let account_group = account_group.clone();
+                source_fetches.push(async move {
+                    match source_type.as_str() {
+                        "web" | "password" | "password-oauth" => {
+                            let mut result = None;
+                            for candidate in &candidates {
+                                if let Some(models) = self
+                                    .fetch_native_models(
+                                        &candidate.token,
+                                        Some(&account_group),
+                                        candidate.chatgpt_account_id.as_deref(),
+                                        deadline,
+                                    )
+                                    .await
+                                {
+                                    result = Some((models, candidate.clone()));
+                                    break;
+                                }
+                            }
+                            result
+                        }
+                        "codex" => {
+                            let mut result = None;
+                            for candidate in &candidates {
+                                if let Some(models) = self
+                                    .fetch_codex_models(
+                                        &candidate.token,
+                                        Some(&account_group),
+                                        candidate.chatgpt_account_id.as_deref(),
+                                        deadline,
+                                    )
+                                    .await
+                                {
+                                    result = Some((models, candidate.clone()));
+                                    break;
+                                }
+                            }
+                            result
+                        }
+                        _ => None,
+                    }
+                });
+            }
+
+            let mut models = Vec::new();
+            let mut owners = Vec::new();
+            let mut model_sources = HashMap::<String, HashSet<String>>::new();
+            while let Some(result) = source_fetches.next().await {
+                match result {
+                    Some((source_models, owner)) => {
+                        for model in &source_models {
+                            model_sources
+                                .entry(model.id.clone())
+                                .or_default()
+                                .insert(owner.source_type.clone());
+                        }
+                        models = Self::merge_catalog_models(models, source_models);
+                        owners.push(owner);
+                    }
+                    None => complete = false,
+                }
+            }
+            complete &= owners.len() == expected_source_count;
             if !models.is_empty() {
-                let complete = web_owner.is_some() && codex_owner.is_some();
-                let owners = CatalogOwners::from_endpoints(web_owner, codex_owner);
-                return Some((models, owners, complete));
+                return Some((
+                    models,
+                    CatalogOwners::with_model_sources(owners, model_sources),
+                    complete,
+                ));
             }
             return None;
         }
@@ -1317,9 +1376,18 @@ impl AccountTypeCatalog {
                 false,
             )
             .map(|models| {
+                let model_sources = models
+                    .iter()
+                    .map(|model| {
+                        (
+                            model.id.clone(),
+                            HashSet::from([candidate.source_type.clone()]),
+                        )
+                    })
+                    .collect();
                 (
                     models,
-                    CatalogOwners::from_endpoints(Some(candidate.clone()), Some(candidate.clone())),
+                    CatalogOwners::with_model_sources(vec![candidate.clone()], model_sources),
                     true,
                 )
             });
@@ -1587,6 +1655,27 @@ impl AccountTypeCatalog {
             }
         }
         Some(types)
+    }
+
+    fn source_types_for(
+        &self,
+        model: &str,
+        allowed_groups: Option<&HashSet<AccountModelGroup>>,
+    ) -> HashSet<String> {
+        let snapshot = self.snapshot.read().expect("account type catalog lock");
+        let mut sources = HashSet::new();
+        for (group, entry) in &snapshot.entries {
+            if allowed_groups.is_some_and(|groups| !groups.contains(group)) {
+                continue;
+            }
+            if !entry.ready {
+                continue;
+            }
+            if let Some(model_sources) = entry.model_sources.get(model) {
+                sources.extend(model_sources.iter().cloned());
+            }
+        }
+        sources
     }
 
     fn allows_anonymous_model(&self, model: &str) -> bool {
@@ -3973,6 +4062,13 @@ async fn acquire_native_codex_lease(
 ) -> Option<AccountLease> {
     if state.account_type_catalog.enabled() {
         state.account_type_catalog.refresh_for_model(model).await;
+        let groups = state.account_type_catalog.supported_types_for(model);
+        let sources = state
+            .account_type_catalog
+            .source_types_for(model, groups.as_ref());
+        if !sources.is_empty() && !sources.contains("codex") {
+            return None;
+        }
     }
     let allowed_groups = state.account_type_catalog.supported_types_for(model);
     state
@@ -4187,7 +4283,7 @@ async fn chat_completions_with_timeout(
         let allowed_account_types = if !catalog_enabled {
             None
         } else if use_catalog_for_route {
-            catalog_groups
+            catalog_groups.clone()
         } else if allows_anonymous {
             Some(HashSet::new())
         } else if has_static_model && !state.account_type_catalog.model_catalog_pending(model) {
@@ -4214,12 +4310,22 @@ async fn chat_completions_with_timeout(
             });
         }
         let mut attempted_tokens = HashSet::new();
+        let source_types = if use_catalog_for_route {
+            state
+                .account_type_catalog
+                .source_types_for(model, catalog_groups.as_ref())
+        } else {
+            HashSet::new()
+        };
+        let required_source_type = (source_types.len() == 1)
+            .then(|| source_types.into_iter().next().expect("source type"));
         let mut lease = state
             .account_store
-            .acquire_excluding_with_type_filter(
+            .acquire_excluding_with_type_and_source_filter(
                 model,
                 &HashSet::new(),
                 allowed_account_types.as_ref(),
+                required_source_type.as_deref(),
             )
             .await;
         if lease.is_none() && !allows_anonymous {
@@ -4259,10 +4365,11 @@ async fn chat_completions_with_timeout(
                     drop(lease);
                     lease = state
                         .account_store
-                        .acquire_excluding_with_type_filter(
+                        .acquire_excluding_with_type_and_source_filter(
                             model,
                             &attempted_tokens,
                             allowed_account_types.as_ref(),
+                            required_source_type.as_deref(),
                         )
                         .await;
                     if lease.is_none() {
@@ -10206,7 +10313,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_models_catalog_uses_one_representative_per_type_with_dual_catalogs() {
+    async fn native_models_catalog_uses_one_representative_per_source_capability() {
         let account_path = std::env::temp_dir().join(format!(
             "chatgpt2api-rust-native-models-{}-{}.json",
             std::process::id(),
@@ -10398,7 +10505,7 @@ data: [DONE]
                                 let slug = if authorization == "Bearer web-token" {
                                     "codex-only-model"
                                 } else if authorization == "Bearer codex-token" {
-                                    "codex-token-model"
+                                    "collision-model"
                                 } else {
                                     "plus-only-model"
                                 };
@@ -10548,13 +10655,7 @@ data: [DONE]
             .clone();
         let mut auth_model_calls = auth_model_calls;
         auth_model_calls.sort();
-        assert_eq!(
-            auth_model_calls,
-            vec![
-                "Bearer codex-no-id".to_owned(),
-                "Bearer web-token".to_owned()
-            ]
-        );
+        assert_eq!(auth_model_calls, vec!["Bearer web-token".to_owned()]);
         state
             .account_type_catalog
             .refresh_inner_with_budget(Duration::from_secs(1))
@@ -10588,7 +10689,7 @@ data: [DONE]
         assert!(ids.contains("web-only-model"));
         assert!(ids.contains("collision-model"));
         assert!(ids.contains("plus-only-model"));
-        assert!(ids.contains("codex-only-model"));
+        assert!(ids.contains("collision-model"));
         assert_eq!(
             state
                 .account_type_catalog
@@ -10757,9 +10858,9 @@ data: [DONE]
         fs::remove_file(account_path).expect("cleanup");
     }
 
-    async fn assert_catalog_queries_both_endpoints_concurrently() {
+    async fn assert_web_catalog_uses_only_web_endpoint() {
         let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-dual-source-merge-{}-{}.json",
+            "chatgpt2api-rust-web-source-catalog-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -10769,12 +10870,10 @@ data: [DONE]
         )
         .expect("account snapshot");
 
-        let delayed_started = Arc::new(Notify::new());
-        let delayed_started_for_upstream = delayed_started.clone();
-        let fast_finished = Arc::new(Notify::new());
-        let fast_finished_for_upstream = fast_finished.clone();
-        let release_delayed = Arc::new(Notify::new());
-        let release_delayed_for_upstream = release_delayed.clone();
+        let web_calls = Arc::new(AtomicUsize::new(0));
+        let codex_calls = Arc::new(AtomicUsize::new(0));
+        let web_calls_for_upstream = web_calls.clone();
+        let codex_calls_for_upstream = codex_calls.clone();
         let upstream_ready = Arc::new(Notify::new());
         let upstream_ready_for_task = upstream_ready.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -10783,12 +10882,6 @@ data: [DONE]
         let address = listener.local_addr().expect("address");
         let upstream_task = tokio::spawn(async move {
             upstream_ready_for_task.notify_one();
-            let delayed_started_for_web = delayed_started_for_upstream.clone();
-            let delayed_started_for_codex = delayed_started_for_upstream.clone();
-            let release_for_web = release_delayed_for_upstream.clone();
-            let release_for_codex = release_delayed_for_upstream.clone();
-            let fast_web_finished = fast_finished_for_upstream.clone();
-            let fast_codex_finished = fast_finished_for_upstream.clone();
             axum::serve(
                 listener,
                 Router::new()
@@ -10804,38 +10897,20 @@ data: [DONE]
                     .route(
                         "/backend-api/models",
                         get(move || {
-                            let is_delayed = true;
-                            let started = delayed_started_for_web.clone();
-                            let release = release_for_web.clone();
-                            let finished = fast_web_finished.clone();
+                            let calls = web_calls_for_upstream.clone();
                             async move {
-                                if is_delayed {
-                                    started.notify_one();
-                                    release.notified().await;
-                                    Json(json!({"models":[{"slug":"web-delayed-model"}]}))
-                                } else {
-                                    finished.notify_one();
-                                    Json(json!({"models":[{"slug":"web-fast-model"}]}))
-                                }
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Json(json!({"models":[{"slug":"web-model"}]}))
                             }
                         }),
                     )
                     .route(
                         "/backend-api/codex/models",
                         get(move || {
-                            let is_delayed = false;
-                            let started = delayed_started_for_codex.clone();
-                            let release = release_for_codex.clone();
-                            let finished = fast_codex_finished.clone();
+                            let calls = codex_calls_for_upstream.clone();
                             async move {
-                                if is_delayed {
-                                    started.notify_one();
-                                    release.notified().await;
-                                    Json(json!({"models":[{"slug":"codex-delayed-model","supported_in_api":true}]}))
-                                } else {
-                                    finished.notify_one();
-                                    Json(json!({"models":[{"slug":"codex-fast-model","supported_in_api":true}]}))
-                                }
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Json(json!({"models":[{"slug":"must-not-be-requested","supported_in_api":true}]}))
                             }
                         }),
                     ),
@@ -10857,9 +10932,6 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
-        state
-            .account_type_catalog
-            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
         let candidates = vec![CatalogAccountCandidate {
             token: "representative".to_owned(),
             source_type: "web".to_owned(),
@@ -10875,20 +10947,18 @@ data: [DONE]
                 )
                 .await
         });
-        delayed_started.notified().await;
-        tokio::time::timeout(Duration::from_millis(500), fast_finished.notified())
-            .await
-            .expect("fast Codex endpoint must run before slow Web release");
-        release_delayed.notify_one();
         let result = fetch.await.expect("fetch task").expect("catalog result");
-        let ids = result
-            .0
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect::<HashSet<_>>();
-        let expected = HashSet::from(["web-delayed-model", "codex-fast-model"]);
-        assert_eq!(ids, expected);
+        assert_eq!(
+            result
+                .0
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web-model"]
+        );
         assert!(result.2);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
 
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -10897,20 +10967,20 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_catalog_representative_merges_web_and_codex_endpoints() {
-        assert_catalog_queries_both_endpoints_concurrently().await;
+    async fn native_catalog_web_representative_uses_only_web_endpoint() {
+        assert_web_catalog_uses_only_web_endpoint().await;
     }
 
     #[tokio::test]
-    async fn native_catalog_codex_slow_does_not_block_fast_web() {
+    async fn native_catalog_codex_representative_uses_only_codex_endpoint() {
         let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-dual-source-reverse-{}-{}.json",
+            "chatgpt2api-rust-codex-source-catalog-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(
             &account_path,
-            r#"[{"access_token":"representative","status":"正常","type":"Pro"}]"#,
+            r#"[{"access_token":"representative","status":"正常","type":"Pro","source_type":"codex"}]"#,
         )
         .expect("account snapshot");
         let web_finished = Arc::new(Notify::new());
@@ -10965,7 +11035,7 @@ data: [DONE]
             .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
         let candidates = vec![CatalogAccountCandidate {
             token: "representative".to_owned(),
-            source_type: "web".to_owned(),
+            source_type: "codex".to_owned(),
             chatgpt_account_id: None,
         }];
         let catalog = state.account_type_catalog.clone();
@@ -10978,10 +11048,13 @@ data: [DONE]
                 )
                 .await
         });
-        tokio::time::timeout(Duration::from_millis(500), web_finished.notified())
-            .await
-            .expect("Web must finish while Codex is pending");
         codex_started.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), web_finished.notified())
+                .await
+                .is_err(),
+            "Codex representatives must not call the Web endpoint"
+        );
         assert!(!fetch.is_finished());
         release_codex.notify_one();
         let result = fetch.await.expect("fetch task").expect("catalog result");
@@ -10991,7 +11064,7 @@ data: [DONE]
                 .into_iter()
                 .map(|model| model.id)
                 .collect::<HashSet<_>>(),
-            HashSet::from(["web-fast-model".to_owned(), "codex-slow-model".to_owned()])
+            HashSet::from(["codex-slow-model".to_owned()])
         );
         assert!(result.2);
         state.account_type_catalog.shutdown().await;
@@ -11034,9 +11107,9 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_catalog_partial_endpoint_marks_incomplete() {
+    async fn native_catalog_codex_timeout_does_not_probe_web_endpoint() {
         let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-dual-source-timeout-{}-{}.json",
+            "chatgpt2api-rust-codex-source-timeout-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -11132,23 +11205,20 @@ data: [DONE]
                 .await
         });
         codex_started.notified().await;
-        tokio::time::timeout(Duration::from_millis(500), web_finished.notified())
-            .await
-            .expect("fast Web endpoint must finish while Codex is pending");
         let result = tokio::time::timeout(Duration::from_secs(1), fetch)
             .await
             .expect("catalog deadline")
             .expect("fetch task");
-        let result = result.expect("web partial catalog remains usable");
-        assert_eq!(
-            result
-                .0
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["web-survives-timeout"]
+        assert!(
+            result.is_none(),
+            "a failed Codex source has no usable catalog"
         );
-        assert!(!result.2, "a missing endpoint cannot be complete");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), web_finished.notified())
+                .await
+                .is_err(),
+            "Codex representatives must not probe Web"
+        );
 
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -11161,7 +11231,7 @@ data: [DONE]
         codex_status: StatusCode,
     ) -> (Option<(HashSet<String>, bool)>, usize, usize) {
         let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-dual-source-status-{}-{}.json",
+            "chatgpt2api-rust-web-source-status-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
         ));
@@ -11256,25 +11326,23 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_catalog_web_failure_keeps_codex_partial_and_incomplete() {
+    async fn native_catalog_web_failure_does_not_fallback_across_transport() {
         let (result, web_calls, codex_calls) =
             catalog_endpoint_status_case(StatusCode::BAD_GATEWAY, StatusCode::OK).await;
-        let (models, complete) = result.expect("Codex partial catalog remains usable");
-        assert_eq!(models, HashSet::from(["codex-model".to_owned()]));
-        assert!(!complete);
-        assert_eq!((web_calls, codex_calls), (1, 1));
+        assert!(result.is_none());
+        assert_eq!((web_calls, codex_calls), (1, 0));
     }
 
     #[tokio::test]
-    async fn native_catalog_both_endpoint_failures_are_not_ready() {
+    async fn native_catalog_web_failure_is_not_hidden_by_codex_success() {
         let (result, web_calls, codex_calls) =
             catalog_endpoint_status_case(StatusCode::BAD_GATEWAY, StatusCode::UNAUTHORIZED).await;
         assert!(result.is_none());
-        assert_eq!((web_calls, codex_calls), (1, 1));
+        assert_eq!((web_calls, codex_calls), (1, 0));
     }
 
     #[tokio::test]
-    async fn native_catalog_each_endpoint_falls_back_to_next_same_type_candidate() {
+    async fn native_catalog_web_source_falls_back_to_next_same_type_candidate() {
         let web_calls = Arc::new(AtomicUsize::new(0));
         let codex_calls = Arc::new(AtomicUsize::new(0));
         let web_calls_for_upstream = web_calls.clone();
@@ -11314,18 +11382,8 @@ data: [DONE]
                             let calls = codex_calls_for_upstream.clone();
                             async move {
                                 calls.fetch_add(1, Ordering::SeqCst);
-                                let token = headers
-                                    .get(header::AUTHORIZATION)
-                                    .and_then(|value| value.to_str().ok())
-                                    .unwrap_or_default();
-                                assert!(token.ends_with("first"));
-                                Json(json!({
-                                    "models": [{
-                                        "slug": "codex-first-candidate",
-                                        "supported_in_api": true
-                                    }]
-                                }))
-                                .into_response()
+                                let _ = headers;
+                                StatusCode::INTERNAL_SERVER_ERROR.into_response()
                             }
                         }),
                     ),
@@ -11357,7 +11415,7 @@ data: [DONE]
             },
             CatalogAccountCandidate {
                 token: "second".to_owned(),
-                source_type: "codex".to_owned(),
+                source_type: "web".to_owned(),
                 chatgpt_account_id: None,
             },
         ];
@@ -11371,35 +11429,107 @@ data: [DONE]
             .await
             .expect("partial endpoint fallback remains usable");
         let owners = result.1.clone();
-        assert_eq!(
-            owners.web.as_ref().map(|owner| owner.token.as_str()),
-            Some("second")
-        );
-        assert_eq!(
-            owners.codex.as_ref().map(|owner| owner.token.as_str()),
-            Some("first")
-        );
+        assert_eq!(owners.candidates[0].token, "second");
         assert_eq!(
             result
                 .0
                 .into_iter()
                 .map(|model| model.id)
                 .collect::<HashSet<_>>(),
-            HashSet::from([
-                "web-second-candidate".to_owned(),
-                "codex-first-candidate".to_owned()
-            ])
+            HashSet::from(["web-second-candidate".to_owned()])
         );
-        assert!(result.2, "both endpoint representatives succeeded");
+        assert!(result.2, "the second same-source representative succeeds");
         assert_eq!(
             (
                 web_calls.load(Ordering::SeqCst),
                 codex_calls.load(Ordering::SeqCst)
             ),
-            (2, 1),
-            "each endpoint must stop after its first successful candidate"
+            (2, 0),
+            "a source group stops after its first successful candidate and never crosses transport"
         );
 
+        state.account_type_catalog.shutdown().await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+    }
+
+    #[tokio::test]
+    async fn native_catalog_codex_source_falls_back_to_next_same_type_candidate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_upstream = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/backend-api/codex/models",
+                    get(move |headers: HeaderMap| {
+                        let calls = calls_for_upstream.clone();
+                        async move {
+                            let call = calls.fetch_add(1, Ordering::SeqCst);
+                            let token = headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default();
+                            if call == 0 {
+                                assert!(token.ends_with("first"));
+                                return StatusCode::BAD_GATEWAY.into_response();
+                            }
+                            assert!(token.ends_with("second"));
+                            Json(json!({
+                                "models": [{"slug":"codex-second-candidate","supported_in_api":true}]
+                            }))
+                            .into_response()
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+        let candidates = vec![
+            CatalogAccountCandidate {
+                token: "first".to_owned(),
+                source_type: "codex".to_owned(),
+                chatgpt_account_id: None,
+            },
+            CatalogAccountCandidate {
+                token: "second".to_owned(),
+                source_type: "codex".to_owned(),
+                chatgpt_account_id: None,
+            },
+        ];
+        let result = state
+            .account_type_catalog
+            .fetch_account_type_models(
+                &"pro".to_owned(),
+                &candidates,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("same-source fallback");
+        assert_eq!(result.0[0].id, "codex-second-candidate");
+        assert!(result.2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result.1.candidates[0].token, "second");
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
@@ -13899,16 +14029,23 @@ data: [DONE]
                 catalog_group.clone(),
                 AccountTypeCatalogEntry {
                     models: Arc::new(vec![catalog_model]),
+                    model_sources: HashMap::from([(
+                        "collision-model".to_owned(),
+                        HashSet::from(["codex".to_owned()]),
+                    )]),
                     ready: true,
                     tokens: vec!["codex-token".to_owned()],
-                    owners: CatalogOwners {
-                        web: None,
-                        codex: Some(CatalogAccountCandidate {
+                    owners: CatalogOwners::with_model_sources(
+                        vec![CatalogAccountCandidate {
                             token: "codex-token".to_owned(),
                             source_type: "codex".to_owned(),
                             chatgpt_account_id: Some("codex-account".to_owned()),
-                        }),
-                    },
+                        }],
+                        HashMap::from([(
+                            "collision-model".to_owned(),
+                            HashSet::from(["codex".to_owned()]),
+                        )]),
+                    ),
                     expires_at: Instant::now() + Duration::from_secs(60),
                     retry_at: Instant::now(),
                 },
