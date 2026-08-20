@@ -40,6 +40,45 @@ pub(super) fn native_codex_responses_json(
                     .ok_or_else(ApiError::upstream)?;
                 text.push_str(delta);
             }
+            Some("response.output_text.done") => {
+                value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(ApiError::upstream)?;
+            }
+            Some("response.output_item.added") | Some("response.output_item.done") => {
+                value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(ApiError::upstream)?;
+                let item = value
+                    .get("item")
+                    .and_then(Value::as_object)
+                    .ok_or_else(ApiError::upstream)?;
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        if let Some(arguments) = item.get("arguments") {
+                            arguments.as_str().ok_or_else(ApiError::upstream)?;
+                        }
+                    }
+                    Some("web_search_call") => {
+                        item.get("id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(ApiError::upstream)?;
+                    }
+                    Some(_) | None => return Err(ApiError::upstream()),
+                }
+            }
+            Some("response.function_call_arguments.delta") => {
+                value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(ApiError::upstream)?;
+                value
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .ok_or_else(ApiError::upstream)?;
+            }
             Some("response.completed") => {
                 terminal = true;
                 if let Some(response) = value.get("response") {
@@ -53,7 +92,7 @@ pub(super) fn native_codex_responses_json(
             Some("response.failed") | Some("response.incomplete") => {
                 return Err(ApiError::upstream());
             }
-            _ => {}
+            _ => return Err(ApiError::upstream()),
         }
     }
     if !terminal || !buffer.iter().all(u8::is_ascii_whitespace) {

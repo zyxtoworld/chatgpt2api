@@ -14976,6 +14976,21 @@ data: {"type":"response.completed","response":{"id":"resp-search","output":[{"ty
     }
 
     #[test]
+    fn native_responses_unknown_event_fails_closed() {
+        let body = br#"data: {"type":"response.created","response":{"id":"resp-1"}}
+
+data: {"type":"response.future_event","future":true}
+
+data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}
+
+"#;
+        assert!(
+            native_codex_responses_json(body, "gpt-test").is_err(),
+            "unknown upstream event must not be silently discarded"
+        );
+    }
+
+    #[test]
     fn chat_effort_aliases_match_python_contract() {
         let mut object = json!({
             "reasoning": {"effort": " NONE "},
