@@ -46,6 +46,33 @@ pub(super) fn native_codex_responses_json(
                     .and_then(Value::as_str)
                     .ok_or_else(ApiError::upstream)?;
             }
+            Some("response.content_part.added") | Some("response.content_part.done") => {
+                value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(ApiError::upstream)?;
+                value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(ApiError::upstream)?;
+                value
+                    .get("content_index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(ApiError::upstream)?;
+                let part = value
+                    .get("part")
+                    .and_then(Value::as_object)
+                    .ok_or_else(ApiError::upstream)?;
+                if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                    return Err(ApiError::upstream());
+                }
+                if let Some(text) = part.get("text") {
+                    text.as_str().ok_or_else(ApiError::upstream)?;
+                }
+                if let Some(annotations) = part.get("annotations") {
+                    annotations.as_array().ok_or_else(ApiError::upstream)?;
+                }
+            }
             Some("response.output_item.added") | Some("response.output_item.done") => {
                 value
                     .get("output_index")
@@ -66,6 +93,11 @@ pub(super) fn native_codex_responses_json(
                             .and_then(Value::as_str)
                             .ok_or_else(ApiError::upstream)?;
                     }
+                    Some("message") | Some("reasoning") => {
+                        if let Some(content) = item.get("content") {
+                            content.as_array().ok_or_else(ApiError::upstream)?;
+                        }
+                    }
                     Some(_) | None => return Err(ApiError::upstream()),
                 }
             }
@@ -78,6 +110,25 @@ pub(super) fn native_codex_responses_json(
                     .get("delta")
                     .and_then(Value::as_str)
                     .ok_or_else(ApiError::upstream)?;
+            }
+            Some("response.function_call_arguments.done") => {
+                value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(ApiError::upstream)?;
+                value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(ApiError::upstream)?;
+                let arguments = value
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .ok_or_else(ApiError::upstream)?;
+                let parsed: Value =
+                    serde_json::from_str(arguments).map_err(|_| ApiError::upstream())?;
+                if !parsed.is_object() {
+                    return Err(ApiError::upstream());
+                }
             }
             Some("response.completed") => {
                 terminal = true;

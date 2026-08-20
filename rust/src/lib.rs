@@ -4250,8 +4250,25 @@ async fn chat_completions_with_timeout(
     let payload: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?;
     let object = validate_chat_payload(payload)?;
     if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
-        if native_conversation_payload(&object).is_err()
-            && native_codex_response_payload(&object).is_err()
+        let chat_payload = native_conversation_payload(&object);
+        let codex_payload = native_codex_response_payload(&object);
+        if chat_payload.is_err() && codex_payload.is_err() {
+            return Err(ApiError::unavailable());
+        }
+        if chat_payload.is_err()
+            && state
+                .account_store
+                .acquire_excluding_with_type_and_source_filter(
+                    object
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("auto"),
+                    &HashSet::new(),
+                    None,
+                    Some("codex"),
+                )
+                .await
+                .is_none()
         {
             return Err(ApiError::unavailable());
         }
@@ -8971,6 +8988,29 @@ data: [DONE]
         }))
         .expect("validated chat payload");
         assert!(native_conversation_payload(&payload).is_err());
+    }
+
+    #[test]
+    fn native_codex_chat_tool_history_is_converted_for_replay() {
+        let payload = validate_chat_payload(json!({
+            "model": "auto",
+            "messages": [
+                {"role":"user","content":"lookup rust"},
+                {"role":"assistant","content":null,"tool_calls":[{
+                    "id":"call-1","type":"function",
+                    "function":{"name":"lookup","arguments":"{\"q\":\"rust\"}"}
+                }]},
+                {"role":"tool","tool_call_id":"call-1","content":"sunny"}
+            ]
+        }))
+        .expect("validated chat payload");
+        let converted = native_codex_response_payload(&payload)
+            .expect("tool history must reach the Codex Responses payload");
+        assert_eq!(converted["input"][1]["type"], "function_call");
+        assert_eq!(converted["input"][1]["call_id"], "call-1");
+        assert_eq!(converted["input"][2]["type"], "function_call_output");
+        assert_eq!(converted["input"][2]["call_id"], "call-1");
+        assert_eq!(converted["input"][2]["output"], "sunny");
     }
 
     #[test]
@@ -14988,6 +15028,25 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[]}}
             native_codex_responses_json(body, "gpt-test").is_err(),
             "unknown upstream event must not be silently discarded"
         );
+    }
+
+    #[test]
+    fn native_responses_known_lifecycle_events_are_not_unknown() {
+        let body = br#"data: {"type":"response.created","response":{"id":"resp-1"}}
+
+data: {"type":"response.content_part.added","item_id":"msg-1","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}
+
+data: {"type":"response.content_part.done","item_id":"msg-1","output_index":0,"content_index":0,"part":{"type":"output_text","text":"hello"}}
+
+data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}}
+
+data: {"type":"response.function_call_arguments.done","item_id":"fc-1","output_index":1,"arguments":"{}"}
+
+data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}]},{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}]}}
+
+"#;
+        native_codex_responses_json(body, "gpt-test")
+            .expect("known Responses lifecycle must be accepted");
     }
 
     #[test]
