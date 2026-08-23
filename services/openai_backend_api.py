@@ -41,12 +41,8 @@ class InvalidAccessTokenError(RuntimeError):
         self.path = path
 
 
-class CatalogConfigurationError(RuntimeError):
-    """A catalog request cannot run until deployment configuration is fixed."""
-
-
-class CatalogIncompleteError(RuntimeError):
-    """Only part of the authenticated model catalog was fetched."""
+class CodexClientConfigurationError(RuntimeError):
+    """A Codex conversation request is missing its client version."""
 
 
 class ImageTaskError(RuntimeError):
@@ -172,12 +168,9 @@ class ChatRequirements:
 
 
 DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
-# Codex's models client sends its own semver-like client version.  It is not
-# the Web client's `prod-*` build identifier.  This release value is explicit
-# and independently configurable for a coordinated Codex client rollout.
-# This is a release-controlled protocol value.  Do not silently reuse a
-# possibly stale client version when the deployment has not configured it.
-CODEX_MODELS_CLIENT_VERSION = os.getenv("CODEX_MODELS_CLIENT_VERSION", "").strip()
+# Codex Responses uses a semver-like client version. An absent version is a
+# configuration error; do not silently send a malformed conversation request.
+CODEX_CLIENT_VERSION = os.getenv("CODEX_CLIENT_VERSION", "").strip()
 _CODEX_CLIENT_VERSION_RE = re.compile(
     r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$"
 )
@@ -560,9 +553,16 @@ class OpenAIBackendAPI:
         fp.setdefault("sec-ch-ua-platform", '"Windows"')
         return fp
 
-    def _headers(self, path: str, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    def _headers(
+        self,
+        path: str,
+        extra: Optional[Dict[str, str]] = None,
+        *,
+        allow_catalog: bool = False,
+    ) -> Dict[str, str]:
         """构造请求头，并补上 web 端要求的 target path/route。"""
-        self._ensure_web_backend_account()
+        if not allow_catalog:
+            self._ensure_web_backend_account()
         headers = dict(self.session.headers)
         headers["X-OpenAI-Target-Path"] = path
         headers["X-OpenAI-Target-Route"] = path
@@ -1000,11 +1000,11 @@ class OpenAIBackendAPI:
             getattr(
                 self,
                 "codex_client_version",
-                CODEX_MODELS_CLIENT_VERSION,
+                CODEX_CLIENT_VERSION,
             )
         ).strip()
         if not _CODEX_CLIENT_VERSION_RE.fullmatch(raw_client_version):
-            raise CatalogConfigurationError("codex models client version is required")
+            raise CodexClientConfigurationError("codex client version is required")
         return raw_client_version
 
     def _codex_responses_headers(self) -> Dict[str, str]:
@@ -1023,25 +1023,6 @@ class OpenAIBackendAPI:
                 account.get("account_id") or account.get("chatgpt_account_id"),
                 max_length=256,
             ) or ""
-        if account_id:
-            headers["ChatGPT-Account-ID"] = account_id
-        return headers
-
-    def _codex_models_headers(self, client_version: str) -> Dict[str, str]:
-        account = getattr(self, "account", {})
-        account_id = ""
-        if isinstance(account, dict):
-            account_id = _safe_upstream_text(
-                account.get("account_id") or account.get("chatgpt_account_id"),
-                max_length=256,
-            ) or ""
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {self.access_token}",
-            "originator": "codex_cli_rs",
-            "User-Agent": f"codex_cli_rs/{client_version}",
-            "version": client_version,
-        }
         if account_id:
             headers["ChatGPT-Account-ID"] = account_id
         return headers
@@ -1376,6 +1357,9 @@ class OpenAIBackendAPI:
             images: list[str] | None = None,
             size: str | None = None,
             quality: str = "auto",
+            output_format: str = "png",
+            output_compression: int | None = None,
+            background: str = "auto",
     ) -> Iterator[Dict[str, Any]]:
         payload = {
             "model": CODEX_RESPONSES_MODEL,
@@ -1388,11 +1372,14 @@ class OpenAIBackendAPI:
                 "action": "edit" if images else "generate",
                 "size": str(size or "1024x1024"),
                 "quality": str(quality or "auto"),
-                "output_format": "png",
+                "output_format": str(output_format or "png"),
+                "background": str(background or "auto"),
             }],
             "tool_choice": {"type": "image_generation"},
             "stream": True,
         }
+        if output_compression is not None:
+            payload["tools"][0]["output_compression"] = output_compression
         yield from self.iter_codex_response_events(payload, timeout=1200)
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
@@ -3522,13 +3509,20 @@ class OpenAIBackendAPI:
             except Exception:
                 pass
 
-    def _bootstrap(self, *, timeout_secs: float = 30.0, deadline: float | None = None) -> None:
+    def _bootstrap(
+        self,
+        *,
+        timeout_secs: float = 30.0,
+        deadline: float | None = None,
+        for_catalog: bool = False,
+    ) -> None:
         """预热首页，并提取 PoW 相关脚本引用。"""
         # Bootstrap is a Web capability request too, but it predates the
         # endpoint-specific _headers() call.  Keep the identity fence before
         # the first session operation so unsupported/stale accounts cannot
         # reach the Web transport through this side door.
-        self._ensure_web_backend_account()
+        if not for_catalog:
+            self._ensure_web_backend_account()
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
@@ -3699,7 +3693,7 @@ class OpenAIBackendAPI:
         cls,
         payload: object,
         *,
-        is_codex: bool,
+        is_codex: bool = False,
     ) -> dict[str, dict[str, Any]]:
         if not isinstance(payload, dict):
             return {}
@@ -3734,7 +3728,7 @@ class OpenAIBackendAPI:
         route: str,
         headers: Dict[str, str],
         *,
-        is_codex: bool,
+        is_codex: bool = False,
         timeout_secs: float,
         deadline: float | None,
     ) -> dict[str, dict[str, Any]]:
@@ -3749,30 +3743,6 @@ class OpenAIBackendAPI:
             is_codex=is_codex,
         )
 
-    def list_catalog_models(
-        self,
-        *,
-        timeout_secs: float = 30.0,
-        deadline: float | None = None,
-    ) -> Dict[str, Any]:
-        """Fetch and merge both authenticated catalogs for one representative."""
-        if not self.access_token:
-            return self.list_models(timeout_secs=timeout_secs, deadline=deadline)
-        account = getattr(self, "account", {})
-        source_type = str(
-            getattr(self, "_catalog_source_type", None)
-            or (account.get("source_type") if isinstance(account, dict) else None)
-            or "web"
-        ).strip().lower()
-        if source_type not in {"web", "password", "password-oauth", "codex"}:
-            raise RuntimeError("catalog endpoint is not supported for this account source")
-        # Catalog discovery is source-capability bound.  A Codex token must not
-        # enter the Web bootstrap/models flow, and Web credentials must not be
-        # sent to the Codex transport.  list_models() is the single owner of
-        # that endpoint selection and cleanup contract.
-        result = self.list_models(timeout_secs=timeout_secs, deadline=deadline)
-        result["catalog_complete"] = True
-        return result
     def list_models(
             self,
             *,
@@ -3782,60 +3752,18 @@ class OpenAIBackendAPI:
         """返回当前模式下可用模型，格式对齐 OpenAI `/v1/models`。"""
         # Model discovery must request the account's complete catalog. Tying this
         # query to the conversation privacy mode hides paid-plan models upstream.
-        account = getattr(self, "account", {})
-        source_type = str(getattr(self, "_catalog_source_type", "") or "").strip().lower()
-        if not source_type:
-            source_type = (
-                str(account.get("source_type") or "").strip().lower()
-                if isinstance(account, dict)
-                else ""
-            )
-        is_codex = bool(self.access_token and source_type == "codex")
-        request_session = self.session
-        codex_session = None
-        if is_codex:
-            # Codex's ModelsClient talks directly to the Codex endpoint.  It does
-            # not participate in the web sentinel/bootstrap flow; running that
-            # handshake first can reject an otherwise valid Codex session.
-            raw_client_version = self._codex_client_version()
-            client_version = quote(raw_client_version, safe="")
-            path = f"/backend-api/codex/models?client_version={client_version}"
-            route = "/backend-api/codex/models"
-            request_headers = self._codex_models_headers(raw_client_version)
-            codex_session = self._codex_session()
-            request_session = codex_session
-        else:
-            self._bootstrap(timeout_secs=timeout_secs, deadline=deadline)
-            path = "/backend-api/models?history_and_training_disabled=false" if self.access_token else (
-                "/backend-anon/models?iim=false&is_gizmo=false"
-            )
-            route = "/backend-api/models" if self.access_token else "/backend-anon/models"
-            request_headers = self._headers(route)
-            if self.access_token:
-                catalog_account_id = _safe_upstream_text(
-                    getattr(self, "_catalog_account_id", None),
-                    max_length=256,
-                )
-                if catalog_account_id:
-                    request_headers["ChatGPT-Account-ID"] = catalog_account_id
-        context = "auth_models" if self.access_token else "anon_models"
-        primary_error: BaseException | None = None
-        try:
-            models = self._fetch_model_catalog_endpoint(
-                request_session,
-                path,
-                route,
-                request_headers,
-                is_codex=is_codex,
-                timeout_secs=timeout_secs,
-                deadline=deadline,
-            )
-            return {"object": "list", "data": [models[key] for key in sorted(models)]}
-        except BaseException as exc:
-            primary_error = exc
-            raise
-        finally:
-            if codex_session is not None:
-                cleanup_error = _close_codex_resource(codex_session, "models_session")
-                if cleanup_error is not None and primary_error is None:
-                    raise cleanup_error
+        self._bootstrap(timeout_secs=timeout_secs, deadline=deadline)
+        path = "/backend-api/models?history_and_training_disabled=false" if self.access_token else (
+            "/backend-anon/models?iim=false&is_gizmo=false"
+        )
+        route = "/backend-api/models" if self.access_token else "/backend-anon/models"
+        request_headers = self._headers(route, allow_catalog=True)
+        models = self._fetch_model_catalog_endpoint(
+            self.session,
+            path,
+            route,
+            request_headers,
+            timeout_secs=timeout_secs,
+            deadline=deadline,
+        )
+        return {"object": "list", "data": [models[key] for key in sorted(models)]}

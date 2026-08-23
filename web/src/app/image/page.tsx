@@ -447,6 +447,8 @@ async function recoverConversationHistory(items: ImageConversation[], isCurrent:
 
 function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const quotaOwnerRef = useRef(createLatestActionOwner());
+  const quotaAbortControllerRef = useRef<AbortController | null>(null);
+  const modelAbortControllerRef = useRef<AbortController | null>(null);
   const continueEditOwnerRef = useRef(createLatestActionOwner());
   const continueEditAbortRef = useRef<AbortController | null>(null);
   const historyLoadOwnerRef = useRef(createLatestActionOwner());
@@ -694,13 +696,16 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, [loadHistory]);
 
   useEffect(() => {
+    const abortController = new AbortController();
+    modelAbortControllerRef.current?.abort();
+    modelAbortControllerRef.current = abortController;
     let cancelled = false;
 
     const loadImageModels = async () => {
       try {
-        const data = await fetchModels();
+        const data = await fetchModels(abortController.signal);
         const loaded = resolveImageModelLoadSuccess(data);
-        if (cancelled) {
+        if (cancelled || abortController.signal.aborted) {
           return;
         }
         const available = loaded.models as ImageModel[];
@@ -711,7 +716,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         });
         setImageModelStatus(loaded.status as ImageModelLoadStatus);
       } catch {
-        if (!cancelled) {
+        if (!cancelled && !abortController.signal.aborted) {
           const failed = resolveImageModelLoadError();
           setImageModels(failed.models);
           setImageModel("");
@@ -723,18 +728,28 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     void loadImageModels();
     return () => {
       cancelled = true;
+      abortController.abort();
+      if (modelAbortControllerRef.current === abortController) {
+        modelAbortControllerRef.current = null;
+      }
     };
   }, []);
 
   const loadQuota = useCallback(async () => {
     const quotaOwner = quotaOwnerRef.current;
     const requestOwner = quotaOwner.begin();
+    quotaAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    quotaAbortControllerRef.current = abortController;
     if (!isAdmin) {
       if (quotaOwner.accepts(requestOwner)) setAvailableQuota("--");
+      if (quotaAbortControllerRef.current === abortController) {
+        quotaAbortControllerRef.current = null;
+      }
       return;
     }
     try {
-      const data = await fetchAccounts();
+      const data = await fetchAccounts(abortController.signal);
       if (quotaOwner.accepts(requestOwner)) {
         setAvailableQuota(formatAvailableQuota(data.items));
       }
@@ -742,13 +757,21 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       if (quotaOwner.accepts(requestOwner)) {
         setAvailableQuota((prev) => (prev === "加载中..." ? "--" : prev));
       }
+    } finally {
+      if (quotaAbortControllerRef.current === abortController) {
+        quotaAbortControllerRef.current = null;
+      }
     }
   }, [isAdmin]);
 
   useEffect(() => {
     const quotaOwner = quotaOwnerRef.current;
     quotaOwner.activate();
-    return () => quotaOwner.cancel();
+    return () => {
+      quotaOwner.cancel();
+      quotaAbortControllerRef.current?.abort();
+      quotaAbortControllerRef.current = null;
+    };
   }, []);
 
   useEffect(() => {

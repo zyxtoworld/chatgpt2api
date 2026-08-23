@@ -15,44 +15,46 @@ COPY web ./
 RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" bun run build
 
 
-FROM --platform=$TARGETPLATFORM python:3.13-slim AS app
+FROM --platform=$TARGETPLATFORM rust:1.89-bookworm AS rust-build
+
+WORKDIR /app/rust
+
+COPY rust/Cargo.toml rust/Cargo.lock ./
+COPY rust/file_identity ./file_identity
+COPY rust/src ./src
+RUN cargo build --release --locked --bin chatgpt2api-rust
+
+
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS app
 
 ARG TARGETPLATFORM
 ARG TARGETARCH
-ARG CODEX_MODELS_CLIENT_VERSION
+ARG CODEX_CLIENT_VERSION
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy \
-    CODEX_MODELS_CLIENT_VERSION=${CODEX_MODELS_CLIENT_VERSION}
+ENV CODEX_CLIENT_VERSION=${CODEX_CLIENT_VERSION} \
+    RUST_PRODUCTION=1 \
+    RUST_BIND=0.0.0.0:80 \
+    RUST_DATA_DIR=/app/data \
+    RUST_UPSTREAM_PROTOCOL=chatgpt \
+    RUST_UPSTREAM_BASE_URL=https://chatgpt.com
 
 WORKDIR /app
 
-# 安装系统依赖
-# - git: Git 存储后端需要
-# - libpq-dev: PostgreSQL 客户端库
-# - gcc: 编译 psycopg2-binary 需要
+# Rust runtime needs CA roots for ChatGPT and a small HTTP client for the
+# container health check. Build-only compilers and Python are not shipped.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    libpq-dev \
-    gcc \
-    openssl \
+    ca-certificates \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir uv
-
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
-
-COPY main.py ./
 COPY config.json ./
 COPY VERSION ./
-COPY api ./api
-COPY services ./services
-COPY utils ./utils
-COPY scripts ./scripts
 COPY --from=web-build /app/web/out ./web_dist
+COPY --from=rust-build /app/rust/target/release/chatgpt2api-rust /usr/local/bin/chatgpt2api-rust
 
 EXPOSE 80
 
-CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--no-access-log"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD wget --quiet --output-document=- 'http://127.0.0.1:80/health?format=json' > /dev/null || exit 1
+
+CMD ["/usr/local/bin/chatgpt2api-rust"]

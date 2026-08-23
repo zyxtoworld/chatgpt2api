@@ -1,58 +1,56 @@
+"""Opt-in live contract for the PPT editable-file lifecycle."""
+
 from __future__ import annotations
 
-import json
+import os
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
-from pathlib import Path
 from uuid import uuid4
 
-BASE_URL = "http://127.0.0.1:8000"
+import pytest
+
+from test.live_contract_support import live_base_url, request_json, task_status
+
+
 PROMPT = "生成一份 2026 年 Q2 电商运营复盘 PPT，8 页以内，商务科技风，包含销售、用户、渠道、广告、618 活动和 Q3 规划。"
-BASE64_IMAGES: list[str] = []
-TIMEOUT_SECS = 600
-POLL_INTERVAL_SECS = 5
+TASK_TIMEOUT_SECS = float(os.getenv("CHATGPT2API_LIVE_TASK_TIMEOUT_SECS", "600"))
+POLL_INTERVAL_SECS = float(os.getenv("CHATGPT2API_LIVE_TASK_POLL_SECS", "5"))
 
 
-def request_json(method: str, path: str, payload: dict | None = None) -> dict:
-    api_key = json.loads((Path(__file__).resolve().parents[1] / "config.json").read_text(encoding="utf-8"))["auth-key"]
-    if not api_key.strip():
-        raise ValueError("API_KEY is empty")
-    data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode()
-    request = urllib.request.Request(
-        BASE_URL.rstrip("/") + path,
-        data=data,
-        method=method,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(exc.read().decode("utf-8", "replace")) from exc
-
-
-def main() -> None:
-    task = request_json("POST", "/v1/ppt/generations", {
-        "client_task_id": str(uuid4()),
-        "prompt": PROMPT,
-        "base64_images": BASE64_IMAGES,
-    })
-    task_id = str(task.get("taskId") or task.get("id") or "")
-    if not task_id:
-        raise RuntimeError(f"missing taskId: {task}")
-    print(json.dumps(task, ensure_ascii=False, indent=2))
-    deadline = time.time() + TIMEOUT_SECS
-    while time.time() < deadline:
+def _wait_for_success(task_id: str) -> dict[str, object]:
+    deadline = time.monotonic() + TASK_TIMEOUT_SECS
+    while time.monotonic() < deadline:
+        status_payload = task_status(task_id)
+        items = status_payload.get("items")
+        assert isinstance(items, list) and items, "editable task status returned no item"
+        item = items[0]
+        assert isinstance(item, dict)
+        state = item.get("status")
+        if state == "error":
+            raise AssertionError("PPT editable task reached error terminal state")
+        if state == "success":
+            result = item.get("result")
+            assert isinstance(result, dict)
+            assert isinstance(result.get("primary_url"), str) and result["primary_url"]
+            assert isinstance(result.get("zip_url"), str) and result["zip_url"]
+            return item
+        assert state in {"queued", "running"}, f"unexpected PPT task status: {state!r}"
         time.sleep(POLL_INTERVAL_SECS)
-        status = request_json("GET", "/v1/editable-file-tasks?ids=" + urllib.parse.quote(task_id))
-        print(json.dumps(status, ensure_ascii=False, indent=2))
-        item = (status.get("items") or [{}])[0]
-        if item.get("status") in {"success", "error"}:
-            return
-    raise TimeoutError(f"task timeout: {task_id}")
+    raise AssertionError("PPT editable task timed out")
 
 
-if __name__ == "__main__":
-    main()
+@pytest.mark.live_upstream
+def test_ppt_generation_has_success_terminal_and_download_urls():
+    task = request_json(
+        "POST",
+        "/v1/ppt/generations",
+        {
+            "client_task_id": f"live-ppt-{uuid4().hex}",
+            "prompt": PROMPT,
+            "base64_images": [],
+        },
+        base_url=live_base_url(),
+        timeout=60,
+    )
+    task_id = str(task.get("taskId") or task.get("id") or "")
+    assert task_id
+    _wait_for_success(task_id)

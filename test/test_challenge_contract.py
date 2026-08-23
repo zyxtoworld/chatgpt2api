@@ -10,6 +10,7 @@ import services.openai_backend_api as backend_module
 import utils.turnstile as turnstile_module
 from utils.pow import parse_pow_resources
 from services.openai_backend_api import OpenAIBackendAPI
+from services.protocol.conversation import apply_text_patch, assistant_raw_text, sanitize_output_text
 
 
 def _backend_without_network() -> OpenAIBackendAPI:
@@ -44,10 +45,41 @@ def test_turnstile_solver_rejects_an_oversized_instruction_program() -> None:
     assert turnstile_module.solve_turnstile_token(encoded, source_p) is None
 
 
+def test_turnstile_python_fixture_with_ordered_map_and_callbacks() -> None:
+    source_p = "source-p"
+    # Keep this byte-for-byte aligned with the Rust fixture. It exercises the
+    # preseeded window/p slots, Reflect.set, OrderedMap, JSON, and opcodes
+    # 20/23. The current Python contract returns None: JSON serialization of
+    # OrderedMap raises TypeError, then opcode 23 passes its raw numeric
+    # argument to func_3 and raises again.
+    encoded = (
+        "KDRNXkNVAVBCXyheQz4fXFNeWVJBN0gWHwoWBkE4AVAoWVlSUUkNQF9PRC9PRXZCX09GXkNHXhUHTSheQz4fRF9PQV5DVwFQQDJZUjhXAVBGQ1VQFAxDFBwYWz0BD0gTB0EWAAYEWRVRMllSOFQaXFNZWVJWOAFQKF1ZUlRJDVISTSheQz4fXFNXWVJBBw8tX08uRU9FGVxTWVlSVEkNSC5DVSlSUAFQSkNVRD5JDStLQ1VDUkkNQUUyWVI4VwFQQl1ZUkEWTB0WTSheQz4fXFNeRl5DR14RHgpXL09FdkJfT0RGT0UcRS5DVSlRSQ1BRkNVUBcERBxRMllSOFcdXFNeR15DVB5cU11ZUlJRAVBCWiheQz4fQ19PREBPRR5cU1YoLw=="
+    )
+
+    assert turnstile_module.solve_turnstile_token(encoded, source_p) is None
+
+
+def test_python_pow_resource_parser_accepts_html_attribute_variants() -> None:
+    scripts, data_build = parse_pow_resources(
+        '<html data-build="build-canary"><SCRIPT defer SRC = \'/c/abc/_build.js\'></SCRIPT>'
+    )
+    assert scripts == ["/c/abc/_build.js"]
+    assert data_build == "c/abc/_"
+
+
+def test_python_pow_resource_parser_requires_a_real_script_tag_name() -> None:
+    scripts, data_build = parse_pow_resources(
+        "<scripture src='/wrong.js'></scripture><script src='/right.js'></script>"
+    )
+    assert scripts == ["/right.js"]
+    assert data_build == ""
+
+
 def test_python_pow_resource_parser_accepts_single_quoted_data_build() -> None:
     scripts, data_build = parse_pow_resources("<html data-build='build-single-quote'></html>")
     assert scripts == ["https://chatgpt.com/backend-api/sentinel/sdk.js"]
     assert data_build == "build-single-quote"
+
 
 def test_build_requirements_rejects_oversized_turnstile_dx_before_solving() -> None:
     backend = _backend_without_network()
@@ -167,6 +199,44 @@ def test_chat_requirements_rejects_malformed_proof_of_work_fields(seed: str, dif
             )
 
     build.assert_not_called()
+
+
+def test_chat_requirements_accepts_python_unicode_seed_character_limit() -> None:
+    backend = _backend_without_network()
+    with mock.patch.object(backend_module, "build_proof_token", return_value="proof") as build:
+        assert (
+            backend_module._build_proof_of_work_token(
+                {"required": True, "seed": "é" * 256, "difficulty": "00"},
+                backend.user_agent,
+            )
+            == "proof"
+        )
+    build.assert_called_once()
+
+
+def test_python_conversation_patch_and_annotation_contract_vectors() -> None:
+    path = "/message/content/parts/0"
+    assert assistant_raw_text({"p": path, "o": "append", "v": "hello"}) == "hello"
+    assert assistant_raw_text(
+        {"o": "patch", "v": [{"p": path, "o": "append", "v": "hello"}, {"p": path, "o": "append", "v": " world"}]}
+    ) == "hello world"
+    assert apply_text_patch({"v": " world"}, "hello") == "hello world"
+    assert apply_text_patch({"p": path, "o": "replace", "v": "history: answer"}, "", "history: ") == "answer"
+    with pytest.raises(RuntimeError, match="malformed text patch"):
+        apply_text_patch({"p": path, "o": "append", "v": {"canary": True}}, "")
+
+    annotated = (
+        "Repo: \ue200url\ue202chatgpt2api\ue202https://example.test/repo\ue201 done "
+        "\ue200cite\ue202turn0search0\ue201."
+    )
+    assert sanitize_output_text(annotated) == "Repo: chatgpt2api (https://example.test/repo) done."
+    assert sanitize_output_text(
+        "x \ue200cite\ue202turnfoo\ue202Readable\ue201. y "
+        "\ue200cite\ue202turntable\ue202Other\ue201."
+    ) == "x Readable. y Other."
+    assert sanitize_output_text("The \ue200entity\ue202Invincible\ue201.") == "The Invincible."
+    assert sanitize_output_text("partial \ue200cite\ue202turn0search0") == "partial "
+    assert sanitize_output_text("done \ue200cite\ue202turn0search0\ue201.") == "done."
 
 
 def test_chat_requirements_rejects_non_object_prepare_response() -> None:

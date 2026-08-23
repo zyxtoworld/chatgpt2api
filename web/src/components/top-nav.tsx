@@ -41,6 +41,7 @@ export function TopNav() {
   const [isCanvasDialogOpen, setIsCanvasDialogOpen] = useState(false);
   const authSessionOwnerRef = useRef(createLatestActionOwner());
   const thirdPartyOwnerRef = useRef(createLatestActionOwner());
+  const thirdPartyAbortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const authSessionOwner = authSessionOwnerRef.current;
@@ -78,14 +79,21 @@ export function TopNav() {
     thirdPartyOwner.activate();
     const load = async () => {
       const requestOwner = thirdPartyOwner.begin(owner);
+      thirdPartyAbortControllerRef.current?.abort();
+      const abortController = new AbortController();
+      thirdPartyAbortControllerRef.current = abortController;
       try {
-        const data = await fetchThirdPartyApps();
+        const data = await fetchThirdPartyApps(abortController.signal);
         if (thirdPartyOwner.accepts(requestOwner, owner)) {
           setThirdPartyState({ owner, apps: data.third_party_apps });
         }
       } catch {
         if (thirdPartyOwner.accepts(requestOwner, owner)) {
           setThirdPartyState((current) => current?.owner === owner ? null : current);
+        }
+      } finally {
+        if (thirdPartyAbortControllerRef.current === abortController) {
+          thirdPartyAbortControllerRef.current = null;
         }
       }
     };
@@ -95,6 +103,8 @@ export function TopNav() {
     window.addEventListener("third-party-apps-updated", reload);
     return () => {
       thirdPartyOwner.cancel();
+      thirdPartyAbortControllerRef.current?.abort();
+      thirdPartyAbortControllerRef.current = null;
       window.removeEventListener("third-party-apps-updated", reload);
     };
   }, [session]);

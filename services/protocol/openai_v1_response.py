@@ -50,6 +50,7 @@ from utils.helper import (
     UpstreamHTTPError,
     extract_image_from_message_content,
     extract_response_prompt,
+    is_codex_image_model,
     has_response_image_generation_tool,
     is_supported_image_model,
 )
@@ -198,19 +199,28 @@ _PUBLIC_CODEX_RESPONSE_FIELDS = frozenset({
     "parallel_tool_calls",
     "usage",
 })
-_PUBLIC_CODEX_ITEM_FIELDS = frozenset().union(
-    SUPPORTED_RESPONSE_MESSAGE_FIELDS,
-    SUPPORTED_FUNCTION_CALL_OUTPUT_FIELDS,
-    SUPPORTED_CUSTOM_TOOL_CALL_FIELDS,
-    SUPPORTED_FUNCTION_CALL_FIELDS,
-    SUPPORTED_REASONING_FIELDS,
-    SUPPORTED_COMPACTION_FIELDS,
-    SUPPORTED_IMAGE_GENERATION_CALL_FIELDS,
-    SUPPORTED_WEB_SEARCH_CALL_FIELDS,
-    SUPPORTED_TOOL_SEARCH_CALL_FIELDS,
-    SUPPORTED_TOOL_SEARCH_OUTPUT_FIELDS,
-    SUPPORTED_MCP_TOOL_CALL_OUTPUT_FIELDS,
-)
+_PUBLIC_CODEX_ITEM_FIELDS_BY_TYPE = {
+    "message": SUPPORTED_RESPONSE_MESSAGE_FIELDS,
+    "function_call_output": SUPPORTED_FUNCTION_CALL_OUTPUT_FIELDS,
+    "custom_tool_call_output": SUPPORTED_CUSTOM_TOOL_CALL_OUTPUT_FIELDS,
+    "function_call": SUPPORTED_FUNCTION_CALL_FIELDS,
+    "custom_tool_call": SUPPORTED_CUSTOM_TOOL_CALL_FIELDS,
+    "reasoning": SUPPORTED_REASONING_FIELDS,
+    "compaction": SUPPORTED_COMPACTION_FIELDS,
+    "image_generation_call": SUPPORTED_IMAGE_GENERATION_CALL_FIELDS,
+    "web_search_call": SUPPORTED_WEB_SEARCH_CALL_FIELDS,
+    "tool_search_call": SUPPORTED_TOOL_SEARCH_CALL_FIELDS,
+    "tool_search_output": SUPPORTED_TOOL_SEARCH_OUTPUT_FIELDS,
+    "mcp_call_output": SUPPORTED_MCP_TOOL_CALL_OUTPUT_FIELDS,
+    "mcp_tool_call_output": SUPPORTED_MCP_TOOL_CALL_OUTPUT_FIELDS,
+    "computer_call": {"type", "id", "call_id", "pending_safety_checks", "status"},
+    "computer_call_output": {"type", "id", "call_id", "output", "status"},
+    "shell_call": {"type", "id", "action", "call_id", "environment", "status"},
+    "shell_call_output": {"type", "id", "call_id", "max_output_length", "output", "status"},
+    "apply_patch_call": {"type", "id", "call_id", "operation", "status"},
+    "apply_patch_call_output": {"type", "id", "call_id", "status"},
+    "code_interpreter_call": {"type", "id", "code", "container_id", "outputs", "status"},
+}
 _PUBLIC_CODEX_CONTENT_FIELDS = frozenset({
     "type",
     "text",
@@ -254,6 +264,48 @@ _PUBLIC_CODEX_ACTION_FIELDS = frozenset({
     "queries",
     "url",
     "pattern",
+})
+_PUBLIC_CODEX_ENVIRONMENT_FIELDS = frozenset({
+    "type",
+    "id",
+    "name",
+    "container_id",
+    "shell",
+    "working_directory",
+    "env",
+    "network",
+    "timeout",
+    "description",
+    "text",
+})
+_PUBLIC_CODEX_OPERATION_FIELDS = frozenset({
+    "type",
+    "id",
+    "operation",
+    "path",
+    "patch",
+    "status",
+    "command",
+    "description",
+    "text",
+})
+_PUBLIC_CODEX_SAFETY_CHECK_FIELDS = frozenset({"type", "id", "code", "message", "reason"})
+_PUBLIC_CODEX_OUTPUT_FIELDS = frozenset({
+    "type",
+    "id",
+    "text",
+    "logs",
+    "files",
+    "stdout",
+    "stderr",
+    "command",
+    "exit_code",
+    "status",
+    "mime_type",
+    "filename",
+    "url",
+    "data",
+    "content",
 })
 _PUBLIC_CODEX_TOOL_DEFINITION_FIELDS = frozenset({
     "type",
@@ -338,6 +390,15 @@ _PUBLIC_CODEX_SCALAR_FIELDS = frozenset({
     "reasoning_tokens",
     "parallel_tool_calls",
     "description",
+    "path",
+    "patch",
+    "command",
+    "stdout",
+    "stderr",
+    "logs",
+    "mime_type",
+    "filename",
+    "reason",
 })
 _PUBLIC_CODEX_STRING_FIELDS = frozenset(_PUBLIC_CODEX_SCALAR_FIELDS - {
     "sequence_number",
@@ -371,6 +432,8 @@ _PUBLIC_CODEX_INTEGER_FIELDS = frozenset({
     "text_tokens",
     "image_tokens",
     "reasoning_tokens",
+    "exit_code",
+    "timeout",
 })
 CODEX_SUPPORTED_INCLUDE_VALUES = {
     CODEX_DEFAULT_INCLUDE,
@@ -1128,7 +1191,11 @@ def validate_image_response_parameters(body: dict[str, Any]) -> None:
             tool.get("output_compression"),
             tool["output_format"],
         )
-        tool["background"] = normalize_supported_image_background(tool.get("background"))
+        tool["background"] = normalize_supported_image_background(
+            tool.get("background"),
+            allow_non_auto=is_codex_image_model(tool.get("model")),
+            output_format=tool["output_format"],
+        )
         tool["moderation"] = normalize_supported_image_moderation(tool.get("moderation"))
         tool["partial_images"] = normalize_supported_partial_images(tool.get("partial_images"))
     except PublicSafeValueError as exc:
@@ -1695,6 +1762,51 @@ def in_progress_response_from_event(event: dict[str, Any]) -> dict[str, Any] | N
     return _active_response_from_event(event, "response.in_progress")
 
 
+def _project_public_codex_object(value: Any, allowed: set[str] | frozenset[str]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError("codex returned malformed public response event")
+    return {
+        key: _project_public_codex_value(child, field=key)
+        for key, child in value.items()
+        if key in allowed
+    }
+
+
+def _project_public_codex_environment(value: Any) -> dict[str, Any]:
+    return _project_public_codex_object(value, _PUBLIC_CODEX_ENVIRONMENT_FIELDS)
+
+
+def _project_public_codex_operation(value: Any) -> dict[str, Any]:
+    return _project_public_codex_object(value, _PUBLIC_CODEX_OPERATION_FIELDS)
+
+
+def _project_public_codex_safety_checks(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(child, dict) for child in value):
+        raise RuntimeError("codex returned malformed public response event")
+    return [
+        _project_public_codex_object(child, _PUBLIC_CODEX_SAFETY_CHECK_FIELDS)
+        for child in value
+    ]
+
+
+def _project_public_codex_output_object(value: Any) -> dict[str, Any]:
+    return _project_public_codex_object(value, _PUBLIC_CODEX_OUTPUT_FIELDS)
+
+
+def _project_public_codex_outputs(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(child, dict) for child in value):
+        raise RuntimeError("codex returned malformed public response event")
+    return [_project_public_codex_output_object(child) for child in value]
+
+
+def _project_public_codex_item_output(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return _project_public_codex_output_object(value)
+    return _project_public_codex_outputs(value)
+
+
 def _project_public_codex_value(value: Any, *, field: str | None = None) -> Any:
     if field in {"error", "item", "response", "usage"}:
         if value is not None and not isinstance(value, dict):
@@ -1704,7 +1816,7 @@ def _project_public_codex_value(value: Any, *, field: str | None = None) -> Any:
             return None
         if not isinstance(value, list) or any(not isinstance(child, dict) for child in value):
             raise RuntimeError("codex returned malformed public response event")
-        return [_project_public_codex_value(child, field="item") for child in value]
+        return [_project_public_codex_response_item(child) for child in value]
     if field == "tools":
         if value is None:
             return None
@@ -1759,13 +1871,21 @@ def _project_public_codex_value(value: Any, *, field: str | None = None) -> Any:
         return value
     if field == "parameters":
         return _project_public_codex_tool_schema(value)
+    if field == "environment":
+        return _project_public_codex_environment(value)
+    if field == "operation":
+        return _project_public_codex_operation(value)
+    if field == "pending_safety_checks":
+        return _project_public_codex_safety_checks(value)
+    if field in {"outputs", "files"}:
+        return _project_public_codex_outputs(value)
+    if field == "item":
+        return _project_public_codex_response_item(value)
     if isinstance(value, dict):
         if field == "error":
             allowed = _PUBLIC_CODEX_ERROR_FIELDS
         elif field == "usage":
             allowed = _PUBLIC_CODEX_USAGE_FIELDS
-        elif field in {"item", "output"}:
-            allowed = _PUBLIC_CODEX_ITEM_FIELDS
         elif field == "response":
             allowed = _PUBLIC_CODEX_RESPONSE_FIELDS
         elif field in {"input_tokens_details", "output_tokens_details"}:
@@ -1873,7 +1993,41 @@ def _project_public_codex_tool_schema(value: Any) -> dict[str, Any]:
 
 
 def _project_public_codex_response_item(item: dict[str, Any]) -> dict[str, Any]:
-    return _project_public_codex_value(item, field="item")
+    if not isinstance(item, dict):
+        raise RuntimeError("codex returned malformed public response event")
+    item_type = item.get("type")
+    if not isinstance(item_type, str):
+        raise RuntimeError("codex returned malformed public response event")
+    allowed = _PUBLIC_CODEX_ITEM_FIELDS_BY_TYPE.get(item_type)
+    if allowed is None:
+        raise RuntimeError("codex returned malformed public response event")
+
+    projected: dict[str, Any] = {}
+    for key, child in item.items():
+        if key not in allowed:
+            continue
+        if key == "environment":
+            projected[key] = _project_public_codex_environment(child)
+        elif key == "operation":
+            projected[key] = _project_public_codex_operation(child)
+        elif key == "pending_safety_checks":
+            projected[key] = _project_public_codex_safety_checks(child)
+        elif key in {"outputs", "files"}:
+            projected[key] = _project_public_codex_outputs(child)
+        elif key == "output" and item_type == "computer_call_output":
+            projected[key] = _project_public_codex_output_object(child)
+        elif key == "output" and item_type in {"shell_call_output", "code_interpreter_call"}:
+            projected[key] = _project_public_codex_outputs(child)
+        elif key == "output" and item_type in {
+            "function_call_output",
+            "custom_tool_call_output",
+            "mcp_call_output",
+            "mcp_tool_call_output",
+        }:
+            projected[key] = _project_public_codex_item_output(child)
+        else:
+            projected[key] = _project_public_codex_value(child, field=key)
+    return projected
 
 
 def project_public_codex_response_event(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -1892,10 +2046,22 @@ def project_public_codex_response_event(event: dict[str, Any]) -> dict[str, Any]
         item = projected.get("item")
         if isinstance(item, dict):
             projected["item"] = _project_public_codex_response_item(item)
-        response = projected.get("response")
-        if isinstance(response, dict):
-            public_response = _project_public_codex_value(response, field="response")
-            projected["response"] = public_response
+        if event_type in {"response.created", "response.in_progress"}:
+            active_response = _active_response_from_event(event, event_type)
+            if active_response is not None:
+                projected["response"] = _project_public_codex_value(
+                    active_response,
+                    field="response",
+                )
+        elif event_type in {"response.completed", "response.incomplete"}:
+            terminal_response = terminal_response_from_event(event)
+            if terminal_response is None:
+                raise RuntimeError("codex returned a malformed terminal response")
+            projected["response"] = terminal_response
+        else:
+            response = projected.get("response")
+            if isinstance(response, dict):
+                projected["response"] = _project_public_codex_value(response, field="response")
         return projected
     except RuntimeError as exc:
         if event_type in {"response.created", "response.in_progress"}:

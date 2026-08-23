@@ -1044,6 +1044,268 @@ class PublicErrorContractTests(unittest.TestCase):
         self.assertNotIn("future_response_field", projected["response"])
         self.assertNotIn("future_item_field", projected["response"]["output"][0])
 
+    def test_codex_response_item_projection_is_discriminated_and_recursive(self) -> None:
+        canary = "codex-cross-type-item-canary owner@example.test"
+        message = {
+            "type": "message",
+            "id": "msg_public",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{
+                "type": "output_text",
+                "text": "visible message",
+                "annotations": [{
+                    "type": "url_citation",
+                    "url": "https://example.test/source",
+                    "title": "Source",
+                    "start_index": 0,
+                    "end_index": 7,
+                    "nested_secret": canary,
+                }],
+            }],
+            "call_id": canary,
+            "arguments": canary,
+            "action": {"type": "search", "query": canary},
+            "output": {"type": "result", "text": canary},
+            "pending_safety_checks": [{"type": "safety", "message": canary}],
+            "environment": {"type": "container", "id": canary},
+            "operation": {"type": "patch", "path": canary},
+        }
+        function_call = {
+            "type": "function_call",
+            "id": "call_public",
+            "call_id": "call_1",
+            "name": "lookup",
+            "arguments": '{"query":"rust"}',
+            "status": "completed",
+            "content": [{"type": "output_text", "text": canary}],
+            "role": "assistant",
+            "annotations": [{"type": "url_citation", "url": canary}],
+            "action": {"type": "search", "query": canary},
+            "output": {"type": "result", "text": canary},
+            "pending_safety_checks": [{"type": "safety", "message": canary}],
+            "environment": {"type": "container", "id": canary},
+            "operation": {"type": "patch", "path": canary},
+        }
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_public_items",
+                "status": "completed",
+                "output": [message, function_call],
+            },
+        }
+
+        projected = openai_v1_response_module.project_public_codex_response_event(event)
+
+        self.assertIsNotNone(projected)
+        output = projected["response"]["output"]
+        public_message, public_function_call = output
+        self.assertEqual(public_message["role"], "assistant")
+        self.assertEqual(public_message["content"][0]["text"], "visible message")
+        self.assertEqual(
+            public_message["content"][0]["annotations"][0]["url"],
+            "https://example.test/source",
+        )
+        self.assertEqual(public_function_call["call_id"], "call_1")
+        self.assertEqual(public_function_call["arguments"], '{"query":"rust"}')
+        for item, forbidden in (
+            (
+                public_message,
+                (
+                    "call_id",
+                    "arguments",
+                    "action",
+                    "output",
+                    "pending_safety_checks",
+                    "environment",
+                    "operation",
+                ),
+            ),
+            (
+                public_function_call,
+                (
+                    "content",
+                    "role",
+                    "annotations",
+                    "action",
+                    "output",
+                    "pending_safety_checks",
+                    "environment",
+                    "operation",
+                ),
+            ),
+        ):
+            for field in forbidden:
+                self.assertNotIn(field, item)
+        serialized = json.dumps(projected, ensure_ascii=False)
+        self.assertNotIn(canary, serialized)
+
+        recursive_items = [
+            {
+                "type": "web_search_call",
+                "id": "search_1",
+                "action": {
+                    "type": "search",
+                    "query": "rust",
+                    "secret": canary,
+                },
+                "status": "completed",
+            },
+            {
+                "type": "shell_call",
+                "id": "shell_1",
+                "action": {"type": "command", "query": "echo"},
+                "environment": {
+                    "type": "container",
+                    "id": "container_1",
+                    "secret": canary,
+                },
+                "status": "completed",
+            },
+            {
+                "type": "apply_patch_call",
+                "id": "patch_1",
+                "call_id": "call_patch",
+                "operation": {
+                    "type": "patch",
+                    "path": "README.md",
+                    "secret": canary,
+                },
+                "status": "completed",
+            },
+            {
+                "type": "computer_call",
+                "id": "computer_1",
+                "call_id": "call_computer",
+                "pending_safety_checks": [{
+                    "type": "safety",
+                    "id": "check_1",
+                    "reason": "review",
+                    "secret": canary,
+                }],
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "id": "output_1",
+                "call_id": "call_1",
+                "output": {"type": "result", "text": "ok", "secret": canary},
+                "status": "completed",
+            },
+        ]
+        recursive_event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_recursive",
+                "status": "completed",
+                "output": recursive_items,
+            },
+        }
+        recursive_projected = openai_v1_response_module.project_public_codex_response_event(
+            recursive_event
+        )
+        recursive_output = recursive_projected["response"]["output"]
+        self.assertEqual(recursive_output[0]["action"]["query"], "rust")
+        self.assertNotIn("secret", recursive_output[0]["action"])
+        self.assertEqual(recursive_output[1]["environment"]["id"], "container_1")
+        self.assertNotIn("secret", recursive_output[1]["environment"])
+        self.assertEqual(recursive_output[2]["operation"]["path"], "README.md")
+        self.assertNotIn("secret", recursive_output[2]["operation"])
+        self.assertEqual(recursive_output[3]["pending_safety_checks"][0]["reason"], "review")
+        self.assertNotIn("secret", recursive_output[3]["pending_safety_checks"][0])
+        self.assertEqual(recursive_output[4]["output"]["text"], "ok")
+        self.assertNotIn("secret", recursive_output[4]["output"])
+        self.assertNotIn(canary, json.dumps(recursive_projected, ensure_ascii=False))
+
+        schema = openai_v1_response_module._project_public_codex_value(
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "search query",
+                        "secret": canary,
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+                "secret": canary,
+            },
+            field="parameters",
+        )
+        self.assertEqual(schema["properties"]["query"]["type"], "string")
+        self.assertNotIn("secret", schema)
+        self.assertNotIn("secret", schema["properties"]["query"])
+
+    def test_codex_active_response_events_require_in_progress_and_allow_nulls(self) -> None:
+        for event_type in ("response.created", "response.in_progress"):
+            with self.subTest(event_type=event_type):
+                event = {
+                    "type": event_type,
+                    "response": {
+                        "id": f"resp_{event_type}",
+                        "status": "in_progress",
+                        "error": None,
+                        "incomplete_details": None,
+                        "output": [],
+                    },
+                }
+                projected = openai_v1_response_module.project_public_codex_response_event(event)
+                self.assertEqual(projected["response"]["status"], "in_progress")
+                self.assertIsNone(projected["response"]["error"])
+                self.assertIsNone(projected["response"]["incomplete_details"])
+                for field, value in (
+                    ("status", "completed"),
+                    ("error", {"message": "bad"}),
+                    ("incomplete_details", {"reason": "max_output_tokens"}),
+                    ("status", []),
+                    ("error", []),
+                    ("incomplete_details", []),
+                ):
+                    malformed = json.loads(json.dumps(event))
+                    malformed["response"][field] = value
+                    with self.assertRaisesRegex(RuntimeError, "malformed"):
+                        openai_v1_response_module.project_public_codex_response_event(malformed)
+
+    def test_codex_terminal_response_status_and_details_are_type_checked(self) -> None:
+        for event_type, expected_status in (
+            ("response.completed", "completed"),
+            ("response.incomplete", "incomplete"),
+        ):
+            with self.subTest(event_type=event_type):
+                response = {
+                    "id": f"resp_{event_type}",
+                    "status": expected_status,
+                    "error": None,
+                    "incomplete_details": None,
+                    "output": [],
+                }
+                if expected_status == "incomplete":
+                    response["incomplete_details"] = {"reason": "max_output_tokens"}
+                event = {"type": event_type, "response": response}
+                projected = openai_v1_response_module.project_public_codex_response_event(event)
+                self.assertEqual(projected["response"]["status"], expected_status)
+                self.assertIsNone(projected["response"]["error"])
+                if expected_status == "incomplete":
+                    self.assertEqual(
+                        projected["response"]["incomplete_details"]["reason"],
+                        "max_output_tokens",
+                    )
+                else:
+                    self.assertIsNone(projected["response"]["incomplete_details"])
+
+                for field, value in (
+                    ("status", "incomplete" if expected_status == "completed" else "completed"),
+                    ("error", {"type": "upstream"}),
+                    ("incomplete_details", []),
+                    ("output", {}),
+                ):
+                    malformed = json.loads(json.dumps(event))
+                    malformed["response"][field] = value
+                    with self.assertRaisesRegex(RuntimeError, "malformed"):
+                        openai_v1_response_module.project_public_codex_response_event(malformed)
+
     def test_codex_response_event_projection_preserves_search_citations(self) -> None:
         event = {
             "type": "response.completed",

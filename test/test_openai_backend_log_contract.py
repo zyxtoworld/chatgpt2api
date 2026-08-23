@@ -802,97 +802,59 @@ class OpenAIBackendLogContractTests(unittest.TestCase):
                 self.assertTrue(response.closed)
                 self.assertFalse(response.iterated)
 
-    def test_catalog_dispatches_source_compatible_endpoint_for_one_account_source(self) -> None:
-        for source_type in ("web", "password", "password-oauth", "codex"):
-            with self.subTest(source_type=source_type):
-                backend = object.__new__(OpenAIBackendAPI)
-                backend.access_token = "source-token"
-                backend.account = {"source_type": source_type}
-                backend._catalog_source_type = source_type
-                backend.session = mock.Mock()
-                backend._bootstrap = mock.Mock()
-                backend._headers = mock.Mock(return_value={})
-                backend._codex_client_version = mock.Mock(return_value="0.147.0")
-                backend._codex_models_headers = mock.Mock(return_value={})
-                codex_session = mock.Mock()
-                backend._codex_session = mock.Mock(return_value=codex_session)
-                observed: list[tuple[object, str]] = []
-
-                def fetch(session: object, path: str, _route: str, _headers: dict[str, str], **_kwargs: object):
-                    observed.append((session, path))
-                    return {"model": {"id": "model"}}
-
-                backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
-
-                result = OpenAIBackendAPI.list_catalog_models(backend)
-
-                self.assertEqual(result["data"][0]["id"], "model")
-                self.assertTrue(result["catalog_complete"])
-                expected_path = (
-                    "/backend-api/codex/models?client_version=0.147.0"
-                    if source_type == "codex"
-                    else "/backend-api/models?history_and_training_disabled=false"
-                )
-                self.assertEqual(len(observed), 1)
-                self.assertEqual(observed[0][1], expected_path)
-                if source_type == "codex":
-                    backend._bootstrap.assert_not_called()
-                    codex_session.close.assert_called_once()
-                else:
-                    backend._bootstrap.assert_called_once()
-                    codex_session.close.assert_not_called()
-
-    def test_codex_catalog_never_sends_web_request_or_bootstrap(self) -> None:
+    def test_model_list_uses_authenticated_web_once_and_never_codex(self) -> None:
         backend = object.__new__(OpenAIBackendAPI)
         backend.access_token = "codex-token"
-        backend.account = {"source_type": "codex", "account_id": "acct-codex"}
-        backend._catalog_source_type = "codex"
+        backend.account = {"source_type": "codex"}
+        backend.base_url = "https://chatgpt.com"
         backend.session = mock.Mock()
         backend._bootstrap = mock.Mock()
-        backend._headers = mock.Mock(return_value={})
-        backend._codex_client_version = mock.Mock(return_value="0.147.0")
-        backend._codex_models_headers = mock.Mock(return_value={})
-        codex_session = mock.Mock()
-        backend._codex_session = mock.Mock(return_value=codex_session)
+        backend._headers = mock.Mock(return_value={"Authorization": "Bearer codex-token"})
+        backend._codex_session = mock.Mock()
+        backend._fetch_model_catalog_endpoint = mock.Mock(
+            return_value={"web-model": {"id": "web-model"}}
+        )
 
-        def fetch(
-            _session: object,
-            path: str,
-            _route: str,
-            _headers: dict[str, str],
-            **_kwargs: object,
-        ) -> dict[str, dict[str, str]]:
-            self.assertEqual(
-                path,
-                "/backend-api/codex/models?client_version=0.147.0",
-            )
-            return {"codex-model": {"id": "codex-model"}}
+        result = backend.list_models()
 
-        backend._fetch_model_catalog_endpoint = mock.Mock(side_effect=fetch)
-
-        result = OpenAIBackendAPI.list_catalog_models(backend)
-
-        self.assertEqual([item["id"] for item in result["data"]], ["codex-model"])
-        self.assertTrue(result["catalog_complete"])
-        backend._bootstrap.assert_not_called()
-        backend._headers.assert_not_called()
+        self.assertEqual([item["id"] for item in result["data"]], ["web-model"])
+        backend._bootstrap.assert_called_once()
+        backend._headers.assert_called_once_with(
+            "/backend-api/models",
+            allow_catalog=True,
+        )
         backend._fetch_model_catalog_endpoint.assert_called_once()
-        codex_session.close.assert_called_once()
+        call = backend._fetch_model_catalog_endpoint.call_args
+        self.assertIs(call.args[0], backend.session)
+        self.assertEqual(
+            call.args[1],
+            "/backend-api/models?history_and_training_disabled=false",
+        )
+        backend._codex_session.assert_not_called()
 
-    def test_catalog_rejects_oauth_and_unknown_sources_before_any_transport(self) -> None:
+    def test_model_list_uses_same_web_request_for_unknown_source_metadata(self) -> None:
         for source_type in ("oauth_login", "future-incompatible"):
             with self.subTest(source_type=source_type):
                 backend = object.__new__(OpenAIBackendAPI)
                 backend.access_token = "source-token"
                 backend.account = {"source_type": source_type}
-                backend._catalog_source_type = source_type
-                backend.list_models = mock.Mock()
+                backend.base_url = "https://chatgpt.com"
+                backend.session = mock.Mock()
+                backend._bootstrap = mock.Mock()
+                backend._headers = mock.Mock(return_value={})
+                backend._codex_session = mock.Mock()
+                backend._fetch_model_catalog_endpoint = mock.Mock(
+                    return_value={"web-model": {"id": "web-model"}}
+                )
 
-                with self.assertRaisesRegex(RuntimeError, "catalog endpoint"):
-                    OpenAIBackendAPI.list_catalog_models(backend)
+                result = backend.list_models()
 
-                backend.list_models.assert_not_called()
-
+                self.assertEqual(
+                    [item["id"] for item in result["data"]],
+                    ["web-model"],
+                )
+                backend._fetch_model_catalog_endpoint.assert_called_once()
+                backend._codex_session.assert_not_called()
     def test_blob_puts_are_streamed_and_closed(self) -> None:
         class JSONResponse:
             status_code = 200

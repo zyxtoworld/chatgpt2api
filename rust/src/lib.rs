@@ -1,16 +1,19 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 mod account_pool;
 mod codex_sse;
 mod codex_upstream;
 mod config;
 mod errors;
+mod management;
 mod model_pool;
 mod native_pow;
 mod protocol_anthropic;
 mod protocol_chat;
 mod protocol_codex_payload;
 mod protocol_responses;
+mod responses_websocket;
 mod shutdown;
 use account_pool::{
     AccountLease, AccountModelGroup, AccountRecord, AccountStore, CatalogAccountCandidate,
@@ -19,13 +22,13 @@ use account_pool::{
 use codex_sse::native_codex_text;
 use codex_sse::{
     codex_sse_data, native_codex_delta_frame, native_codex_response_to_chat,
-    native_codex_responses_json,
+    native_codex_responses_json, project_codex_response_event, validate_codex_response_event,
 };
 #[cfg(test)]
 use codex_upstream::parse_codex_client_version;
 use codex_upstream::{
     NativeRequestContext, codex_client_version, codex_request_headers, native_browser_headers,
-    native_codex_response_payload,
+    native_browser_headers_with_referer, native_codex_response_payload,
 };
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
@@ -52,27 +55,37 @@ use shutdown::{serve_state_with_bounded_shutdown, serve_with_bounded_shutdown};
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    env,
+    ffi::OsStr,
     fs,
-    io::{self, Read},
+    io::{self, Cursor, Read, Seek, Write},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc, LazyLock, RwLock,
+        Arc, LazyLock, Mutex as StdMutex, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use base64::Engine as _;
+use file_identity::{
+    DirectoryHandle, create_regular_file_at, identity as kernel_identity, open_directory,
+    open_or_create_directory, open_regular_file_at, open_regular_file_for_lock_at,
+    open_regular_file_for_replace_at, open_regular_file_for_replace_check_at, remove_file_at,
+    remove_open_file_at, replace_file_at,
+};
+use fs2::FileExt;
 use futures_util::{Stream, StreamExt, stream, stream::FuturesUnordered};
+use image::ImageReader;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -88,6 +101,7 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AUTH_KEYS_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_KEYS: usize = 10_000;
+const MAX_AUTH_KEY_NAME_LENGTH: usize = 128;
 const MAX_ACCOUNT_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_ACCOUNTS: usize = 10_000;
 const MAX_ACCOUNT_TOKEN_LENGTH: usize = 16 * 1024;
@@ -95,9 +109,25 @@ const MAX_MODEL_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
 const MAX_MODEL_TEXT_LENGTH: usize = 256;
 const MAX_MODEL_CREATED: i64 = i64::MAX;
+const MAX_IMAGE_TAG_FILE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_REGISTRY_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TAGGED_IMAGES: usize = 10_000;
+const MAX_IMAGE_TAGS_PER_IMAGE: usize = 64;
+const MAX_IMAGE_TAG_LENGTH: usize = 256;
+const MAX_IMAGE_REL_LENGTH: usize = 1024;
+const MAX_NATIVE_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+const MAX_NATIVE_IMAGE_PIXELS: u64 = 25_000_000;
+const MAX_EDITABLE_TASK_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_EDITABLE_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_EDITABLE_TASKS: usize = 5_000;
 const PUBLIC_SERVER_ERROR: &str = "The upstream request failed. Please try again later.";
 const INVALID_AUTH: &str = "密钥无效或已失效，请重新登录";
 const NATIVE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const NATIVE_SEARCH_TIMEOUT: Duration = Duration::from_secs(90);
+const NATIVE_SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(3);
+const NATIVE_SEARCH_MAX_FIELD_CHARS: usize = 4096;
+const NATIVE_SEARCH_MAX_SOURCES: usize = 100;
+const NATIVE_SEARCH_MODEL: &str = "gpt-5-5";
 const CODEX_RESPONSES_MODEL: &str = "gpt-5.5";
 const NATIVE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 const NATIVE_ORIGIN: &str = "https://chatgpt.com";
@@ -115,6 +145,65 @@ const MAX_TURNSTILE_INSTRUCTIONS: usize = 100_000;
 const MAX_TURNSTILE_VALUE_STRING_CHARS: usize = 64 * 1024;
 static NATIVE_POW_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(NATIVE_POW_MAX_CONCURRENCY)));
+static AUTH_WRITE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+static LOCAL_WRITE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+static REGISTRY_MUTATION_GATES: LazyLock<StdMutex<HashMap<PathBuf, Arc<StdMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+static IMAGE_TAGS_MUTATION_GATE: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+static HEALTH_STORAGE_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
+static HEALTH_ACCOUNTS_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
+#[cfg(test)]
+#[derive(Clone)]
+struct HealthBlockingTestHook {
+    version: String,
+    started: Arc<Notify>,
+    starts: Arc<AtomicUsize>,
+    block: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+static HEALTH_STORAGE_TEST_HOOK: LazyLock<StdMutex<Option<HealthBlockingTestHook>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static HEALTH_ACCOUNTS_TEST_HOOK: LazyLock<StdMutex<Option<HealthBlockingTestHook>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static HEALTH_TEST_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[cfg(test)]
+static IMAGE_TAG_READ_REBIND_HOOK: LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_WRITE_REBIND_HOOK: LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_WRITE_AFTER_CHECK_REBIND_HOOK: LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_TARGET_SWAP_HOOK: LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_TARGET_CREATE_HOOK: LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_TARGET_CREATE_AFTER_CHECK_HOOK: LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_TARGET_SWAP_AFTER_NAME_CHECK_HOOK: LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_CWD_SWITCH_HOOK: LazyLock<StdMutex<Option<PathBuf>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_TEMP_PATH_OVERRIDE: LazyLock<StdMutex<Option<PathBuf>>> =
+    LazyLock::new(|| StdMutex::new(None));
+#[cfg(test)]
+static IMAGE_TAG_REPLACE_FAILURE_HOOK: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static IMAGE_TAG_SECURITY_TEST_GATE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[cfg(test)]
 static NATIVE_POW_ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
@@ -149,6 +238,14 @@ impl Drop for NativePowWorkerGuard {
 struct AuthRecord {
     key_hash: String,
     enabled: bool,
+    raw: Value,
+}
+
+#[derive(Clone)]
+struct OAuthSession {
+    code_verifier: String,
+    state: String,
+    created_at: Instant,
 }
 
 #[derive(Clone)]
@@ -159,12 +256,28 @@ struct AuthSnapshot {
     records: Vec<AuthRecord>,
 }
 
+#[derive(Clone, Copy)]
+enum AuthMutationFailure {
+    FailClosed,
+    InvalidRequest,
+    PreserveSnapshot,
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 struct AuthReloadTestHook {
     pause_before_publish: Arc<AtomicBool>,
     read_complete: Arc<Notify>,
     release_publish: Arc<Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct AuthMutationTestHook {
+    pause_before_cas: Arc<AtomicBool>,
+    cas_ready: Arc<Notify>,
+    release_cas: Arc<Notify>,
+    fail_before_write: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -174,6 +287,8 @@ struct AuthStore {
     reload_gate: Arc<Mutex<()>>,
     #[cfg(test)]
     test_hook: Arc<RwLock<Option<AuthReloadTestHook>>>,
+    #[cfg(test)]
+    mutation_test_hook: Arc<RwLock<Option<AuthMutationTestHook>>>,
 }
 
 impl AuthStore {
@@ -194,6 +309,8 @@ impl AuthStore {
             reload_gate: Arc::new(Mutex::new(())),
             #[cfg(test)]
             test_hook: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            mutation_test_hook: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -258,10 +375,208 @@ impl AuthStore {
             record.enabled && constant_time_equal(candidate.as_bytes(), record.key_hash.as_bytes())
         })
     }
+
+    fn accepts_role(&self, token: &str, role: &str) -> bool {
+        let snapshot = self.snapshot.read().expect("auth snapshot lock");
+        if !snapshot.valid {
+            return false;
+        }
+        let candidate = auth_key_hash(token);
+        snapshot.records.iter().any(|record| {
+            record.enabled
+                && record
+                    .raw
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(role))
+                && constant_time_equal(candidate.as_bytes(), record.key_hash.as_bytes())
+        })
+    }
+
+    fn identity(&self, token: &str) -> Option<(String, String, String)> {
+        let candidate = auth_key_hash(token);
+        self.snapshot
+            .read()
+            .expect("auth snapshot lock")
+            .records
+            .iter()
+            .find(|record| {
+                record.enabled
+                    && constant_time_equal(candidate.as_bytes(), record.key_hash.as_bytes())
+            })
+            .map(|record| {
+                let role = record
+                    .raw
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user")
+                    .to_owned();
+                let subject = record
+                    .raw
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user")
+                    .to_owned();
+                let name = record
+                    .raw
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                (role, subject, name)
+            })
+    }
+
+    fn public_records(&self) -> Vec<Value> {
+        self.snapshot
+            .read()
+            .expect("auth snapshot lock")
+            .records
+            .iter()
+            .map(|record| {
+                let mut object = record.raw.as_object().cloned().unwrap_or_default();
+                object.remove("key");
+                object.remove("key_hash");
+                object.insert("enabled".to_owned(), Value::Bool(record.enabled));
+                Value::Object(object)
+            })
+            .collect()
+    }
+
+    fn invalidate_snapshot(&self) {
+        let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
+        snapshot.generation = snapshot.generation.saturating_add(1);
+        snapshot.valid = false;
+        snapshot.records.clear();
+    }
+
+    #[cfg(test)]
+    fn set_mutation_test_hook(&self, hook: Option<AuthMutationTestHook>) {
+        *self
+            .mutation_test_hook
+            .write()
+            .expect("auth mutation test hook lock") = hook;
+    }
+
+    #[cfg(test)]
+    async fn pause_before_mutation_cas(&self) {
+        let hook = self
+            .mutation_test_hook
+            .read()
+            .expect("auth mutation test hook lock")
+            .clone();
+        let Some(hook) = hook else {
+            return;
+        };
+        if hook.pause_before_cas.swap(false, Ordering::SeqCst) {
+            hook.cas_ready.notify_one();
+            hook.release_cas.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn should_fail_mutation_write(&self) -> bool {
+        self.mutation_test_hook
+            .read()
+            .expect("auth mutation test hook lock")
+            .as_ref()
+            .is_some_and(|hook| hook.fail_before_write.swap(false, Ordering::SeqCst))
+    }
+
+    async fn mutate_raw<F, R>(&self, mutator: F) -> Result<R, ApiError>
+    where
+        F: FnOnce(&mut Vec<Value>) -> Result<R, ApiError>,
+    {
+        let Some(path) = self.path.clone() else {
+            return Err(ApiError::unsupported_capability());
+        };
+        let _write_guard = self.reload_gate.lock().await;
+        let _file_lock = acquire_path_write_lock(path.as_ref()).await?;
+        let read_path = path.as_ref().clone();
+        let (mut document, _parsed, expected_fingerprint) =
+            tokio::task::spawn_blocking(move || read_auth_document(&read_path))
+                .await
+                .map_err(|_| ApiError::unavailable())?
+                .map_err(|_| {
+                    self.invalidate_snapshot();
+                    ApiError::unavailable()
+                })?;
+        let mut records = document
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                self.invalidate_snapshot();
+                ApiError::unavailable()
+            })?;
+        let result = mutator(&mut records)?;
+        if records.len() > MAX_AUTH_KEYS {
+            return Err(ApiError::invalid_request());
+        }
+
+        #[cfg(test)]
+        self.pause_before_mutation_cas().await;
+
+        #[cfg(test)]
+        let fail_before_write = self.should_fail_mutation_write();
+
+        let target = path.as_ref().clone();
+        let items = Value::Array(records);
+        let (parsed, fingerprint) = tokio::task::spawn_blocking(move || {
+            let (_, current_fingerprint) =
+                read_auth_snapshot(&target).map_err(|_| AuthMutationFailure::FailClosed)?;
+            if current_fingerprint != expected_fingerprint {
+                return Err(AuthMutationFailure::FailClosed);
+            }
+            let object = document
+                .as_object_mut()
+                .ok_or(AuthMutationFailure::FailClosed)?;
+            object.insert("items".to_owned(), items);
+            let bytes = serde_json::to_vec_pretty(&document)
+                .map_err(|_| AuthMutationFailure::PreserveSnapshot)?;
+            if bytes.len() as u64 > MAX_AUTH_KEYS_BYTES {
+                return Err(AuthMutationFailure::InvalidRequest);
+            }
+            #[cfg(test)]
+            if fail_before_write {
+                return Err(AuthMutationFailure::PreserveSnapshot);
+            }
+            let (_, written_records, written_fingerprint) =
+                parse_auth_document_bytes(&bytes).map_err(|_| AuthMutationFailure::FailClosed)?;
+            atomic_replace_checked_with_limit(&target, &bytes, MAX_AUTH_KEYS_BYTES, false)
+                .map_err(|_| AuthMutationFailure::PreserveSnapshot)?;
+            let committed =
+                read_auth_snapshot(&target).map_err(|_| AuthMutationFailure::FailClosed)?;
+            if committed.1 != written_fingerprint {
+                return Err(AuthMutationFailure::FailClosed);
+            }
+            Ok((written_records, committed.1))
+        })
+        .await
+        .map_err(|_| ApiError::unavailable())?
+        .map_err(|failure| match failure {
+            AuthMutationFailure::FailClosed => {
+                self.invalidate_snapshot();
+                ApiError::unavailable()
+            }
+            AuthMutationFailure::InvalidRequest => ApiError::invalid_request(),
+            AuthMutationFailure::PreserveSnapshot => ApiError::unavailable(),
+        })?;
+        let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
+        snapshot.generation = snapshot.generation.saturating_add(1);
+        snapshot.fingerprint = fingerprint;
+        snapshot.records = parsed;
+        snapshot.valid = true;
+        Ok(result)
+    }
 }
 
-fn read_auth_snapshot(path: &Path) -> Result<(Vec<AuthRecord>, [u8; 32]), AppInitError> {
-    let file = fs::File::open(path).map_err(|_| AppInitError::AuthSnapshot)?;
+fn read_auth_document(path: &Path) -> Result<(Value, Vec<AuthRecord>, [u8; 32]), AppInitError> {
+    let parent = checked_parent_identity(path)
+        .map_err(|_| AppInitError::AuthSnapshot)?
+        .ok_or(AppInitError::AuthSnapshot)?;
+    let name = path.file_name().ok_or(AppInitError::AuthSnapshot)?;
+    let file = open_regular_file_at(&parent._file, name).map_err(|_| AppInitError::AuthSnapshot)?;
     let mut bytes = Vec::new();
     file.take(MAX_AUTH_KEYS_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -269,8 +584,17 @@ fn read_auth_snapshot(path: &Path) -> Result<(Vec<AuthRecord>, [u8; 32]), AppIni
     if bytes.len() as u64 > MAX_AUTH_KEYS_BYTES {
         return Err(AppInitError::AuthSnapshot);
     }
-    let fingerprint = Sha256::digest(&bytes).into();
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| AppInitError::AuthSnapshot)?;
+    parse_auth_document_bytes(&bytes)
+}
+
+fn parse_auth_document_bytes(
+    bytes: &[u8],
+) -> Result<(Value, Vec<AuthRecord>, [u8; 32]), AppInitError> {
+    if bytes.len() as u64 > MAX_AUTH_KEYS_BYTES {
+        return Err(AppInitError::AuthSnapshot);
+    }
+    let fingerprint = Sha256::digest(bytes).into();
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| AppInitError::AuthSnapshot)?;
     let items = value
         .as_object()
         .and_then(|object| object.get("items"))
@@ -301,13 +625,26 @@ fn read_auth_snapshot(path: &Path) -> Result<(Vec<AuthRecord>, [u8; 32]), AppIni
         records.push(AuthRecord {
             key_hash: key_hash.to_ascii_lowercase(),
             enabled,
+            raw: object.clone().into(),
         });
     }
+    Ok((value, records, fingerprint))
+}
+
+fn read_auth_snapshot(path: &Path) -> Result<(Vec<AuthRecord>, [u8; 32]), AppInitError> {
+    let (_, records, fingerprint) = read_auth_document(path)?;
     Ok((records, fingerprint))
 }
 
-fn read_account_snapshot(path: &Path) -> Result<(Vec<AccountRecord>, [u8; 32]), AppInitError> {
-    let file = fs::File::open(path).map_err(|_| AppInitError::AccountSnapshot)?;
+fn read_account_document(
+    path: &Path,
+) -> Result<(Value, Vec<AccountRecord>, [u8; 32]), AppInitError> {
+    let parent = checked_parent_identity(path)
+        .map_err(|_| AppInitError::AccountSnapshot)?
+        .ok_or(AppInitError::AccountSnapshot)?;
+    let name = path.file_name().ok_or(AppInitError::AccountSnapshot)?;
+    let file =
+        open_regular_file_at(&parent._file, name).map_err(|_| AppInitError::AccountSnapshot)?;
     let mut bytes = Vec::new();
     file.take(MAX_ACCOUNT_SNAPSHOT_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -315,8 +652,17 @@ fn read_account_snapshot(path: &Path) -> Result<(Vec<AccountRecord>, [u8; 32]), 
     if bytes.len() as u64 > MAX_ACCOUNT_SNAPSHOT_BYTES {
         return Err(AppInitError::AccountSnapshot);
     }
-    let fingerprint = Sha256::digest(&bytes).into();
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| AppInitError::AccountSnapshot)?;
+    parse_account_document_bytes(&bytes)
+}
+
+fn parse_account_document_bytes(
+    bytes: &[u8],
+) -> Result<(Value, Vec<AccountRecord>, [u8; 32]), AppInitError> {
+    if bytes.len() as u64 > MAX_ACCOUNT_SNAPSHOT_BYTES {
+        return Err(AppInitError::AccountSnapshot);
+    }
+    let fingerprint = Sha256::digest(bytes).into();
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| AppInitError::AccountSnapshot)?;
     let items = match &value {
         Value::Array(items) => items,
         Value::Object(object) => object
@@ -334,6 +680,7 @@ fn read_account_snapshot(path: &Path) -> Result<(Vec<AccountRecord>, [u8; 32]), 
         let object = item.as_object().ok_or(AppInitError::AccountSnapshot)?;
         let token = object
             .get("access_token")
+            .or_else(|| object.get("accessToken"))
             .or_else(|| object.get("token"))
             .and_then(Value::as_str)
             .map(str::trim)
@@ -393,8 +740,14 @@ fn read_account_snapshot(path: &Path) -> Result<(Vec<AccountRecord>, [u8; 32]), 
             chatgpt_account_id,
             account_type,
             models,
+            raw: object.clone().into(),
         });
     }
+    Ok((value, records, fingerprint))
+}
+
+fn read_account_snapshot(path: &Path) -> Result<(Vec<AccountRecord>, [u8; 32]), AppInitError> {
+    let (_, records, fingerprint) = read_account_document(path)?;
     Ok((records, fingerprint))
 }
 
@@ -476,23 +829,53 @@ fn normalize_account_type(value: Option<&Value>) -> Result<String, AppInitError>
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<AppConfig>,
+    config_path: Arc<PathBuf>,
+    data_dir: Arc<PathBuf>,
     auth_store: Arc<AuthStore>,
     account_store: Arc<AccountStore>,
+    account_progress: Arc<Mutex<HashMap<String, Value>>>,
+    oauth_sessions: Arc<Mutex<HashMap<String, OAuthSession>>>,
     models: Arc<ModelStore>,
     account_type_catalog: Arc<AccountTypeCatalog>,
     client: Client,
 }
 
 impl AppState {
-    pub fn new(config: AppConfig) -> Result<Self, AppInitError> {
+    pub fn new(mut config: AppConfig) -> Result<Self, AppInitError> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()
             .map_err(AppInitError::Client)?;
+        let initial_cwd = env::current_dir().map_err(|_| AppInitError::AccountSnapshot)?;
+        for path in [
+            config.auth_keys_path.as_mut(),
+            config.models_path.as_mut(),
+            config.accounts_path.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !path.is_absolute() {
+                *path = initial_cwd.join(&*path);
+            }
+        }
         let auth_store = AuthStore::load(config.auth_keys_path.as_deref())?;
         let account_store = AccountStore::load(config.accounts_path.as_deref())?;
         let models = ModelStore::load(config.models_path.as_deref(), &config.models)?;
+        let data_dir = config
+            .accounts_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_owned)
+            .or_else(|| env::var_os("RUST_DATA_DIR").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("data"));
+        let data_dir = if data_dir.is_absolute() {
+            data_dir
+        } else {
+            initial_cwd.join(data_dir)
+        };
+        let config_path = absolute_legacy_config_path(&initial_cwd, &data_dir);
         let account_type_catalog = AccountTypeCatalog::new(
             Arc::new(account_store.clone()),
             client.clone(),
@@ -503,8 +886,12 @@ impl AppState {
         );
         Ok(Self {
             config: Arc::new(config),
+            config_path: Arc::new(config_path),
+            data_dir: Arc::new(data_dir),
             auth_store: Arc::new(auth_store),
             account_store: Arc::new(account_store),
+            account_progress: Arc::new(Mutex::new(HashMap::new())),
+            oauth_sessions: Arc::new(Mutex::new(HashMap::new())),
             models: Arc::new(models),
             account_type_catalog: Arc::new(account_type_catalog),
             client,
@@ -515,44 +902,5217 @@ impl AppState {
         Router::new()
             .route("/health", get(health))
             .route("/v1/models", get(models))
+            .route(
+                "/api/accounts",
+                get(api_accounts)
+                    .post(api_accounts_add)
+                    .delete(api_accounts_delete),
+            )
+            .route("/api/accounts/update", post(api_accounts_update))
+            .route("/api/accounts/refresh", post(api_accounts_refresh))
+            .route(
+                "/api/accounts/refresh/progress/{progress_id}",
+                get(api_accounts_refresh_progress),
+            )
+            .route("/api/accounts/export", post(api_accounts_export))
+            .route("/api/accounts/re-login", post(api_accounts_relogin))
+            .route(
+                "/api/accounts/re-login/progress/{progress_id}",
+                get(api_accounts_relogin_progress),
+            )
+            .route("/api/accounts/oauth/start", post(api_accounts_oauth_start))
+            .route(
+                "/api/accounts/oauth/finish",
+                post(api_accounts_oauth_finish),
+            )
+            .route("/api/auth/users", get(api_users).post(api_users_add))
+            .route(
+                "/api/auth/users/{key_id}",
+                post(api_users_update).delete(api_users_delete),
+            )
+            .route("/auth/login", post(management::login))
+            .route("/version", get(version))
+            .route("/api/images", get(management::list_images))
+            .route("/images/{*image_path}", get(image_file))
+            .route("/image-thumbnails/{*image_path}", get(image_file))
+            .route("/files/{*file_path}", get(download_editable_file))
+            .route("/api/images/delete", post(management::delete_images))
+            .route("/api/images/download", post(management::download_images))
+            .route(
+                "/api/images/download/{*image_path}",
+                get(management::download_single_image),
+            )
+            .route(
+                "/api/images/tags",
+                get(api_image_tags).post(api_image_tags_update),
+            )
+            .route("/api/images/tags/{tag}", delete(api_image_tag_delete))
+            .route("/api/images/storage", get(management::image_storage))
+            .route(
+                "/api/images/storage/compress",
+                post(management::compress_images),
+            )
+            .route(
+                "/api/images/storage/cleanup-to-target",
+                post(management::cleanup_images),
+            )
+            .route(
+                "/api/proxy",
+                get(management::proxy_settings).post(management::update_proxy_settings),
+            )
+            .route("/api/logs", get(management::list_logs))
+            .route("/api/logs/delete", post(management::delete_logs))
+            .route("/api/proxy/test", post(management::test_proxy))
+            .route(
+                "/api/proxy/runtime",
+                get(management::proxy_runtime).post(management::update_proxy_runtime),
+            )
+            .route(
+                "/api/proxy/clearance/test",
+                post(management::test_clearance),
+            )
+            .route("/api/backup/test", post(management::test_backup))
+            .route(
+                "/api/image-storage/test",
+                post(management::test_image_storage),
+            )
+            .route(
+                "/api/image-storage/sync",
+                post(management::sync_image_storage),
+            )
+            .route("/api/backups", get(management::list_backups))
+            .route("/api/backups/run", post(management::run_backup))
+            .route("/api/backups/delete", post(management::delete_backup))
+            .route("/api/backups/detail", get(management::backup_detail))
+            .route("/api/backups/download", get(management::download_backup))
+            .route("/v1/images/generations", post(image_generation))
+            .route("/v1/images/edits", post(image_edit))
+            .route("/v1/search", post(search))
+            .route("/v1/ppt/generations", post(ppt_generation))
+            .route("/v1/psd/generations", post(psd_generation))
+            .route("/v1/editable-file-tasks", get(editable_file_tasks))
+            .route("/api/image-tasks", get(image_tasks))
+            .route("/api/image-tasks/generations", post(image_task_generation))
+            .route("/api/image-tasks/edits", post(image_task_edit))
+            .route(
+                "/api/image-tasks/{task_id}/resume-poll",
+                post(image_task_resume),
+            )
+            .route("/api/settings", get(api_settings).post(api_settings_update))
+            .route("/api/third-party-apps", get(api_third_party_apps))
+            .route("/api/storage/info", get(api_storage_info))
+            .route(
+                "/api/cpa/pools",
+                get(management::cpa_pools).post(management::create_cpa_pool),
+            )
+            .route(
+                "/api/cpa/pools/{pool_id}/files",
+                get(management::cpa_pool_files),
+            )
+            .route(
+                "/api/cpa/pools/{pool_id}/import",
+                get(management::cpa_import_progress).post(management::start_cpa_import),
+            )
+            .route(
+                "/api/cpa/pools/{pool_id}",
+                post(management::update_cpa_pool).delete(management::delete_cpa_pool),
+            )
+            .route(
+                "/api/sub2api/servers",
+                get(management::sub2api_servers).post(management::create_sub2api_server),
+            )
+            .route(
+                "/api/sub2api/servers/{server_id}/groups",
+                get(management::sub2api_groups),
+            )
+            .route(
+                "/api/sub2api/servers/{server_id}/accounts",
+                get(management::sub2api_accounts),
+            )
+            .route(
+                "/api/sub2api/servers/{server_id}/import",
+                get(management::sub2api_import_progress).post(management::start_sub2api_import),
+            )
+            .route(
+                "/api/sub2api/servers/{server_id}",
+                post(management::update_sub2api_server).delete(management::delete_sub2api_server),
+            )
+            .route(
+                "/api/ccload/servers",
+                get(management::ccload_servers).post(management::create_ccload_server),
+            )
+            .route(
+                "/api/ccload/servers/{server_id}/channels",
+                get(management::ccload_channels),
+            )
+            .route(
+                "/api/ccload/servers/{server_id}/channel-models",
+                post(management::ccload_channel_models),
+            )
+            .route(
+                "/api/ccload/servers/{server_id}/import",
+                get(management::ccload_import_progress).post(management::start_ccload_import),
+            )
+            .route(
+                "/api/ccload/servers/{server_id}",
+                post(management::update_ccload_server).delete(management::delete_ccload_server),
+            )
             .route("/v1/chat/completions", post(chat_completions))
-            .route("/v1/responses", post(responses))
+            .route(
+                "/v1/responses",
+                get(responses_websocket_upgrade).post(responses),
+            )
             .route("/v1/messages", post(messages))
+            .route("/", get(web_root))
+            .route("/{*web_path}", get(web_asset))
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
             .with_state(self.clone())
     }
 }
 
-fn health_payload(state: &AppState) -> Value {
-    let accounts = state.account_store.health_summary();
-    json!({
-        "status": "degraded",
-        "healthy": false,
-        "version": state.config.version,
-        "storage": {
-            "backend": "unknown",
-            "health": {
-                "status": "unhealthy",
-                "error": "storage health unavailable",
-            },
-        },
-        "proxy_runtime": {
-            "enabled": false,
-            "clearance_enabled": false,
-        },
-        "accounts": {
-            "total": accounts.total,
-            "cumulative_total": 0,
-            "active": accounts.active,
-            "limited": accounts.limited,
-            "abnormal": accounts.abnormal,
-            "disabled": accounts.disabled,
-            "total_quota": 0,
-            "total_success": 0,
-            "total_fail": 0,
-            "by_type": {},
-        },
+async fn version(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({"version": state.config.version}))
+}
+
+fn web_dist_root() -> PathBuf {
+    env::var_os("RUST_WEB_DIST")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let app = Path::new("/app/web_dist");
+            app.is_dir().then(|| app.to_owned())
+        })
+        .unwrap_or_else(|| PathBuf::from("web_dist"))
+}
+
+fn web_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "css" => "text/css; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn checked_web_asset(requested_path: &str) -> Option<PathBuf> {
+    let root = fs::canonicalize(web_dist_root()).ok()?;
+    let clean_path = requested_path.trim_matches('/');
+    let candidates = if clean_path.is_empty() {
+        vec![PathBuf::from("index.html")]
+    } else {
+        let relative = safe_relative_path(clean_path)?;
+        vec![
+            relative.clone(),
+            relative.join("index.html"),
+            PathBuf::from(format!("{clean_path}.html")),
+        ]
+    };
+    candidates.into_iter().find_map(|relative| {
+        let relative = safe_relative_path(&relative.to_string_lossy())?;
+        let path = fs::canonicalize(root.join(relative)).ok()?;
+        (path.starts_with(&root) && path.is_file()).then_some(path)
     })
+}
+
+fn web_path_disables_spa_fallback(requested_path: &str) -> bool {
+    matches!(
+        requested_path.trim_matches('/').split('/').next(),
+        Some("_next" | "api" | "v1" | "health" | "version" | "images" | "image-thumbnails")
+    )
+}
+
+async fn web_root(State(_state): State<AppState>) -> Result<Response, ApiError> {
+    let path = checked_web_asset("").ok_or_else(ApiError::not_found)?;
+    let body = fs::read(&path).map_err(|_| ApiError::not_found())?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, web_content_type(&path))],
+        Body::from(body),
+    )
+        .into_response())
+}
+
+async fn web_asset(
+    State(_state): State<AppState>,
+    AxumPath(web_path): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let path = match checked_web_asset(&web_path) {
+        Some(path) => path,
+        None if !web_path_disables_spa_fallback(&web_path) => {
+            checked_web_asset("").ok_or_else(ApiError::not_found)?
+        }
+        None => return Err(ApiError::not_found()),
+    };
+    let body = fs::read(&path).map_err(|_| ApiError::not_found())?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, web_content_type(&path))],
+        Body::from(body),
+    )
+        .into_response())
+}
+
+fn public_account(record: &AccountRecord) -> Value {
+    let mut object = record.raw.as_object().cloned().unwrap_or_default();
+    for key in [
+        "access_token",
+        "accessToken",
+        "token",
+        "refresh_token",
+        "id_token",
+        "proxy",
+    ] {
+        object.remove(key);
+    }
+    object.insert("status".to_owned(), Value::String(record.status.clone()));
+    object.insert(
+        "type".to_owned(),
+        Value::String(record.account_type.clone()),
+    );
+    object.insert(
+        "source_type".to_owned(),
+        Value::String(record.source_type.clone()),
+    );
+    object.insert(
+        "chatgpt_account_id".to_owned(),
+        record
+            .chatgpt_account_id
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "models".to_owned(),
+        Value::Array(record.models.iter().cloned().map(Value::String).collect()),
+    );
+    Value::Object(object)
+}
+
+fn public_accounts(state: &AppState) -> Value {
+    json!({
+        "items": state
+            .account_store
+            .records()
+            .iter()
+            .map(|record| {
+                let mut item = public_account(record);
+                if let Some(last_used_at) = state.account_store.last_used_at(&record.token) {
+                    item["last_used_at"] = Value::String(last_used_at);
+                }
+                item
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn account_token(value: &Value) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("access_token")
+                .or_else(|| object.get("accessToken"))
+                .or_else(|| object.get("token"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty() && token.len() <= MAX_ACCOUNT_TOKEN_LENGTH)
+        .map(ToOwned::to_owned)
+}
+
+fn account_request_payload_token(value: &Value) -> Option<String> {
+    value
+        .as_object()
+        .and_then(|object| {
+            object
+                .get("access_token")
+                .or_else(|| object.get("accessToken"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn public_token_ref(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) async fn refresh_oauth_account(
+    state: &AppState,
+    raw: &Value,
+) -> Result<Value, &'static str> {
+    let object = raw.as_object().ok_or("invalid_account")?;
+    let refresh_token = object
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or("missing_refresh_token")?;
+    let token_url = env::var("RUST_OAUTH_TOKEN_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://auth.openai.com/oauth/token".to_owned());
+    let response = state
+        .client
+        .post(token_url)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", "app_2SKx67EdpoN0G6j64rFvigXD"),
+        ])
+        .send()
+        .await
+        .map_err(|_| "network_error")?;
+    let status = response.status();
+    let body = bounded_response_body(response)
+        .await
+        .map_err(|_| "invalid_response")?;
+    if !status.is_success() {
+        return Err(if status.is_client_error() {
+            "http_4xx"
+        } else {
+            "http_5xx"
+        });
+    }
+    let payload: Value = serde_json::from_slice(&body).map_err(|_| "invalid_response")?;
+    let access_token = payload
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty() && token.len() <= MAX_ACCOUNT_TOKEN_LENGTH)
+        .ok_or("invalid_response")?;
+    let mut updated = raw.clone();
+    let target = updated.as_object_mut().ok_or("invalid_account")?;
+    target.insert(
+        "access_token".to_owned(),
+        Value::String(access_token.to_owned()),
+    );
+    if let Some(value) = payload.get("refresh_token").and_then(Value::as_str)
+        && !value.trim().is_empty()
+        && value.len() <= MAX_ACCOUNT_TOKEN_LENGTH
+    {
+        target.insert("refresh_token".to_owned(), Value::String(value.to_owned()));
+    }
+    if let Some(value) = payload.get("id_token").and_then(Value::as_str)
+        && !value.trim().is_empty()
+        && value.len() <= MAX_ACCOUNT_TOKEN_LENGTH
+    {
+        target.insert("id_token".to_owned(), Value::String(value.to_owned()));
+    }
+    target.insert("status".to_owned(), Value::String("正常".to_owned()));
+    target.remove("last_refresh_error");
+    target.remove("last_refresh_error_at");
+    Ok(updated)
+}
+
+async fn account_json_body(body: Body) -> Result<Value, ApiError> {
+    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::validation())?;
+    serde_json::from_slice(&bytes).map_err(|_| ApiError::invalid_request())
+}
+
+async fn api_accounts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    state.account_store.reload().await;
+    Ok(Json(public_accounts(&state)))
+}
+
+async fn api_accounts_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let value = account_json_body(body).await?;
+    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let items = object
+        .get("accounts")
+        .map(|value| {
+            let items = value.as_array().ok_or_else(ApiError::validation)?;
+            if items.iter().any(|item| !item.is_object()) {
+                return Err(ApiError::validation());
+            }
+            Ok(items.clone())
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let raw_tokens = object
+        .get("tokens")
+        .map(|value| {
+            let tokens = value.as_array().ok_or_else(ApiError::validation)?;
+            if tokens.iter().any(|token| !token.is_string()) {
+                return Err(ApiError::validation());
+            }
+            Ok(tokens.clone())
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let tokens = raw_tokens
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let payload_tokens = items
+        .iter()
+        .filter_map(account_request_payload_token)
+        .collect::<Vec<_>>();
+    let payload_token_set = payload_tokens.iter().cloned().collect::<HashSet<_>>();
+    let mut requested_tokens = Vec::new();
+    let mut seen_requested = HashSet::new();
+    for token in tokens.iter().chain(payload_tokens.iter()) {
+        if seen_requested.insert(token.clone()) {
+            requested_tokens.push(token.clone());
+        }
+    }
+    let mut additions = items
+        .iter()
+        .filter(|item| account_request_payload_token(item).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    additions.extend(
+        tokens
+            .iter()
+            .filter(|token| !payload_token_set.contains(*token))
+            .map(|token| json!({"access_token": token, "source_type": "web"})),
+    );
+    if requested_tokens.is_empty() {
+        return Err(ApiError::invalid_request());
+    }
+    let (added, skipped) = state.account_store.merge_import_records(additions).await?;
+    let refresh = refresh_accounts_now(&state, &requested_tokens).await?;
+    Ok(Json(json!({
+        "added": added,
+        "skipped": skipped,
+        "refreshed": refresh["refreshed"].clone(),
+        "errors": refresh["errors"].clone(),
+        "items": refresh["items"].clone(),
+    })))
+}
+
+async fn api_accounts_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let value = account_json_body(body).await?;
+    let tokens = match value {
+        Value::Object(object) => object
+            .get("tokens")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(ApiError::invalid_request)?,
+        _ => return Err(ApiError::invalid_request()),
+    };
+    let targets = tokens
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect::<HashSet<_>>();
+    if targets.is_empty() {
+        return Err(ApiError::invalid_request());
+    }
+    let removed = state
+        .account_store
+        .mutate_raw(|records| {
+            let before = records.len();
+            records.retain(|item| {
+                account_token(item).is_none_or(|token| !targets.contains(token.as_str()))
+            });
+            Ok(before.saturating_sub(records.len()))
+        })
+        .await?;
+    Ok(Json(
+        json!({"removed": removed, "items": public_accounts(&state)["items"]}),
+    ))
+}
+
+async fn api_accounts_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let value = account_json_body(body).await?;
+    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let token = account_token(&value).ok_or_else(ApiError::invalid_request)?;
+    state
+        .account_store
+        .mutate_raw(|records| {
+            let Some(item) = records
+                .iter_mut()
+                .find(|item| account_token(item).as_deref() == Some(token.as_str()))
+            else {
+                return Err(ApiError::unavailable());
+            };
+            let target = item.as_object_mut().ok_or_else(ApiError::invalid_request)?;
+            for key in [
+                "status",
+                "type",
+                "source_type",
+                "chatgpt_account_id",
+                "models",
+                "quota",
+            ] {
+                if let Some(value) = object.get(key) {
+                    target.insert(key.to_owned(), value.clone());
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    let record = state
+        .account_store
+        .records()
+        .into_iter()
+        .find(|record| record.token == token)
+        .ok_or_else(ApiError::unavailable)?;
+    let mut item = public_account(&record);
+    if let Some(last_used_at) = state.account_store.last_used_at(&record.token) {
+        item["last_used_at"] = Value::String(last_used_at);
+    }
+    Ok(Json(json!({
+        "item": item,
+        "items": public_accounts(&state)["items"]
+    })))
+}
+
+async fn api_accounts_export(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let value = account_json_body(body).await?;
+    let targets = value
+        .get("access_tokens")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<HashSet<_>>()
+        });
+    let records = state.account_store.raw_records();
+    let exported = records
+        .into_iter()
+        .filter(|item| {
+            targets.as_ref().is_none_or(|wanted| {
+                account_token(item).is_some_and(|token| wanted.contains(token.as_str()))
+            })
+        })
+        .collect::<Vec<_>>();
+    let bytes =
+        serde_json::to_vec(&json!({"items": exported})).map_err(|_| ApiError::unavailable())?;
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=accounts.json",
+            ),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+async fn api_accounts_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let value = account_json_body(body).await?;
+    let tokens = value
+        .get("access_tokens")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let requested = if tokens.is_empty() {
+        state
+            .account_store
+            .raw_records()
+            .iter()
+            .filter_map(account_token)
+            .collect::<Vec<_>>()
+    } else {
+        tokens
+    };
+    if requested.is_empty() {
+        return Err(ApiError::invalid_request());
+    }
+    let progress_id = format!(
+        "refresh-{}-{}",
+        std::process::id(),
+        AUTH_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    {
+        let mut progress = state.account_progress.lock().await;
+        progress.insert(
+            progress_id.clone(),
+            json!({
+                "progress_id": progress_id,
+                "status": "queued",
+                "total": requested.len(),
+                "completed": 0,
+                "refreshed": 0,
+                "errors": []
+            }),
+        );
+    }
+    let task_state = state.clone();
+    let task_progress_id = progress_id.clone();
+    tokio::spawn(async move {
+        {
+            let mut progress = task_state.account_progress.lock().await;
+            if let Some(item) = progress.get_mut(&task_progress_id) {
+                item["status"] = Value::String("running".to_owned());
+            }
+        }
+        let result = refresh_accounts_now(&task_state, &requested).await;
+        let mut progress = task_state.account_progress.lock().await;
+        if let Some(item) = progress.get_mut(&task_progress_id) {
+            match result {
+                Ok(result) => {
+                    item["status"] = Value::String("completed".to_owned());
+                    item["completed"] = item["total"].clone();
+                    item["refreshed"] = result["refreshed"].clone();
+                    item["errors"] = result["errors"].clone();
+                    item["items"] = result["items"].clone();
+                }
+                Err(_) => {
+                    item["status"] = Value::String("failed".to_owned());
+                    item["error"] = Value::String("refresh failed".to_owned());
+                }
+            }
+        }
+    });
+    Ok(Json(json!({"progress_id": progress_id})))
+}
+
+async fn refresh_accounts_now(state: &AppState, requested: &[String]) -> Result<Value, ApiError> {
+    // Refresh is deliberately explicit: only accounts carrying a refresh token
+    // are sent to the OAuth endpoint. The snapshot is replaced once after all
+    // successful rotations, so a failed network call cannot publish a half
+    // rotated account generation.
+    let mut errors = Vec::new();
+    let mut refreshed = 0usize;
+    let records = state.account_store.raw_records();
+    let mut updated_records = Vec::<(String, Value)>::new();
+    let mut failed_tokens = Vec::<(String, &str)>::new();
+    for token in requested {
+        let Some(index) = records
+            .iter()
+            .position(|item| account_token(item).as_deref() == Some(token.as_str()))
+        else {
+            errors.push(json!({"token": public_token_ref(token), "code": "not_found"}));
+            continue;
+        };
+        match refresh_oauth_account(state, &records[index]).await {
+            Ok(updated) => {
+                updated_records.push((token.clone(), updated));
+                refreshed += 1;
+            }
+            Err(code) => {
+                errors.push(json!({"token": public_token_ref(token), "code": code}));
+                let _ = index;
+                failed_tokens.push((token.clone(), code));
+            }
+        }
+    }
+    if !updated_records.is_empty() || !failed_tokens.is_empty() {
+        state
+            .account_store
+            .mutate_raw(|current| {
+                for (old_token, updated) in &updated_records {
+                    let Some(target) = current
+                        .iter_mut()
+                        .find(|item| account_token(item).as_deref() == Some(old_token.as_str()))
+                    else {
+                        continue;
+                    };
+                    let Some(target_object) = target.as_object_mut() else {
+                        continue;
+                    };
+                    if let Some(updated_object) = updated.as_object() {
+                        for (key, value) in updated_object {
+                            let useful = !value.is_null()
+                                && (!value.is_string()
+                                    || !value.as_str().unwrap_or_default().trim().is_empty());
+                            if useful || !target_object.contains_key(key) {
+                                target_object.insert(key.clone(), value.clone());
+                            }
+                        }
+                    }
+                }
+                for (token, code) in &failed_tokens {
+                    if let Some(target) = current
+                        .iter_mut()
+                        .find(|item| account_token(item).as_deref() == Some(token.as_str()))
+                        && let Some(object) = target.as_object_mut()
+                    {
+                        object.insert("status".to_owned(), Value::String("异常".to_owned()));
+                        object.insert(
+                            "last_refresh_error".to_owned(),
+                            Value::String((*code).to_owned()),
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+    }
+    Ok(json!({
+        "refreshed": refreshed,
+        "errors": errors,
+        "items": public_accounts(state)["items"]
+    }))
+}
+
+async fn api_accounts_refresh_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(progress_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let progress = state.account_progress.lock().await;
+    progress
+        .get(&progress_id)
+        .cloned()
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
+async fn api_accounts_relogin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    // Rust can safely perform the same persisted OAuth refresh lifecycle for
+    // records that carry a refresh token. Password re-login itself is not
+    // inferred from opaque snapshots; the progress contract remains explicit
+    // and failures are published instead of being reported as success.
+    api_accounts_refresh(State(state), headers, body).await
+}
+
+async fn api_accounts_relogin_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(progress_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    api_accounts_refresh_progress(State(state), headers, AxumPath(progress_id)).await
+}
+
+const OAUTH_CLIENT_ID: &str = "app_2SKx67EdpoN0G6j64rFvigXD";
+const OAUTH_AUTH_BASE: &str = "https://auth.openai.com";
+const OAUTH_REDIRECT_URI: &str = "https://platform.openai.com/auth/callback";
+const OAUTH_AUDIENCE: &str = "https://api.openai.com/v1";
+const OAUTH_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+const OAUTH_MAX_SESSIONS: usize = 64;
+
+fn random_urlsafe(bytes_len: usize) -> Result<String, ApiError> {
+    let mut bytes = vec![0u8; bytes_len];
+    getrandom::getrandom(&mut bytes).map_err(|_| ApiError::unavailable())?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn oauth_callback_parts(callback: &str) -> Result<(String, String), ApiError> {
+    let callback = callback.trim();
+    if callback.is_empty() || callback.len() > MAX_ACCOUNT_TOKEN_LENGTH {
+        return Err(ApiError::invalid_request());
+    }
+    if callback.starts_with("http://") || callback.starts_with("https://") {
+        let url = url::Url::parse(callback).map_err(|_| ApiError::invalid_request())?;
+        let mut code = None;
+        let mut state = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "code" => code = Some(value.into_owned()),
+                "state" => state = Some(value.into_owned()),
+                _ => {}
+            }
+        }
+        let code = code
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ApiError::invalid_request)?;
+        return Ok((code, state.unwrap_or_default()));
+    }
+    Ok((callback.to_owned(), String::new()))
+}
+
+async fn api_accounts_oauth_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let body = account_json_body(body).await?;
+    let email_hint = body
+        .get("email_hint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if email_hint.chars().count() > 256 {
+        return Err(ApiError::invalid_request());
+    }
+    let verifier = random_urlsafe(48)?;
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    let session_id = random_urlsafe(24)?;
+    let state_value = format!("{}.{}", session_id, random_urlsafe(16)?);
+    let query = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("issuer", OAUTH_AUTH_BASE)
+            .append_pair("client_id", OAUTH_CLIENT_ID)
+            .append_pair("audience", OAUTH_AUDIENCE)
+            .append_pair("redirect_uri", OAUTH_REDIRECT_URI)
+            .append_pair("scope", "openid profile email offline_access")
+            .append_pair("response_type", "code")
+            .append_pair("response_mode", "query")
+            .append_pair("state", &state_value)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        if !email_hint.is_empty() {
+            query.append_pair("login_hint", email_hint);
+        }
+        query.finish()
+    };
+    let mut sessions = state.oauth_sessions.lock().await;
+    let now = Instant::now();
+    sessions.retain(|_, session| now.duration_since(session.created_at) <= OAUTH_SESSION_TTL);
+    while sessions.len() >= OAUTH_MAX_SESSIONS {
+        let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, session)| session.created_at)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        sessions.remove(&oldest);
+    }
+    sessions.insert(
+        session_id.clone(),
+        OAuthSession {
+            code_verifier: verifier,
+            state: state_value,
+            created_at: now,
+        },
+    );
+    Ok(Json(json!({
+        "session_id": session_id,
+        "authorize_url": format!("{OAUTH_AUTH_BASE}/api/accounts/authorize?{query}"),
+        "expires_in": OAUTH_SESSION_TTL.as_secs(),
+        "redirect_uri_prefix": OAUTH_REDIRECT_URI,
+    })))
+}
+
+async fn api_accounts_oauth_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let body = account_json_body(body).await?;
+    let session_id = body
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .ok_or_else(ApiError::invalid_request)?
+        .to_owned();
+    let callback = body
+        .get("callback")
+        .and_then(Value::as_str)
+        .ok_or_else(ApiError::invalid_request)?;
+    let (code, callback_state) = oauth_callback_parts(callback)?;
+    let session = {
+        let mut sessions = state.oauth_sessions.lock().await;
+        let session = sessions
+            .remove(&session_id)
+            .ok_or_else(ApiError::invalid_request)?;
+        if Instant::now().duration_since(session.created_at) > OAUTH_SESSION_TTL
+            || (!callback_state.is_empty() && callback_state != session.state)
+        {
+            return Err(ApiError::invalid_request());
+        }
+        session
+    };
+    let token_url = env::var("RUST_OAUTH_TOKEN_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{OAUTH_AUTH_BASE}/oauth/token"));
+    let form = {
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        form.append_pair("grant_type", "authorization_code")
+            .append_pair("client_id", OAUTH_CLIENT_ID)
+            .append_pair("code", &code)
+            .append_pair("code_verifier", &session.code_verifier)
+            .append_pair("redirect_uri", OAUTH_REDIRECT_URI);
+        form.finish()
+    };
+    let response = tokio::time::timeout(
+        NATIVE_UPSTREAM_TIMEOUT,
+        state
+            .client
+            .post(token_url)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form)
+            .send(),
+    )
+    .await
+    .map_err(|_| ApiError::upstream())?
+    .map_err(|_| ApiError::upstream())?;
+    if !response.status().is_success() {
+        return Err(ApiError::upstream());
+    }
+    let body = bounded_response_body(response).await?;
+    let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+    let access_token = value
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ApiError::upstream)?;
+    let refresh_token = value
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ApiError::upstream)?;
+    let id_token = value
+        .get("id_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let account = json!({
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "source_type": "codex",
+        "login_source": "oauth_login",
+        "status": "正常"
+    });
+    state
+        .account_store
+        .merge_import_records(vec![account])
+        .await?;
+    Ok(Json(json!({
+        "item": public_accounts(&state)["items"].as_array().and_then(|items| items.last()).cloned().unwrap_or_else(|| json!({})),
+        "items": public_accounts(&state)["items"].clone()
+    })))
+}
+
+async fn api_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    if !state.auth_store.reload().await {
+        return Err(ApiError::unavailable());
+    }
+    Ok(Json(json!({"items": state.auth_store.public_records()})))
+}
+
+fn public_auth_record(record: &Value) -> Value {
+    let mut object = record.as_object().cloned().unwrap_or_default();
+    object.remove("key");
+    object.remove("key_hash");
+    Value::Object(object)
+}
+
+fn random_user_key() -> Result<String, ApiError> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|_| ApiError::unavailable())?;
+    let suffix = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("sk-user-{suffix}"))
+}
+
+fn auth_key_hash(key: &str) -> String {
+    Sha256::digest(key.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn bounded_auth_name(value: Option<&Value>) -> Result<String, ApiError> {
+    let name = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= MAX_AUTH_KEY_NAME_LENGTH)
+        .ok_or_else(ApiError::invalid_request)?;
+    Ok(name.to_owned())
+}
+
+async fn api_users_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let name = bounded_auth_name(body.get("name"))?;
+    let key = random_user_key()?;
+    let id = format!(
+        "user-{}-{}",
+        std::process::id(),
+        AUTH_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let record = json!({
+        "id": id,
+        "name": name,
+        "role": "user",
+        "enabled": true,
+        "key_hash": auth_key_hash(&key),
+    });
+    let created = record.clone();
+    state
+        .auth_store
+        .mutate_raw(|records| {
+            records.push(record);
+            Ok(created.clone())
+        })
+        .await?;
+    Ok(Json(json!({
+        "item": public_auth_record(&created),
+        "key": key,
+        "items": state.auth_store.public_records(),
+    })))
+}
+
+async fn api_users_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(key_id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let mut name = None;
+    if let Some(value) = body.get("name") {
+        name = Some(bounded_auth_name(Some(value))?);
+    }
+    let enabled = body
+        .get("enabled")
+        .map(|value| value.as_bool().ok_or_else(ApiError::invalid_request))
+        .transpose()?;
+    let replacement_key = if let Some(value) = body.get("key") {
+        let key = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= MAX_ACCOUNT_TOKEN_LENGTH)
+            .ok_or_else(ApiError::invalid_request)?
+            .to_owned();
+        Some(key)
+    } else {
+        None
+    };
+    if name.is_none() && enabled.is_none() && replacement_key.is_none() {
+        return Err(ApiError::invalid_request());
+    }
+    let replacement_hash = replacement_key.as_deref().map(auth_key_hash);
+    let (updated, replacement_key) = state
+        .auth_store
+        .mutate_raw(|records| {
+            let Some(record) = records.iter_mut().find(|record| {
+                record
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == key_id)
+            }) else {
+                return Err(ApiError::not_found());
+            };
+            let object = record
+                .as_object_mut()
+                .ok_or_else(ApiError::invalid_request)?;
+            if let Some(name) = &name {
+                object.insert("name".to_owned(), Value::String(name.clone()));
+            }
+            if let Some(enabled) = enabled {
+                object.insert("enabled".to_owned(), Value::Bool(enabled));
+            }
+            if let Some(hash) = &replacement_hash {
+                object.insert("key_hash".to_owned(), Value::String(hash.clone()));
+            }
+            Ok((record.clone(), replacement_key.clone()))
+        })
+        .await?;
+    let mut response = json!({
+        "item": public_auth_record(&updated),
+        "items": state.auth_store.public_records(),
+    });
+    if let Some(key) = replacement_key {
+        response["key"] = Value::String(key);
+    }
+    Ok(Json(response))
+}
+
+async fn api_users_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(key_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    state
+        .auth_store
+        .mutate_raw(|records| {
+            let original_len = records.len();
+            records.retain(|record| {
+                record
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value != key_id)
+            });
+            if records.len() == original_len {
+                return Err(ApiError::not_found());
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({"items": state.auth_store.public_records()})))
+}
+
+fn data_file(state: &AppState, name: &str) -> PathBuf {
+    state.data_dir.join(name)
+}
+
+fn path_write_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("store");
+    path.with_file_name(format!(".{file_name}.lock"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PathIdentity {
+    first: u64,
+    second: u64,
+}
+
+struct CheckedDirectory {
+    #[cfg_attr(windows, allow(dead_code))]
+    path: PathBuf,
+    _file: DirectoryHandle,
+    identity: PathIdentity,
+}
+
+fn kernel_path_identity(file: &fs::File) -> Result<PathIdentity, ApiError> {
+    let identity = kernel_identity(file).map_err(|_| ApiError::unavailable())?;
+    Ok(PathIdentity {
+        first: identity.first,
+        second: identity.second,
+    })
+}
+
+fn checked_directory_handle(path: &Path) -> Result<CheckedDirectory, ApiError> {
+    let file = match open_directory(path) {
+        Ok(file) => file,
+        Err(_error) => {
+            return Err(ApiError::unavailable());
+        }
+    };
+    let identity = PathIdentity {
+        first: file.identity().first,
+        second: file.identity().second,
+    };
+    Ok(CheckedDirectory {
+        path: file.path().to_owned(),
+        _file: file,
+        identity,
+    })
+}
+
+#[cfg(unix)]
+fn checked_directory_identity(path: &Path) -> Result<PathIdentity, ApiError> {
+    Ok(checked_directory_handle(path)?.identity)
+}
+
+fn checked_directory_still_same(directory: &CheckedDirectory) -> bool {
+    directory._file.same_identity().ok().unwrap_or(false)
+        && directory._file.identity()
+            == file_identity::Identity {
+                first: directory.identity.first,
+                second: directory.identity.second,
+            }
+        && {
+            #[cfg(unix)]
+            {
+                checked_directory_identity(&directory.path).ok() == Some(directory.identity)
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        }
+}
+
+fn checked_regular_file_identity(
+    directory: &CheckedDirectory,
+    path: &Path,
+) -> Result<PathIdentity, ApiError> {
+    let name = path.file_name().ok_or_else(ApiError::unavailable)?;
+    let file = match open_regular_file_at(&directory._file, name) {
+        Ok(file) => file,
+        Err(_error) => {
+            return Err(ApiError::unavailable());
+        }
+    };
+    kernel_path_identity(&file)
+}
+
+fn checked_regular_file_identity_optional(
+    directory: &CheckedDirectory,
+    path: &Path,
+) -> Result<Option<PathIdentity>, ApiError> {
+    let name = path.file_name().ok_or_else(ApiError::unavailable)?;
+    match open_regular_file_for_replace_check_at(&directory._file, name) {
+        Ok(file) => Ok(Some(kernel_path_identity(&file)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_error) => Err(ApiError::unavailable()),
+    }
+}
+
+fn checked_parent_identity(path: &Path) -> Result<Option<CheckedDirectory>, ApiError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(ApiError::unavailable)?
+        .to_owned();
+    match checked_directory_handle(&parent) {
+        Ok(directory) => Ok(Some(directory)),
+        Err(_) if !parent.exists() => Ok(None),
+        Err(_) => Err(ApiError::unavailable()),
+    }
+}
+
+fn ensure_checked_parent(path: &Path) -> Result<CheckedDirectory, ApiError> {
+    if let Some(parent) = checked_parent_identity(path)? {
+        return Ok(parent);
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(ApiError::unavailable)?
+        .to_owned();
+    let file = open_or_create_directory(&parent).map_err(|_| ApiError::unavailable())?;
+    let identity = PathIdentity {
+        first: file.identity().first,
+        second: file.identity().second,
+    };
+    Ok(CheckedDirectory {
+        path: file.path().to_owned(),
+        _file: file,
+        identity,
+    })
+}
+
+fn read_checked_bounded_file_at(
+    parent: &CheckedDirectory,
+    name: &OsStr,
+    limit: u64,
+    rebind_before_open: bool,
+) -> Result<Vec<u8>, ApiError> {
+    #[cfg(test)]
+    if rebind_before_open {
+        maybe_rebind_image_tag_parent_before_read(&parent.path)?;
+    }
+    #[cfg(not(test))]
+    let _ = rebind_before_open;
+
+    if !checked_directory_still_same(parent) {
+        return Err(ApiError::unavailable());
+    }
+
+    let mut file = match open_regular_file_at(&parent._file, name) {
+        Ok(file) => file,
+        Err(_error) => {
+            return Err(ApiError::unavailable());
+        }
+    };
+    let target_identity = kernel_path_identity(&file)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| ApiError::unavailable())?;
+    if bytes.len() as u64 > limit {
+        return Err(ApiError::unavailable());
+    }
+    if !checked_directory_still_same(parent) || kernel_path_identity(&file)? != target_identity {
+        return Err(ApiError::unavailable());
+    }
+    Ok(bytes)
+}
+
+fn next_atomic_temp_path(path: &Path, use_image_test_hooks: bool) -> PathBuf {
+    #[cfg(test)]
+    if use_image_test_hooks
+        && let Some(path) = IMAGE_TAG_TEMP_PATH_OVERRIDE
+            .lock()
+            .expect("image tag temp path override")
+            .take()
+    {
+        return path;
+    }
+    #[cfg(not(test))]
+    let _ = use_image_test_hooks;
+    path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn remove_temp_file(parent: &CheckedDirectory, name: &OsStr, file: Option<&fs::File>) {
+    if let Some(file) = file {
+        let _ = remove_open_file_at(&parent._file, name, file);
+    } else {
+        let _ = remove_file_at(&parent._file, name);
+    }
+}
+
+fn atomic_replace_checked(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
+    atomic_replace_checked_with_limit(path, bytes, MAX_IMAGE_TAG_FILE_BYTES as u64, true)
+}
+
+fn atomic_replace_checked_with_limit(
+    path: &Path,
+    bytes: &[u8],
+    max_bytes: u64,
+    use_image_test_hooks: bool,
+) -> Result<(), ApiError> {
+    let parent = ensure_checked_parent(path)?;
+    #[cfg(test)]
+    let parent_path = parent.path.as_path();
+    let target_name = path.file_name().ok_or_else(ApiError::unavailable)?;
+    let target_file = match open_regular_file_for_replace_at(&parent._file, target_name) {
+        Ok(file) => Some(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_error) => {
+            return Err(ApiError::unavailable());
+        }
+    };
+    let old_identity = match target_file.as_ref().map(kernel_path_identity).transpose() {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err(error);
+        }
+    };
+    if bytes.len() as u64 > max_bytes {
+        return Err(ApiError::unavailable());
+    }
+    let temp = next_atomic_temp_path(path, use_image_test_hooks);
+    let temp_name = temp.file_name().ok_or_else(ApiError::unavailable)?;
+    let mut file = match create_regular_file_at(&parent._file, temp_name) {
+        Ok(file) => file,
+        Err(_error) => {
+            return Err(ApiError::unavailable());
+        }
+    };
+    if !checked_directory_still_same(&parent) {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+    if file.write_all(bytes).is_err() || file.flush().is_err() || file.sync_all().is_err() {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+    let mut verification = match file.try_clone() {
+        Ok(file) => file,
+        Err(_) => {
+            remove_temp_file(&parent, temp_name, Some(&file));
+            return Err(ApiError::unavailable());
+        }
+    };
+    if verification.rewind().is_err() {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+    let mut written = Vec::new();
+    if (&mut verification)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut written)
+        .is_err()
+    {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+    if written.len() as u64 > max_bytes {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+    if written != bytes {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+    drop(verification);
+    let temporary_identity = match kernel_path_identity(&file) {
+        Ok(identity) => identity,
+        Err(error) => {
+            remove_temp_file(&parent, temp_name, Some(&file));
+            return Err(error);
+        }
+    };
+
+    #[cfg(test)]
+    let _rebound_parent = if use_image_test_hooks {
+        match maybe_rebind_image_tag_parent_before_replace(parent_path) {
+            Ok(value) => value,
+            Err(error) => {
+                remove_temp_file(&parent, temp_name, Some(&file));
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+
+    if !checked_directory_still_same(&parent) {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+    let current_identity = match checked_regular_file_identity_optional(&parent, path) {
+        Ok(identity) => identity,
+        Err(error) => {
+            remove_temp_file(&parent, temp_name, Some(&file));
+            return Err(error);
+        }
+    };
+    if current_identity != old_identity {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+
+    #[cfg(test)]
+    if use_image_test_hooks
+        && let Err(error) = maybe_rebind_image_tag_parent_after_final_check(parent_path)
+    {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(error);
+    }
+
+    #[cfg(test)]
+    if use_image_test_hooks
+        && let Err(error) = maybe_swap_image_tag_target_after_final_check(&parent, target_name)
+    {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(error);
+    }
+
+    #[cfg(test)]
+    if use_image_test_hooks
+        && let Err(error) = maybe_create_image_tag_target_after_final_check(&parent, target_name)
+    {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(error);
+    }
+
+    #[cfg(test)]
+    if use_image_test_hooks && let Err(error) = maybe_switch_image_tag_cwd_after_final_check() {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(error);
+    }
+
+    if match checked_regular_file_identity_optional(&parent, path) {
+        Ok(identity) => identity != old_identity,
+        Err(_) => true,
+    } {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+
+    #[cfg(test)]
+    if use_image_test_hooks
+        && let Err(error) = maybe_swap_image_tag_target_after_name_check(&parent, target_name)
+    {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(error);
+    }
+
+    #[cfg(test)]
+    if use_image_test_hooks
+        && let Err(error) = maybe_create_image_tag_target_after_name_check(&parent, target_name)
+    {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(error);
+    }
+
+    #[cfg(test)]
+    let force_replace_failure = if use_image_test_hooks {
+        IMAGE_TAG_REPLACE_FAILURE_HOOK.swap(false, Ordering::SeqCst)
+    } else {
+        false
+    };
+    #[cfg(not(test))]
+    let force_replace_failure = false;
+
+    let replaced = if force_replace_failure {
+        false
+    } else {
+        match replace_file_at(
+            &parent._file,
+            temp_name,
+            target_name,
+            &file,
+            old_identity.is_some(),
+            target_file.as_ref(),
+        ) {
+            Ok(()) => true,
+            Err(_error) => false,
+        }
+    };
+    if !replaced {
+        remove_temp_file(&parent, temp_name, Some(&file));
+        return Err(ApiError::unavailable());
+    }
+    drop(file);
+    drop(target_file);
+    let final_directory_same = checked_directory_still_same(&parent);
+    let final_identity = checked_regular_file_identity(&parent, path);
+    let final_bytes = read_checked_bounded_file_at(&parent, target_name, max_bytes, false);
+    let final_identity_matches = final_identity
+        .as_ref()
+        .is_ok_and(|identity| *identity == temporary_identity);
+    let final_bytes_match = final_bytes
+        .as_ref()
+        .is_ok_and(|value| value.as_slice() == bytes);
+    if !final_directory_same || !final_identity_matches || !final_bytes_match {
+        return Err(ApiError::unavailable());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn take_rebind_hook(
+    hook: &LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>>,
+    parent: &Path,
+) -> Option<PathBuf> {
+    let mut guard = hook.lock().expect("image tag rebind hook");
+    let (expected, moved) = guard.take()?;
+    if expected == parent {
+        Some(moved)
+    } else {
+        *guard = Some((expected, moved));
+        None
+    }
+}
+
+#[cfg(test)]
+fn maybe_rebind_image_tag_parent_before_read(parent: &Path) -> Result<(), ApiError> {
+    let Some(moved) = take_rebind_hook(&IMAGE_TAG_READ_REBIND_HOOK, parent) else {
+        return Ok(());
+    };
+    let metadata = fs::metadata(parent).map_err(|_| ApiError::unavailable())?;
+    let permissions = metadata.permissions();
+    let access_time = filetime::FileTime::from_last_access_time(&metadata);
+    let modified_time = filetime::FileTime::from_last_modification_time(&metadata);
+    fs::rename(parent, &moved).map_err(|_| ApiError::unavailable())?;
+    fs::create_dir_all(parent).map_err(|_| ApiError::unavailable())?;
+    fs::set_permissions(parent, permissions.clone()).map_err(|_| ApiError::unavailable())?;
+    filetime::set_file_times(parent, access_time, modified_time)
+        .map_err(|_| ApiError::unavailable())?;
+    let copied = fs::metadata(parent).map_err(|_| ApiError::unavailable())?;
+    if copied.permissions().readonly() != permissions.readonly()
+        || filetime::FileTime::from_last_access_time(&copied) != access_time
+        || filetime::FileTime::from_last_modification_time(&copied) != modified_time
+    {
+        return Err(ApiError::unavailable());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_rebind_image_tag_parent_before_replace(
+    parent: &Path,
+) -> Result<Option<PathBuf>, ApiError> {
+    let Some(moved) = take_rebind_hook(&IMAGE_TAG_WRITE_REBIND_HOOK, parent) else {
+        return Ok(None);
+    };
+    let metadata = fs::metadata(parent).map_err(|_| ApiError::unavailable())?;
+    let permissions = metadata.permissions();
+    let access_time = filetime::FileTime::from_last_access_time(&metadata);
+    let modified_time = filetime::FileTime::from_last_modification_time(&metadata);
+    fs::rename(parent, &moved).map_err(|_| ApiError::unavailable())?;
+    fs::create_dir_all(parent).map_err(|_| ApiError::unavailable())?;
+    fs::set_permissions(parent, permissions.clone()).map_err(|_| ApiError::unavailable())?;
+    filetime::set_file_times(parent, access_time, modified_time)
+        .map_err(|_| ApiError::unavailable())?;
+    let copied = fs::metadata(parent).map_err(|_| ApiError::unavailable())?;
+    if copied.permissions().readonly() != permissions.readonly()
+        || filetime::FileTime::from_last_access_time(&copied) != access_time
+        || filetime::FileTime::from_last_modification_time(&copied) != modified_time
+    {
+        return Err(ApiError::unavailable());
+    }
+    Ok(Some(moved))
+}
+
+#[cfg(test)]
+fn maybe_rebind_image_tag_parent_after_final_check(parent: &Path) -> Result<(), ApiError> {
+    let Some(moved) = take_rebind_hook(&IMAGE_TAG_WRITE_AFTER_CHECK_REBIND_HOOK, parent) else {
+        return Ok(());
+    };
+    let metadata = fs::metadata(parent).map_err(|_| ApiError::unavailable())?;
+    let permissions = metadata.permissions();
+    let access_time = filetime::FileTime::from_last_access_time(&metadata);
+    let modified_time = filetime::FileTime::from_last_modification_time(&metadata);
+    fs::rename(parent, &moved).map_err(|_| ApiError::unavailable())?;
+    fs::create_dir_all(parent).map_err(|_| ApiError::unavailable())?;
+    fs::set_permissions(parent, permissions.clone()).map_err(|_| ApiError::unavailable())?;
+    filetime::set_file_times(parent, access_time, modified_time)
+        .map_err(|_| ApiError::unavailable())?;
+    let copied = fs::metadata(parent).map_err(|_| ApiError::unavailable())?;
+    if copied.permissions().readonly() != permissions.readonly()
+        || filetime::FileTime::from_last_access_time(&copied) != access_time
+        || filetime::FileTime::from_last_modification_time(&copied) != modified_time
+    {
+        return Err(ApiError::unavailable());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_swap_image_tag_target_after_final_check(
+    parent: &CheckedDirectory,
+    name: &OsStr,
+) -> Result<(), ApiError> {
+    let target = parent.path.join(name);
+    let Some(replacement) = take_rebind_hook(&IMAGE_TAG_TARGET_SWAP_HOOK, &target) else {
+        return Ok(());
+    };
+    let backup = target.with_extension("target-swap-old");
+    fs::rename(&target, &backup).map_err(|_| ApiError::unavailable())?;
+    if fs::copy(&replacement, &target).is_err() {
+        let _ = fs::rename(&backup, &target);
+        return Err(ApiError::unavailable());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_create_image_tag_target_after_final_check(
+    parent: &CheckedDirectory,
+    name: &OsStr,
+) -> Result<(), ApiError> {
+    let target = parent.path.join(name);
+    let Some(replacement) = take_rebind_hook(&IMAGE_TAG_TARGET_CREATE_HOOK, &target) else {
+        return Ok(());
+    };
+    fs::copy(&replacement, &target).map_err(|_| ApiError::unavailable())?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_create_image_tag_target_after_name_check(
+    parent: &CheckedDirectory,
+    name: &OsStr,
+) -> Result<(), ApiError> {
+    let target = parent.path.join(name);
+    let Some(replacement) = take_rebind_hook(&IMAGE_TAG_TARGET_CREATE_AFTER_CHECK_HOOK, &target)
+    else {
+        return Ok(());
+    };
+    fs::copy(&replacement, &target).map_err(|_| ApiError::unavailable())?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_swap_image_tag_target_after_name_check(
+    parent: &CheckedDirectory,
+    name: &OsStr,
+) -> Result<(), ApiError> {
+    let target = parent.path.join(name);
+    let Some(replacement) = take_rebind_hook(&IMAGE_TAG_TARGET_SWAP_AFTER_NAME_CHECK_HOOK, &target)
+    else {
+        return Ok(());
+    };
+    let backup = target.with_extension("target-swap-after-name-check-old");
+    fs::rename(&target, &backup).map_err(|_| ApiError::unavailable())?;
+    if fs::copy(&replacement, &target).is_err() {
+        let _ = fs::rename(&backup, &target);
+        return Err(ApiError::unavailable());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_switch_image_tag_cwd_after_final_check() -> Result<(), ApiError> {
+    let Some(path) = IMAGE_TAG_CWD_SWITCH_HOOK
+        .lock()
+        .expect("cwd switch hook")
+        .take()
+    else {
+        return Ok(());
+    };
+    env::set_current_dir(path).map_err(|_| ApiError::unavailable())
+}
+
+pub(crate) fn acquire_path_write_lock_sync(path: &Path) -> Result<fs::File, ApiError> {
+    let parent = ensure_checked_parent(path)?;
+    let lock_path = path_write_lock_path(path);
+    let lock_name = lock_path.file_name().ok_or_else(ApiError::unavailable)?;
+    let old_identity = checked_regular_file_identity_optional(&parent, &lock_path)?;
+    let file = match file_identity::create_regular_file_for_lock_at(&parent._file, lock_name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            match open_regular_file_for_lock_at(&parent._file, lock_name) {
+                Ok(file) => file,
+                Err(_error) => return Err(ApiError::unavailable()),
+            }
+        }
+        Err(error) => {
+            let _ = error;
+            return Err(ApiError::unavailable());
+        }
+    };
+    let opened_identity = match kernel_path_identity(&file) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err(error);
+        }
+    };
+    if !checked_directory_still_same(&parent)
+        || old_identity.is_some_and(|identity| identity != opened_identity)
+    {
+        return Err(ApiError::unavailable());
+    }
+    if let Err(error) = file.lock_exclusive() {
+        let _ = error;
+        return Err(ApiError::unavailable());
+    }
+    if !checked_directory_still_same(&parent) || kernel_path_identity(&file)? != opened_identity {
+        return Err(ApiError::unavailable());
+    }
+    Ok(file)
+}
+
+pub(crate) async fn acquire_path_write_lock(path: &Path) -> Result<fs::File, ApiError> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || acquire_path_write_lock_sync(&path))
+        .await
+        .map_err(|_error| ApiError::unavailable())?
+}
+
+fn safe_relative_path(value: &str) -> Option<PathBuf> {
+    let path = Path::new(value);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(path.to_owned())
+}
+
+fn image_root(state: &AppState) -> PathBuf {
+    state.data_dir.join("images")
+}
+
+fn image_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        _ => "image/png",
+    }
+}
+
+async fn image_file(
+    State(state): State<AppState>,
+    AxumPath(image_path): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let relative = safe_relative_path(&image_path).ok_or_else(ApiError::invalid_request)?;
+    let path = image_root(&state).join(relative);
+    let bytes = fs::read(&path).map_err(|_| ApiError::unavailable())?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, image_content_type(&path))],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+fn image_tags_path(state: &AppState) -> PathBuf {
+    data_file(state, "image_tags.json")
+}
+
+fn validate_image_tags(tags: &Map<String, Value>) -> Result<(), ApiError> {
+    if tags.len() > MAX_TAGGED_IMAGES {
+        return Err(ApiError::unavailable());
+    }
+    for (relative, value) in tags {
+        if relative.is_empty()
+            || relative.trim() != relative
+            || relative.chars().count() > MAX_IMAGE_REL_LENGTH
+        {
+            return Err(ApiError::unavailable());
+        }
+        let items = value.as_array().ok_or_else(ApiError::unavailable)?;
+        if items.len() > MAX_IMAGE_TAGS_PER_IMAGE {
+            return Err(ApiError::unavailable());
+        }
+        for item in items {
+            let tag = item.as_str().ok_or_else(ApiError::unavailable)?;
+            if tag.is_empty() || tag.trim() != tag || tag.chars().count() > MAX_IMAGE_TAG_LENGTH {
+                return Err(ApiError::unavailable());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_image_tags(state: &AppState) -> Result<Map<String, Value>, ApiError> {
+    let path = image_tags_path(state);
+    let Some(parent) = checked_parent_identity(&path)? else {
+        return Ok(Map::new());
+    };
+    let name = path.file_name().ok_or_else(ApiError::unavailable)?;
+    if checked_regular_file_identity_optional(&parent, &path)?.is_none() {
+        return Ok(Map::new());
+    }
+    let bytes = read_checked_bounded_file_at(&parent, name, MAX_IMAGE_TAG_FILE_BYTES as u64, true)?;
+    let value = serde_json::from_slice::<Value>(&bytes).map_err(|_| ApiError::unavailable())?;
+    let tags = value
+        .as_object()
+        .cloned()
+        .ok_or_else(ApiError::unavailable)?;
+    validate_image_tags(&tags)?;
+    Ok(tags)
+}
+
+fn read_image_tags_for_mutation(state: &AppState) -> Result<Map<String, Value>, ApiError> {
+    read_image_tags(state)
+}
+
+fn all_image_tags(tags: &Map<String, Value>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for value in tags.values() {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                if let Some(tag) = item.as_str()
+                    && seen.insert(tag.to_owned())
+                {
+                    result.push(tag.to_owned());
+                }
+            }
+        }
+    }
+    result
+}
+
+fn write_image_tags(state: &AppState, tags: &Map<String, Value>) -> Result<(), ApiError> {
+    // Contract: every production writer acquires the canonical sidecar lock
+    // before calling this private helper. FileRenameInfoEx has no portable
+    // target-ID compare-and-swap for an uncooperative writer that swaps the
+    // target after the final pathname check; that threat is outside this
+    // lock-based writer contract.
+    validate_image_tags(tags)?;
+    let path = image_tags_path(state);
+    let mut bytes = serde_json::to_vec_pretty(tags).map_err(|_| ApiError::unavailable())?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_IMAGE_TAG_FILE_BYTES {
+        return Err(ApiError::unavailable());
+    }
+    atomic_replace_checked(&path, &bytes)
+}
+
+async fn api_image_tags(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let tags = read_image_tags(&state)?;
+    Ok(Json(json!({"tags": all_image_tags(&tags)})))
+}
+
+fn normalize_image_tag_path(value: &str) -> Option<String> {
+    let value = value.trim().trim_start_matches('/');
+    let path = safe_relative_path(value)?;
+    let relative = path.to_string_lossy().replace('\\', "/");
+    (!relative.is_empty() && relative.chars().count() <= MAX_IMAGE_REL_LENGTH).then_some(relative)
+}
+
+async fn api_image_tags_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let value = account_json_body(body).await?;
+    let path = value
+        .get("path")
+        .and_then(Value::as_str)
+        .and_then(normalize_image_tag_path)
+        .ok_or_else(ApiError::invalid_request)?
+        .to_owned();
+    let tags = value
+        .get("tags")
+        .and_then(Value::as_array)
+        .ok_or_else(ApiError::invalid_request)?;
+    if tags.len() > MAX_IMAGE_TAGS_PER_IMAGE {
+        return Err(ApiError::invalid_request());
+    }
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.chars().count() <= MAX_IMAGE_TAG_LENGTH)
+            .ok_or_else(ApiError::invalid_request)?;
+        if !normalized.iter().any(|item: &String| item == tag) {
+            normalized.push(tag.to_owned());
+        }
+    }
+    let _file_lock = acquire_path_write_lock(&image_tags_path(&state)).await?;
+    let gate = IMAGE_TAGS_MUTATION_GATE.lock().expect("image tags gate");
+    let mut all = read_image_tags_for_mutation(&state)?;
+    if normalized.is_empty() {
+        all.remove(&path);
+    } else {
+        all.insert(
+            path,
+            Value::Array(normalized.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    write_image_tags(&state, &all)?;
+    drop(gate);
+    Ok(Json(json!({"ok": true, "tags": normalized})))
+}
+
+async fn api_image_tag_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(tag): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    let tag = tag.trim();
+    if tag.is_empty() || tag.chars().count() > MAX_IMAGE_TAG_LENGTH {
+        return Err(ApiError::invalid_request());
+    }
+    let _file_lock = match acquire_path_write_lock(&image_tags_path(&state)).await {
+        Ok(file) => file,
+        Err(error) => return Err(error),
+    };
+    let _gate = IMAGE_TAGS_MUTATION_GATE.lock().expect("image tags gate");
+    let mut all = match read_image_tags_for_mutation(&state) {
+        Ok(all) => all,
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0usize;
+    let mut empty_paths = Vec::new();
+    for (path, value) in &mut all {
+        if let Some(items) = value.as_array_mut()
+            && items.iter().any(|item| item.as_str() == Some(tag))
+        {
+            items.retain(|item| item.as_str() != Some(tag));
+            removed += 1;
+            if items.is_empty() {
+                empty_paths.push(path.clone());
+            }
+        }
+    }
+    for path in empty_paths {
+        all.remove(&path);
+    }
+    if removed > 0 {
+        write_image_tags(&state, &all)?;
+    }
+    Ok(Json(json!({"ok": true, "removed_from": removed})))
+}
+
+async fn image_proxy(
+    state: AppState,
+    headers: HeaderMap,
+    body: Body,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    authenticated(&headers, &state).await?;
+    if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
+        return native_image_request_proxy(state, body, endpoint).await;
+    }
+    if state.config.upstream_protocol != UpstreamProtocol::OpenAi {
+        return Err(ApiError::unsupported_capability());
+    }
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(ApiError::unavailable)?;
+    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::validation())?;
+    let url = format!("{}/v1/{endpoint}", base_url.trim_end_matches('/'));
+    let mut request = state.client.post(url).body(bytes);
+    if let Some(value) = headers.get(header::CONTENT_TYPE) {
+        request = request.header(header::CONTENT_TYPE, value);
+    }
+    if let Some(auth) = state.config.upstream_auth.as_deref() {
+        request = request.header(header::AUTHORIZATION, auth);
+    }
+    let response = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send())
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
+    if !response.status().is_success() || upstream_declares_oversize(&response) {
+        return Err(ApiError::upstream());
+    }
+    let body = bounded_response_body(response)
+        .await
+        .map_err(|_| ApiError::upstream())?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response())
+}
+
+struct NativeImageRequest {
+    model: String,
+    codex: bool,
+    plan_type: Option<String>,
+    prompt: String,
+    n: usize,
+    size: Option<String>,
+    quality: String,
+    response_format: String,
+    output_format: String,
+    output_compression: Option<u64>,
+    background: String,
+    stream: bool,
+    images: Vec<String>,
+}
+
+fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<String>), ApiError> {
+    let model = match value {
+        None => "gpt-image-2".to_owned(),
+        Some(Value::String(value)) => value.trim().to_ascii_lowercase(),
+        Some(_) => return Err(ApiError::invalid_request()),
+    };
+    if model == "gpt-image-2" {
+        return Ok((model, false, None));
+    }
+    if model == "codex-gpt-image-2" {
+        return Ok((model, true, None));
+    }
+    for plan_type in ["plus", "team", "pro"] {
+        if model == format!("{plan_type}-codex-gpt-image-2") {
+            return Ok((model, true, Some(plan_type.to_owned())));
+        }
+    }
+    if model.is_empty() {
+        Err(ApiError::invalid_request())
+    } else {
+        Err(ApiError::unsupported_capability())
+    }
+}
+
+fn native_image_string_option(
+    object: &Map<String, Value>,
+    key: &str,
+    default: &str,
+    whitespace_is_default: bool,
+) -> Result<String, ApiError> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(default.to_owned()),
+        Some(Value::String(value)) if value.is_empty() => Ok(default.to_owned()),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if whitespace_is_default && value.is_empty() {
+                Ok(default.to_owned())
+            } else {
+                Ok(value.to_owned())
+            }
+        }
+        Some(_) => Err(ApiError::invalid_request()),
+    }
+}
+
+fn native_image_size(value: Option<&Value>, editing: bool) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let size = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ApiError::invalid_request)?;
+    if editing {
+        return matches!(size, "auto" | "1024x1024" | "1536x1024" | "1024x1536")
+            .then(|| Some(size.to_owned()))
+            .ok_or_else(ApiError::invalid_request);
+    }
+    if size == "auto" {
+        return Ok(Some(size.to_owned()));
+    }
+    let (width, height) = size
+        .split_once('x')
+        .filter(|(width, height)| !width.is_empty() && !height.is_empty())
+        .and_then(|(width, height)| {
+            if width.len() > 4
+                || height.len() > 4
+                || !width.bytes().all(|value| value.is_ascii_digit())
+                || !height.bytes().all(|value| value.is_ascii_digit())
+                || width.starts_with('0')
+                || height.starts_with('0')
+            {
+                return None;
+            }
+            Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
+        })
+        .ok_or_else(ApiError::invalid_request)?;
+    let long_edge = width.max(height);
+    let short_edge = width.min(height);
+    let pixels = u64::from(width) * u64::from(height);
+    if width % 16 != 0
+        || height % 16 != 0
+        || long_edge > short_edge.saturating_mul(3)
+        || long_edge > 3840
+        || short_edge > 2160
+        || !(655_360..=3840 * 2160).contains(&pixels)
+    {
+        return Err(ApiError::invalid_request());
+    }
+    Ok(Some(format!("{width}x{height}")))
+}
+
+fn native_image_reference_values(value: &Value) -> Result<Vec<String>, ApiError> {
+    let values = match value {
+        Value::String(value) => vec![value.clone()],
+        Value::Array(values) => values
+            .iter()
+            .map(|value| match value {
+                Value::String(value) => Ok(value.clone()),
+                Value::Object(object) => object
+                    .get("b64_json")
+                    .or_else(|| object.get("base64"))
+                    .or_else(|| object.get("image_url"))
+                    .or_else(|| object.get("url"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(ApiError::invalid_request),
+                _ => Err(ApiError::invalid_request()),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Value::Object(object) => object
+            .get("b64_json")
+            .or_else(|| object.get("base64"))
+            .or_else(|| object.get("image_url"))
+            .or_else(|| object.get("url"))
+            .and_then(Value::as_str)
+            .map(|value| vec![value.to_owned()])
+            .ok_or_else(ApiError::invalid_request)?,
+        _ => return Err(ApiError::invalid_request()),
+    };
+    if values.is_empty()
+        || values.len() > 16
+        || values
+            .iter()
+            .any(|value| value.trim().is_empty() || value.len() > MAX_UPSTREAM_BODY_BYTES)
+    {
+        return Err(ApiError::invalid_request());
+    }
+    Ok(values)
+}
+
+fn parse_native_image_request(
+    bytes: &[u8],
+    endpoint: &str,
+) -> Result<NativeImageRequest, ApiError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| ApiError::invalid_request())?;
+    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let allowed = if endpoint == "images/edits" {
+        [
+            "background",
+            "image",
+            "images",
+            "input_fidelity",
+            "mask",
+            "model",
+            "moderation",
+            "n",
+            "output_compression",
+            "output_format",
+            "partial_images",
+            "prompt",
+            "quality",
+            "response_format",
+            "size",
+            "stream",
+        ]
+        .as_slice()
+    } else {
+        [
+            "background",
+            "moderation",
+            "model",
+            "n",
+            "output_compression",
+            "output_format",
+            "partial_images",
+            "prompt",
+            "quality",
+            "response_format",
+            "size",
+            "stream",
+            "style",
+            "user",
+        ]
+        .as_slice()
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(ApiError::invalid_request());
+    }
+    let (model, codex, plan_type) = native_image_model(object.get("model"))?;
+    let prompt = object
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 32_000)
+        .ok_or_else(ApiError::invalid_request)?
+        .to_owned();
+    let n = object
+        .get("n")
+        .map(|value| value.as_u64().ok_or_else(ApiError::invalid_request))
+        .transpose()?
+        .unwrap_or(1);
+    let n = usize::try_from(n)
+        .ok()
+        .filter(|value| (1..=10).contains(value))
+        .ok_or_else(ApiError::invalid_request)?;
+    let size = native_image_size(object.get("size"), endpoint == "images/edits")?;
+    let quality = native_image_string_option(object, "quality", "auto", false)?;
+    if !matches!(quality.as_str(), "auto" | "low" | "medium" | "high") {
+        return Err(ApiError::invalid_request());
+    }
+    let response_format = native_image_string_option(object, "response_format", "b64_json", true)?;
+    if !matches!(response_format.as_str(), "b64_json" | "url") {
+        return Err(ApiError::invalid_request());
+    }
+    let output_format =
+        native_image_string_option(object, "output_format", "png", false)?.to_ascii_lowercase();
+    if !matches!(output_format.as_str(), "png" | "jpeg" | "webp") {
+        return Err(ApiError::invalid_request());
+    }
+    let output_compression = object
+        .get("output_compression")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| *value <= 100)
+                .ok_or_else(ApiError::invalid_request)
+        })
+        .transpose()?;
+    if output_compression.is_some() && output_format == "png" {
+        return Err(ApiError::invalid_request());
+    }
+    let background = native_image_string_option(object, "background", "auto", false)?;
+    if !matches!(background.as_str(), "auto" | "opaque" | "transparent") {
+        return Err(ApiError::invalid_request());
+    }
+    if codex && background == "transparent" && output_format == "jpeg" {
+        return Err(ApiError::invalid_request());
+    }
+    let stream = object
+        .get("stream")
+        .map(|value| value.as_bool().ok_or_else(ApiError::invalid_request))
+        .transpose()?
+        .unwrap_or(false);
+    if object
+        .get("moderation")
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| value.as_str() != Some("auto"))
+        || (!codex && background != "auto")
+        || object
+            .get("partial_images")
+            .filter(|value| !value.is_null())
+            .is_some_and(|value| value.as_u64() != Some(0))
+        || object
+            .get("style")
+            .filter(|value| !value.is_null())
+            .is_some()
+        || object
+            .get("user")
+            .filter(|value| !value.is_null())
+            .is_some()
+        || (endpoint == "images/edits"
+            && object
+                .get("input_fidelity")
+                .filter(|value| !value.is_null())
+                .is_some())
+    {
+        return Err(ApiError::unsupported_capability());
+    }
+    let images = if endpoint == "images/edits" {
+        let source = object
+            .get("images")
+            .or_else(|| object.get("image"))
+            .ok_or_else(ApiError::invalid_request)?;
+        let images = native_image_reference_values(source)?;
+        if object.get("mask").is_some_and(|value| !value.is_null()) {
+            return Err(ApiError::unsupported_capability());
+        }
+        images
+    } else {
+        Vec::new()
+    };
+    Ok(NativeImageRequest {
+        model,
+        codex,
+        plan_type,
+        prompt,
+        n,
+        size,
+        quality,
+        response_format,
+        output_format,
+        output_compression,
+        background,
+        stream,
+        images,
+    })
+}
+
+fn native_image_tool_results(value: &Value) -> Vec<String> {
+    value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            (object.get("type").and_then(Value::as_str) == Some("image_generation_call"))
+                .then(|| object.get("result"))
+                .flatten()
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && value.len() <= MAX_UPSTREAM_BODY_BYTES)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn native_image_usage() -> Value {
+    json!({
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "input_tokens_details": {"text_tokens": 0, "image_tokens": 0, "cached_tokens": 0},
+        "output_tokens_details": {"text_tokens": 0, "image_tokens": 0, "reasoning_tokens": 0}
+    })
+}
+
+async fn native_image_request_proxy(
+    state: AppState,
+    body: Body,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::invalid_request())?;
+    let request = parse_native_image_request(&bytes, endpoint)?;
+    if request.codex {
+        native_codex_image_request_proxy(state, request, endpoint).await
+    } else {
+        native_web_image_request_proxy(state, request, endpoint).await
+    }
+}
+
+struct NativeUploadedImage {
+    file_id: String,
+    file_name: String,
+    file_size: usize,
+    mime_type: String,
+    width: u32,
+    height: u32,
+}
+
+fn native_image_input(value: &str) -> Result<(Vec<u8>, String, u32, u32), ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::invalid_request());
+    }
+    let (mime_type, encoded) = if let Some(data) = value.strip_prefix("data:") {
+        let (metadata, encoded) = data.split_once(',').ok_or_else(ApiError::invalid_request)?;
+        let mime_type = metadata
+            .split(';')
+            .next()
+            .filter(|value| value.starts_with("image/"))
+            .ok_or_else(ApiError::invalid_request)?;
+        if !metadata
+            .split(';')
+            .skip(1)
+            .any(|value| value.eq_ignore_ascii_case("base64"))
+        {
+            return Err(ApiError::invalid_request());
+        }
+        (mime_type.to_owned(), encoded)
+    } else {
+        ("image/png".to_owned(), value)
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| ApiError::invalid_request())?;
+    if bytes.is_empty() || bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::invalid_request());
+    }
+    let reader = ImageReader::new(Cursor::new(bytes.clone()))
+        .with_guessed_format()
+        .map_err(|_| ApiError::invalid_request())?;
+    let image = reader.decode().map_err(|_| ApiError::invalid_request())?;
+    let width = image.width();
+    let height = image.height();
+    if width == 0
+        || height == 0
+        || u64::from(width).saturating_mul(u64::from(height)) > MAX_NATIVE_IMAGE_PIXELS
+    {
+        return Err(ApiError::invalid_request());
+    }
+    Ok((bytes, mime_type, width, height))
+}
+
+fn native_image_output(
+    bytes: &[u8],
+    output_format: &str,
+    output_compression: Option<u64>,
+) -> Result<Vec<u8>, ApiError> {
+    if bytes.is_empty() || bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::upstream());
+    }
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| ApiError::upstream())?;
+    let image = reader.decode().map_err(|_| ApiError::upstream())?;
+    if image.width() == 0
+        || image.height() == 0
+        || u64::from(image.width()).saturating_mul(u64::from(image.height()))
+            > MAX_NATIVE_IMAGE_PIXELS
+    {
+        return Err(ApiError::upstream());
+    }
+    if output_format == "png" && bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Ok(bytes.to_vec());
+    }
+    let mut output = Cursor::new(Vec::new());
+    match output_format {
+        "png" => image
+            .write_to(&mut output, image::ImageFormat::Png)
+            .map_err(|_| ApiError::upstream())?,
+        "jpeg" => {
+            let quality = native_jpeg_quality(output_compression)?;
+            let image = image::DynamicImage::ImageRgb8(image.to_rgb8());
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, quality);
+            image
+                .write_with_encoder(encoder)
+                .map_err(|_| ApiError::upstream())?;
+        }
+        "webp" => {
+            let rgba = image.to_rgba8();
+            let webp_image = webp_rust::ImageBuffer {
+                width: rgba.width() as usize,
+                height: rgba.height() as usize,
+                rgba: rgba.into_raw(),
+            };
+            let config = webp_rust::LossyEncodingConfig {
+                quality: output_compression.unwrap_or(100) as f32,
+                ..Default::default()
+            };
+            let encoded =
+                webp_rust::encoder::encode_lossy_image_to_webp_with_config(&webp_image, &config)
+                    .map_err(|_| ApiError::upstream())?;
+            output.get_mut().extend_from_slice(&encoded);
+        }
+        _ => return Err(ApiError::invalid_request()),
+    }
+    let bytes = output.into_inner();
+    if bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::upstream());
+    }
+    Ok(bytes)
+}
+
+fn native_jpeg_quality(output_compression: Option<u64>) -> Result<u8, ApiError> {
+    let value = output_compression.unwrap_or(100);
+    u8::try_from(value)
+        .ok()
+        .filter(|value| *value <= 100)
+        .ok_or_else(ApiError::invalid_request)
+}
+
+fn native_image_extension(output_format: &str) -> &'static str {
+    match output_format {
+        "jpeg" => "jpg",
+        "webp" => "webp",
+        _ => "png",
+    }
+}
+
+fn native_save_image(
+    state: &AppState,
+    bytes: &[u8],
+    output_format: &str,
+) -> Result<String, ApiError> {
+    let root = image_root(state);
+    fs::create_dir_all(&root).map_err(|_| ApiError::unavailable())?;
+    let name = format!(
+        "native-{}-{}.{}",
+        std::process::id(),
+        LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        native_image_extension(output_format)
+    );
+    let path = root.join(&name);
+    atomic_replace_checked_with_limit(&path, bytes, MAX_NATIVE_IMAGE_BYTES as u64, false)?;
+    Ok(format!("/images/{name}"))
+}
+
+async fn native_upload_image(
+    state: &AppState,
+    lease: &AccountLease,
+    context: &NativeRequestContext,
+    value: &str,
+    index: usize,
+) -> Result<NativeUploadedImage, ApiError> {
+    let (bytes, mime_type, width, height) = native_image_input(value)?;
+    let file_name = format!("image-{index}.png");
+    let path = "/backend-api/files";
+    let mut request = native_browser_headers(
+        state.client.post(format!(
+            "{}{path}",
+            state
+                .config
+                .upstream_base_url
+                .as_deref()
+                .ok_or_else(ApiError::unavailable)?
+                .trim_end_matches('/')
+        )),
+        context,
+    )
+    .header(header::CONTENT_TYPE, "application/json")
+    .header(header::ACCEPT, "application/json")
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .json(&json!({
+        "file_name": file_name,
+        "file_size": bytes.len(),
+        "use_case": "multimodal",
+        "width": width,
+        "height": height,
+    }));
+    if let Some(account_id) = lease.chatgpt_account_id() {
+        request = request.header("ChatGPT-Account-ID", account_id);
+    }
+    let response = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send())
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
+    if !response.status().is_success() || upstream_declares_oversize(&response) {
+        return Err(ApiError::upstream());
+    }
+    let body = bounded_response_body(response).await?;
+    let meta: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+    let file_id = meta
+        .get("file_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .ok_or_else(ApiError::upstream)?
+        .to_owned();
+    let upload_url = meta
+        .get("upload_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+        .ok_or_else(ApiError::upstream)?
+        .to_owned();
+    let upload = tokio::time::timeout(
+        NATIVE_UPSTREAM_TIMEOUT,
+        state
+            .client
+            .put(upload_url)
+            .header(header::CONTENT_TYPE, &mime_type)
+            .header("x-ms-blob-type", "BlockBlob")
+            .header("x-ms-version", "2020-04-08")
+            .body(bytes.clone())
+            .send(),
+    )
+    .await
+    .map_err(|_| ApiError::upstream())?
+    .map_err(|_| ApiError::upstream())?;
+    if !upload.status().is_success() {
+        return Err(ApiError::upstream());
+    }
+    let uploaded_path = format!("/backend-api/files/{file_id}/uploaded");
+    let mut confirm = native_browser_headers(
+        state.client.post(format!(
+            "{}{uploaded_path}",
+            state
+                .config
+                .upstream_base_url
+                .as_deref()
+                .ok_or_else(ApiError::unavailable)?
+                .trim_end_matches('/')
+        )),
+        context,
+    )
+    .header(header::CONTENT_TYPE, "application/json")
+    .header(header::ACCEPT, "application/json")
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .body("{}");
+    if let Some(account_id) = lease.chatgpt_account_id() {
+        confirm = confirm.header("ChatGPT-Account-ID", account_id);
+    }
+    let response = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, confirm.send())
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
+    if !response.status().is_success() {
+        return Err(ApiError::upstream());
+    }
+    let _ = bounded_response_body(response).await?;
+    Ok(NativeUploadedImage {
+        file_id,
+        file_name,
+        file_size: bytes.len(),
+        mime_type,
+        width,
+        height,
+    })
+}
+
+fn native_image_file_id(value: &str) -> Option<String> {
+    let value = value
+        .strip_prefix("file-service://")
+        .unwrap_or(value)
+        .trim();
+    (!value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then(|| value.to_owned())
+}
+
+fn native_collect_image_file_ids(value: &Value, ids: &mut Vec<String>, depth: usize) {
+    if depth > 16 || ids.len() >= 16 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for key in ["file_id", "fileId", "asset_pointer"] {
+                if let Some(value) = object.get(key).and_then(Value::as_str)
+                    && let Some(value) = native_image_file_id(value)
+                    && !ids.contains(&value)
+                {
+                    ids.push(value);
+                }
+            }
+            for key in [
+                "mapping",
+                "message",
+                "content",
+                "parts",
+                "metadata",
+                "attachments",
+                "output",
+                "item",
+                "data",
+                "result",
+            ] {
+                if let Some(value) = object.get(key) {
+                    if key == "mapping" {
+                        if let Some(mapping) = value.as_object() {
+                            for node in mapping.values().take(128) {
+                                native_collect_image_file_ids(node, ids, depth + 1);
+                            }
+                        }
+                    } else {
+                        native_collect_image_file_ids(value, ids, depth + 1);
+                    }
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values.iter().take(128) {
+                native_collect_image_file_ids(value, ids, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn native_poll_image_file_ids(
+    state: &AppState,
+    lease: &AccountLease,
+    context: &NativeRequestContext,
+    conversation_id: &str,
+    deadline: Instant,
+) -> Result<Vec<String>, ApiError> {
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(ApiError::unavailable)?
+        .trim_end_matches('/');
+    loop {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err(ApiError::upstream());
+        }
+        let path = format!("/backend-api/conversation/{conversation_id}");
+        let referer = format!("{base_url}/c/{conversation_id}");
+        let mut request = native_browser_headers_with_referer(
+            state.client.get(format!("{base_url}{path}")),
+            context,
+            &referer,
+        )
+        .header(header::ACCEPT, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
+        if let Some(account_id) = lease.chatgpt_account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        let response =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
+                .await
+                .map_err(|_| ApiError::upstream())?
+                .map_err(|_| ApiError::upstream())?;
+        if !response.status().is_success() {
+            if matches!(
+                response.status(),
+                StatusCode::NOT_FOUND
+                    | StatusCode::CONFLICT
+                    | StatusCode::LOCKED
+                    | StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ) {
+                if !sleep_search_poll_with_interval(deadline, Duration::from_secs(1)).await {
+                    return Err(ApiError::upstream());
+                }
+                continue;
+            }
+            return Err(ApiError::upstream());
+        }
+        let body = bounded_response_body(response).await?;
+        let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+        let mut ids = Vec::new();
+        native_collect_image_file_ids(&value, &mut ids, 0);
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+        if !sleep_search_poll_with_interval(deadline, Duration::from_secs(1)).await {
+            return Err(ApiError::upstream());
+        }
+    }
+}
+
+async fn native_download_image_files(
+    state: &AppState,
+    lease: &AccountLease,
+    context: &NativeRequestContext,
+    ids: &[String],
+    deadline: Instant,
+) -> Result<Vec<Vec<u8>>, ApiError> {
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(ApiError::unavailable)?
+        .trim_end_matches('/');
+    let mut outputs = Vec::new();
+    for id in ids {
+        let path = format!("/backend-api/files/{id}/download");
+        let mut request = native_browser_headers_with_referer(
+            state.client.get(format!("{base_url}{path}")),
+            context,
+            &format!("{base_url}/"),
+        )
+        .header(header::ACCEPT, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
+        if let Some(account_id) = lease.chatgpt_account_id() {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        let response =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
+                .await
+                .map_err(|_| ApiError::upstream())?
+                .map_err(|_| ApiError::upstream())?;
+        if !response.status().is_success() {
+            return Err(ApiError::upstream());
+        }
+        let body = bounded_response_body(response).await?;
+        let meta: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+        let url = meta
+            .get("download_url")
+            .or_else(|| meta.get("url"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+            .ok_or_else(ApiError::upstream)?;
+        let response = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            state.client.get(url).send(),
+        )
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
+        if !response.status().is_success() {
+            return Err(ApiError::upstream());
+        }
+        outputs.push(bounded_response_body(response).await?);
+    }
+    Ok(outputs)
+}
+
+async fn native_web_image_request_proxy(
+    state: AppState,
+    request: NativeImageRequest,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    let lease = state
+        .account_store
+        .acquire_excluding_with_type_and_capability_filter(
+            "auto",
+            &HashSet::new(),
+            None,
+            Some("web"),
+        )
+        .await
+        .ok_or_else(ApiError::unavailable)?;
+    let result = native_web_image_attempt(&state, &lease, &request, endpoint).await;
+    let token = lease.token().to_owned();
+    match result {
+        Ok(data) => {
+            if !state.account_store.mark_text_used(&token) {
+                AccountStore::note_usage_mark_failure();
+            }
+            drop(lease);
+            Ok(data)
+        }
+        Err(error) => {
+            drop(lease);
+            Err(error)
+        }
+    }
+}
+
+async fn native_web_image_attempt(
+    state: &AppState,
+    lease: &AccountLease,
+    request: &NativeImageRequest,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(ApiError::unavailable)?
+        .trim_end_matches('/');
+    let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
+    let context = NativeRequestContext::new();
+    let mut uploads = Vec::new();
+    for (index, image) in request.images.iter().enumerate() {
+        uploads.push(native_upload_image(state, lease, &context, image, index + 1).await?);
+    }
+    let resources = native_bootstrap_with_timeout_context(
+        &state.client,
+        base_url,
+        lease.token(),
+        deadline.saturating_duration_since(Instant::now()),
+        &context,
+    )
+    .await
+    .map_err(|_| ApiError::upstream())?;
+    let requirements = native_chat_requirements_with_resources_for_route_context(
+        &state.client,
+        base_url,
+        lease.token(),
+        &resources,
+        deadline.saturating_duration_since(Instant::now()),
+        true,
+        &context,
+    )
+    .await
+    .map_err(|_| ApiError::upstream())?;
+    let upstream_model = state
+        .models
+        .current()
+        .first()
+        .map(|model| model.id.clone())
+        .unwrap_or_else(|| "auto".to_owned());
+    let prepare_path = "/backend-api/f/conversation/prepare";
+    let prepare_payload = json!({
+        "action": "next",
+        "fork_from_shared_post": false,
+        "parent_message_id": "client-created-root",
+        "model": upstream_model,
+        "client_prepare_state": "success",
+        "timezone_offset_min": -480,
+        "timezone": "Asia/Shanghai",
+        "conversation_mode": {"kind": "primary_assistant"},
+        "system_hints": ["picture_v2"],
+        "partial_query": {
+            "id": native_message_id(),
+            "author": {"role": "user"},
+            "content": {"content_type": "text", "parts": [request.prompt]},
+        },
+        "supports_buffering": true,
+        "supported_encodings": ["v1"],
+        "client_contextual_info": {"app_name": "chatgpt.com"},
+    });
+    let mut prepare = native_browser_headers(
+        state.client.post(format!("{base_url}{prepare_path}")),
+        &context,
+    )
+    .header(header::ACCEPT, "*/*")
+    .header("X-Conduit-Token", "no-token")
+    .header("X-OpenAI-Target-Path", prepare_path)
+    .header("X-OpenAI-Target-Route", prepare_path)
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .json(&prepare_payload);
+    if let Some(account_id) = lease.chatgpt_account_id() {
+        prepare = prepare.header("ChatGPT-Account-ID", account_id);
+    }
+    let prepare = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), prepare.send())
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
+    if !prepare.status().is_success() {
+        return Err(ApiError::upstream());
+    }
+    let conduit = serde_json::from_slice::<Value>(&bounded_response_body(prepare).await?)
+        .map_err(|_| ApiError::upstream())?
+        .get("conduit_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 4096)
+        .ok_or_else(ApiError::upstream)?
+        .to_owned();
+    let mut parts = Vec::new();
+    for upload in &uploads {
+        parts.push(json!({
+            "content_type": "image_asset_pointer",
+            "asset_pointer": format!("file-service://{}", upload.file_id),
+            "width": upload.width,
+            "height": upload.height,
+            "size_bytes": upload.file_size,
+        }));
+    }
+    parts.push(Value::String(request.prompt.clone()));
+    let content = if uploads.is_empty() {
+        json!({"content_type":"text","parts":parts})
+    } else {
+        json!({"content_type":"multimodal_text","parts":parts})
+    };
+    let run_path = "/backend-api/f/conversation";
+    let run_payload = json!({
+        "action": "next",
+        "messages": [{
+            "id": native_message_id(),
+            "author": {"role": "user"},
+            "create_time": native_created(),
+            "content": content,
+            "metadata": {
+                "developer_mode_connector_ids": [],
+                "selected_github_repos": [],
+                "selected_all_github_repos": false,
+                "system_hints": ["picture_v2"],
+                "serialization_metadata": {"custom_symbol_offsets": []},
+                "attachments": uploads.iter().map(|upload| json!({
+                    "id": upload.file_id,
+                    "mimeType": upload.mime_type,
+                    "name": upload.file_name,
+                    "size": upload.file_size,
+                    "width": upload.width,
+                    "height": upload.height,
+                })).collect::<Vec<_>>(),
+            }
+        }],
+        "parent_message_id": "client-created-root",
+        "model": upstream_model,
+        "client_prepare_state": "sent",
+        "timezone_offset_min": -480,
+        "timezone": "Asia/Shanghai",
+        "conversation_mode": {"kind": "primary_assistant"},
+        "enable_message_followups": true,
+        "system_hints": [],
+        "supports_buffering": true,
+        "supported_encodings": ["v1"],
+        "client_contextual_info": {"app_name": "chatgpt.com"},
+        "paragen_cot_summary_display_override": "allow",
+        "force_parallel_switch": "auto",
+    });
+    let mut run =
+        native_browser_headers(state.client.post(format!("{base_url}{run_path}")), &context)
+            .header(header::ACCEPT, "text/event-stream")
+            .header("X-OpenAI-Target-Path", run_path)
+            .header("X-OpenAI-Target-Route", run_path)
+            .header("X-Conduit-Token", conduit)
+            .header(
+                "OpenAI-Sentinel-Chat-Requirements-Token",
+                requirements.token,
+            )
+            .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+            .json(&run_payload);
+    if let Some(account_id) = lease.chatgpt_account_id() {
+        run = run.header("ChatGPT-Account-ID", account_id);
+    }
+    if let Some(value) = requirements.so_token {
+        run = run.header("OpenAI-Sentinel-SO-Token", value);
+    }
+    if let Some(value) = requirements.proof_token {
+        run = run.header("OpenAI-Sentinel-Proof-Token", value);
+    }
+    if let Some(value) = requirements.turnstile_token {
+        run = run.header("OpenAI-Sentinel-Turnstile-Token", value);
+    }
+    let response = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), run.send())
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
+    if !response.status().is_success() {
+        return Err(ApiError::upstream());
+    }
+    let conversation_id = search_conversation_id_from_response(response, deadline)
+        .await
+        .map_err(|_| ApiError::upstream())?;
+    let ids =
+        native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline).await?;
+    let downloaded = native_download_image_files(state, lease, &context, &ids, deadline).await?;
+    let mut data = Vec::new();
+    for bytes in downloaded {
+        let bytes =
+            native_image_output(&bytes, &request.output_format, request.output_compression)?;
+        let url = native_save_image(state, &bytes, &request.output_format)?;
+        let mut item = Map::new();
+        if request.response_format == "b64_json" {
+            item.insert(
+                "b64_json".to_owned(),
+                Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+            );
+        }
+        item.insert("url".to_owned(), Value::String(url));
+        item.insert(
+            "revised_prompt".to_owned(),
+            Value::String(request.prompt.clone()),
+        );
+        data.push(Value::Object(item));
+    }
+    if data.is_empty() {
+        return Err(ApiError::upstream());
+    }
+    let event_type = if endpoint == "images/edits" {
+        "image_edit.completed"
+    } else {
+        "image_generation.completed"
+    };
+    if request.stream {
+        let event = json!({
+            "type": event_type,
+            "created_at": native_created(),
+            "background": request.background,
+            "output_format": request.output_format,
+            "quality": request.quality,
+            "size": request.size.clone().unwrap_or_else(|| "auto".to_owned()),
+            "b64_json": data.first().and_then(|item| item.get("b64_json")).cloned().unwrap_or(Value::Null),
+            "usage": native_image_usage(),
+        });
+        let serialized = serde_json::to_string(&event).map_err(|_| ApiError::upstream())?;
+        let body = format!("event: {event_type}\ndata: {serialized}\n\n");
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            Body::from(body),
+        )
+            .into_response());
+    }
+    Ok(Json(json!({
+        "created": native_created(),
+        "data": data,
+        "usage": native_image_usage(),
+        "background": request.background,
+        "output_format": request.output_format,
+        "quality": request.quality,
+        "size": request.size,
+        "model": request.model,
+        "response_format": request.response_format,
+    }))
+    .into_response())
+}
+
+async fn native_codex_image_request_proxy(
+    state: AppState,
+    request: NativeImageRequest,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    let action = if endpoint == "images/edits" {
+        "edit"
+    } else {
+        "generate"
+    };
+    let mut data = Vec::new();
+    for _ in 0..request.n {
+        let mut content = vec![json!({"type":"input_text","text":request.prompt})];
+        for image in &request.images {
+            let image_url = if image.trim_start().starts_with("data:") {
+                image.clone()
+            } else {
+                format!("data:image/png;base64,{}", image.trim())
+            };
+            content.push(json!({"type":"input_image","image_url":image_url}));
+        }
+        let mut tool = json!({
+            "type": "image_generation",
+            "model": "gpt-image-2",
+            "action": action,
+            "quality": request.quality,
+            "output_format": request.output_format,
+            "background": request.background,
+        });
+        if let Some(size) = &request.size {
+            tool["size"] = Value::String(size.clone());
+        }
+        if let Some(compression) = request.output_compression {
+            tool["output_compression"] = json!(compression);
+        }
+        let internal = json!({
+            "model": CODEX_RESPONSES_MODEL,
+            "instructions": "Use the image_generation tool to create exactly one image for the user's request.",
+            "store": false,
+            "input": [{"role":"user","content":content}],
+            "tools": [tool],
+            "tool_choice": {"type":"image_generation"},
+            "stream": false,
+        });
+        let object = internal
+            .as_object()
+            .cloned()
+            .ok_or_else(ApiError::invalid_request)?;
+        let allowed_groups = request
+            .plan_type
+            .clone()
+            .map(|plan_type| HashSet::from([plan_type]))
+            .or_else(|| {
+                request.codex.then(|| {
+                    HashSet::from(["plus".to_owned(), "team".to_owned(), "pro".to_owned()])
+                })
+            });
+        let response = native_responses_with_timeout_and_groups(
+            state.clone(),
+            object,
+            NATIVE_UPSTREAM_TIMEOUT,
+            allowed_groups,
+        )
+        .await?;
+        let body = to_bytes(response.into_body(), MAX_UPSTREAM_BODY_BYTES)
+            .await
+            .map_err(|_| ApiError::upstream())?;
+        let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+        let results = native_image_tool_results(&value);
+        if results.is_empty() {
+            return Err(ApiError::upstream());
+        }
+        data.extend(
+            results
+                .into_iter()
+                .map(|result| json!({"b64_json": result, "revised_prompt": request.prompt})),
+        );
+    }
+    if data.is_empty() {
+        return Err(ApiError::upstream());
+    }
+    Ok(Json(json!({
+        "created": native_created(),
+        "data": data,
+        "usage": native_image_usage(),
+        "background": request.background,
+        "output_format": request.output_format,
+        "quality": request.quality,
+        "size": request.size,
+        "model": request.model,
+        "response_format": request.response_format,
+        "stream": request.stream,
+    }))
+    .into_response())
+}
+
+async fn image_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    image_proxy(state, headers, body, "images/generations").await
+}
+
+async fn image_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    image_proxy(state, headers, body, "images/edits").await
+}
+
+async fn openai_proxy(
+    state: AppState,
+    headers: HeaderMap,
+    body: Body,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    authenticated(&headers, &state).await?;
+    if state.config.upstream_protocol != UpstreamProtocol::OpenAi {
+        return Err(ApiError::unsupported_capability());
+    }
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(ApiError::unavailable)?;
+    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::validation())?;
+    let url = format!("{}/v1/{endpoint}", base_url.trim_end_matches('/'));
+    let mut request = state.client.post(url).body(bytes);
+    if let Some(value) = headers.get(header::CONTENT_TYPE) {
+        request = request.header(header::CONTENT_TYPE, value);
+    }
+    if let Some(auth) = state.config.upstream_auth.as_deref() {
+        request = request.header(header::AUTHORIZATION, auth);
+    }
+    let response = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send())
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
+    if !response.status().is_success() || upstream_declares_oversize(&response) {
+        return Err(ApiError::upstream());
+    }
+    let body = bounded_response_body(response)
+        .await
+        .map_err(|_| ApiError::upstream())?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from(body),
+    )
+        .into_response())
+}
+
+async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    authenticated(&headers, &state).await?;
+    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::invalid_request())?;
+    let payload: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::invalid_request())?;
+    let prompt = search_prompt(&payload)?;
+    if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
+        return native_search_with_timeout(state, prompt, NATIVE_SEARCH_TIMEOUT).await;
+    }
+    if state.config.upstream_protocol == UpstreamProtocol::OpenAi {
+        return openai_proxy(state, headers, Body::from(bytes), "search").await;
+    }
+    Err(ApiError::unavailable())
+}
+
+fn search_prompt(payload: &Value) -> Result<String, ApiError> {
+    let object = payload.as_object().ok_or_else(ApiError::invalid_request)?;
+    let prompt = object
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|prompt| {
+            !prompt.trim().is_empty() && prompt.chars().count() <= MAX_REQUEST_BODY_BYTES
+        })
+        .ok_or_else(ApiError::invalid_request)?;
+    Ok(prompt.to_owned())
+}
+
+async fn acquire_native_search_lease(
+    state: &AppState,
+    attempted_tokens: &HashSet<String>,
+) -> Option<AccountLease> {
+    let allowed_groups = if state.account_type_catalog.enabled() {
+        state
+            .account_type_catalog
+            .refresh_for_model(NATIVE_SEARCH_MODEL)
+            .await;
+        state
+            .account_type_catalog
+            .supported_types_for(NATIVE_SEARCH_MODEL)
+    } else {
+        None
+    };
+    state
+        .account_store
+        .acquire_excluding_with_type_and_capability_filter(
+            NATIVE_SEARCH_MODEL,
+            attempted_tokens,
+            allowed_groups.as_ref(),
+            Some("web"),
+        )
+        .await
+}
+
+async fn native_search_with_timeout(
+    state: AppState,
+    prompt: String,
+    timeout: Duration,
+) -> Result<Response, ApiError> {
+    let deadline = Instant::now() + timeout;
+    let mut attempted_tokens = HashSet::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ApiError::upstream());
+        }
+        let Some(lease) = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            acquire_native_search_lease(&state, &attempted_tokens),
+        )
+        .await
+        .map_err(|_| ApiError::upstream())?
+        else {
+            return Err(ApiError::unavailable());
+        };
+        attempted_tokens.insert(lease.token().to_owned());
+        match native_search_attempt(&state, &lease, &prompt, deadline).await {
+            Ok(result) => {
+                if !state.account_store.mark_text_used(lease.token()) {
+                    AccountStore::note_usage_mark_failure();
+                }
+                drop(lease);
+                return Ok(Json(project_public_search_result(&result)).into_response());
+            }
+            Err((error, true)) => {
+                drop(lease);
+                if attempted_tokens.len() >= state.account_store.records().len() {
+                    return Err(error);
+                }
+            }
+            Err((error, false)) => {
+                drop(lease);
+                return Err(error);
+            }
+        }
+    }
+}
+
+async fn native_search_attempt(
+    state: &AppState,
+    lease: &AccountLease,
+    prompt: &str,
+    deadline: Instant,
+) -> Result<Value, (ApiError, bool)> {
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(|| (ApiError::unavailable(), false))?;
+    let context = NativeRequestContext::new();
+    let base_url = base_url.trim_end_matches('/');
+    let prepare_path = "/backend-api/f/conversation/prepare";
+    let prepare_payload = json!({
+        "action": "next",
+        "fork_from_shared_post": false,
+        "parent_message_id": "client-created-root",
+        "model": NATIVE_SEARCH_MODEL,
+        "client_prepare_state": "success",
+        "timezone_offset_min": -480,
+        "timezone": "Asia/Shanghai",
+        "conversation_mode": {"kind": "primary_assistant"},
+        "system_hints": ["search"],
+        "partial_query": {
+            "id": native_message_id(),
+            "author": {"role": "user"},
+            "content": {"content_type": "text", "parts": [prompt]}
+        },
+        "supports_buffering": true,
+        "supported_encodings": ["v1"],
+        "client_contextual_info": {"app_name": "chatgpt.com"}
+    });
+    let mut request = native_browser_headers(
+        state.client.post(format!("{base_url}{prepare_path}")),
+        &context,
+    )
+    .header(header::ACCEPT, "*/*")
+    .header("X-Conduit-Token", "no-token")
+    .header("X-OpenAI-Target-Path", prepare_path)
+    .header("X-OpenAI-Target-Route", prepare_path)
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .json(&prepare_payload);
+    if let Some(account_id) = lease.chatgpt_account_id() {
+        request = request.header("ChatGPT-Account-ID", account_id);
+    }
+    let prepare = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
+        .await
+        .map_err(|_| (ApiError::upstream(), false))?
+        .map_err(|_| (ApiError::upstream(), true))?;
+    let prepare_status = prepare.status();
+    if !prepare_status.is_success() {
+        return Err((
+            ApiError::upstream(),
+            native_stage_retryable(prepare_status, true),
+        ));
+    }
+    let prepare_body = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        bounded_response_body(prepare),
+    )
+    .await
+    .map_err(|_| (ApiError::upstream(), false))?
+    .map_err(|_| (ApiError::upstream(), false))?;
+    let prepare_value: Value =
+        serde_json::from_slice(&prepare_body).map_err(|_| (ApiError::upstream(), false))?;
+    let conduit_token = prepare_value
+        .get("conduit_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty() && token.chars().count() <= 4096)
+        .ok_or_else(|| (ApiError::upstream(), false))?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err((ApiError::upstream(), false));
+    }
+    let resources = native_bootstrap_with_timeout_context(
+        &state.client,
+        base_url,
+        lease.token(),
+        remaining,
+        &context,
+    )
+    .await?;
+    let requirements = native_chat_requirements_with_resources_for_route_context(
+        &state.client,
+        base_url,
+        lease.token(),
+        &resources,
+        deadline.saturating_duration_since(Instant::now()),
+        true,
+        &context,
+    )
+    .await?;
+
+    let run_path = "/backend-api/f/conversation";
+    let run_payload = json!({
+        "action": "next",
+        "messages": [{
+            "id": native_message_id(),
+            "author": {"role": "user"},
+            "create_time": native_created(),
+            "content": {"content_type": "text", "parts": [prompt]},
+            "metadata": {
+                "developer_mode_connector_ids": [],
+                "selected_github_repos": [],
+                "selected_all_github_repos": false,
+                "system_hints": ["search"],
+                "serialization_metadata": {"custom_symbol_offsets": []}
+            }
+        }],
+        "parent_message_id": "client-created-root",
+        "model": NATIVE_SEARCH_MODEL,
+        "client_prepare_state": "success",
+        "timezone_offset_min": -480,
+        "timezone": "Asia/Shanghai",
+        "conversation_mode": {"kind": "primary_assistant"},
+        "enable_message_followups": true,
+        "system_hints": [],
+        "supports_buffering": true,
+        "supported_encodings": ["v1"],
+        "force_use_search": true,
+        "client_reported_search_source": "conversation_composer_web_icon",
+        "client_contextual_info": {
+            "is_dark_mode": false,
+            "time_since_loaded": 36,
+            "page_height": 925,
+            "page_width": 886,
+            "pixel_ratio": 2,
+            "screen_height": 1440,
+            "screen_width": 2560,
+            "app_name": "chatgpt.com"
+        },
+        "paragen_cot_summary_display_override": "allow",
+        "force_parallel_switch": "auto"
+    });
+    let mut request =
+        native_browser_headers(state.client.post(format!("{base_url}{run_path}")), &context)
+            .header(header::ACCEPT, "text/event-stream")
+            .header("X-OpenAI-Target-Path", run_path)
+            .header("X-OpenAI-Target-Route", run_path)
+            .header("X-Conduit-Token", conduit_token)
+            .header(
+                "OpenAI-Sentinel-Chat-Requirements-Token",
+                requirements.token,
+            )
+            .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+            .json(&run_payload);
+    if let Some(account_id) = lease.chatgpt_account_id() {
+        request = request.header("ChatGPT-Account-ID", account_id);
+    }
+    if let Some(value) = requirements.so_token {
+        request = request.header("OpenAI-Sentinel-SO-Token", value);
+    }
+    if let Some(value) = requirements.proof_token {
+        request = request.header("OpenAI-Sentinel-Proof-Token", value);
+    }
+    if let Some(value) = requirements.turnstile_token {
+        request = request.header("OpenAI-Sentinel-Turnstile-Token", value);
+    }
+    let run = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
+        .await
+        .map_err(|_| (ApiError::upstream(), false))?
+        .map_err(|_| (ApiError::upstream(), true))?;
+    let run_status = run.status();
+    if !run_status.is_success() {
+        return Err((
+            ApiError::upstream(),
+            native_stage_retryable(run_status, true),
+        ));
+    }
+    if upstream_declares_oversize(&run) {
+        return Err((ApiError::upstream(), false));
+    }
+    let conversation_id = search_conversation_id_from_response(run, deadline).await?;
+    native_search_poll(NativeSearchPollRequest {
+        client: &state.client,
+        base_url,
+        token: lease.token(),
+        account_id: lease.chatgpt_account_id(),
+        context: &context,
+        conversation_id,
+        deadline,
+        poll_interval: NATIVE_SEARCH_POLL_INTERVAL,
+    })
+    .await
+}
+
+struct NativeSearchPollRequest<'a> {
+    client: &'a Client,
+    base_url: &'a str,
+    token: &'a str,
+    account_id: Option<&'a str>,
+    context: &'a NativeRequestContext,
+    conversation_id: String,
+    deadline: Instant,
+    poll_interval: Duration,
+}
+
+async fn native_search_poll(
+    request: NativeSearchPollRequest<'_>,
+) -> Result<Value, (ApiError, bool)> {
+    let NativeSearchPollRequest {
+        client,
+        base_url,
+        token,
+        account_id,
+        context,
+        conversation_id,
+        deadline,
+        poll_interval,
+    } = request;
+    let mut last_answer = String::new();
+    let mut stable_hits = 0usize;
+    loop {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err((ApiError::upstream(), false));
+        }
+        let poll_path = format!("/backend-api/conversation/{conversation_id}");
+        let referer = format!("{base_url}/c/{conversation_id}");
+        let mut request = native_browser_headers_with_referer(
+            client.get(format!("{base_url}{poll_path}")),
+            context,
+            &referer,
+        )
+        .header(header::ACCEPT, "*/*")
+        .header("X-OpenAI-Target-Path", poll_path.as_str())
+        .header("X-OpenAI-Target-Route", poll_path.as_str())
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+        if let Some(account_id) = account_id {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        let poll =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send()).await;
+        let poll = match poll {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                if !sleep_search_poll_with_interval(deadline, poll_interval).await {
+                    return Err((ApiError::upstream(), false));
+                }
+                continue;
+            }
+            Err(_) => return Err((ApiError::upstream(), false)),
+        };
+        if !poll.status().is_success() {
+            if matches!(
+                poll.status(),
+                StatusCode::NOT_FOUND
+                    | StatusCode::CONFLICT
+                    | StatusCode::LOCKED
+                    | StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::INTERNAL_SERVER_ERROR
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ) {
+                if !sleep_search_poll_with_interval(deadline, poll_interval).await {
+                    return Err((ApiError::upstream(), false));
+                }
+                continue;
+            }
+            return Err((ApiError::upstream(), false));
+        }
+        if upstream_declares_oversize(&poll) {
+            return Err((ApiError::upstream(), false));
+        }
+        let body = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            bounded_response_body(poll),
+        )
+        .await
+        .map_err(|_| (ApiError::upstream(), false))?
+        .map_err(|_| (ApiError::upstream(), false))?;
+        let conversation: Value =
+            serde_json::from_slice(&body).map_err(|_| (ApiError::upstream(), false))?;
+        let internal = extract_search_result(&conversation_id, &conversation);
+        let answer = internal
+            .get("answer")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let status = internal
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !answer.is_empty() {
+            if matches!(
+                status,
+                "finished_successfully" | "finished_partial_completion"
+            ) {
+                return Ok(internal);
+            }
+            if answer == last_answer {
+                stable_hits += 1;
+            } else {
+                stable_hits = 0;
+            }
+            last_answer = answer.to_owned();
+            if stable_hits >= 2 {
+                return Ok(internal);
+            }
+        }
+        if !sleep_search_poll_with_interval(deadline, poll_interval).await {
+            return Err((ApiError::upstream(), false));
+        }
+    }
+}
+
+async fn search_conversation_id_from_response(
+    response: reqwest::Response,
+    deadline: Instant,
+) -> Result<String, (ApiError, bool)> {
+    if upstream_declares_oversize(&response) {
+        return Err((ApiError::upstream(), false));
+    }
+    let mut input = Box::pin(response.bytes_stream());
+    let mut buffer = Vec::new();
+    let mut total = 0usize;
+    let mut conversation_id = None;
+    loop {
+        let next = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), input.next())
+            .await
+            .map_err(|_| (ApiError::upstream(), false))?;
+        let Some(chunk) = next else {
+            return conversation_id.ok_or((ApiError::upstream(), false));
+        };
+        let chunk = chunk.map_err(|_| (ApiError::upstream(), false))?;
+        total = total
+            .checked_add(chunk.len())
+            .filter(|total| *total <= MAX_UPSTREAM_BODY_BYTES)
+            .ok_or((ApiError::upstream(), false))?;
+        buffer.extend_from_slice(&chunk);
+        while let Some((position, delimiter_length)) = sse_delimiter(&buffer) {
+            let event = buffer.drain(..position).collect::<Vec<_>>();
+            buffer.drain(..delimiter_length);
+            let data = codex_sse_data(&event).map_err(|_| (ApiError::upstream(), false))?;
+            let Some(data) = data else { continue };
+            if data == "[DONE]" {
+                return conversation_id.ok_or((ApiError::upstream(), false));
+            }
+            let value: Value =
+                serde_json::from_str(&data).map_err(|_| (ApiError::upstream(), false))?;
+            if conversation_id.is_none() {
+                conversation_id = search_find_string(&value, "conversation_id")
+                    .filter(|id| valid_search_conversation_id(id));
+            }
+        }
+    }
+}
+
+async fn sleep_search_poll_with_interval(deadline: Instant, interval: Duration) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return false;
+    }
+    tokio::time::sleep(remaining.min(interval)).await;
+    !deadline.saturating_duration_since(Instant::now()).is_zero()
+}
+
+fn search_find_string(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(object) => object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                object
+                    .values()
+                    .find_map(|value| search_find_string(value, key))
+            }),
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| search_find_string(value, key)),
+        _ => None,
+    }
+}
+
+fn valid_search_conversation_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && value.chars().count() <= 256
+        && value
+            .chars()
+            .all(|value| value.is_ascii_alphanumeric() || matches!(value, '_' | '.' | ':' | '-'))
+}
+
+fn extract_search_result(conversation_id: &str, conversation: &Value) -> Value {
+    let mapping = conversation.get("mapping").and_then(Value::as_object);
+    let mut selected: Option<&Map<String, Value>> = None;
+    let mut selected_time = f64::MIN;
+    if let Some(mapping) = mapping {
+        for node in mapping.values() {
+            let Some(message) = node.get("message").and_then(Value::as_object) else {
+                continue;
+            };
+            if message
+                .get("author")
+                .and_then(Value::as_object)
+                .and_then(|author| author.get("role"))
+                .and_then(Value::as_str)
+                != Some("assistant")
+            {
+                continue;
+            }
+            let create_time = message
+                .get("create_time")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(0.0);
+            if selected.is_none() || create_time >= selected_time {
+                selected = Some(message);
+                selected_time = create_time;
+            }
+        }
+    }
+    let message = selected;
+    let answer = message.map_or_else(String::new, search_message_text);
+    let status = message.and_then(search_message_status).unwrap_or_default();
+    let mut sources = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(message) = message {
+        search_collect_sources(message, &mut sources, &mut seen);
+    }
+    for token in answer.split_whitespace() {
+        if sources.len() >= NATIVE_SEARCH_MAX_SOURCES {
+            break;
+        }
+        if let Some(url) = normalize_public_search_url(&Value::String(token.to_owned()))
+            && seen.insert(url.clone())
+        {
+            sources.push(json!({"title":"", "url":url, "snippet":"", "source_type":""}));
+        }
+    }
+    json!({
+        "conversation_id": conversation_id,
+        "status": status,
+        "answer": answer,
+        "sources": sources,
+        "assistant_message_id": message
+            .and_then(|message| message.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default(),
+        "create_time": message
+            .and_then(|message| message.get("create_time"))
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0),
+    })
+}
+
+fn project_public_search_result(internal: &Value) -> Value {
+    let mut projected = Map::new();
+    projected.insert(
+        "answer".to_owned(),
+        Value::String(
+            internal
+                .get("answer")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        ),
+    );
+    let mut seen = HashSet::new();
+    let sources = internal
+        .get("sources")
+        .and_then(Value::as_array)
+        .map(|sources| {
+            sources
+                .iter()
+                .filter_map(|source| {
+                    if seen.len() >= NATIVE_SEARCH_MAX_SOURCES {
+                        return None;
+                    }
+                    let source = source.as_object()?;
+                    let url = normalize_public_search_url(source.get("url")?)?;
+                    if !seen.insert(url.clone()) {
+                        return None;
+                    }
+                    Some(json!({
+                        "title": public_search_text(source.get("title")),
+                        "url": url,
+                        "snippet": public_search_text(source.get("snippet")),
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    projected.insert("sources".to_owned(), Value::Array(sources));
+    if let Some(conversation_id) = internal
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .filter(|value| valid_search_conversation_id(value.trim()))
+    {
+        projected.insert(
+            "conversation_id".to_owned(),
+            Value::String(conversation_id.trim().to_owned()),
+        );
+    }
+    if let Some(status) = internal
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| {
+            matches!(
+                *status,
+                "finished_successfully" | "finished_partial_completion"
+            )
+        })
+    {
+        projected.insert("status".to_owned(), Value::String(status.to_owned()));
+    }
+    Value::Object(projected)
+}
+
+fn search_message_text(message: &Map<String, Value>) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    match content {
+        Value::String(value) => parts.push(value.clone()),
+        Value::Object(object) => {
+            if let Some(value) = object.get("text").and_then(Value::as_str) {
+                parts.push(value.to_owned());
+            }
+            if let Some(values) = object.get("parts").and_then(Value::as_array) {
+                for value in values {
+                    match value {
+                        Value::String(value) => parts.push(value.clone()),
+                        Value::Object(object) => {
+                            for field in ["text", "summary", "content"] {
+                                if let Some(value) = object.get(field).and_then(Value::as_str)
+                                    && !value.trim().is_empty()
+                                {
+                                    parts.push(value.to_owned());
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    parts
+        .into_iter()
+        .map(|part| part.trim().to_owned())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn search_message_status(message: &Map<String, Value>) -> Option<String> {
+    let direct = message
+        .get("metadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| {
+            metadata
+                .get("finish_details")
+                .and_then(Value::as_object)
+                .and_then(|details| details.get("type"))
+                .or_else(|| metadata.get("status"))
+        })
+        .and_then(Value::as_str)
+        .or_else(|| message.get("status").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(ToOwned::to_owned);
+    direct.or_else(|| search_known_status_in_map(message, 0))
+}
+
+fn search_known_status_in_map(message: &Map<String, Value>, depth: usize) -> Option<String> {
+    if depth > 4 {
+        return None;
+    }
+    if let Some(status) = message
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| !status.trim().is_empty())
+    {
+        return Some(status.trim().to_owned());
+    }
+    for field in [
+        "metadata",
+        "finish_details",
+        "content",
+        "parts",
+        "messages",
+        "message",
+        "data",
+        "result",
+    ] {
+        if let Some(status) = message
+            .get(field)
+            .and_then(|value| search_known_status_in_value(value, depth + 1))
+        {
+            return Some(status);
+        }
+    }
+    None
+}
+
+fn search_known_status_in_value(value: &Value, depth: usize) -> Option<String> {
+    match value {
+        Value::Object(object) => search_known_status_in_map(object, depth),
+        Value::Array(values) if depth <= 4 => values
+            .iter()
+            .take(128)
+            .find_map(|value| search_known_status_in_value(value, depth + 1)),
+        _ => None,
+    }
+}
+
+fn search_collect_sources(
+    message: &Map<String, Value>,
+    sources: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+) {
+    let Some(metadata) = message.get("metadata").and_then(Value::as_object) else {
+        return;
+    };
+    for field in ["sources", "search_sources", "citations", "url_citations"] {
+        if let Some(value) = metadata.get(field) {
+            search_collect_known_sources(value, sources, seen);
+        }
+    }
+}
+
+fn search_collect_known_sources(
+    value: &Value,
+    sources: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+) {
+    if sources.len() >= NATIVE_SEARCH_MAX_SOURCES {
+        return;
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                search_collect_known_sources(value, sources, seen);
+            }
+        }
+        Value::Object(object) => {
+            let url = object
+                .get("url")
+                .or_else(|| object.get("link"))
+                .or_else(|| object.get("source_url"))
+                .and_then(normalize_public_search_url);
+            if let Some(url) = url
+                && seen.insert(url.clone())
+            {
+                let title = ["title", "name", "source"]
+                    .iter()
+                    .find_map(|field| bounded_search_text(object.get(*field)))
+                    .unwrap_or_default();
+                let snippet = ["snippet", "text", "description"]
+                    .iter()
+                    .find_map(|field| bounded_search_text(object.get(*field)))
+                    .unwrap_or_default();
+                let source_type = ["type", "source_type"]
+                    .iter()
+                    .find_map(|field| bounded_search_text(object.get(*field)))
+                    .unwrap_or_default();
+                sources.push(json!({
+                    "title":title,
+                    "url":url,
+                    "snippet":snippet,
+                    "source_type":source_type
+                }));
+            }
+            for field in ["sources", "results", "items", "citations"] {
+                if let Some(value) = object.get(field) {
+                    search_collect_known_sources(value, sources, seen);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn bounded_search_text(value: Option<&Value>) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    (!value.is_empty()).then(|| {
+        value
+            .chars()
+            .take(NATIVE_SEARCH_MAX_FIELD_CHARS)
+            .collect::<String>()
+    })
+}
+
+fn public_search_text(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_str)
+        .map(|value| {
+            value
+                .trim()
+                .chars()
+                .take(NATIVE_SEARCH_MAX_FIELD_CHARS)
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_public_search_url(value: &Value) -> Option<String> {
+    let text = value
+        .as_str()?
+        .trim()
+        .trim_end_matches([',', '.', ';', '，', '。', '；']);
+    if text.is_empty()
+        || text.contains('\\')
+        || !valid_percent_encoding(text)
+        || text
+            .chars()
+            .any(|value| value.is_control() || value.is_whitespace())
+    {
+        return None;
+    }
+    let mut parsed = url::Url::parse(text).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    parsed.set_fragment(None);
+    Some(parsed.to_string())
+}
+
+fn valid_percent_encoding(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+async fn ppt_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    openai_proxy(state, headers, body, "ppt/generations").await
+}
+
+async fn psd_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    openai_proxy(state, headers, body, "psd/generations").await
+}
+
+fn editable_file_tasks_path(state: &AppState) -> PathBuf {
+    data_file(state, "editable_file_tasks.json")
+}
+
+fn read_editable_task_records(state: &AppState) -> Result<Vec<Value>, ApiError> {
+    let path = editable_file_tasks_path(state);
+    let Some(parent) = checked_parent_identity(&path)? else {
+        return Ok(Vec::new());
+    };
+    let name = path.file_name().ok_or_else(ApiError::unavailable)?;
+    if checked_regular_file_identity_optional(&parent, &path)?.is_none() {
+        return Ok(Vec::new());
+    }
+    let bytes = read_checked_bounded_file_at(&parent, name, MAX_EDITABLE_TASK_FILE_BYTES, false)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::unavailable())?;
+    let records = value
+        .get("tasks")
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+        .ok_or_else(ApiError::unavailable)?;
+    if records.len() > MAX_EDITABLE_TASKS {
+        return Err(ApiError::unavailable());
+    }
+    let mut result = Vec::with_capacity(records.len());
+    for record in records {
+        let object = record.as_object().ok_or_else(ApiError::unavailable)?;
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| valid_editable_task_id(value))
+            .ok_or_else(ApiError::unavailable)?;
+        let _owner_id = object
+            .get("owner_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && value.chars().count() <= 256)
+            .ok_or_else(ApiError::unavailable)?;
+        let status = object
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "queued" | "running" | "success" | "error"))
+            .ok_or_else(ApiError::unavailable)?;
+        let kind = object
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "ppt" | "psd"))
+            .ok_or_else(ApiError::unavailable)?;
+        let created_at = object
+            .get("created_at")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && value.chars().count() <= 128)
+            .ok_or_else(ApiError::unavailable)?;
+        let updated_at = object
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty() && value.chars().count() <= 128)
+            .ok_or_else(ApiError::unavailable)?;
+        let mut public = Map::new();
+        public.insert("id".to_owned(), Value::String(id.to_owned()));
+        public.insert("taskId".to_owned(), Value::String(id.to_owned()));
+        public.insert("status".to_owned(), Value::String(status.to_owned()));
+        public.insert("kind".to_owned(), Value::String(kind.to_owned()));
+        public.insert(
+            "created_at".to_owned(),
+            Value::String(created_at.to_owned()),
+        );
+        public.insert(
+            "updated_at".to_owned(),
+            Value::String(updated_at.to_owned()),
+        );
+        let start = object
+            .get("started_ts")
+            .or_else(|| object.get("created_ts"))
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or_default();
+        let end = object
+            .get("ended_ts")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|value| value.as_secs_f64())
+                    .unwrap_or(start)
+            });
+        public.insert(
+            "elapsed_seconds".to_owned(),
+            json!(if start > 0.0 {
+                (end - start).max(0.0).floor() as i64
+            } else {
+                0
+            }),
+        );
+        if let Some(result) = object.get("result") {
+            let result_object = result.as_object().ok_or_else(ApiError::unavailable)?;
+            if result_object.keys().any(|field| {
+                !matches!(
+                    field.as_str(),
+                    "conversation_id" | "primary_url" | "zip_url"
+                )
+            }) {
+                return Err(ApiError::unavailable());
+            }
+            let mut projected = Map::new();
+            for field in ["conversation_id", "primary_url", "zip_url"] {
+                if let Some(value) = result_object.get(field) {
+                    if !value.is_null() && !value.is_string() {
+                        return Err(ApiError::unavailable());
+                    }
+                    projected.insert(field.to_owned(), value.clone());
+                }
+            }
+            if !projected.is_empty() {
+                public.insert("result".to_owned(), Value::Object(projected));
+            }
+        }
+        if let Some(error) = object.get("error") {
+            if !error.is_null() && !error.is_string() {
+                return Err(ApiError::unavailable());
+            }
+            if error.as_str().is_some_and(|value| {
+                !value.is_empty()
+                    && !matches!(
+                        value,
+                        "editable file task failed"
+                            | "PSD 任务需要至少一张图片"
+                            | "服务已重启，未完成的任务已中断"
+                    )
+            }) {
+                return Err(ApiError::unavailable());
+            }
+            if error.as_str().is_some_and(|value| !value.is_empty()) {
+                public.insert("error".to_owned(), error.clone());
+            }
+        }
+        let mut raw = Map::new();
+        raw.insert("record".to_owned(), record.clone());
+        raw.insert("public".to_owned(), Value::Object(public));
+        result.push(Value::Object(raw));
+    }
+    Ok(result)
+}
+
+fn valid_editable_task_id(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value.chars().count() <= 256
+        && !value.contains(['/', '\\', ':', ','])
+        && value.chars().all(|character| !character.is_control())
+}
+
+async fn authenticated_subject(headers: &HeaderMap, state: &AppState) -> Result<String, ApiError> {
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(ApiError::unauthorized());
+    };
+    let Some((scheme, raw_token)) = value.split_once(' ') else {
+        return Err(ApiError::unauthorized());
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(ApiError::unauthorized());
+    }
+    let token = raw_token.trim();
+    if token.is_empty() {
+        return Err(ApiError::unauthorized());
+    }
+    if state
+        .config
+        .auth_key
+        .as_deref()
+        .is_some_and(|expected| constant_time_equal(token.as_bytes(), expected.trim().as_bytes()))
+    {
+        return Ok("admin".to_owned());
+    }
+    if !state.auth_store.reload().await {
+        return Err(ApiError::unauthorized());
+    }
+    state
+        .auth_store
+        .identity(token)
+        .map(|(_, subject, _)| subject)
+        .ok_or_else(ApiError::unauthorized)
+}
+
+async fn editable_file_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let subject = authenticated_subject(&headers, &state).await?;
+    let requested = query
+        .get("ids")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if requested.len() > MAX_EDITABLE_TASKS {
+        return Err(ApiError::invalid_request());
+    }
+    let records = read_editable_task_records(&state)?;
+    let mut items = Vec::new();
+    let mut found = HashSet::new();
+    for record in records {
+        let owner = record
+            .get("record")
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("owner_id"))
+            .and_then(Value::as_str);
+        if owner != Some(subject.as_str()) {
+            continue;
+        }
+        let id = record
+            .get("public")
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if requested.is_empty() || requested.iter().any(|value| value == id) {
+            found.insert(id.to_owned());
+            if let Some(public) = record.get("public") {
+                items.push(public.clone());
+            }
+        }
+    }
+    items.sort_by(|left, right| {
+        right["updated_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(left["updated_at"].as_str().unwrap_or_default())
+    });
+    let missing_ids = requested
+        .iter()
+        .filter(|id| !found.contains(id.as_str()))
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"items": items, "missing_ids": missing_ids})))
+}
+
+fn editable_capability_digest(
+    capability: &str,
+    owner_id: &str,
+    kind: &str,
+    task_id: &str,
+    relative_path: &str,
+) -> String {
+    let payload = format!("{capability}\0{owner_id}\0{kind}\0{task_id}\0{relative_path}");
+    Sha256::digest(payload.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn editable_relative_path(value: &str) -> Option<String> {
+    let normalized = value.replace('\\', "/");
+    let parts = normalized.split('/').collect::<Vec<_>>();
+    if parts.is_empty()
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || matches!(*part, "." | "..")
+                || part.contains(':')
+                || part.chars().any(char::is_control)
+        })
+    {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+fn editable_content_type(path: &str) -> &'static str {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "psd" => "image/vnd.adobe.photoshop",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn download_editable_file(
+    State(state): State<AppState>,
+    AxumPath(file_path): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let parts = file_path.replace('\\', "/");
+    let parts = parts.trim_start_matches('/').split('/').collect::<Vec<_>>();
+    if parts.len() < 5 {
+        return Err(ApiError::not_found());
+    }
+    let capability = parts[0];
+    let owner_scope = parts[1];
+    let kind = parts[2];
+    let task_id = parts[3];
+    if capability.is_empty()
+        || capability.chars().count() > 256
+        || owner_scope.len() != 64
+        || !owner_scope
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !matches!(kind, "ppt" | "psd")
+        || !valid_editable_task_id(task_id)
+    {
+        return Err(ApiError::not_found());
+    }
+    let relative_path =
+        editable_relative_path(&parts[4..].join("/")).ok_or_else(ApiError::not_found)?;
+    let records = read_editable_task_records(&state)?;
+    let Some(_task) = records.into_iter().find_map(|record| {
+        let raw = record.get("record")?.as_object()?;
+        if raw.get("id").and_then(Value::as_str) != Some(task_id)
+            || raw.get("kind").and_then(Value::as_str) != Some(kind)
+            || raw.get("status").and_then(Value::as_str) != Some("success")
+        {
+            return None;
+        }
+        let owner = raw.get("owner_id").and_then(Value::as_str)?;
+        let computed_scope = Sha256::digest(owner.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if computed_scope != owner_scope {
+            return None;
+        }
+        let digest = raw
+            .get("download_capability_hashes")
+            .and_then(Value::as_object)?
+            .get(&relative_path)
+            .and_then(Value::as_str)?;
+        let expected = editable_capability_digest(capability, owner, kind, task_id, &relative_path);
+        constant_time_equal(digest.as_bytes(), expected.as_bytes())
+            .then_some((owner.to_owned(), raw.clone()))
+    }) else {
+        return Err(ApiError::not_found());
+    };
+    let output_dir = state
+        .data_dir
+        .join("files")
+        .join(owner_scope)
+        .join(kind)
+        .join(task_id);
+    let target = output_dir.join(&relative_path);
+    let parent = checked_directory_handle(target.parent().ok_or_else(ApiError::not_found)?)
+        .map_err(|_| ApiError::not_found())?;
+    let name = target.file_name().ok_or_else(ApiError::not_found)?;
+    let bytes = read_checked_bounded_file_at(&parent, name, MAX_EDITABLE_FILE_BYTES, false)
+        .map_err(|_| ApiError::not_found())?;
+    let filename = name.to_string_lossy().replace('"', "");
+    let disposition = format!("attachment; filename=\"{filename}\"");
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, editable_content_type(&relative_path)),
+            (header::CONTENT_DISPOSITION, disposition.as_str()),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+async fn read_tasks(state: &AppState) -> Vec<Value> {
+    let path = data_file(state, "image_tasks.json");
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .and_then(|value: Value| value.as_array().cloned())
+        .unwrap_or_default()
+}
+
+fn write_tasks(state: &AppState, tasks: &[Value]) -> Result<(), ApiError> {
+    fs::create_dir_all(state.data_dir.as_ref()).map_err(|_| ApiError::unavailable())?;
+    let path = data_file(state, "image_tasks.json");
+    let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec(tasks).map_err(|_| ApiError::unavailable())?;
+    if fs::write(&temp, bytes).is_err() {
+        let _ = fs::remove_file(&temp);
+        return Err(ApiError::unavailable());
+    }
+    fs::rename(&temp, &path).map_err(|_| {
+        let _ = fs::remove_file(&temp);
+        ApiError::unavailable()
+    })
+}
+
+async fn image_tasks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authenticated(&headers, &state).await?;
+    Ok(Json(json!({"items": read_tasks(&state).await})))
+}
+
+async fn image_task_generation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    authenticated(&headers, &state).await?;
+    let value = account_json_body(body).await?;
+    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let task_id = object
+        .get("client_task_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && !value.contains(','))
+        .ok_or_else(ApiError::invalid_request)?
+        .to_owned();
+    let mut tasks = read_tasks(&state).await;
+    let task =
+        json!({"id": task_id, "client_task_id": task_id, "status": "queued", "request": value});
+    tasks.retain(|item| item.get("id") != Some(&Value::String(task_id.clone())));
+    tasks.push(task.clone());
+    write_tasks(&state, &tasks)?;
+    Ok(Json(task))
+}
+
+async fn image_task_edit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    image_task_generation(State(state), headers, body).await
+}
+
+async fn image_task_resume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    authenticated(&headers, &state).await?;
+    read_tasks(&state)
+        .await
+        .into_iter()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(task_id.as_str()))
+        .map(Json)
+        .ok_or_else(ApiError::unavailable)
+}
+
+async fn api_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authenticated(&headers, &state).await?;
+    let mut config = read_legacy_config(state.config_path.as_ref());
+    if !config.is_object() {
+        config = json!({});
+    }
+    if let Some(object) = config.as_object_mut() {
+        object.insert(
+            "version".to_owned(),
+            Value::String(state.config.version.clone()),
+        );
+        object.insert(
+            "models".to_owned(),
+            Value::Array(
+                state
+                    .config
+                    .models
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "data_dir".to_owned(),
+            Value::String(state.data_dir.to_string_lossy().into_owned()),
+        );
+    }
+    Ok(Json(json!({"config": redact_config(config)})))
+}
+
+async fn api_settings_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    authenticated(&headers, &state).await?;
+    let value = account_json_body(body).await?;
+    let updates = value.get("config").cloned().unwrap_or(value);
+    let updates = updates.as_object().ok_or_else(ApiError::invalid_request)?;
+    if updates.keys().any(|key| {
+        let key = key.to_ascii_lowercase();
+        key.contains("password")
+            || key.contains("secret")
+            || key.contains("api_key")
+            || key == "auth-key"
+            || key == "auth_key"
+    }) {
+        return Err(ApiError::invalid_request());
+    }
+    let mut config = read_legacy_config(state.config_path.as_ref());
+    let target = config.as_object_mut().ok_or_else(ApiError::unavailable)?;
+    for (key, update) in updates {
+        target.insert(key.clone(), update.clone());
+    }
+    write_legacy_config(state.config_path.as_ref(), &config)?;
+    Ok(Json(json!({"config": redact_config(config)})))
+}
+
+async fn api_third_party_apps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authenticated(&headers, &state).await?;
+    let config = read_legacy_config(state.config_path.as_ref());
+    Ok(Json(json!({
+        "third_party_apps": config.get("third_party_apps").cloned().unwrap_or_else(|| json!({}))
+    })))
+}
+
+async fn api_storage_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authenticated(&headers, &state).await?;
+    let path = state.data_dir.as_ref();
+    Ok(Json(json!({
+        "backend": "local",
+        "path": path.to_string_lossy(),
+        "exists": path.is_dir(),
+        "health": {"status": if path.is_dir() { "healthy" } else { "unavailable" }},
+    })))
+}
+
+fn absolute_legacy_config_path(initial_cwd: &Path, data_dir: &Path) -> PathBuf {
+    let path = env::var_os("CHATGPT2API_CONFIG_FILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let path = Path::new("/app/config.json");
+            path.is_file().then(|| path.to_owned())
+        })
+        .unwrap_or_else(|| data_dir.join("config.json"));
+    if path.is_absolute() {
+        path
+    } else {
+        initial_cwd.join(path)
+    }
+}
+
+fn read_legacy_config(path: &Path) -> Value {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
+fn write_legacy_config(path: &Path, value: &Value) -> Result<(), ApiError> {
+    let bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::unavailable())?;
+    let _lock = acquire_path_write_lock_sync(path)?;
+    atomic_replace_checked_with_limit(path, &bytes, MAX_REQUEST_BODY_BYTES as u64, false)
+}
+
+fn redact_config(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| {
+                    let lowered = key.to_ascii_lowercase();
+                    let redacted = lowered.contains("password")
+                        || lowered.contains("secret")
+                        || lowered.contains("api_key")
+                        || lowered == "auth-key"
+                        || lowered == "auth_key";
+                    (
+                        key,
+                        if redacted {
+                            Value::String("[redacted]".to_owned())
+                        } else {
+                            redact_config(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_config).collect()),
+        value => value,
+    }
+}
+
+fn server_registry_path(state: &AppState, kind: &str) -> PathBuf {
+    let file = match kind {
+        "cpa_pools" => "cpa_config.json",
+        "sub2api" => "sub2api_config.json",
+        "ccload" => "ccload_config.json",
+        _ => return data_file(state, &format!("{kind}_servers.json")),
+    };
+    data_file(state, file)
+}
+
+fn read_server_registry(state: &AppState, kind: &str) -> Vec<Value> {
+    let path = server_registry_path(state, kind);
+    let parent = match checked_parent_identity(&path) {
+        Ok(Some(parent)) => parent,
+        Ok(None) | Err(_) => return Vec::new(),
+    };
+    let name = match path.file_name() {
+        Some(name) => name,
+        None => return Vec::new(),
+    };
+    match checked_regular_file_identity_optional(&parent, &path) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => return Vec::new(),
+    }
+    read_checked_bounded_file_at(&parent, name, MAX_REGISTRY_FILE_BYTES, false)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .as_array()
+                .cloned()
+                .or_else(|| (kind == "cpa_pools").then(|| vec![value]))
+        })
+        .unwrap_or_default()
+}
+
+fn read_server_registry_for_mutation(state: &AppState, kind: &str) -> Result<Vec<Value>, ApiError> {
+    let path = server_registry_path(state, kind);
+    let parent = ensure_checked_parent(&path)?;
+    let name = path.file_name().ok_or_else(ApiError::unavailable)?;
+    let bytes = match checked_regular_file_identity_optional(&parent, &path)? {
+        Some(_) => read_checked_bounded_file_at(&parent, name, MAX_REGISTRY_FILE_BYTES, false)?,
+        None => return Ok(Vec::new()),
+    };
+    let value = serde_json::from_slice::<Value>(&bytes).map_err(|_| ApiError::unavailable())?;
+    value
+        .as_array()
+        .cloned()
+        .or_else(|| (kind == "cpa_pools").then(|| vec![value]))
+        .ok_or_else(ApiError::unavailable)
+}
+
+fn registry_mutation_gate(path: &Path) -> Arc<StdMutex<()>> {
+    let mut gates = REGISTRY_MUTATION_GATES
+        .lock()
+        .expect("registry mutation gates lock");
+    gates
+        .entry(path.to_owned())
+        .or_insert_with(|| Arc::new(StdMutex::new(())))
+        .clone()
+}
+
+fn write_server_registry_unlocked(
+    state: &AppState,
+    kind: &str,
+    items: &[Value],
+) -> Result<(), ApiError> {
+    let path = server_registry_path(state, kind);
+    let bytes = serde_json::to_vec(items).map_err(|_| ApiError::unavailable())?;
+    atomic_replace_checked_with_limit(&path, &bytes, MAX_REGISTRY_FILE_BYTES, false)
+}
+
+fn mutate_server_registry<F, R>(state: &AppState, kind: &str, mutator: F) -> Result<R, ApiError>
+where
+    F: FnOnce(&mut Vec<Value>) -> Result<R, ApiError>,
+{
+    let path = server_registry_path(state, kind);
+    let gate = registry_mutation_gate(&path);
+    let _guard = gate.lock().expect("registry mutation gate");
+    let _file_lock = acquire_path_write_lock_sync(&path)?;
+    let mut items = read_server_registry_for_mutation(state, kind)?;
+    let result = mutator(&mut items)?;
+    write_server_registry_unlocked(state, kind, &items)?;
+    Ok(result)
+}
+
+fn health_counter(value: Option<&Value>) -> u64 {
+    value
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+        })
+        .unwrap_or_default()
+}
+
+fn read_health_bounded_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > max_bytes {
+        return None;
+    }
+    Some(bytes)
+}
+
+fn health_cumulative_total(state: &AppState, total: u64) -> u64 {
+    let Some(path) = state.account_store.path.as_deref() else {
+        return total;
+    };
+    let sidecar = path.parent().map(|parent| parent.join(".cumulative_total"));
+    let sidecar_total = sidecar
+        .as_deref()
+        .and_then(|path| read_health_bounded_file(path, MAX_ACCOUNT_SNAPSHOT_BYTES))
+        .and_then(|bytes| {
+            std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+        .unwrap_or_default();
+    let snapshot_total = read_health_bounded_file(path, MAX_ACCOUNT_SNAPSHOT_BYTES)
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("cumulative_total").cloned())
+        .map(|value| health_counter(Some(&value)))
+        .unwrap_or_default();
+    total.max(sidecar_total).max(snapshot_total)
+}
+
+fn health_accounts(state: &AppState) -> Value {
+    #[cfg(test)]
+    if let Some(hook) = HEALTH_ACCOUNTS_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .filter(|hook| hook.version == state.config.version)
+    {
+        hook.starts.fetch_add(1, Ordering::SeqCst);
+        hook.started.notify_waiters();
+        while hook.block.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let records = state.account_store.raw_records();
+    let total = records.len() as u64;
+    let mut active = 0u64;
+    let mut limited = 0u64;
+    let mut abnormal = 0u64;
+    let mut disabled = 0u64;
+    let mut total_quota = 0u64;
+    let mut total_success = 0u64;
+    let mut total_fail = 0u64;
+    let mut by_type = Map::new();
+    for record in &records {
+        let object = record.as_object();
+        match object
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+        {
+            Some("正常") => {
+                active += 1;
+                total_quota = total_quota
+                    .saturating_add(health_counter(object.and_then(|value| value.get("quota"))));
+            }
+            Some("限流") => limited += 1,
+            Some("异常") => abnormal += 1,
+            Some("禁用") => disabled += 1,
+            _ => {}
+        }
+        total_success = total_success.saturating_add(health_counter(
+            object.and_then(|value| value.get("success")),
+        ));
+        total_fail =
+            total_fail.saturating_add(health_counter(object.and_then(|value| value.get("fail"))));
+        let raw_account_type = object
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("free");
+        let account_type = match raw_account_type {
+            "free" | "Plus" | "Pro" | "ProLite" | "Team" | "Enterprise" => raw_account_type,
+            _ => "other",
+        };
+        let bucket = by_type
+            .entry(account_type.to_owned())
+            .or_insert_with(|| Value::from(0u64));
+        *bucket = Value::from(health_counter(Some(bucket)).saturating_add(1));
+    }
+    json!({
+        "total": total,
+        "cumulative_total": health_cumulative_total(state, total),
+        "active": active,
+        "limited": limited,
+        "abnormal": abnormal,
+        "disabled": disabled,
+        "total_quota": total_quota,
+        "total_success": total_success,
+        "total_fail": total_fail,
+        "by_type": by_type,
+    })
+}
+
+fn health_storage(state: &AppState) -> (Value, bool) {
+    #[cfg(test)]
+    if let Some(hook) = HEALTH_STORAGE_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .filter(|hook| hook.version == state.config.version)
+    {
+        hook.starts.fetch_add(1, Ordering::SeqCst);
+        hook.started.notify_waiters();
+        while hook.block.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let mut healthy = state.data_dir.is_dir() && fs::read_dir(state.data_dir.as_ref()).is_ok();
+    if healthy && let Some(path) = state.account_store.path.as_deref() {
+        healthy = read_account_snapshot(path).is_ok();
+    }
+    if healthy && let Some(path) = state.auth_store.path.as_deref() {
+        healthy = read_auth_snapshot(path).is_ok();
+    }
+    if healthy && let Some(path) = state.models.configured_path() {
+        healthy = ModelCatalog::load_with_fingerprint(Some(&path), &[]).is_ok();
+    }
+    let status = if healthy { "healthy" } else { "unhealthy" };
+    let health = if healthy {
+        json!({"status": status})
+    } else {
+        json!({"status": status, "error": "存储后端健康检查失败"})
+    };
+    (json!({"backend": "json", "health": health}), healthy)
+}
+
+fn unhealthy_health_storage() -> (Value, bool) {
+    (
+        json!({
+            "backend": "json",
+            "health": {"status": "unhealthy", "error": "存储后端健康检查失败"},
+        }),
+        false,
+    )
+}
+
+fn empty_health_accounts() -> Value {
+    json!({
+        "total": 0,
+        "cumulative_total": 0,
+        "active": 0,
+        "limited": 0,
+        "abnormal": 0,
+        "disabled": 0,
+        "total_quota": 0,
+        "total_success": 0,
+        "total_fail": 0,
+        "by_type": {},
+    })
+}
+
+fn health_payload_with_storage(state: &AppState, accounts: Value, storage: (Value, bool)) -> Value {
+    let (storage, storage_healthy) = storage;
+    let healthy = accounts
+        .get("active")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+        > 0
+        && storage_healthy;
+    json!({
+        "status": if healthy { "ok" } else { "degraded" },
+        "healthy": healthy,
+        "version": state.config.version,
+        "storage": storage,
+        "proxy_runtime": management::health_proxy_runtime(state),
+        "accounts": accounts,
+    })
+}
+
+fn health_html_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn health_html_text(value: &Value) -> String {
+    match value {
+        Value::String(value) => health_html_escape(value),
+        Value::Number(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn health_html(payload: &Value) -> String {
+    let status = payload["status"].as_str().unwrap_or("degraded");
+    let healthy = status == "ok";
+    let status_class = if healthy {
+        "status-ok"
+    } else {
+        "status-degraded"
+    };
+    let status_color = if healthy { "green" } else { "yellow" };
+    let status_text = if healthy { "正常" } else { "异常" };
+    let accounts = &payload["accounts"];
+    let mut by_type = accounts["by_type"]
+        .as_object()
+        .map(|items| {
+            let mut items = items.iter().collect::<Vec<_>>();
+            items.sort_by(|left, right| left.0.cmp(right.0));
+            items
+        })
+        .unwrap_or_default();
+    let type_rows = if by_type.is_empty() {
+        "<tr><td colspan=\"2\">暂无数据</td></tr>".to_owned()
+    } else {
+        by_type
+            .drain(..)
+            .map(|(account_type, count)| {
+                format!(
+                    "<tr><td>{}</td><td>{}</td></tr>",
+                    health_html_escape(account_type),
+                    health_html_text(count),
+                )
+            })
+            .collect::<String>()
+    };
+    let version = health_html_text(&payload["version"]);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>号池健康监控 - chatgpt2api</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
+.header{{background:#1a1d27;border-bottom:1px solid #2a2d3a;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}}
+.header h1{{font-size:20px}}
+.status-dot{{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}}
+.status-ok{{background:#22c55e;box-shadow:0 0 8px #22c55e88}}
+.status-degraded{{background:#f59e0b;box-shadow:0 0 8px #f59e0b88}}
+.container{{max-width:960px;margin:0 auto;padding:24px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px}}
+.card{{background:#1a1d27;border:1px solid #2a2d3a;border-radius:10px;padding:16px}}
+.card .value{{font-size:28px;font-weight:700;margin:4px 0}}
+.card .label{{font-size:13px;color:#94a3b8}}
+.green{{color:#22c55e}}.yellow{{color:#f59e0b}}.red{{color:#ef4444}}.blue{{color:#6c63ff}}
+table{{width:100%;border-collapse:collapse;background:#1a1d27;border:1px solid #2a2d3a;border-radius:10px;overflow:hidden}}
+th{{background:#242836;font-weight:600;text-align:left;padding:10px 12px;font-size:12px;color:#94a3b8;text-transform:uppercase}}
+td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{background:rgba(108,99,255,.05)}}
+.api-url{{font-family:monospace;font-size:12px;color:#6c63ff}}
+.refresh{{font-size:12px;color:#64748b;text-align:center;margin-top:24px}}
+</style>
+<meta http-equiv="refresh" content="30">
+</head>
+<body>
+<div class="header">
+<h1><span class="status-dot {status_class}"></span>号池健康监控</h1>
+<div style="font-size:13px;color:#94a3b8">v{version} · 30s 自动刷新</div>
+</div>
+<div class="container">
+<div class="cards">
+<div class="card"><div class="label">号池状态</div><div class="value {status_color}">{status_text}</div></div>
+<div class="card"><div class="label">当前账号</div><div class="value blue">{total}</div></div>
+<div class="card"><div class="label">累计入库</div><div class="value">{cumulative_total}</div></div>
+<div class="card"><div class="label">可用账号</div><div class="value green">{active}</div></div>
+<div class="card"><div class="label">剩余额度</div><div class="value">{total_quota}</div></div>
+<div class="card"><div class="label">限流</div><div class="value yellow">{limited}</div></div>
+<div class="card"><div class="label">异常</div><div class="value red">{abnormal}</div></div>
+<div class="card"><div class="label">禁用</div><div class="value">{disabled}</div></div>
+<div class="card"><div class="label">成功/失败</div><div class="value">{total_success}<span style="font-size:18px;color:#94a3b8">/</span><span class="red">{total_fail}</span></div></div>
+</div>
+<h2 style="margin-bottom:12px;font-size:16px">账号类型分布</h2>
+<table><tr><th>类型</th><th>数量</th></tr>{type_rows}</table>
+<div class="refresh">JSON: <span class="api-url">/health?format=json</span></div>
+</div></body></html>"#,
+        total = health_html_text(&accounts["total"]),
+        cumulative_total = health_html_text(&accounts["cumulative_total"]),
+        active = health_html_text(&accounts["active"]),
+        total_quota = health_html_text(&accounts["total_quota"]),
+        limited = health_html_text(&accounts["limited"]),
+        abnormal = health_html_text(&accounts["abnormal"]),
+        disabled = health_html_text(&accounts["disabled"]),
+        total_success = health_html_text(&accounts["total_success"]),
+        total_fail = health_html_text(&accounts["total_fail"]),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,25 +6121,88 @@ struct HealthQuery {
 }
 
 async fn health(State(state): State<AppState>, Query(query): Query<HealthQuery>) -> Response {
-    let _ = state.account_store.reload().await;
-    let payload = health_payload(&state);
+    const OVERALL: Duration = Duration::from_millis(500);
+    const SUBCHECK: Duration = Duration::from_millis(250);
+    let account_store = state.account_store.clone();
+    let account_state = state.clone();
+    let storage_state = state.clone();
+    let probes = async move {
+        let account_probe = async move {
+            let reloaded = tokio::time::timeout(SUBCHECK, account_store.reload())
+                .await
+                .ok()
+                .unwrap_or(false);
+            if !reloaded {
+                return empty_health_accounts();
+            }
+            let permit =
+                tokio::time::timeout(SUBCHECK, HEALTH_ACCOUNTS_SEMAPHORE.clone().acquire_owned())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            let Some(permit) = permit else {
+                return empty_health_accounts();
+            };
+            tokio::time::timeout(
+                SUBCHECK,
+                tokio::task::spawn_blocking(move || {
+                    let accounts = health_accounts(&account_state);
+                    drop(permit);
+                    accounts
+                }),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_else(empty_health_accounts)
+        };
+        let storage_probe = async {
+            let permit =
+                tokio::time::timeout(SUBCHECK, HEALTH_STORAGE_SEMAPHORE.clone().acquire_owned())
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+            let Some(permit) = permit else {
+                return (
+                    json!({
+                        "backend": "json",
+                        "health": {"status": "unhealthy", "error": "存储后端健康检查失败"},
+                    }),
+                    false,
+                );
+            };
+            tokio::time::timeout(
+                SUBCHECK,
+                tokio::task::spawn_blocking(move || {
+                    let storage = health_storage(&storage_state);
+                    drop(permit);
+                    storage
+                }),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_else(unhealthy_health_storage)
+        };
+        tokio::join!(account_probe, storage_probe)
+    };
+    let (accounts, storage) = tokio::time::timeout(OVERALL, probes)
+        .await
+        .unwrap_or_else(|_| (empty_health_accounts(), unhealthy_health_storage()));
+    let payload = health_payload_with_storage(&state, accounts, storage);
     if query.format.as_deref() == Some("json") {
         return Json(payload).into_response();
     }
-    let status = payload["status"].as_str().unwrap_or("degraded");
-    Html(format!(
-        "<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"utf-8\"><title>号池健康监控</title></head><body><h1>号池健康监控</h1><p>status: {status}</p></body></html>"
-    ))
-    .into_response()
+    Html(health_html(&payload)).into_response()
 }
 
 const ACCOUNT_TYPE_MODEL_TTL: Duration = Duration::from_secs(300);
 const ACCOUNT_TYPE_MODEL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const ACCOUNT_TYPE_MODEL_REFRESH_DEADLINE: Duration = Duration::from_secs(90);
 const ACCOUNT_TYPE_REFRESH_CONCURRENCY: usize = 4;
-// Model discovery is published by normalized account type, but each source
-// capability owns its own representative and endpoint.  A credential is
-// never sent to an endpoint that belongs to another source capability.
+// Model discovery is published by normalized account type.  One authenticated
+// Web catalog represents the type; source_type remains metadata for later
+// conversation capability routing.
 #[derive(Clone)]
 struct CatalogOwners {
     candidates: Vec<CatalogAccountCandidate>,
@@ -945,7 +6568,16 @@ impl AccountTypeCatalog {
                         let needs_refresh =
                             snapshot.entries.get(account_group).is_none_or(|entry| {
                                 let owner_invalid = !entry.owners.is_current(candidates);
+                                let live_sources = candidates
+                                    .iter()
+                                    .map(|candidate| candidate.source_type.clone())
+                                    .collect::<HashSet<_>>();
+                                let source_capability_changed = entry
+                                    .model_sources
+                                    .values()
+                                    .any(|sources| sources != &live_sources);
                                 owner_invalid
+                                    || source_capability_changed
                                     || ((!entry.ready || now >= entry.expires_at)
                                         && now >= entry.retry_at)
                             });
@@ -1259,104 +6891,35 @@ impl AccountTypeCatalog {
         deadline: Instant,
     ) -> Option<(Vec<PublicModel>, CatalogOwners, bool)> {
         if self.protocol == UpstreamProtocol::ChatGpt {
-            let mut source_groups = Vec::<(String, Vec<CatalogAccountCandidate>)>::new();
+            // Upstream model discovery has one authenticated Web catalog per
+            // normalized account type.  source_type is only a later
+            // conversation capability selector; it never selects another
+            // model-discovery endpoint.  Try the next same-type candidate
+            // only when this representative's Web request fails.
             for candidate in candidate_accounts {
-                if let Some((_, candidates)) = source_groups
-                    .iter_mut()
-                    .find(|(source, _)| source == &candidate.source_type)
+                if let Some(models) = self
+                    .fetch_native_models(
+                        &candidate.token,
+                        Some(account_group),
+                        candidate.chatgpt_account_id.as_deref(),
+                        deadline,
+                    )
+                    .await
                 {
-                    candidates.push(candidate.clone());
-                } else {
-                    source_groups.push((candidate.source_type.clone(), vec![candidate.clone()]));
+                    let live_sources = candidate_accounts
+                        .iter()
+                        .map(|candidate| candidate.source_type.clone())
+                        .collect::<HashSet<_>>();
+                    let model_sources = models
+                        .iter()
+                        .map(|model| (model.id.clone(), live_sources.clone()))
+                        .collect();
+                    return Some((
+                        models,
+                        CatalogOwners::with_model_sources(vec![candidate.clone()], model_sources),
+                        true,
+                    ));
                 }
-            }
-
-            // Each source capability gets one independent representative
-            // search.  In particular, a Web credential is never probed via
-            // the Codex endpoint and vice versa.  The futures are still
-            // concurrent so one slow capability cannot starve another.
-            let mut source_fetches = FuturesUnordered::new();
-            let mut expected_source_count = 0usize;
-            let mut complete = !source_groups.is_empty();
-            for (source_type, candidates) in source_groups {
-                let source_supported = matches!(
-                    source_type.as_str(),
-                    "web" | "password" | "password-oauth" | "codex"
-                );
-                if !source_supported {
-                    complete = false;
-                    continue;
-                }
-                expected_source_count += 1;
-                let account_group = account_group.clone();
-                source_fetches.push(async move {
-                    match source_type.as_str() {
-                        "web" | "password" | "password-oauth" => {
-                            let mut result = None;
-                            for candidate in &candidates {
-                                if let Some(models) = self
-                                    .fetch_native_models(
-                                        &candidate.token,
-                                        Some(&account_group),
-                                        candidate.chatgpt_account_id.as_deref(),
-                                        deadline,
-                                    )
-                                    .await
-                                {
-                                    result = Some((models, candidate.clone()));
-                                    break;
-                                }
-                            }
-                            result
-                        }
-                        "codex" => {
-                            let mut result = None;
-                            for candidate in &candidates {
-                                if let Some(models) = self
-                                    .fetch_codex_models(
-                                        &candidate.token,
-                                        Some(&account_group),
-                                        candidate.chatgpt_account_id.as_deref(),
-                                        deadline,
-                                    )
-                                    .await
-                                {
-                                    result = Some((models, candidate.clone()));
-                                    break;
-                                }
-                            }
-                            result
-                        }
-                        _ => None,
-                    }
-                });
-            }
-
-            let mut models = Vec::new();
-            let mut owners = Vec::new();
-            let mut model_sources = HashMap::<String, HashSet<String>>::new();
-            while let Some(result) = source_fetches.next().await {
-                match result {
-                    Some((source_models, owner)) => {
-                        for model in &source_models {
-                            model_sources
-                                .entry(model.id.clone())
-                                .or_default()
-                                .insert(owner.source_type.clone());
-                        }
-                        models = Self::merge_catalog_models(models, source_models);
-                        owners.push(owner);
-                    }
-                    None => complete = false,
-                }
-            }
-            complete &= owners.len() == expected_source_count;
-            if !models.is_empty() {
-                return Some((
-                    models,
-                    CatalogOwners::with_model_sources(owners, model_sources),
-                    complete,
-                ));
             }
             return None;
         }
@@ -1422,38 +6985,11 @@ impl AccountTypeCatalog {
         None
     }
 
-    fn merge_catalog_models(
-        mut first: Vec<PublicModel>,
-        second: Vec<PublicModel>,
-    ) -> Vec<PublicModel> {
-        let mut merged = HashMap::<String, PublicModel>::new();
-        for model in first.drain(..).chain(second) {
-            if let Some(existing) = merged.get_mut(&model.id) {
-                existing.allow_anonymous |= model.allow_anonymous;
-                for account_type in model.supported_account_types {
-                    if !existing.supported_account_types.contains(&account_type) {
-                        existing.supported_account_types.push(account_type);
-                    }
-                }
-                for effort in model.supported_reasoning_efforts {
-                    if !existing.supported_reasoning_efforts.contains(&effort) {
-                        existing.supported_reasoning_efforts.push(effort);
-                    }
-                }
-            } else {
-                merged.insert(model.id.clone(), model);
-            }
-        }
-        let mut models = merged.into_values().collect::<Vec<_>>();
-        models.sort_by(|left, right| left.id.cmp(&right.id));
-        models
-    }
-
     async fn fetch_native_models(
         &self,
         token: &str,
         account_type: Option<&str>,
-        chatgpt_account_id: Option<&str>,
+        account_id: Option<&str>,
         deadline: Instant,
     ) -> Option<Vec<PublicModel>> {
         let base_url = self.base_url.as_deref()?;
@@ -1498,7 +7034,7 @@ impl AccountTypeCatalog {
             );
         if authenticated {
             request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
-            if let Some(account_id) = chatgpt_account_id.filter(|value| !value.is_empty()) {
+            if let Some(account_id) = account_id {
                 request = request.header("ChatGPT-Account-ID", account_id);
             }
         }
@@ -1519,49 +7055,6 @@ impl AccountTypeCatalog {
         .ok()?;
         let value = serde_json::from_slice::<Value>(&body).ok()?;
         project_remote_model_list(&value, "models", !authenticated, account_type, true, false)
-    }
-
-    async fn fetch_codex_models(
-        &self,
-        token: &str,
-        account_type: Option<&str>,
-        chatgpt_account_id: Option<&str>,
-        deadline: Instant,
-    ) -> Option<Vec<PublicModel>> {
-        let base_url = self.base_url.as_deref()?;
-        let version = self.codex_client_version()?;
-        let url = format!(
-            "{}/backend-api/codex/models?client_version={version}",
-            base_url.trim_end_matches('/')
-        );
-        let mut request = self
-            .client
-            .get(url)
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::ACCEPT, "application/json")
-            .header("originator", "codex_cli_rs")
-            .header("User-Agent", format!("codex_cli_rs/{version}"))
-            .header("version", version);
-        if let Some(account_id) = chatgpt_account_id.filter(|value| !value.is_empty()) {
-            request = request.header("ChatGPT-Account-ID", account_id);
-        }
-        let response =
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
-                .await
-                .ok()?
-                .ok()?;
-        if !response.status().is_success() || upstream_declares_oversize(&response) {
-            return None;
-        }
-        let body = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            bounded_response_body(response),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        let value = serde_json::from_slice::<Value>(&body).ok()?;
-        project_remote_model_list(&value, "models", false, account_type, true, true)
     }
 
     async fn fetch_anonymous_models(&self, deadline: Instant) -> Option<Vec<PublicModel>> {
@@ -1653,6 +7146,61 @@ impl AccountTypeCatalog {
                     model.supported_account_types = vec![account_type.to_ascii_lowercase()];
                     indexes.insert(model.id.clone(), models.len());
                     models.push(model);
+                }
+            }
+        }
+
+        if self.protocol == UpstreamProtocol::ChatGpt {
+            let mut web_image_types = HashSet::new();
+            let mut codex_image_types = HashSet::new();
+            for (account_group, candidates) in &snapshot.live_candidates {
+                let group = account_group.to_ascii_lowercase();
+                for candidate in candidates {
+                    match candidate.source_type.as_str() {
+                        "web" | "password" | "password-oauth" => {
+                            web_image_types.insert(group.clone());
+                        }
+                        "codex" if matches!(group.as_str(), "plus" | "team" | "pro") => {
+                            codex_image_types.insert(group.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let mut upsert_image_model = |id: String, supported: Vec<String>| {
+                if let Some(index) = indexes.get(&id).copied() {
+                    models[index].allow_anonymous = false;
+                    models[index].supported_account_types = supported;
+                } else {
+                    indexes.insert(id.clone(), models.len());
+                    models.push(PublicModel {
+                        id: id.clone(),
+                        object: "model",
+                        created: 0,
+                        owned_by: "chatgpt2api".to_owned(),
+                        permission: Vec::new(),
+                        root: id,
+                        parent: None,
+                        allow_anonymous: false,
+                        supported_account_types: supported,
+                        supported_reasoning_efforts: Vec::new(),
+                    });
+                }
+            };
+            let mut web_types = web_image_types.into_iter().collect::<Vec<_>>();
+            web_types.sort();
+            if !web_types.is_empty() {
+                upsert_image_model("gpt-image-2".to_owned(), web_types);
+            }
+            let mut codex_types = codex_image_types.into_iter().collect::<Vec<_>>();
+            codex_types.sort();
+            if !codex_types.is_empty() {
+                upsert_image_model("codex-gpt-image-2".to_owned(), codex_types.clone());
+                for account_type in codex_types {
+                    upsert_image_model(
+                        format!("{account_type}-codex-gpt-image-2"),
+                        vec![account_type],
+                    );
                 }
             }
         }
@@ -1923,6 +7471,41 @@ async fn authenticated(headers: &HeaderMap, state: &AppState) -> Result<(), ApiE
         return Err(ApiError::unauthorized());
     }
     if state.auth_store.accepts(token) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized())
+    }
+}
+
+async fn admin_authenticated(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(ApiError::unauthorized());
+    };
+    let Some((scheme, raw_token)) = value.split_once(' ') else {
+        return Err(ApiError::unauthorized());
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(ApiError::unauthorized());
+    }
+    let token = raw_token.trim();
+    if token.is_empty() {
+        return Err(ApiError::unauthorized());
+    }
+    if state
+        .config
+        .auth_key
+        .as_deref()
+        .is_some_and(|expected| constant_time_equal(token.as_bytes(), expected.trim().as_bytes()))
+    {
+        return Ok(());
+    }
+    if !state.auth_store.reload().await {
+        return Err(ApiError::unauthorized());
+    }
+    if state.auth_store.accepts_role(token, "admin") {
         Ok(())
     } else {
         Err(ApiError::unauthorized())
@@ -3333,6 +8916,98 @@ fn native_turnstile_concat_string(value: &Value) -> Option<String> {
     }
 }
 
+fn native_chat_tool_frame(
+    completion_id: &str,
+    model: &str,
+    created: i64,
+    tool_call: Value,
+    include_usage: bool,
+) -> Vec<u8> {
+    let mut frame = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index":0,"delta":{"tool_calls":[tool_call]},"finish_reason":null}],
+    });
+    if include_usage {
+        frame["usage"] = Value::Null;
+    }
+    let mut output = b"data: ".to_vec();
+    output.extend(serde_json::to_vec(&frame).expect("static tool frame"));
+    output.extend_from_slice(b"\n\n");
+    output
+}
+
+fn native_chat_finish_frame(
+    completion_id: &str,
+    model: &str,
+    created: i64,
+    reason: &str,
+    include_usage: bool,
+) -> Vec<u8> {
+    let mut frame = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index":0,"delta":{},"finish_reason":reason}],
+    });
+    if include_usage {
+        frame["usage"] = Value::Null;
+    }
+    let mut output = b"data: ".to_vec();
+    output.extend(serde_json::to_vec(&frame).expect("static finish frame"));
+    output.extend_from_slice(b"\n\n");
+    output
+}
+
+fn native_chat_usage_from_response(
+    response: &Value,
+    model: &str,
+    prompt_tokens: usize,
+) -> Result<Value, io::Error> {
+    let Some(usage) = response.get("usage").and_then(Value::as_object) else {
+        return native_usage_for_prompt_tokens(model, prompt_tokens, "")
+            .map_err(|_| io::Error::other("Codex usage calculation failed"));
+    };
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| io::Error::other("malformed Codex usage"))?;
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| io::Error::other("malformed Codex usage"))?;
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| io::Error::other("malformed Codex usage"))?;
+    Ok(json!({
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }))
+}
+
+struct NativeCodexChatStreamState {
+    input: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    pending: VecDeque<Vec<u8>>,
+    buffer: Vec<u8>,
+    total: usize,
+    finished: bool,
+    role_sent: bool,
+    lease: Option<AccountLease>,
+    completion_id: String,
+    model: String,
+    created: i64,
+    include_usage: bool,
+    prompt_tokens: usize,
+    item_indexes: HashMap<String, usize>,
+    argument_deltas: HashSet<String>,
+    saw_tool_call: bool,
+}
+
 fn native_codex_stream_response(
     response: reqwest::Response,
     lease: Option<AccountLease>,
@@ -3340,300 +9015,308 @@ fn native_codex_stream_response(
     include_usage: bool,
     prompt_tokens: usize,
 ) -> Response {
-    type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
-    let input: UpstreamStream = Box::pin(response.bytes_stream());
-    let completion_id = native_completion_id();
-    let created = native_created();
-    let stream = stream::unfold(
-        (
-            input,
-            VecDeque::<Vec<u8>>::new(),
-            Vec::new(),
-            0usize,
-            false,
-            false,
-            Some(lease),
-            completion_id,
-            model,
-            created,
-            include_usage,
-            prompt_tokens,
-        ),
-        |(
-            mut input,
-            mut pending,
-            mut buffer,
-            mut total,
-            mut finished,
-            mut role_sent,
-            mut lease,
-            completion_id,
-            model,
-            created,
-            include_usage,
-            prompt_tokens,
-        )| async move {
-            loop {
-                if let Some(frame) = pending.pop_front() {
+    let state = NativeCodexChatStreamState {
+        input: Box::pin(response.bytes_stream()),
+        pending: VecDeque::new(),
+        buffer: Vec::new(),
+        total: 0,
+        finished: false,
+        role_sent: false,
+        lease,
+        completion_id: native_completion_id(),
+        created: native_created(),
+        model,
+        include_usage,
+        prompt_tokens,
+        item_indexes: HashMap::new(),
+        argument_deltas: HashSet::new(),
+        saw_tool_call: false,
+    };
+    let stream = stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(frame) = state.pending.pop_front() {
+                return Some((Ok(Bytes::from(frame)), state));
+            }
+            if state.finished {
+                drop(state.lease.take());
+                return None;
+            }
+            let next = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, state.input.next()).await;
+            let chunk = match next {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(_))) | Err(_) => {
+                    drop(state.lease.take());
+                    state.finished = true;
+                    return Some((Err(io::Error::other("Codex upstream stream failed")), state));
+                }
+                Ok(None) => {
+                    drop(state.lease.take());
+                    state.finished = true;
                     return Some((
-                        Ok(Bytes::from(frame)),
-                        (
-                            input,
-                            pending,
-                            buffer,
-                            total,
-                            finished,
-                            role_sent,
-                            lease,
-                            completion_id,
-                            model,
-                            created,
-                            include_usage,
-                            prompt_tokens,
-                        ),
+                        Err(io::Error::other(
+                            "Codex stream ended without terminal event",
+                        )),
+                        state,
                     ));
                 }
-                if finished {
-                    drop(lease.take());
-                    return None;
+            };
+            state.total = match state.total.checked_add(chunk.len()) {
+                Some(total) if total <= MAX_UPSTREAM_BODY_BYTES => total,
+                _ => {
+                    drop(state.lease.take());
+                    state.finished = true;
+                    return Some((
+                        Err(io::Error::other("Codex upstream body exceeded limit")),
+                        state,
+                    ));
                 }
-                let next = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, input.next()).await;
-                let chunk = match next {
-                    Ok(Some(Ok(chunk))) => chunk,
-                    Ok(Some(Err(_))) | Err(_) => {
-                        drop(lease.take());
-                        return Some((
-                            Err(io::Error::other("Codex upstream stream failed")),
-                            (
-                                input,
-                                pending,
-                                buffer,
-                                total,
-                                true,
-                                role_sent,
-                                lease,
-                                completion_id,
-                                model,
-                                created,
-                                include_usage,
-                                prompt_tokens,
-                            ),
-                        ));
-                    }
-                    Ok(None) => {
-                        drop(lease.take());
-                        return Some((
-                            Err(io::Error::other(
-                                "Codex stream ended without terminal event",
-                            )),
-                            (
-                                input,
-                                pending,
-                                buffer,
-                                total,
-                                true,
-                                role_sent,
-                                lease,
-                                completion_id,
-                                model,
-                                created,
-                                include_usage,
-                                prompt_tokens,
-                            ),
-                        ));
+            };
+            state.buffer.extend_from_slice(&chunk);
+            while let Some((position, delimiter_length)) = sse_delimiter(&state.buffer) {
+                let event = state.buffer.drain(..position).collect::<Vec<_>>();
+                state.buffer.drain(..delimiter_length);
+                let data = match codex_sse_data(&event) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        drop(state.lease.take());
+                        state.finished = true;
+                        return Some((Err(error), state));
                     }
                 };
-                total = match total.checked_add(chunk.len()) {
-                    Some(total) if total <= MAX_UPSTREAM_BODY_BYTES => total,
-                    _ => {
-                        drop(lease.take());
-                        return Some((
-                            Err(io::Error::other("Codex upstream body exceeded limit")),
-                            (
-                                input,
-                                pending,
-                                buffer,
-                                total,
-                                true,
-                                role_sent,
-                                lease,
-                                completion_id,
-                                model,
-                                created,
-                                include_usage,
-                                prompt_tokens,
-                            ),
-                        ));
-                    }
-                };
-                buffer.extend_from_slice(&chunk);
-                while let Some((position, delimiter_length)) = sse_delimiter(&buffer) {
-                    let event = buffer.drain(..position).collect::<Vec<_>>();
-                    buffer.drain(..delimiter_length);
-                    let data = match codex_sse_data(&event) {
-                        Ok(Some(data)) => data,
-                        Ok(None) => continue,
-                        Err(error) => {
-                            drop(lease.take());
-                            return Some((
-                                Err(error),
-                                (
-                                    input,
-                                    pending,
-                                    buffer,
-                                    total,
-                                    true,
-                                    role_sent,
-                                    lease,
-                                    completion_id,
-                                    model,
-                                    created,
-                                    include_usage,
-                                    prompt_tokens,
-                                ),
-                            ));
-                        }
-                    };
-                    if data == "[DONE]" {
-                        continue;
-                    }
-                    let value: Value = match serde_json::from_str(&data) {
-                        Ok(value) => value,
-                        Err(_) => {
-                            drop(lease.take());
-                            return Some((
-                                Err(io::Error::other("malformed Codex event")),
-                                (
-                                    input,
-                                    pending,
-                                    buffer,
-                                    total,
-                                    true,
-                                    role_sent,
-                                    lease,
-                                    completion_id,
-                                    model,
-                                    created,
-                                    include_usage,
-                                    prompt_tokens,
-                                ),
-                            ));
-                        }
-                    };
-                    match value.get("type").and_then(Value::as_str) {
-                        Some("response.output_text.delta") => {
-                            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
-                                drop(lease.take());
-                                return Some((
-                                    Err(io::Error::other("malformed Codex delta")),
-                                    (
-                                        input,
-                                        pending,
-                                        buffer,
-                                        total,
-                                        true,
-                                        role_sent,
-                                        lease,
-                                        completion_id,
-                                        model,
-                                        created,
-                                        include_usage,
-                                        prompt_tokens,
-                                    ),
-                                ));
-                            };
-                            pending.push_back(native_codex_delta_frame(
-                                &completion_id,
-                                &model,
-                                created,
-                                delta,
-                                include_usage,
-                                !role_sent,
-                            ));
-                            role_sent = true;
-                        }
-                        Some("response.completed") => {
-                            if !role_sent {
-                                pending.push_back(native_role_frame(
-                                    &completion_id,
-                                    &model,
-                                    created,
-                                    include_usage,
-                                ));
-                                role_sent = true;
-                            }
-                            pending.push_back(native_finish_frame(
-                                &completion_id,
-                                &model,
-                                created,
-                                include_usage,
-                            ));
-                            if include_usage {
-                                match native_usage_for_prompt_tokens(&model, prompt_tokens, "") {
-                                    Ok(usage) => pending.push_back(native_usage_frame(
-                                        &completion_id,
-                                        &model,
-                                        created,
-                                        usage,
-                                    )),
-                                    Err(_) => {
-                                        drop(lease.take());
-                                        return Some((
-                                            Err(io::Error::other("Codex usage calculation failed")),
-                                            (
-                                                input,
-                                                pending,
-                                                buffer,
-                                                total,
-                                                true,
-                                                role_sent,
-                                                lease,
-                                                completion_id,
-                                                model,
-                                                created,
-                                                include_usage,
-                                                prompt_tokens,
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
-                            pending.push_back(b"data: [DONE]\n\n".to_vec());
-                            finished = true;
-                            break;
-                        }
-                        Some("response.failed") | Some("response.incomplete") => {
-                            drop(lease.take());
-                            return Some((
-                                Err(io::Error::other("Codex response failed")),
-                                (
-                                    input,
-                                    pending,
-                                    buffer,
-                                    total,
-                                    true,
-                                    role_sent,
-                                    lease,
-                                    completion_id,
-                                    model,
-                                    created,
-                                    include_usage,
-                                    prompt_tokens,
-                                ),
-                            ));
-                        }
-                        _ => {}
-                    }
-                    if finished {
-                        break;
-                    }
-                }
-                if !pending.is_empty() || finished {
+                if data == "[DONE]" {
                     continue;
                 }
+                let value: Value = match serde_json::from_str(&data) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        drop(state.lease.take());
+                        state.finished = true;
+                        return Some((Err(io::Error::other("malformed Codex event")), state));
+                    }
+                };
+                let event_type = match validate_codex_response_event(&value) {
+                    Ok(event_type) => event_type,
+                    Err(error) => {
+                        drop(state.lease.take());
+                        state.finished = true;
+                        return Some((Err(error), state));
+                    }
+                };
+                match event_type {
+                    "response.created" => {
+                        if let Some(response) = value.get("response").and_then(Value::as_object) {
+                            if let Some(id) = response.get("id").and_then(Value::as_str) {
+                                state.completion_id = if id.starts_with("chatcmpl-") {
+                                    id.to_owned()
+                                } else {
+                                    format!("chatcmpl-{id}")
+                                };
+                            }
+                            if let Some(model) = response.get("model").and_then(Value::as_str) {
+                                state.model = model.to_owned();
+                            }
+                            if let Some(created) =
+                                response.get("created_at").and_then(Value::as_i64)
+                            {
+                                state.created = created;
+                            }
+                        }
+                        if !state.role_sent {
+                            state.pending.push_back(native_role_frame(
+                                &state.completion_id,
+                                &state.model,
+                                state.created,
+                                state.include_usage,
+                            ));
+                            state.role_sent = true;
+                        }
+                    }
+                    "response.output_text.delta" => {
+                        let delta = value
+                            .get("delta")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| io::Error::other("malformed Codex delta"));
+                        let delta = match delta {
+                            Ok(delta) => delta,
+                            Err(error) => {
+                                drop(state.lease.take());
+                                state.finished = true;
+                                return Some((Err(error), state));
+                            }
+                        };
+                        state.pending.push_back(native_codex_delta_frame(
+                            &state.completion_id,
+                            &state.model,
+                            state.created,
+                            delta,
+                            state.include_usage,
+                            !state.role_sent,
+                        ));
+                        state.role_sent = true;
+                    }
+                    "response.output_item.added" => {
+                        let item = value.get("item").expect("validated output item");
+                        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                            let item_id =
+                                item.get("id").and_then(Value::as_str).unwrap_or_else(|| {
+                                    item.get("call_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                });
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default();
+                            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+                            let index = state.item_indexes.len();
+                            state.item_indexes.insert(item_id.to_owned(), index);
+                            state.saw_tool_call = true;
+                            if !state.role_sent {
+                                state.pending.push_back(native_role_frame(
+                                    &state.completion_id,
+                                    &state.model,
+                                    state.created,
+                                    state.include_usage,
+                                ));
+                                state.role_sent = true;
+                            }
+                            state.pending.push_back(native_chat_tool_frame(
+                                &state.completion_id,
+                                &state.model,
+                                state.created,
+                                json!({
+                                    "index": index,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""}
+                                }),
+                                state.include_usage,
+                            ));
+                        }
+                    }
+                    "response.function_call_arguments.delta" => {
+                        let item_id = value.get("item_id").and_then(Value::as_str);
+                        let delta = value.get("delta").and_then(Value::as_str);
+                        let (Some(item_id), Some(delta), Some(index)) = (
+                            item_id,
+                            delta,
+                            item_id.and_then(|id| state.item_indexes.get(id).copied()),
+                        ) else {
+                            drop(state.lease.take());
+                            state.finished = true;
+                            return Some((
+                                Err(io::Error::other("malformed Codex function call delta")),
+                                state,
+                            ));
+                        };
+                        state.argument_deltas.insert(item_id.to_owned());
+                        if !state.role_sent {
+                            state.pending.push_back(native_role_frame(
+                                &state.completion_id,
+                                &state.model,
+                                state.created,
+                                state.include_usage,
+                            ));
+                            state.role_sent = true;
+                        }
+                        state.pending.push_back(native_chat_tool_frame(
+                            &state.completion_id,
+                            &state.model,
+                            state.created,
+                            json!({"index":index,"function":{"arguments":delta}}),
+                            state.include_usage,
+                        ));
+                    }
+                    "response.output_item.done" => {
+                        let item = value.get("item").expect("validated output item");
+                        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                            let item_id =
+                                item.get("id").and_then(Value::as_str).unwrap_or_else(|| {
+                                    item.get("call_id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                });
+                            if let Some(index) = state.item_indexes.get(item_id).copied()
+                                && !state.argument_deltas.contains(item_id)
+                                && let Some(arguments) =
+                                    item.get("arguments").and_then(Value::as_str)
+                            {
+                                state.pending.push_back(native_chat_tool_frame(
+                                    &state.completion_id,
+                                    &state.model,
+                                    state.created,
+                                    json!({"index":index,"function":{"arguments":arguments}}),
+                                    state.include_usage,
+                                ));
+                            }
+                        }
+                    }
+                    "response.completed" | "response.incomplete" => {
+                        if !state.role_sent {
+                            state.pending.push_back(native_role_frame(
+                                &state.completion_id,
+                                &state.model,
+                                state.created,
+                                state.include_usage,
+                            ));
+                            state.role_sent = true;
+                        }
+                        let reason = if event_type == "response.incomplete" {
+                            "length"
+                        } else if state.saw_tool_call {
+                            "tool_calls"
+                        } else {
+                            "stop"
+                        };
+                        state.pending.push_back(native_chat_finish_frame(
+                            &state.completion_id,
+                            &state.model,
+                            state.created,
+                            reason,
+                            state.include_usage,
+                        ));
+                        if state.include_usage {
+                            let response = value.get("response").cloned().unwrap_or(Value::Null);
+                            let usage = match native_chat_usage_from_response(
+                                &response,
+                                &state.model,
+                                state.prompt_tokens,
+                            ) {
+                                Ok(usage) => usage,
+                                Err(error) => {
+                                    drop(state.lease.take());
+                                    state.finished = true;
+                                    return Some((Err(error), state));
+                                }
+                            };
+                            state.pending.push_back(native_usage_frame(
+                                &state.completion_id,
+                                &state.model,
+                                state.created,
+                                usage,
+                            ));
+                        }
+                        state.pending.push_back(b"data: [DONE]\n\n".to_vec());
+                        state.finished = true;
+                        break;
+                    }
+                    "response.failed" | "error" => {
+                        drop(state.lease.take());
+                        state.finished = true;
+                        return Some((Err(io::Error::other("Codex response failed")), state));
+                    }
+                    _ => {}
+                }
+                if state.finished {
+                    break;
+                }
             }
-        },
-    );
+            if !state.pending.is_empty() || state.finished {
+                continue;
+            }
+        }
+    });
     let mut output = Response::new(Body::from_stream(stream));
     output.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -3767,6 +9450,17 @@ async fn responses(
     body: Body,
 ) -> Result<Response, ApiError> {
     responses_with_timeout(state, headers, body, NATIVE_UPSTREAM_TIMEOUT).await
+}
+
+async fn responses_websocket_upgrade(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    authenticated(&headers, &state).await?;
+    Ok(upgrade
+        .on_upgrade(move |socket| responses_websocket::run(socket, state, headers))
+        .into_response())
 }
 
 async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
@@ -3993,84 +9687,151 @@ fn native_codex_responses_stream_response(
     deadline: Instant,
 ) -> Response {
     type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
-    let input: UpstreamStream = Box::pin(response.bytes_stream());
-    let stream = stream::unfold(
-        (input, Vec::new(), 0usize, false, Some(lease)),
-        move |(mut input, mut buffer, total, terminal, mut lease)| async move {
-            if terminal {
-                drop(lease.take());
+    struct State {
+        input: UpstreamStream,
+        buffer: Vec<u8>,
+        pending: VecDeque<Bytes>,
+        total: usize,
+        terminal: bool,
+        lease: Option<AccountLease>,
+    }
+    let state = State {
+        input: Box::pin(response.bytes_stream()),
+        buffer: Vec::new(),
+        pending: VecDeque::new(),
+        total: 0,
+        terminal: false,
+        lease: Some(lease),
+    };
+    let stream = stream::unfold(state, move |mut state| async move {
+        loop {
+            if let Some(frame) = state.pending.pop_front() {
+                return Some((Ok(frame), state));
+            }
+            if state.terminal {
+                drop(state.lease.take());
                 return None;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                drop(lease.take());
+                drop(state.lease.take());
+                state.terminal = true;
                 return Some((
                     Err(io::Error::other("Codex Responses stream timed out")),
-                    (input, buffer, total, true, lease),
+                    state,
                 ));
             }
-            let next = tokio::time::timeout(remaining, input.next()).await;
+            let next = tokio::time::timeout(remaining, state.input.next()).await;
             let chunk = match next {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(Some(Err(_))) | Err(_) => {
-                    drop(lease.take());
+                    drop(state.lease.take());
+                    state.terminal = true;
                     return Some((
                         Err(io::Error::other("Codex Responses stream failed")),
-                        (input, buffer, total, true, lease),
+                        state,
                     ));
                 }
                 Ok(None) => {
-                    drop(lease.take());
-                    return if terminal {
-                        None
+                    drop(state.lease.take());
+                    state.terminal = true;
+                    let error = if state.buffer.iter().all(u8::is_ascii_whitespace) {
+                        "Codex Responses stream ended without completion"
                     } else {
-                        Some((
-                            Err(io::Error::other(
-                                "Codex Responses stream ended without completion",
-                            )),
-                            (input, buffer, total, true, lease),
-                        ))
+                        "Codex Responses stream ended with an incomplete SSE event"
                     };
+                    return Some((Err(io::Error::other(error)), state));
                 }
             };
-            let Some(next_total) = total.checked_add(chunk.len()) else {
-                drop(lease.take());
-                return Some((
-                    Err(io::Error::other("Codex Responses body exceeded limit")),
-                    (input, buffer, total, true, lease),
-                ));
+            state.total = match state.total.checked_add(chunk.len()) {
+                Some(total) if total <= MAX_UPSTREAM_BODY_BYTES => total,
+                _ => {
+                    drop(state.lease.take());
+                    state.terminal = true;
+                    return Some((
+                        Err(io::Error::other("Codex Responses body exceeded limit")),
+                        state,
+                    ));
+                }
             };
-            if next_total > MAX_UPSTREAM_BODY_BYTES {
-                drop(lease.take());
-                return Some((
-                    Err(io::Error::other("Codex Responses body exceeded limit")),
-                    (input, buffer, total, true, lease),
-                ));
-            }
-            buffer.extend_from_slice(&chunk);
-            let mut saw_terminal = false;
-            while let Some((position, delimiter_length)) = sse_delimiter(&buffer) {
-                let event = buffer[..position].to_vec();
-                buffer.drain(..position + delimiter_length);
-                if let Ok(Some(data)) = codex_sse_data(&event) {
-                    match serde_json::from_str::<Value>(&data)
-                        .ok()
-                        .and_then(|value| {
-                            value.get("type").and_then(Value::as_str).map(str::to_owned)
-                        })
-                        .as_deref()
-                    {
-                        Some("response.completed") => saw_terminal = true,
-                        Some("response.failed") | Some("response.incomplete") => {
-                            saw_terminal = true
-                        }
-                        _ => {}
+            state.buffer.extend_from_slice(&chunk);
+            while let Some((position, delimiter_length)) = sse_delimiter(&state.buffer) {
+                let event = state.buffer.drain(..position).collect::<Vec<_>>();
+                state.buffer.drain(..delimiter_length);
+                let data = match codex_sse_data(&event) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        drop(state.lease.take());
+                        state.terminal = true;
+                        return Some((Err(error), state));
                     }
+                };
+                if data == "[DONE]" {
+                    continue;
+                }
+                if state.terminal {
+                    drop(state.lease.take());
+                    return Some((
+                        Err(io::Error::other(
+                            "Codex Responses stream emitted an event after terminal",
+                        )),
+                        state,
+                    ));
+                }
+                let value: Value = match serde_json::from_str(&data) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        drop(state.lease.take());
+                        state.terminal = true;
+                        return Some((Err(io::Error::other("malformed Codex event")), state));
+                    }
+                };
+                let event_type = match validate_codex_response_event(&value) {
+                    Ok(event_type) => event_type,
+                    Err(error) => {
+                        drop(state.lease.take());
+                        state.terminal = true;
+                        return Some((Err(error), state));
+                    }
+                };
+                let public = match project_codex_response_event(&value) {
+                    Ok(public) => public,
+                    Err(error) => {
+                        drop(state.lease.take());
+                        state.terminal = true;
+                        return Some((Err(error), state));
+                    }
+                };
+                if let Some(public) = public {
+                    let mut frame = b"data: ".to_vec();
+                    let serialized = match serde_json::to_vec(&public) {
+                        Ok(serialized) => serialized,
+                        Err(_) => {
+                            drop(state.lease.take());
+                            state.terminal = true;
+                            return Some((
+                                Err(io::Error::other("Codex event projection failed")),
+                                state,
+                            ));
+                        }
+                    };
+                    frame.extend(serialized);
+                    frame.extend_from_slice(b"\n\n");
+                    state.pending.push_back(Bytes::from(frame));
+                }
+                if matches!(
+                    event_type,
+                    "response.completed" | "response.incomplete" | "response.failed" | "error"
+                ) {
+                    state.terminal = true;
                 }
             }
-            Some((Ok(chunk), (input, buffer, next_total, saw_terminal, lease)))
-        },
-    );
+            if !state.pending.is_empty() || state.terminal {
+                continue;
+            }
+        }
+    });
     let mut output = Response::new(Body::from_stream(stream));
     output.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -4087,6 +9848,15 @@ async fn acquire_native_codex_lease(
     model: &str,
     excluded_tokens: &HashSet<String>,
 ) -> Option<AccountLease> {
+    acquire_native_codex_lease_with_groups(state, model, excluded_tokens, None).await
+}
+
+async fn acquire_native_codex_lease_with_groups(
+    state: &AppState,
+    model: &str,
+    excluded_tokens: &HashSet<String>,
+    forced_groups: Option<&HashSet<String>>,
+) -> Option<AccountLease> {
     if state.account_type_catalog.enabled() {
         state.account_type_catalog.refresh_for_model(model).await;
         let groups = state.account_type_catalog.supported_types_for(model);
@@ -4097,7 +9867,9 @@ async fn acquire_native_codex_lease(
             return None;
         }
     }
-    let allowed_groups = state.account_type_catalog.supported_types_for(model);
+    let allowed_groups = forced_groups
+        .cloned()
+        .or_else(|| state.account_type_catalog.supported_types_for(model));
     state
         .account_store
         .acquire_excluding_with_type_and_source_filter(
@@ -4176,6 +9948,15 @@ async fn native_responses_with_timeout(
     object: Map<String, Value>,
     upstream_timeout: Duration,
 ) -> Result<Response, ApiError> {
+    native_responses_with_timeout_and_groups(state, object, upstream_timeout, None).await
+}
+
+async fn native_responses_with_timeout_and_groups(
+    state: AppState,
+    object: Map<String, Value>,
+    upstream_timeout: Duration,
+    forced_groups: Option<HashSet<String>>,
+) -> Result<Response, ApiError> {
     let payload = native_codex_responses_payload(&object)?;
     let model = object
         .get("model")
@@ -4191,7 +9972,12 @@ async fn native_responses_with_timeout(
     let mut attempted_tokens = HashSet::new();
     let mut lease = tokio::time::timeout_at(
         tokio::time::Instant::from_std(route_deadline),
-        acquire_native_codex_lease(&state, &model, &attempted_tokens),
+        acquire_native_codex_lease_with_groups(
+            &state,
+            &model,
+            &attempted_tokens,
+            forced_groups.as_ref(),
+        ),
     )
     .await
     .map_err(|_| ApiError::upstream())?
@@ -4219,7 +10005,12 @@ async fn native_responses_with_timeout(
                 drop(lease);
                 let acquired = match tokio::time::timeout_at(
                     tokio::time::Instant::from_std(route_deadline),
-                    acquire_native_codex_lease(&state, &model, &attempted_tokens),
+                    acquire_native_codex_lease_with_groups(
+                        &state,
+                        &model,
+                        &attempted_tokens,
+                        forced_groups.as_ref(),
+                    ),
                 )
                 .await
                 {
@@ -4255,6 +10046,10 @@ async fn native_responses_with_timeout(
     .await
     .map_err(|_| ApiError::upstream())??;
     let response = native_codex_responses_json(&body, &model)?;
+    let used_token = lease.token().to_owned();
+    if !state.account_store.mark_text_used(&used_token) {
+        AccountStore::note_usage_mark_failure();
+    }
     drop(lease);
     Ok((
         StatusCode::OK,
@@ -4670,7 +10465,7 @@ mod tests {
             .collect::<Vec<_>>();
         base64::engine::general_purpose::STANDARD.encode(masked)
     }
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use http_body_util::BodyExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
@@ -4688,6 +10483,3441 @@ mod tests {
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("client")
+    }
+
+    fn auth_state(path: &Path) -> AppState {
+        AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: Some(path.to_owned()),
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("auth state")
+    }
+
+    fn account_state(path: &Path) -> AppState {
+        AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.to_owned()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("account state")
+    }
+
+    struct TestTempRoot {
+        path: PathBuf,
+    }
+
+    impl TestTempRoot {
+        fn join<P: AsRef<Path>>(&self, child: P) -> PathBuf {
+            static TEST_TEMP_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
+            let raw_name = child
+                .as_ref()
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_else(|| std::borrow::Cow::Borrowed("case"));
+            let safe_name = raw_name
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            let sequence = TEST_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let case_dir = self
+                .path
+                .join(format!("{safe_name}-{}-{sequence}", std::process::id()));
+            fs::create_dir_all(&case_dir).expect("case-local test temp directory");
+            case_dir.join(safe_name)
+        }
+    }
+
+    struct HealthHookCleanup {
+        storage: bool,
+        accounts: bool,
+    }
+
+    impl Drop for HealthHookCleanup {
+        fn drop(&mut self) {
+            if self.storage {
+                *HEALTH_STORAGE_TEST_HOOK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+            if self.accounts {
+                *HEALTH_ACCOUNTS_TEST_HOOK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            }
+        }
+    }
+
+    fn reset_image_tag_test_state() {
+        *IMAGE_TAG_READ_REBIND_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *IMAGE_TAG_WRITE_REBIND_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *IMAGE_TAG_WRITE_AFTER_CHECK_REBIND_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *IMAGE_TAG_TARGET_SWAP_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *IMAGE_TAG_TARGET_CREATE_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *IMAGE_TAG_TARGET_CREATE_AFTER_CHECK_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *IMAGE_TAG_TARGET_SWAP_AFTER_NAME_CHECK_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *IMAGE_TAG_CWD_SWITCH_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        *IMAGE_TAG_TEMP_PATH_OVERRIDE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        IMAGE_TAG_REPLACE_FAILURE_HOOK.store(false, Ordering::SeqCst);
+    }
+
+    struct ImageTagTestCleanup {
+        original_cwd: PathBuf,
+    }
+
+    impl ImageTagTestCleanup {
+        fn new() -> Self {
+            reset_image_tag_test_state();
+            Self {
+                original_cwd: env::current_dir().expect("image tag test cwd"),
+            }
+        }
+    }
+
+    impl Drop for ImageTagTestCleanup {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.original_cwd);
+            reset_image_tag_test_state();
+        }
+    }
+
+    fn test_tmp_dir() -> TestTempRoot {
+        let path = env::var_os("CHATGPT2API_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("..")
+                    .join(".local")
+                    .join("codex")
+                    .join("tmp")
+                    .join("rust")
+            });
+        fs::create_dir_all(&path).expect("project-local test temp directory");
+        TestTempRoot { path }
+    }
+
+    fn account_snapshot_path(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        test_tmp_dir().join(format!(
+            "chatgpt2api-rust-{label}-{}-{stamp}.json",
+            std::process::id()
+        ))
+    }
+
+    async fn remove_test_file_after_release(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::remove_file(path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+                    ) && Instant::now() < deadline =>
+                {
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("cleanup: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn public_search_urls_require_valid_percent_triplets() {
+        assert!(normalize_public_search_url(&json!("https://example.test/%")).is_none());
+        assert!(normalize_public_search_url(&json!("https://example.test/%A")).is_none());
+        assert!(normalize_public_search_url(&json!("https://example.test/%GG")).is_none());
+        assert_eq!(
+            normalize_public_search_url(&json!("https://example.test/%20")),
+            Some("https://example.test/%20".to_owned())
+        );
+    }
+
+    fn test_account_jwt(account_id: &str, exp: i64, iat: i64) -> String {
+        let payload = json!({
+            "exp": exp,
+            "iat": iat,
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id}
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).expect("JWT payload"));
+        format!("e30.{encoded}.sig")
+    }
+
+    async fn json_response(response: Response) -> Value {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("json response")
+    }
+
+    #[tokio::test]
+    async fn editable_file_tasks_are_owner_scoped_and_download_capability_bound() {
+        let root = account_snapshot_path("editable-file-contract");
+        let data_dir = root.parent().expect("data parent").to_owned();
+        let auth_path = data_dir.join("editable-auth.json");
+        let account_path = data_dir.join("editable-accounts.json");
+        fs::write(&account_path, "[]").expect("accounts");
+        let user_key = "user-editable-key";
+        let user_id = "owner-a";
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&json!({
+                "items": [{
+                    "id": user_id,
+                    "name": "Owner A",
+                    "role": "user",
+                    "enabled": true,
+                    "key_hash": auth_key_hash(user_key)
+                }]
+            }))
+            .expect("auth json"),
+        )
+        .expect("auth snapshot");
+        let owner_scope = Sha256::digest(user_id.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let output_dir = data_dir
+            .join("files")
+            .join(&owner_scope)
+            .join("ppt")
+            .join("task-a");
+        fs::create_dir_all(&output_dir).expect("editable output directory");
+        fs::write(output_dir.join("primary.pptx"), b"owner-a-ppt").expect("editable output");
+        let capability = "editable-capability";
+        let digest =
+            editable_capability_digest(capability, user_id, "ppt", "task-a", "primary.pptx");
+        fs::write(
+            data_dir.join("editable_file_tasks.json"),
+            serde_json::to_vec(&json!({
+                "tasks": [
+                    {
+                        "id": "task-a",
+                        "owner_id": user_id,
+                        "status": "success",
+                        "kind": "ppt",
+                        "created_at": "2026-08-22 12:00:00",
+                        "updated_at": "2026-08-22 12:00:01",
+                        "created_ts": 1.0,
+                        "result": {
+                            "conversation_id": "conversation-a",
+                            "primary_url": format!("/files/{capability}/{owner_scope}/ppt/task-a/primary.pptx"),
+                            "zip_url": format!("/files/{capability}/{owner_scope}/ppt/task-a/assets.zip")
+                        },
+                        "download_capability_hashes": {"primary.pptx": digest}
+                    },
+                    {
+                        "id": "task-secret",
+                        "owner_id": "owner-b",
+                        "status": "success",
+                        "kind": "ppt",
+                        "created_at": "2026-08-22 12:00:00",
+                        "updated_at": "2026-08-22 12:00:01"
+                    }
+                ]
+            }))
+            .expect("task json"),
+        )
+        .expect("task snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: Some(auth_path.clone()),
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let app = state.router();
+        let list = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/editable-file-tasks?ids=task-a,task-secret,missing")
+                    .header(header::AUTHORIZATION, format!("Bearer {user_key}"))
+                    .body(Body::empty())
+                    .expect("editable list request"),
+            )
+            .await
+            .expect("editable list response");
+        assert_eq!(list.status(), StatusCode::OK);
+        let list_value = json_response(list).await;
+        assert_eq!(list_value["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(list_value["items"][0]["id"], "task-a");
+        assert!(list_value["items"][0].get("owner_id").is_none());
+        assert_eq!(list_value["missing_ids"], json!(["task-secret", "missing"]));
+
+        let file = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/files/{capability}/{owner_scope}/ppt/task-a/primary.pptx"
+                    ))
+                    .body(Body::empty())
+                    .expect("editable download request"),
+            )
+            .await
+            .expect("editable download response");
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(
+            file.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static(
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ))
+        );
+        let file_body = file
+            .into_body()
+            .collect()
+            .await
+            .expect("editable download body")
+            .to_bytes();
+        assert_eq!(&file_body[..], b"owner-a-ppt");
+
+        let wrong_capability = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/files/wrong/{owner_scope}/ppt/task-a/primary.pptx"
+                    ))
+                    .body(Body::empty())
+                    .expect("wrong capability request"),
+            )
+            .await
+            .expect("wrong capability response");
+        assert_eq!(wrong_capability.status(), StatusCode::NOT_FOUND);
+        for path in [
+            auth_path,
+            account_path,
+            data_dir.join("editable_file_tasks.json"),
+        ] {
+            let _ = fs::remove_file(path);
+        }
+        let _ = fs::remove_dir_all(data_dir.join("files"));
+    }
+
+    async fn health_json(state: &AppState) -> Value {
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health?format=json")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        assert_eq!(response.status(), StatusCode::OK);
+        json_response(response).await
+    }
+
+    async fn management_request(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        token: Option<&str>,
+    ) -> Response {
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request_body = match body {
+            Some(value) => {
+                builder = builder.header(header::CONTENT_TYPE, "application/json");
+                Body::from(serde_json::to_vec(&value).expect("request JSON"))
+            }
+            None => Body::empty(),
+        };
+        state
+            .router()
+            .oneshot(builder.body(request_body).expect("management request"))
+            .await
+            .expect("management response")
+    }
+
+    struct PythonLockChild {
+        child: std::process::Child,
+        release: PathBuf,
+    }
+
+    impl PythonLockChild {
+        fn wait(&mut self) -> std::process::ExitStatus {
+            self.child.wait().expect("python lock child")
+        }
+    }
+
+    impl Drop for PythonLockChild {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.release, b"release");
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    fn spawn_python_lock_child(script: &str, args: &[&Path]) -> std::process::Child {
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("project root")
+            .to_owned();
+        let test_tmp = env::var_os("CHATGPT2API_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| project_root.join(".local").join("codex").join("tmp"));
+        let pycache = project_root.join(".local").join("codex").join("pycache");
+        fs::create_dir_all(&test_tmp).expect("project-local python temp directory");
+        fs::create_dir_all(&pycache).expect("project-local python cache directory");
+        let venv_python = if cfg!(windows) {
+            project_root
+                .join(".venv")
+                .join("Scripts")
+                .join("python.exe")
+        } else {
+            project_root.join(".venv").join("bin").join("python")
+        };
+        let python = env::var_os("CHATGPT2API_TEST_PYTHON").unwrap_or_else(|| {
+            if venv_python.is_file() {
+                venv_python.as_os_str().to_owned()
+            } else {
+                std::ffi::OsString::from("python")
+            }
+        });
+        let mut command = std::process::Command::new(python);
+        command
+            .current_dir(&project_root)
+            .arg("-c")
+            .arg(script)
+            .args(args)
+            .env("PYTHONPATH", &project_root)
+            .env("PYTHONPYCACHEPREFIX", &pycache)
+            .env("TEMP", &test_tmp)
+            .env("TMP", &test_tmp)
+            .env("TMPDIR", &test_tmp)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.spawn().expect("python lock child")
+    }
+
+    fn wait_for_test_marker(marker: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "test marker timeout: {marker:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    const PYTHON_HOLD_LOCK: &str = r#"
+import pathlib
+import sys
+import time
+
+from services.storage.base import canonical_path_write_lock
+
+path = pathlib.Path(sys.argv[1])
+ready = pathlib.Path(sys.argv[2])
+release = pathlib.Path(sys.argv[3])
+error = pathlib.Path(sys.argv[4])
+try:
+    with canonical_path_write_lock(path):
+        ready.write_text("ready", encoding="ascii")
+        deadline = time.monotonic() + 10
+        while not release.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("python lock release timeout")
+            time.sleep(0.005)
+except Exception as exc:
+    error.write_text(type(exc).__name__, encoding="ascii")
+    raise
+"#;
+
+    const PYTHON_SET_TAGS: &str = r#"
+import pathlib
+import sys
+import traceback
+
+import services.image_tags_service as module
+
+tags_path = pathlib.Path(sys.argv[1])
+started = pathlib.Path(sys.argv[2])
+result = pathlib.Path(sys.argv[3])
+module.TAGS_FILE = tags_path
+started.write_text("started", encoding="ascii")
+try:
+    module.set_tags("images/python.png", ["python"])
+except Exception as exc:
+    result.write_text(
+        f"error:{type(exc).__name__}:{exc!s}\\n{traceback.format_exc()}",
+        encoding="utf-8",
+    )
+    raise
+else:
+    result.write_text("success", encoding="ascii")
+"#;
+
+    const PYTHON_SET_TAGS_AT_GATE: &str = r#"
+import pathlib
+import sys
+import time
+
+import services.image_tags_service as module
+
+tags_path = pathlib.Path(sys.argv[1])
+started = pathlib.Path(sys.argv[2])
+go = pathlib.Path(sys.argv[3])
+result = pathlib.Path(sys.argv[4])
+module.TAGS_FILE = tags_path
+started.write_text("started", encoding="ascii")
+deadline = time.monotonic() + 10
+while not go.exists():
+    if time.monotonic() >= deadline:
+        raise TimeoutError("simultaneous lock start timeout")
+    time.sleep(0.005)
+try:
+    module.set_tags("images/python.png", ["python"])
+except Exception as exc:
+    result.write_text(f"error:{type(exc).__name__}:{exc!s}", encoding="utf-8")
+    raise
+else:
+    result.write_text("success", encoding="ascii")
+"#;
+
+    async fn start_management_stub() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+        let cpa_hits = hits.clone();
+        let cpa_download_hits = hits.clone();
+        let sub_login_hits = hits.clone();
+        let sub_groups_hits = hits.clone();
+        let sub_accounts_hits = hits.clone();
+        let sub_data_hits = hits.clone();
+        let cc_login_hits = hits.clone();
+        let cc_channels_hits = hits.clone();
+        let cc_editor_hits = hits.clone();
+        let app = Router::new()
+            .route(
+                "/v0/management/auth-files",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    let hits = cpa_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("GET {} auth={}", uri, headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"files": [{"name": "one.json", "email": "one@example.com"}]}))
+                    }
+                }),
+            )
+            .route(
+                "/v0/management/auth-files/download",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    let hits = cpa_download_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("GET {} auth={}", uri, headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"access_token": "imported-cpa-token"}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/auth/login",
+                post(move |headers: HeaderMap| {
+                    let hits = sub_login_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("POST /api/v1/auth/login auth={}", headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"access_token": "sub-token", "expires_in": 3600}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/admin/groups",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    let hits = sub_groups_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("GET {} auth={}", uri, headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"data": [{"id": "group-1", "name": "Default", "description": "", "platform": "openai", "status": "active", "account_count": 1, "active_account_count": 1}]}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/admin/accounts",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    let hits = sub_accounts_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("GET {} auth={}", uri, headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"data": [{"id": "account-1", "name": "one", "credentials": {"email": "one@example.com", "plan_type": "pro", "expires_at": "2099-01-01", "refresh_token": "refresh"}, "status": "active"}]}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/admin/accounts/data",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    let hits = sub_data_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("GET {} auth={}", uri, headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"accounts": [{"id": "account-1", "credentials": {"access_token": "imported-sub-token", "plan_type": "pro"}}]}))
+                    }
+                }),
+            )
+            .route(
+                "/login",
+                post(move |headers: HeaderMap| {
+                    let hits = cc_login_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("POST /login auth={}", headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"success": true, "data": {"token": "cc-token", "role": "admin"}}))
+                    }
+                }),
+            )
+            .route(
+                "/admin/channels",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    let hits = cc_channels_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("GET {} auth={}", uri, headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"success": true, "data": [{"id": 1, "name": "Codex", "auth_type": "codex_oauth", "enabled": true, "codex_plan_type": "pro"}], "count": 1}))
+                    }
+                }),
+            )
+            .route(
+                "/admin/channels/{channel_id}/editor",
+                get(move |headers: HeaderMap, uri: axum::http::Uri| {
+                    let hits = cc_editor_hits.clone();
+                    async move {
+                        hits.lock()
+                            .await
+                            .push(format!("GET {} auth={}", uri, headers.contains_key(header::AUTHORIZATION)));
+                        Json(json!({"success": true, "data": {"channel": {"id": 1, "auth_type": "codex_oauth"}, "oauth_credential": {"access_token": "imported-cc-token", "refresh_token": "imported-cc-refresh", "plan_type": "pro"}}}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("management stub listener");
+        let address = listener.local_addr().expect("management stub address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("management stub server");
+        });
+        (address, shutdown_tx, task, hits)
+    }
+
+    #[tokio::test]
+    async fn management_server_flows_cover_storage_remote_contracts_and_restart() {
+        let account_path = account_snapshot_path("management-flows");
+        let data_dir = account_path.parent().expect("data parent").to_owned();
+        fs::create_dir_all(data_dir.join("images")).expect("data directory");
+        fs::write(&account_path, b"[]").expect("accounts snapshot");
+        fs::write(
+            data_dir.join("logs.jsonl"),
+            br#"{"id":"log-1","time":"2026-08-22T00:00:00Z","type":"request","detail":{"message":"ok","access_token":"private"}}
+"#,
+        )
+        .expect("logs");
+        fs::write(data_dir.join("images").join("one.png"), b"png").expect("image");
+        fs::write(
+            data_dir.join("config.json"),
+            br#"{"proxy":"http://user:pass@example.com:8080","backup":{"provider":"local","account_id":"account","access_key_id":"key","secret_access_key":"secret"}}"#,
+        )
+        .expect("config");
+
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+
+        let unauthenticated = management_request(&state, "GET", "/api/logs", None, None).await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+        let logs = management_request(&state, "GET", "/api/logs", None, Some("admin")).await;
+        assert_eq!(logs.status(), StatusCode::OK);
+        let logs = json_response(logs).await;
+        assert_eq!(logs["items"][0]["id"], "log-1");
+        assert!(logs["items"][0]["detail"].get("access_token").is_none());
+
+        let storage =
+            management_request(&state, "GET", "/api/images/storage", None, Some("admin")).await;
+        assert_eq!(storage.status(), StatusCode::OK);
+        assert_eq!(json_response(storage).await["image_count"], 1);
+        let archive = management_request(
+            &state,
+            "POST",
+            "/api/images/download",
+            Some(json!({"paths": ["one.png"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(archive.status(), StatusCode::OK);
+        assert_eq!(
+            archive
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/zip")
+        );
+        let archive_bytes = archive
+            .into_body()
+            .collect()
+            .await
+            .expect("zip body")
+            .to_bytes();
+        assert!(archive_bytes.windows(4).any(|window| window == b"one."));
+        let invalid_image = management_request(
+            &state,
+            "POST",
+            "/api/images/download",
+            Some(json!({"paths": ["../one.png"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(invalid_image.status(), StatusCode::BAD_REQUEST);
+
+        let proxy = management_request(&state, "GET", "/api/proxy", None, Some("admin")).await;
+        assert_eq!(proxy.status(), StatusCode::OK);
+        let proxy = json_response(proxy).await;
+        assert_eq!(proxy["proxy"]["url"], "http://example.com:8080/");
+        assert!(
+            !proxy["proxy"]["url"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pass")
+        );
+
+        let backup_test =
+            management_request(&state, "POST", "/api/backup/test", None, Some("admin")).await;
+        assert_eq!(backup_test.status(), StatusCode::OK);
+        let backup =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin")).await;
+        assert_eq!(backup.status(), StatusCode::OK);
+        let backup_key = json_response(backup).await["result"]["key"]
+            .as_str()
+            .expect("backup key")
+            .to_owned();
+        let detail = management_request(
+            &state,
+            "GET",
+            &format!("/api/backups/detail?key={backup_key}"),
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        assert!(json_response(detail).await["item"]["files"].is_array());
+
+        let (stub_address, shutdown, stub_task, hits) = start_management_stub().await;
+        let stub = format!("http://{stub_address}");
+        let cpa = management_request(
+            &state,
+            "POST",
+            "/api/cpa/pools",
+            Some(json!({"name":"CPA","base_url":stub,"secret_key":"secret"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(cpa.status(), StatusCode::OK);
+        let cpa_id = json_response(cpa).await["pool"]["id"]
+            .as_str()
+            .expect("CPA id")
+            .to_owned();
+        let cpa_update = management_request(
+            &state,
+            "POST",
+            &format!("/api/cpa/pools/{cpa_id}"),
+            Some(json!({"name":"CPA-updated"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(cpa_update.status(), StatusCode::OK);
+
+        let first_tags = management_request(
+            &state,
+            "POST",
+            "/api/images/tags",
+            Some(json!({"path":"images/one.png","tags":["first"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(first_tags.status(), StatusCode::OK);
+        let second_tags = management_request(
+            &state,
+            "POST",
+            "/api/images/tags",
+            Some(json!({"path":"images/two.png","tags":["second"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(second_tags.status(), StatusCode::OK);
+        let tags = management_request(&state, "GET", "/api/images/tags", None, Some("admin")).await;
+        assert_eq!(tags.status(), StatusCode::OK);
+        let tags = json_response(tags).await;
+        assert_eq!(tags["tags"], json!(["first", "second"]));
+        let files = management_request(
+            &state,
+            "GET",
+            &format!("/api/cpa/pools/{cpa_id}/files"),
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(files.status(), StatusCode::OK);
+        assert_eq!(json_response(files).await["files"][0]["name"], "one.json");
+
+        let sub = management_request(
+            &state,
+            "POST",
+            "/api/sub2api/servers",
+            Some(json!({"name":"Sub","base_url":stub,"api_key":"key"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(sub.status(), StatusCode::OK);
+        let sub_id = json_response(sub).await["server"]["id"]
+            .as_str()
+            .expect("Sub id")
+            .to_owned();
+        let groups = management_request(
+            &state,
+            "GET",
+            &format!("/api/sub2api/servers/{sub_id}/groups"),
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(groups.status(), StatusCode::OK);
+        assert_eq!(json_response(groups).await["groups"][0]["id"], "group-1");
+
+        let cc = management_request(
+            &state,
+            "POST",
+            "/api/ccload/servers",
+            Some(json!({"name":"CC","base_url":stub,"password":"password"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(cc.status(), StatusCode::OK);
+        let cc_id = json_response(cc).await["server"]["id"]
+            .as_str()
+            .expect("CC id")
+            .to_owned();
+        let channels = management_request(
+            &state,
+            "GET",
+            &format!("/api/ccload/servers/{cc_id}/channels"),
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(channels.status(), StatusCode::OK);
+        assert_eq!(json_response(channels).await["channels"][0]["id"], "1");
+
+        shutdown.send(()).expect("stub shutdown");
+        stub_task.await.expect("stub join");
+        let hit_text = hits.lock().await.join("\n");
+        assert!(hit_text.contains("auth=true"));
+        assert!(hit_text.contains("page_size=5000"));
+
+        drop(state);
+        let restarted = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("restarted state");
+        let persisted =
+            management_request(&restarted, "GET", "/api/cpa/pools", None, Some("admin")).await;
+        assert_eq!(persisted.status(), StatusCode::OK);
+        assert_eq!(
+            json_response(persisted).await["pools"][0]["name"],
+            "CPA-updated"
+        );
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn registry_mutations_from_independent_states_preserve_unrelated_writes() {
+        let account_path = account_snapshot_path("registry-concurrency");
+        let data_dir = account_path.parent().expect("data parent").to_owned();
+        fs::write(&account_path, b"[]").expect("accounts snapshot");
+        let config = |path: &Path| AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.to_owned()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        };
+        let state_a = AppState::new(config(&account_path)).expect("state a");
+        let state_b = AppState::new(config(&account_path)).expect("state b");
+
+        let first = std::thread::spawn(move || {
+            mutate_server_registry(&state_a, "cpa_pools", |items| {
+                std::thread::sleep(Duration::from_millis(25));
+                items.push(json!({"id": "pool-a"}));
+                Ok(())
+            })
+        });
+        let second = std::thread::spawn(move || {
+            mutate_server_registry(&state_b, "cpa_pools", |items| {
+                items.push(json!({"id": "pool-b"}));
+                Ok(())
+            })
+        });
+        first.join().expect("first mutation").expect("first result");
+        second
+            .join()
+            .expect("second mutation")
+            .expect("second result");
+
+        let state = AppState::new(config(&account_path)).expect("verification state");
+        let ids = read_server_registry(&state, "cpa_pools")
+            .into_iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            ids,
+            HashSet::from(["pool-a".to_owned(), "pool-b".to_owned()])
+        );
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn account_management_preserves_private_fields_and_writes_atomically() {
+        let path = account_snapshot_path("management");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([
+                {
+                    "access_token": "token-one",
+                    "refresh_token": "refresh-one",
+                    "id_token": "id-one",
+                    "status": "正常",
+                    "type": "plus",
+                    "source_type": "web",
+                    "quota": 7,
+                    "proxy": "http://proxy.invalid"
+                }
+            ]))
+            .expect("snapshot"),
+        )
+        .expect("write snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let get = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/accounts")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("get accounts");
+        let public = json_response(get).await;
+        assert_eq!(public["items"][0]["quota"], 7);
+        assert!(public["items"][0].get("access_token").is_none());
+        assert!(public["items"][0].get("refresh_token").is_none());
+
+        let add = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/accounts")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"tokens":["token-two"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("add accounts");
+        assert_eq!(add.status(), StatusCode::OK);
+        let stored: Value = serde_json::from_slice(&fs::read(&path).expect("stored snapshot"))
+            .expect("stored json");
+        assert_eq!(stored.as_array().expect("array").len(), 2);
+
+        let update = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/accounts/update")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"access_token":"token-one","status":"限流"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("update account");
+        assert_eq!(update.status(), StatusCode::OK);
+        let stored: Value = serde_json::from_slice(&fs::read(&path).expect("updated snapshot"))
+            .expect("updated json");
+        assert_eq!(stored[0]["status"], "限流");
+        assert_eq!(stored[0]["refresh_token"], "refresh-one");
+
+        let delete = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/api/accounts")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"tokens":["token-two"]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("delete account");
+        assert_eq!(delete.status(), StatusCode::OK);
+        let stored: Value = serde_json::from_slice(&fs::read(&path).expect("deleted snapshot"))
+            .expect("deleted json");
+        assert_eq!(stored.as_array().expect("array").len(), 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_import_validates_public_shapes_and_preserves_refresh_order() {
+        let path = account_snapshot_path("management-import-contract");
+        let initial = serde_json::to_vec(&json!([
+            {
+                "access_token": "account-token",
+                "chatgpt_account_id": "acct-1",
+                "status": "限流",
+                "quota": 7,
+                "private_canary": "keep"
+            }
+        ]))
+        .expect("initial snapshot");
+        fs::write(&path, &initial).expect("write initial snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+
+        let invalid = management_request(
+            &state,
+            "POST",
+            "/api/accounts",
+            Some(json!({
+                "tokens": ["extra-token", "account-token", "extra-token", 42],
+                "accounts": [
+                    {"access_token": "account-token"},
+                    {"token": "must-not-be-a-public-token"},
+                    "not-an-account"
+                ]
+            })),
+            Some("secret"),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(fs::read(&path).expect("unchanged snapshot"), initial);
+
+        let valid = management_request(
+            &state,
+            "POST",
+            "/api/accounts",
+            Some(json!({
+                "tokens": ["extra-token", "account-token", "extra-token"],
+                "accounts": [
+                    {
+                        "access_token": "account-token",
+                        "chatgpt_account_id": "acct-1",
+                        "private_new": "kept"
+                    },
+                    {"accessToken": "alias-token", "chatgpt_account_id": "acct-2"},
+                    {"token": "must-be-ignored"}
+                ]
+            })),
+            Some("secret"),
+        )
+        .await;
+        assert_eq!(valid.status(), StatusCode::OK);
+        let response = json_response(valid).await;
+        let errors = response["errors"].as_array().expect("refresh errors");
+        assert_eq!(errors.len(), 3);
+        assert_eq!(errors[0]["token"], public_token_ref("extra-token"));
+        assert_eq!(errors[1]["token"], public_token_ref("account-token"));
+        assert_eq!(errors[2]["token"], public_token_ref("alias-token"));
+        let stored: Value = serde_json::from_slice(&fs::read(&path).expect("stored snapshot"))
+            .expect("stored JSON");
+        let records = stored.as_array().expect("account array");
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["access_token"], "account-token");
+        assert_eq!(records[0]["private_canary"], "keep");
+        assert_eq!(records[0]["private_new"], "kept");
+        assert_eq!(records[1]["access_token"], "alias-token");
+        assert_eq!(records[2]["access_token"], "extra-token");
+        assert!(records.iter().all(|item| {
+            item.get("access_token") != Some(&Value::String("must-be-ignored".to_owned()))
+        }));
+        assert!(response["items"].as_array().is_some());
+        assert!(
+            response["items"]
+                .as_array()
+                .expect("public items")
+                .iter()
+                .all(|item| item.get("access_token").is_none())
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_import_prefers_newer_identity_token_and_retains_state() {
+        let path = account_snapshot_path("management-import-rank");
+        let old_token = test_account_jwt("acct-rank", 100, 10);
+        let new_token = test_account_jwt("acct-rank", 200, 20);
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": old_token,
+                "chatgpt_account_id": "acct-rank",
+                "status": "限流",
+                "quota": 9,
+                "private_canary": "keep"
+            }]))
+            .expect("rank snapshot"),
+        )
+        .expect("write rank snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("rank state");
+        let (added, skipped) = state
+            .account_store
+            .merge_import_records(vec![json!({
+                "access_token": new_token,
+                "chatgpt_account_id": "acct-rank",
+                "status": "正常",
+                "private_new": "kept"
+            })])
+            .await
+            .expect("newer token merge");
+        assert_eq!((added, skipped), (0, 1));
+        let record = state.account_store.raw_records().pop().expect("record");
+        assert_eq!(record["access_token"], new_token);
+        assert_eq!(record["status"], "限流");
+        assert_eq!(record["quota"], 9);
+        assert_eq!(record["private_canary"], "keep");
+        assert_eq!(record["private_new"], "kept");
+
+        let (added, skipped) = state
+            .account_store
+            .merge_import_records(vec![json!({
+                "access_token": old_token,
+                "chatgpt_account_id": "acct-rank",
+                "private_old": "must-not-rotate"
+            })])
+            .await
+            .expect("older token merge");
+        assert_eq!((added, skipped), (0, 1));
+        let record = state.account_store.raw_records().pop().expect("record");
+        assert_eq!(record["access_token"], new_token);
+        assert_eq!(record["private_old"], "must-not-rotate");
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_reload_uses_latest_valid_last_used_at_and_ignores_malformed_disk_values() {
+        let path = account_snapshot_path("account-reload-last-used-order");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "time-token",
+                "chatgpt_account_id": "account-time",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("initial snapshot"),
+        )
+        .expect("write initial snapshot");
+        let state = account_state(&path);
+
+        assert!(
+            state
+                .account_store
+                .set_last_used_at_for_test("time-token", Some("2026-08-23 01:02:03"))
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "time-token",
+                "chatgpt_account_id": "account-time",
+                "status": "正常",
+                "type": "plus",
+                "last_used_at": "2026-08-23 04:05:06"
+            }]))
+            .expect("disk-new snapshot"),
+        )
+        .expect("write disk-new snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(
+            state.account_store.last_used_at("time-token"),
+            Some("2026-08-23 04:05:06".to_owned())
+        );
+
+        assert!(
+            state
+                .account_store
+                .set_last_used_at_for_test("time-token", Some("2026-08-23 07:08:09"))
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "time-token",
+                "chatgpt_account_id": "account-time",
+                "status": "正常",
+                "type": "plus",
+                "last_used_at": "2026-08-23 06:05:04"
+            }]))
+            .expect("memory-new snapshot"),
+        )
+        .expect("write memory-new snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(
+            state.account_store.last_used_at("time-token"),
+            Some("2026-08-23 07:08:09".to_owned())
+        );
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "time-token",
+                "chatgpt_account_id": "account-time",
+                "status": "正常",
+                "type": "plus",
+                "last_used_at": "9999-99-99 99:99:99"
+            }]))
+            .expect("malformed snapshot"),
+        )
+        .expect("write malformed snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(
+            state.account_store.last_used_at("time-token"),
+            Some("2026-08-23 07:08:09".to_owned())
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_reload_status_only_same_token_without_identity_preserves_last_used_and_rejects_limited()
+     {
+        let path = account_snapshot_path("account-reload-status-only");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "status-token",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("initial snapshot"),
+        )
+        .expect("write initial snapshot");
+        let state = account_state(&path);
+        let marker = "2026-08-23 08:09:10";
+        assert!(
+            state
+                .account_store
+                .set_last_used_at_for_test("status-token", Some(marker))
+        );
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "status-token",
+                "status": "限流",
+                "type": "plus"
+            }]))
+            .expect("status-only snapshot"),
+        )
+        .expect("write status-only snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(
+            state.account_store.last_used_at("status-token"),
+            Some(marker.to_owned())
+        );
+        assert!(state.account_store.acquire("auto").await.is_none());
+        assert_eq!(
+            state.account_store.last_used_at("status-token"),
+            Some(marker.to_owned())
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_reload_missing_identity_to_present_does_not_preserve_last_used() {
+        let path = account_snapshot_path("account-reload-missing-to-present");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "missing-present-token",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("initial snapshot"),
+        )
+        .expect("write initial snapshot");
+        let state = account_state(&path);
+        assert!(
+            state
+                .account_store
+                .set_last_used_at_for_test("missing-present-token", Some("2026-08-23 11:12:13"))
+        );
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "missing-present-token",
+                "chatgpt_account_id": "new-account",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("identity-added snapshot"),
+        )
+        .expect("write identity-added snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(
+            state.account_store.last_used_at("missing-present-token"),
+            None
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_reload_present_identity_to_missing_does_not_preserve_last_used() {
+        let path = account_snapshot_path("account-reload-present-to-missing");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "present-missing-token",
+                "chatgpt_account_id": "old-account",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("initial snapshot"),
+        )
+        .expect("write initial snapshot");
+        let state = account_state(&path);
+        assert!(
+            state
+                .account_store
+                .set_last_used_at_for_test("present-missing-token", Some("2026-08-23 12:13:14"))
+        );
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "present-missing-token",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("identity-removed snapshot"),
+        )
+        .expect("write identity-removed snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(
+            state.account_store.last_used_at("present-missing-token"),
+            None
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_reload_token_rotation_same_identity_preserves_last_used() {
+        let path = account_snapshot_path("account-reload-token-rotation");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "old-rotation-token",
+                "chatgpt_account_id": "account-rotation",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("initial snapshot"),
+        )
+        .expect("write initial snapshot");
+        let state = account_state(&path);
+        let marker = "2026-08-23 09:10:11";
+        assert!(
+            state
+                .account_store
+                .set_last_used_at_for_test("old-rotation-token", Some(marker))
+        );
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "new-rotation-token",
+                "chatgpt_account_id": "account-rotation",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("rotated snapshot"),
+        )
+        .expect("write rotated snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(state.account_store.last_used_at("old-rotation-token"), None);
+        assert_eq!(
+            state.account_store.last_used_at("new-rotation-token"),
+            Some(marker.to_owned())
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_reload_token_reuse_different_identity_does_not_preserve_last_used() {
+        let path = account_snapshot_path("account-reload-token-reuse");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "reused-token",
+                "chatgpt_account_id": "old-account",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("initial snapshot"),
+        )
+        .expect("write initial snapshot");
+        let state = account_state(&path);
+        assert!(
+            state
+                .account_store
+                .set_last_used_at_for_test("reused-token", Some("2026-08-23 10:11:12"))
+        );
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "reused-token",
+                "chatgpt_account_id": "new-account",
+                "status": "正常",
+                "type": "plus"
+            }]))
+            .expect("reused-token snapshot"),
+        )
+        .expect("write reused-token snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(state.account_store.last_used_at("reused-token"), None);
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn user_key_management_returns_plaintext_once_and_redacts_snapshots() {
+        let path = account_snapshot_path("auth-users");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "items": [{
+                    "id": "u0",
+                    "name": "old",
+                    "role": "user",
+                    "enabled": true,
+                    "key_hash": auth_key_hash("old-key")
+                }]
+            }))
+            .expect("auth snapshot"),
+        )
+        .expect("write auth snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: Some(path.clone()),
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let create = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/users")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"new"}"#))
+                    .expect("create request"),
+            )
+            .await
+            .expect("create response");
+        assert_eq!(create.status(), StatusCode::OK);
+        let created = json_response(create).await;
+        let key = created["key"].as_str().expect("one-time key").to_owned();
+        let id = created["item"]["id"].as_str().expect("user id").to_owned();
+        assert!(created["item"].get("key_hash").is_none());
+        assert!(created["items"][1].get("key_hash").is_none());
+
+        let forbidden = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/users")
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"nested"}"#))
+                    .expect("forbidden request"),
+            )
+            .await
+            .expect("forbidden response");
+        assert_eq!(forbidden.status(), StatusCode::UNAUTHORIZED);
+
+        let update = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/auth/users/{id}"))
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .expect("update request"),
+            )
+            .await
+            .expect("update response");
+        assert_eq!(update.status(), StatusCode::OK);
+        let updated = json_response(update).await;
+        assert_eq!(updated["item"]["enabled"], false);
+
+        let stored: Value =
+            serde_json::from_slice(&fs::read(&path).expect("stored auth")).expect("stored json");
+        let created_stored = stored["items"]
+            .as_array()
+            .expect("auth items")
+            .iter()
+            .find(|item| item["id"] == id)
+            .expect("created record");
+        assert_eq!(created_stored["key_hash"], auth_key_hash(&key));
+        assert!(created_stored.get("key").is_none());
+
+        let delete = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/auth/users/{id}"))
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .body(Body::empty())
+                    .expect("delete request"),
+            )
+            .await
+            .expect("delete response");
+        assert_eq!(delete.status(), StatusCode::OK);
+        assert!(
+            json_response(delete).await["items"]
+                .as_array()
+                .expect("remaining users")
+                .iter()
+                .all(|item| item["id"] != id)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn auth_mutations_from_independent_states_preserve_all_unrelated_writes() {
+        let path = account_snapshot_path("auth-independent-states");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "revision": 41,
+                "canary": {"owner": "auth-contract"},
+                "items": [{
+                    "id": "u0",
+                    "name": "old",
+                    "role": "user",
+                    "enabled": true,
+                    "key_hash": auth_key_hash("old-key")
+                }]
+            }))
+            .expect("auth snapshot"),
+        )
+        .expect("write auth snapshot");
+        let first = auth_state(&path);
+        let second = auth_state(&path);
+
+        let (create_first, create_second) = tokio::join!(
+            management_request(
+                &first,
+                "POST",
+                "/api/auth/users",
+                Some(json!({"name":"first"})),
+                Some("admin"),
+            ),
+            management_request(
+                &second,
+                "POST",
+                "/api/auth/users",
+                Some(json!({"name":"second"})),
+                Some("admin"),
+            ),
+        );
+        assert_eq!(create_first.status(), StatusCode::OK);
+        assert_eq!(create_second.status(), StatusCode::OK);
+        let first_user = json_response(create_first).await["item"]["id"]
+            .as_str()
+            .expect("first user id")
+            .to_owned();
+        let first_user_uri = format!("/api/auth/users/{first_user}");
+
+        let (update_first, create_third) = tokio::join!(
+            management_request(
+                &first,
+                "POST",
+                &first_user_uri,
+                Some(json!({"name":"first-updated"})),
+                Some("admin"),
+            ),
+            management_request(
+                &second,
+                "POST",
+                "/api/auth/users",
+                Some(json!({"name":"third"})),
+                Some("admin"),
+            ),
+        );
+        assert_eq!(update_first.status(), StatusCode::OK);
+        assert_eq!(create_third.status(), StatusCode::OK);
+        let third_user = json_response(create_third).await["item"]["id"]
+            .as_str()
+            .expect("third user id")
+            .to_owned();
+
+        let (delete_old, update_first_enabled) = tokio::join!(
+            management_request(&first, "DELETE", "/api/auth/users/u0", None, Some("admin"),),
+            management_request(
+                &second,
+                "POST",
+                &first_user_uri,
+                Some(json!({"enabled":false})),
+                Some("admin"),
+            ),
+        );
+        assert_eq!(delete_old.status(), StatusCode::OK);
+        assert_eq!(update_first_enabled.status(), StatusCode::OK);
+
+        let stored: Value =
+            serde_json::from_slice(&fs::read(&path).expect("stored auth")).expect("stored json");
+        assert_eq!(stored["revision"], 41);
+        assert_eq!(stored["canary"]["owner"], "auth-contract");
+        let items = stored["items"].as_array().expect("auth items");
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().all(|item| item["id"] != "u0"));
+        let first_item = items
+            .iter()
+            .find(|item| item["id"] == first_user)
+            .expect("first user retained");
+        assert_eq!(first_item["name"], "first-updated");
+        assert_eq!(first_item["enabled"], false);
+        assert!(items.iter().any(|item| item["id"] == third_user));
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn auth_mutation_rejects_external_revision_and_keeps_external_snapshot() {
+        let path = account_snapshot_path("auth-external-revision");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "revision": 1,
+                "canary": "before",
+                "items": [{
+                    "id": "u0",
+                    "name": "old",
+                    "role": "user",
+                    "enabled": true,
+                    "key_hash": auth_key_hash("old-key")
+                }]
+            }))
+            .expect("auth snapshot"),
+        )
+        .expect("write auth snapshot");
+        let state = auth_state(&path);
+        let hook = AuthMutationTestHook {
+            pause_before_cas: Arc::new(AtomicBool::new(true)),
+            cas_ready: Arc::new(Notify::new()),
+            release_cas: Arc::new(Notify::new()),
+            fail_before_write: Arc::new(AtomicBool::new(false)),
+        };
+        state.auth_store.set_mutation_test_hook(Some(hook.clone()));
+        let worker = state.clone();
+        let request = tokio::spawn(async move {
+            management_request(
+                &worker,
+                "POST",
+                "/api/auth/users",
+                Some(json!({"name":"must-not-win"})),
+                Some("admin"),
+            )
+            .await
+        });
+        hook.cas_ready.notified().await;
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "revision": 2,
+                "canary": "external",
+                "items": [{
+                    "id": "external",
+                    "name": "external-writer",
+                    "role": "user",
+                    "enabled": true,
+                    "key_hash": auth_key_hash("external-key")
+                }]
+            }))
+            .expect("external auth snapshot"),
+        )
+        .expect("external write");
+        hook.release_cas.notify_one();
+        let response = request.await.expect("mutation task");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!state.auth_store.accepts("old-key"));
+        let stored: Value =
+            serde_json::from_slice(&fs::read(&path).expect("external snapshot remains"))
+                .expect("stored json");
+        assert_eq!(stored["revision"], 2);
+        assert_eq!(stored["canary"], "external");
+        assert_eq!(stored["items"][0]["id"], "external");
+        state.auth_store.set_mutation_test_hook(None);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn auth_mutation_write_failure_preserves_old_snapshot_in_memory_and_disk() {
+        let path = account_snapshot_path("auth-write-failure");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "revision": 7,
+                "canary": "before",
+                "items": [{
+                    "id": "u0",
+                    "name": "old",
+                    "role": "user",
+                    "enabled": true,
+                    "key_hash": auth_key_hash("old-key")
+                }]
+            }))
+            .expect("auth snapshot"),
+        )
+        .expect("write auth snapshot");
+        let state = auth_state(&path);
+        let hook = AuthMutationTestHook {
+            pause_before_cas: Arc::new(AtomicBool::new(false)),
+            cas_ready: Arc::new(Notify::new()),
+            release_cas: Arc::new(Notify::new()),
+            fail_before_write: Arc::new(AtomicBool::new(true)),
+        };
+        state.auth_store.set_mutation_test_hook(Some(hook));
+        let response = management_request(
+            &state,
+            "POST",
+            "/api/auth/users",
+            Some(json!({"name":"must-not-write"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.auth_store.accepts("old-key"));
+        let stored: Value = serde_json::from_slice(&fs::read(&path).expect("old snapshot remains"))
+            .expect("stored json");
+        assert_eq!(stored["revision"], 7);
+        assert_eq!(stored["canary"], "before");
+        assert_eq!(stored["items"].as_array().expect("items").len(), 1);
+        state.auth_store.set_mutation_test_hook(None);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn auth_items_limit_returns_bad_request_without_touching_snapshot() {
+        let path = account_snapshot_path("auth-items-limit");
+        let items = (0..MAX_AUTH_KEYS)
+            .map(|index| {
+                json!({
+                    "enabled": true,
+                    "key_hash": if index == 0 {
+                        auth_key_hash("old-key")
+                    } else {
+                        format!("{index:064x}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let before = serde_json::to_vec(&json!({"items": items})).expect("auth snapshot");
+        assert!(before.len() <= MAX_AUTH_KEYS_BYTES as usize);
+        fs::write(&path, &before).expect("write auth snapshot");
+        let state = auth_state(&path);
+        let response = management_request(
+            &state,
+            "POST",
+            "/api/auth/users",
+            Some(json!({"name":"over-limit"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.auth_store.accepts("old-key"));
+        assert_eq!(fs::read(&path).expect("snapshot remains"), before);
+        assert!(
+            !fs::read_dir(path.parent().expect("snapshot parent"))
+                .expect("snapshot parent entries")
+                .flatten()
+                .any(|entry| { entry.file_name().to_string_lossy().contains(".json.tmp-") })
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn auth_serialized_size_limit_returns_bad_request_without_touching_snapshot() {
+        let path = account_snapshot_path("auth-size-limit");
+        let padding = "x".repeat(80);
+        let mut items = Vec::new();
+        for index in 0..5_000 {
+            items.push(json!({
+                "id": format!("u{index}"),
+                "enabled": true,
+                "key_hash": if index == 0 {
+                    auth_key_hash("old-key")
+                } else {
+                    format!("{index:064x}")
+                },
+                "pad": padding.clone(),
+            }));
+        }
+        let before_value = json!({"items": items});
+        let before = serde_json::to_vec(&before_value).expect("compact auth snapshot");
+        let mut pretty_value = before_value.clone();
+        pretty_value["items"][0]["enabled"] = Value::Bool(false);
+        let pretty = serde_json::to_vec_pretty(&pretty_value).expect("pretty auth snapshot");
+        assert!(before.len() <= MAX_AUTH_KEYS_BYTES as usize);
+        assert!(pretty.len() > MAX_AUTH_KEYS_BYTES as usize);
+        fs::write(&path, &before).expect("write auth snapshot");
+        let state = auth_state(&path);
+        let response = management_request(
+            &state,
+            "POST",
+            "/api/auth/users/u0",
+            Some(json!({"enabled":false})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(state.auth_store.accepts("old-key"));
+        assert_eq!(fs::read(&path).expect("snapshot remains"), before);
+        assert!(
+            !fs::read_dir(path.parent().expect("snapshot parent"))
+                .expect("snapshot parent entries")
+                .flatten()
+                .any(|entry| { entry.file_name().to_string_lossy().contains(".json.tmp-") })
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn account_refresh_exposes_bounded_progress_and_redacted_errors() {
+        let path = account_snapshot_path("refresh-progress");
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!([{
+                "access_token": "refresh-token",
+                "status": "正常",
+                "type": "free"
+            }]))
+            .expect("account snapshot"),
+        )
+        .expect("write account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let start = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/accounts/refresh")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"access_tokens":["refresh-token"]}"#))
+                    .expect("refresh request"),
+            )
+            .await
+            .expect("refresh response");
+        assert_eq!(start.status(), StatusCode::OK);
+        let start_body = json_response(start).await;
+        let progress_id = start_body["progress_id"].as_str().expect("progress id");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut finished = None;
+        loop {
+            let response = state
+                .router()
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/accounts/refresh/progress/{progress_id}"))
+                        .header(header::AUTHORIZATION, "Bearer admin")
+                        .body(Body::empty())
+                        .expect("progress request"),
+                )
+                .await
+                .expect("progress response");
+            let value = json_response(response).await;
+            if value["status"] == "completed" || value["status"] == "failed" {
+                finished = Some(value);
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let finished = finished.expect("refresh must finish");
+        assert_eq!(finished["status"], "completed");
+        assert_eq!(finished["errors"][0]["code"], "missing_refresh_token");
+        assert_eq!(
+            finished["errors"][0]["token"],
+            public_token_ref("refresh-token")
+        );
+        assert!(finished["errors"][0].get("access_token").is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn oauth_pkce_start_never_exposes_verifier_and_rejects_state_replay() {
+        let state = state(Some("admin"));
+        let start = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/accounts/oauth/start")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"email_hint":"person@example.com"}"#))
+                    .expect("oauth start request"),
+            )
+            .await
+            .expect("oauth start response");
+        assert_eq!(start.status(), StatusCode::OK);
+        let value = json_response(start).await;
+        let session_id = value["session_id"].as_str().expect("session id");
+        let authorize_url = value["authorize_url"].as_str().expect("authorize url");
+        assert!(authorize_url.contains("code_challenge_method=S256"));
+        assert!(!authorize_url.contains("code_verifier"));
+        let finish = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/accounts/oauth/finish")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        "{{\"session_id\":\"{session_id}\",\"callback\":\"https://platform.openai.com/auth/callback?code=code&state=wrong\"}}"
+                    )))
+                    .expect("oauth finish request"),
+            )
+            .await
+            .expect("oauth finish response");
+        assert_eq!(finish.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn image_and_maintenance_routes_are_bounded_and_fail_closed() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let upstream_calls_for_server = upstream_calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let upstream_address = listener.local_addr().expect("upstream address");
+        let upstream = tokio::spawn(async move {
+            let app = Router::new().fallback(axum::routing::any(move || {
+                upstream_calls_for_server.fetch_add(1, Ordering::SeqCst);
+                async { StatusCode::INTERNAL_SERVER_ERROR }
+            }));
+            axum::serve(listener, app).await.expect("upstream server");
+        });
+        let account_path = account_snapshot_path("image-routes");
+        fs::write(&account_path, "[]").expect("account snapshot");
+        let data_dir = account_path.parent().expect("temp parent").to_owned();
+        let image_dir = data_dir.join("images");
+        fs::create_dir_all(&image_dir).expect("image dir");
+        fs::write(image_dir.join("tiny.png"), b"png").expect("image");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("secret".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: Some(format!("http://{upstream_address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state.account_type_catalog.shutdown().await;
+        let list = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/images")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("image list");
+        assert_eq!(list.status(), StatusCode::OK);
+        assert_eq!(json_response(list).await["items"][0]["name"], "tiny.png");
+
+        let image = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/images/tiny.png")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("image");
+        assert_eq!(image.status(), StatusCode::OK);
+        let download = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/images/download/tiny.png")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .expect("download"),
+            )
+            .await
+            .expect("download response");
+        assert_eq!(download.status(), StatusCode::OK);
+        assert!(download.headers().contains_key(header::CONTENT_DISPOSITION));
+
+        let set_tags = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/images/tags")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"tiny.png","tags":["demo","demo"]}"#))
+                    .expect("tags"),
+            )
+            .await
+            .expect("tags response");
+        assert_eq!(set_tags.status(), StatusCode::OK);
+        assert_eq!(json_response(set_tags).await["tags"], json!(["demo"]));
+        let tags = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/images/tags")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::empty())
+                    .expect("list tags"),
+            )
+            .await
+            .expect("list tags response");
+        assert_eq!(json_response(tags).await["tags"], json!(["demo"]));
+        let traversal = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/images/%2e%2e/config.json")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("traversal");
+        assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+
+        let task = state
+            .router()
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/image-tasks/generations")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"client_task_id":"task-one","prompt":"hello"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("task");
+        assert_eq!(task.status(), StatusCode::OK);
+        assert_eq!(json_response(task).await["status"], "queued");
+
+        let unsupported = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"prompt":"hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("unsupported image");
+        assert_eq!(unsupported.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let unsupported_body = json_response(unsupported).await;
+        assert_eq!(unsupported_body["error"]["type"], "server_error");
+        assert_eq!(unsupported_body["error"]["code"], "upstream_unavailable");
+        assert_eq!(unsupported_body["error"]["message"], PUBLIC_SERVER_ERROR);
+        assert_eq!(state.account_store.records().len(), 0);
+        assert_eq!(state.account_store.inflight(), 0);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+
+        let _ = fs::remove_file(image_dir.join("tiny.png"));
+        let _ = fs::remove_file(data_dir.join("image_tasks.json"));
+        let _ = fs::remove_file(data_dir.join("image_tags.json"));
+        let _ = fs::remove_dir(&image_dir);
+        let _ = fs::remove_file(account_path);
+        upstream.abort();
+        let _ = upstream.await;
+    }
+
+    #[tokio::test]
+    async fn image_tag_delete_matches_python_storage_and_lock_contract() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-delete");
+        fs::write(&account_path, "[]").expect("account snapshot");
+        let data_dir = account_path.parent().expect("temp parent").to_owned();
+        let tags_path = data_dir.join("image_tags.json");
+        let initial = json!({
+            "images/one.png": ["remove", "keep"],
+            "images/two.png": ["remove"],
+            "images/three.png": ["other"]
+        });
+        let mut initial_bytes = serde_json::to_vec_pretty(&initial).expect("tags snapshot");
+        initial_bytes.push(b'\n');
+        fs::write(&tags_path, &initial_bytes).expect("tags snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+
+        let deleted = management_request(
+            &state,
+            "DELETE",
+            "/api/images/tags/remove",
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+        assert_eq!(json_response(deleted).await["removed_from"], 2);
+        let persisted: Value =
+            serde_json::from_slice(&fs::read(&tags_path).expect("persisted tags"))
+                .expect("persisted JSON");
+        assert_eq!(persisted["images/one.png"], json!(["keep"]));
+        assert!(persisted.get("images/two.png").is_none());
+        assert_eq!(persisted["images/three.png"], json!(["other"]));
+        assert!(
+            !data_dir.read_dir().expect("data directory").any(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".json.tmp-")
+            }),
+            "successful publish left a temporary file"
+        );
+
+        let unchanged_bytes = fs::read(&tags_path).expect("tags bytes");
+        let unchanged_mtime = fs::metadata(&tags_path)
+            .expect("tags metadata")
+            .modified()
+            .expect("tags mtime");
+        let missed = management_request(
+            &state,
+            "DELETE",
+            "/api/images/tags/missing",
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(missed.status(), StatusCode::OK);
+        assert_eq!(json_response(missed).await["removed_from"], 0);
+        assert_eq!(
+            fs::read(&tags_path).expect("unchanged tags bytes"),
+            unchanged_bytes
+        );
+        assert_eq!(
+            fs::metadata(&tags_path)
+                .expect("unchanged tags metadata")
+                .modified()
+                .expect("unchanged tags mtime"),
+            unchanged_mtime
+        );
+
+        let corrupt = b"{broken".to_vec();
+        fs::write(&tags_path, &corrupt).expect("corrupt tags");
+        let failed = management_request(
+            &state,
+            "DELETE",
+            "/api/images/tags/remove",
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            fs::read(&tags_path).expect("corrupt snapshot remains"),
+            corrupt
+        );
+
+        let mut valid_bytes = serde_json::to_vec_pretty(&json!({
+            "images/one.png": ["remove"]
+        }))
+        .expect("valid tags");
+        valid_bytes.push(b'\n');
+        fs::write(&tags_path, valid_bytes).expect("valid tags snapshot");
+        let held_lock = acquire_path_write_lock_sync(&tags_path).expect("sidecar lock");
+        let pending = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                management_request(
+                    &state,
+                    "DELETE",
+                    "/api/images/tags/remove",
+                    None,
+                    Some("admin"),
+                )
+                .await
+            })
+        };
+        let mut pending = Box::pin(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "tag mutation bypassed the sidecar lock"
+        );
+        drop(held_lock);
+        let completed = pending.await.expect("locked mutation task");
+        assert_eq!(completed.status(), StatusCode::OK);
+        assert_eq!(json_response(completed).await["removed_from"], 1);
+
+        let _ = fs::remove_file(tags_path);
+        let _ = fs::remove_file(path_write_lock_path(&data_dir.join("image_tags.json")));
+        let _ = fs::remove_file(account_path);
+    }
+
+    #[tokio::test]
+    async fn image_tag_cross_runtime_sidecar_lock_blocks_both_directions() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+
+        let python_held_account_path = account_snapshot_path("image-tag-cross-runtime-python-held");
+        let python_held_dir = python_held_account_path
+            .parent()
+            .expect("python-held data parent")
+            .to_owned();
+        let python_held_tags_path = python_held_dir.join("image_tags.json");
+        fs::write(&python_held_account_path, "[]").expect("python-held accounts");
+        fs::write(&python_held_tags_path, b"{}\n").expect("python-held tags");
+        let python_ready = python_held_dir.join("python-lock-ready");
+        let python_release = python_held_dir.join("python-lock-release");
+        let python_error = python_held_dir.join("python-lock-error");
+        let mut python_lock_child = PythonLockChild {
+            child: spawn_python_lock_child(
+                PYTHON_HOLD_LOCK,
+                &[
+                    &python_held_tags_path,
+                    &python_ready,
+                    &python_release,
+                    &python_error,
+                ],
+            ),
+            release: python_release.clone(),
+        };
+        wait_for_test_marker(&python_ready);
+
+        let python_held_state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(python_held_account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("python-held state");
+        let pending = tokio::spawn({
+            let state = python_held_state.clone();
+            async move {
+                management_request(
+                    &state,
+                    "POST",
+                    "/api/images/tags",
+                    Some(json!({
+                        "path": "images/rust.png",
+                        "tags": ["rust"]
+                    })),
+                    Some("admin"),
+                )
+                .await
+            }
+        });
+        let mut pending = Box::pin(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut pending)
+                .await
+                .is_err(),
+            "Rust image-tag mutation bypassed the Python sidecar lock"
+        );
+        fs::write(&python_release, b"release").expect("release Python lock");
+        let response = pending.await.expect("Rust mutation task");
+        assert_eq!(response.status(), StatusCode::OK);
+        let child_status = python_lock_child.wait();
+        assert!(child_status.success(), "Python lock child failed");
+        assert!(
+            !python_error.exists(),
+            "Python lock child reported an error"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(&python_held_tags_path).expect("Rust-written tags")
+            )
+            .expect("Rust-written tags JSON")["images/rust.png"],
+            json!(["rust"])
+        );
+
+        let rust_held_account_path = account_snapshot_path("image-tag-cross-runtime-rust-held");
+        let rust_held_dir = rust_held_account_path
+            .parent()
+            .expect("Rust-held data parent")
+            .to_owned();
+        let rust_held_tags_path = rust_held_dir.join("image_tags.json");
+        fs::write(&rust_held_account_path, "[]").expect("Rust-held accounts");
+        fs::write(&rust_held_tags_path, b"{}\n").expect("Rust-held tags");
+        let rust_held =
+            acquire_path_write_lock_sync(&rust_held_tags_path).expect("Rust sidecar lock");
+        let python_started = rust_held_dir.join("python-writer-started");
+        let python_result = rust_held_dir.join("python-writer-result");
+        let mut python_writer = PythonLockChild {
+            child: spawn_python_lock_child(
+                PYTHON_SET_TAGS,
+                &[&rust_held_tags_path, &python_started, &python_result],
+            ),
+            release: rust_held_dir.join("unused-release-marker"),
+        };
+        wait_for_test_marker(&python_started);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !python_result.exists(),
+            "Python image-tag mutation bypassed the Rust sidecar lock"
+        );
+        drop(rust_held);
+        let child_status = python_writer.wait();
+        assert!(child_status.success(), "Python writer child failed");
+        assert_eq!(
+            fs::read_to_string(&python_result).expect("Python writer result"),
+            "success"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(&rust_held_tags_path).expect("Python-written tags")
+            )
+            .expect("Python-written tags JSON")["images/python.png"],
+            json!(["python"])
+        );
+
+        let _ = fs::remove_file(&python_held_tags_path);
+        let _ = fs::remove_file(path_write_lock_path(&python_held_tags_path));
+        let _ = fs::remove_file(&python_held_account_path);
+        let _ = fs::remove_file(&rust_held_tags_path);
+        let _ = fs::remove_file(path_write_lock_path(&rust_held_tags_path));
+        let _ = fs::remove_file(&rust_held_account_path);
+    }
+
+    #[tokio::test]
+    async fn image_tag_cross_runtime_sidecar_lock_handles_initialized_and_first_creation() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        const CASES: [(&str, &[u8]); 2] = [("empty", b""), ("initialized", b"lock")];
+
+        for (label, lock_bytes) in CASES {
+            let python_held_account_path =
+                account_snapshot_path(&format!("image-tag-cross-runtime-{label}-python-held"));
+            let data_dir = python_held_account_path
+                .parent()
+                .expect("python-held data parent")
+                .to_owned();
+            let tags_path = data_dir.join("image_tags.json");
+            let lock_path = path_write_lock_path(&tags_path);
+            fs::write(&python_held_account_path, "[]").expect("python-held accounts");
+            fs::write(&tags_path, b"{}\n").expect("python-held tags");
+            fs::write(&lock_path, lock_bytes).expect("python-held sidecar");
+            let ready = data_dir.join("python-lock-ready");
+            let release = data_dir.join("python-lock-release");
+            let error = data_dir.join("python-lock-error");
+            let mut python_lock_child = PythonLockChild {
+                child: spawn_python_lock_child(
+                    PYTHON_HOLD_LOCK,
+                    &[&tags_path, &ready, &release, &error],
+                ),
+                release: release.clone(),
+            };
+            wait_for_test_marker(&ready);
+            let state = AppState::new(AppConfig {
+                version: "test".to_owned(),
+                auth_key: Some("admin".to_owned()),
+                models: Vec::new(),
+                upstream_base_url: None,
+                upstream_auth: None,
+                auth_keys_path: None,
+                models_path: None,
+                accounts_path: Some(python_held_account_path.clone()),
+                upstream_protocol: UpstreamProtocol::ChatGpt,
+            })
+            .expect("python-held state");
+            let pending = tokio::spawn({
+                let state = state.clone();
+                async move {
+                    management_request(
+                        &state,
+                        "POST",
+                        "/api/images/tags",
+                        Some(json!({"path": "images/rust.png", "tags": ["rust"]})),
+                        Some("admin"),
+                    )
+                    .await
+                }
+            });
+            let mut pending = Box::pin(pending);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut pending)
+                    .await
+                    .is_err(),
+                "Rust mutation bypassed Python {label} sidecar lock"
+            );
+            fs::write(&release, b"release").expect("release Python lock");
+            assert_eq!(
+                pending.await.expect("Rust mutation task").status(),
+                StatusCode::OK
+            );
+            assert!(python_lock_child.wait().success());
+            assert!(
+                !error.exists(),
+                "Python lock child failed for {label} sidecar"
+            );
+            let _ = fs::remove_file(&tags_path);
+            let _ = fs::remove_file(&lock_path);
+            let _ = fs::remove_file(&python_held_account_path);
+
+            let rust_held_account_path =
+                account_snapshot_path(&format!("image-tag-cross-runtime-{label}-rust-held"));
+            let data_dir = rust_held_account_path
+                .parent()
+                .expect("Rust-held data parent")
+                .to_owned();
+            let tags_path = data_dir.join("image_tags.json");
+            let lock_path = path_write_lock_path(&tags_path);
+            fs::write(&rust_held_account_path, "[]").expect("Rust-held accounts");
+            fs::write(&tags_path, b"{}\n").expect("Rust-held tags");
+            fs::write(&lock_path, lock_bytes).expect("Rust-held sidecar");
+            let rust_lock = acquire_path_write_lock_sync(&tags_path).expect("Rust sidecar lock");
+            let started = data_dir.join("python-writer-started");
+            let result = data_dir.join("python-writer-result");
+            let mut python_writer = PythonLockChild {
+                child: spawn_python_lock_child(PYTHON_SET_TAGS, &[&tags_path, &started, &result]),
+                release: data_dir.join("unused-release-marker"),
+            };
+            wait_for_test_marker(&started);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !result.exists(),
+                "Python mutation bypassed Rust {label} sidecar lock"
+            );
+            drop(rust_lock);
+            assert!(python_writer.wait().success());
+            assert_eq!(
+                fs::read_to_string(&result).expect("Python writer result"),
+                "success"
+            );
+            let _ = fs::remove_file(&tags_path);
+            let _ = fs::remove_file(&lock_path);
+            let _ = fs::remove_file(&rust_held_account_path);
+        }
+
+        let account_path = account_snapshot_path("image-tag-cross-runtime-first-creation");
+        let data_dir = account_path
+            .parent()
+            .expect("first-creation data parent")
+            .to_owned();
+        let tags_path = data_dir.join("image_tags.json");
+        let lock_path = path_write_lock_path(&tags_path);
+        let python_ready = data_dir.join("first-python-ready");
+        let python_go = data_dir.join("first-go");
+        let python_result = data_dir.join("first-python-result");
+        let rust_go = python_go.clone();
+        fs::write(&account_path, "[]").expect("first-creation accounts");
+        assert!(!tags_path.exists());
+        assert!(!lock_path.exists());
+        let mut python_writer = PythonLockChild {
+            child: spawn_python_lock_child(
+                PYTHON_SET_TAGS_AT_GATE,
+                &[&tags_path, &python_ready, &python_go, &python_result],
+            ),
+            release: data_dir.join("unused-first-release-marker"),
+        };
+        wait_for_test_marker(&python_ready);
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("first-creation state");
+        let rust_writer = tokio::spawn(async move {
+            while !rust_go.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            management_request(
+                &state,
+                "POST",
+                "/api/images/tags",
+                Some(json!({"path": "images/rust.png", "tags": ["rust"]})),
+                Some("admin"),
+            )
+            .await
+        });
+        fs::write(&python_go, b"go").expect("start first-creation writers");
+        assert_eq!(
+            rust_writer
+                .await
+                .expect("Rust first-creation writer")
+                .status(),
+            StatusCode::OK
+        );
+        assert!(python_writer.wait().success());
+        assert_eq!(
+            fs::read_to_string(&python_result).expect("first Python result"),
+            "success"
+        );
+        let final_tags: Value = serde_json::from_slice(&fs::read(&tags_path).expect("first tags"))
+            .expect("first tags JSON");
+        assert_eq!(final_tags["images/python.png"], json!(["python"]));
+        assert_eq!(final_tags["images/rust.png"], json!(["rust"]));
+        let _ = fs::remove_file(&tags_path);
+        let _ = fs::remove_file(&lock_path);
+        let _ = fs::remove_file(&account_path);
+    }
+
+    #[tokio::test]
+    async fn image_tag_checked_storage_rejects_symlink_snapshot_and_lock() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-symlink");
+        fs::write(&account_path, "[]").expect("account snapshot");
+        let data_dir = account_path.parent().expect("data parent").to_owned();
+        let tags_path = data_dir.join("image_tags.json");
+        let outside_tags = data_dir.join("outside-tags.json");
+        let outside_tags_bytes = br#"{"images/secret.png":["tags-canary"]}
+"#;
+        fs::write(&outside_tags, outside_tags_bytes).expect("outside tags canary");
+
+        #[cfg(windows)]
+        let symlink_result = std::os::windows::fs::symlink_file(&outside_tags, &tags_path);
+        #[cfg(unix)]
+        let symlink_result = std::os::unix::fs::symlink(&outside_tags, &tags_path);
+        #[cfg(not(any(unix, windows)))]
+        let symlink_result: io::Result<()> = Err(io::Error::other("symlink unsupported"));
+        if symlink_result.is_err() {
+            let _ = fs::remove_file(outside_tags);
+            let _ = fs::remove_file(account_path);
+            return;
+        }
+
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let response =
+            management_request(&state, "GET", "/api/images/tags", None, Some("admin")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            fs::read(&outside_tags).expect("outside tags unchanged"),
+            outside_tags_bytes
+        );
+
+        let _ = fs::remove_file(&tags_path);
+        let lock_path = path_write_lock_path(&tags_path);
+        let outside_lock = data_dir.join("outside-lock.json");
+        let outside_lock_bytes = b"lock-canary";
+        fs::write(&outside_lock, outside_lock_bytes).expect("outside lock canary");
+        #[cfg(windows)]
+        let lock_symlink_result = std::os::windows::fs::symlink_file(&outside_lock, &lock_path);
+        #[cfg(unix)]
+        let lock_symlink_result = std::os::unix::fs::symlink(&outside_lock, &lock_path);
+        #[cfg(not(any(unix, windows)))]
+        let lock_symlink_result: io::Result<()> = Err(io::Error::other("symlink unsupported"));
+        if lock_symlink_result.is_ok() {
+            assert!(acquire_path_write_lock_sync(&tags_path).is_err());
+            assert_eq!(
+                fs::read(&outside_lock).expect("outside lock unchanged"),
+                outside_lock_bytes
+            );
+        }
+
+        let _ = fs::remove_file(&lock_path);
+        let _ = fs::remove_file(outside_lock);
+        let _ = fs::remove_file(outside_tags);
+        let _ = fs::remove_file(account_path);
+    }
+
+    #[tokio::test]
+    async fn image_tag_read_rejects_parent_directory_rebind_before_open() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-read-rebind");
+        let original_dir = account_path.parent().expect("data parent").to_owned();
+        let moved_dir = original_dir.with_file_name(format!(
+            "{}-moved",
+            original_dir
+                .file_name()
+                .expect("data directory name")
+                .to_string_lossy()
+        ));
+        fs::write(&account_path, "[]").expect("account snapshot");
+        let tags_path = original_dir.join("image_tags.json");
+        let original_bytes = br#"{"images/original.png":["original"]}
+"#;
+        fs::write(&tags_path, original_bytes).expect("original tags");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        *IMAGE_TAG_READ_REBIND_HOOK.lock().expect("read rebind hook") =
+            Some((original_dir.clone(), moved_dir.clone()));
+
+        let response =
+            management_request(&state, "GET", "/api/images/tags", None, Some("admin")).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        #[cfg(unix)]
+        {
+            assert!(moved_dir.is_dir(), "read rebind hook did not run");
+            assert_eq!(
+                fs::read(moved_dir.join("image_tags.json")).expect("moved tags"),
+                original_bytes
+            );
+            assert!(!original_dir.join("image_tags.json").exists());
+            let _ = fs::remove_dir_all(&original_dir);
+            fs::rename(&moved_dir, &original_dir).expect("restore original data directory");
+            assert_eq!(fs::read(&tags_path).expect("restored tags"), original_bytes);
+        }
+        #[cfg(windows)]
+        {
+            assert!(!moved_dir.exists(), "directory rebind was blocked too late");
+            assert_eq!(fs::read(&tags_path).expect("original tags"), original_bytes);
+            let _ = fs::remove_dir_all(&original_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_tag_write_rejects_parent_rebind_and_cleans_temp() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-write-rebind");
+        let original_dir = account_path.parent().expect("data parent").to_owned();
+        let moved_dir = original_dir.with_file_name(format!(
+            "{}-moved",
+            original_dir
+                .file_name()
+                .expect("data directory name")
+                .to_string_lossy()
+        ));
+        fs::write(&account_path, "[]").expect("account snapshot");
+        let tags_path = original_dir.join("image_tags.json");
+        let original_bytes = br#"{"images/original.png":["original"]}
+"#;
+        fs::write(&tags_path, original_bytes).expect("original tags");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let mut updated = Map::new();
+        updated.insert("images/original.png".to_owned(), json!(["updated"]));
+        *IMAGE_TAG_WRITE_REBIND_HOOK
+            .lock()
+            .expect("write rebind hook") = Some((original_dir.clone(), moved_dir.clone()));
+
+        assert!(write_image_tags(&state, &updated).is_err());
+        #[cfg(unix)]
+        {
+            assert!(moved_dir.is_dir(), "write rebind hook did not run");
+            assert_eq!(
+                fs::read(moved_dir.join("image_tags.json")).expect("moved tags"),
+                original_bytes
+            );
+            assert!(
+                !original_dir
+                    .read_dir()
+                    .expect("recreated directory")
+                    .any(|entry| entry
+                        .expect("directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".json.tmp-"))
+            );
+
+            let _ = fs::remove_dir_all(&original_dir);
+            fs::rename(&moved_dir, &original_dir).expect("restore original data directory");
+            assert_eq!(fs::read(&tags_path).expect("restored tags"), original_bytes);
+            assert!(
+                !original_dir
+                    .read_dir()
+                    .expect("restored directory")
+                    .any(|entry| entry
+                        .expect("directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".json.tmp-"))
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert!(!moved_dir.exists(), "directory rebind was blocked too late");
+            assert_eq!(fs::read(&tags_path).expect("original tags"), original_bytes);
+            assert!(
+                !original_dir
+                    .read_dir()
+                    .expect("original directory")
+                    .any(|entry| entry
+                        .expect("directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".json.tmp-"))
+            );
+        }
+        let _ = fs::remove_dir_all(original_dir);
+    }
+
+    #[tokio::test]
+    async fn image_tag_write_after_final_check_stays_on_held_parent() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-write-after-final-check");
+        let original_dir = account_path.parent().expect("data parent").to_owned();
+        let moved_dir = original_dir.with_file_name(format!(
+            "{}-after-final-check-moved",
+            original_dir
+                .file_name()
+                .expect("data directory name")
+                .to_string_lossy()
+        ));
+        fs::write(&account_path, "[]").expect("account snapshot");
+        let tags_path = original_dir.join("image_tags.json");
+        let original_bytes = br#"{"images/original.png":["original"]}
+"#;
+        fs::write(&tags_path, original_bytes).expect("original tags");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let mut updated = Map::new();
+        updated.insert("images/original.png".to_owned(), json!(["updated"]));
+        #[cfg(unix)]
+        let updated_bytes = {
+            let updated_bytes = serde_json::to_vec_pretty(&updated).expect("updated json");
+            [updated_bytes, vec![b'\n']].concat()
+        };
+        *IMAGE_TAG_WRITE_AFTER_CHECK_REBIND_HOOK
+            .lock()
+            .expect("after-final-check rebind hook") =
+            Some((original_dir.clone(), moved_dir.clone()));
+
+        assert!(write_image_tags(&state, &updated).is_err());
+        #[cfg(unix)]
+        {
+            assert!(moved_dir.is_dir(), "after-final-check hook did not run");
+            assert!(original_dir.is_dir(), "recreated directory missing");
+            assert!(
+                !original_dir.join("image_tags.json").exists(),
+                "replacement escaped the held parent"
+            );
+            let moved_bytes = fs::read(moved_dir.join("image_tags.json")).expect("moved tags");
+            assert!(
+                moved_bytes == original_bytes || moved_bytes == updated_bytes,
+                "unexpected bytes in the held parent"
+            );
+
+            let _ = fs::remove_dir_all(&original_dir);
+            fs::rename(&moved_dir, &original_dir).expect("restore original data directory");
+        }
+        #[cfg(windows)]
+        {
+            assert!(!moved_dir.exists(), "directory rebind was blocked too late");
+            assert_eq!(fs::read(&tags_path).expect("original tags"), original_bytes);
+            assert!(
+                !original_dir
+                    .read_dir()
+                    .expect("original directory")
+                    .any(|entry| entry
+                        .expect("directory entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".json.tmp-"))
+            );
+        }
+        let _ = fs::remove_dir_all(original_dir);
+    }
+
+    #[tokio::test]
+    async fn image_tag_write_rejects_target_swap_after_final_check() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-target-swap");
+        let data_dir = account_path.parent().expect("data parent").to_owned();
+        let tags_path = data_dir.join("image_tags.json");
+        let backup_path = tags_path.with_extension("target-swap-old");
+        let attacker_path = data_dir.join("attacker-target.json");
+        let original_bytes = br#"{"images/original.png":["original"]}
+"#;
+        let attacker_bytes = br#"{"images/attacker.png":["attacker"]}
+"#;
+        fs::write(&account_path, "[]").expect("account snapshot");
+        fs::write(&tags_path, original_bytes).expect("original tags");
+        fs::write(&attacker_path, attacker_bytes).expect("attacker target");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let mut updated = Map::new();
+        updated.insert("images/original.png".to_owned(), json!(["updated"]));
+        *IMAGE_TAG_TARGET_SWAP_HOOK.lock().expect("target swap hook") =
+            Some((tags_path.clone(), attacker_path.clone()));
+
+        assert!(write_image_tags(&state, &updated).is_err());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                fs::read(&tags_path).expect("attacker target remains"),
+                attacker_bytes
+            );
+            assert_eq!(
+                fs::read(&backup_path).expect("original target preserved"),
+                original_bytes
+            );
+            fs::remove_file(&tags_path).expect("remove attacker target");
+            fs::rename(&backup_path, &tags_path).expect("restore original target");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                fs::read(&tags_path).expect("attacker target remains"),
+                attacker_bytes
+            );
+            assert_eq!(
+                fs::read(&backup_path).expect("original target preserved"),
+                original_bytes
+            );
+            fs::remove_file(&tags_path).expect("remove attacker target");
+            fs::rename(&backup_path, &tags_path).expect("restore original target");
+        }
+        assert_eq!(
+            fs::read(&attacker_path).expect("attacker source unchanged"),
+            attacker_bytes
+        );
+        assert!(
+            !data_dir.read_dir().expect("data directory").any(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".json.tmp-")
+            }),
+            "target swap left a temporary file"
+        );
+        let _ = fs::remove_file(&attacker_path);
+        let _ = fs::remove_file(&tags_path);
+        let _ = fs::remove_file(&account_path);
+    }
+
+    #[tokio::test]
+    #[ignore = "external target swap is outside the canonical sidecar-lock contract"]
+    async fn image_tag_write_rejects_target_swap_after_last_name_check() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-target-swap-after-name-check");
+        let data_dir = account_path.parent().expect("data parent").to_owned();
+        let tags_path = data_dir.join("image_tags.json");
+        let backup_path = tags_path.with_extension("target-swap-after-name-check-old");
+        let attacker_path = data_dir.join("attacker-target-after-name-check.json");
+        let original_bytes = br#"{"images/original.png":["original"]}
+"#;
+        let attacker_bytes = br#"{"images/attacker.png":["attacker"]}
+"#;
+        fs::write(&account_path, "[]").expect("account snapshot");
+        fs::write(&tags_path, original_bytes).expect("original tags");
+        fs::write(&attacker_path, attacker_bytes).expect("attacker target");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let mut updated = Map::new();
+        updated.insert("images/original.png".to_owned(), json!(["updated"]));
+        *IMAGE_TAG_TARGET_SWAP_AFTER_NAME_CHECK_HOOK
+            .lock()
+            .expect("after-name target swap hook") =
+            Some((tags_path.clone(), attacker_path.clone()));
+
+        // Deliberately retained as an audit canary. Run with --ignored to
+        // demonstrate the unsupported uncooperative-writer CAS guarantee.
+        let result = write_image_tags(&state, &updated);
+        let _ = fs::remove_file(&tags_path);
+        let _ = fs::remove_file(&backup_path);
+        let _ = fs::remove_file(&attacker_path);
+        let _ = fs::remove_file(&account_path);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn image_tag_write_rejects_target_created_after_name_check() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-target-create-race");
+        let data_dir = account_path.parent().expect("data parent").to_owned();
+        let tags_path = data_dir.join("image_tags.json");
+        let attacker_path = data_dir.join("attacker-created-target.json");
+        let attacker_bytes = br#"{"images/attacker.png":["attacker"]}
+"#;
+        fs::write(&account_path, "[]").expect("account snapshot");
+        fs::write(&attacker_path, attacker_bytes).expect("attacker target");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let mut updated = Map::new();
+        updated.insert("images/new.png".to_owned(), json!(["new"]));
+        *IMAGE_TAG_TARGET_CREATE_AFTER_CHECK_HOOK
+            .lock()
+            .expect("target create hook") = Some((tags_path.clone(), attacker_path.clone()));
+
+        assert!(write_image_tags(&state, &updated).is_err());
+        assert_eq!(
+            fs::read(&tags_path).expect("created target remains"),
+            attacker_bytes
+        );
+        assert_eq!(
+            fs::read(&attacker_path).expect("attacker source unchanged"),
+            attacker_bytes
+        );
+        assert!(
+            !data_dir.read_dir().expect("data directory").any(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".json.tmp-")
+            }),
+            "target create race left a temporary file"
+        );
+        let _ = fs::remove_file(&tags_path);
+        let _ = fs::remove_file(&attacker_path);
+        let _ = fs::remove_file(&account_path);
+    }
+
+    #[tokio::test]
+    async fn image_tag_write_uses_stable_absolute_path_across_cwd_change() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let root = account_snapshot_path("image-tag-cwd-root").with_extension("dir");
+        let alternate = root.with_file_name("image-tag-cwd-alternate");
+        fs::create_dir_all(root.join("data")).expect("relative data directory");
+        fs::create_dir_all(&alternate).expect("alternate cwd");
+        let original_cwd = env::current_dir().expect("current cwd");
+        env::set_current_dir(&root).expect("enter relative root");
+        fs::write("data/accounts.json", "[]").expect("relative account snapshot");
+        let original_bytes = br#"{"images/original.png":["original"]}
+"#;
+        fs::write("data/image_tags.json", original_bytes).expect("relative tags snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(PathBuf::from("data/accounts.json")),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("relative state");
+        let mut updated = Map::new();
+        updated.insert("images/original.png".to_owned(), json!(["updated"]));
+        *IMAGE_TAG_CWD_SWITCH_HOOK.lock().expect("cwd switch hook") = Some(alternate.clone());
+
+        let result = write_image_tags(&state, &updated);
+        env::set_current_dir(&original_cwd).expect("restore cwd");
+        assert!(result.is_ok(), "relative data write failed: {result:?}");
+        let written = fs::read(root.join("data/image_tags.json")).expect("stable target");
+        assert_ne!(written, original_bytes);
+        assert!(
+            !alternate.join("data/image_tags.json").exists(),
+            "cwd change redirected the replacement"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&alternate);
+    }
+
+    #[tokio::test]
+    async fn relative_data_dir_write_uses_initial_cwd_after_state_init() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let root = account_snapshot_path("relative-data-dir-root").with_extension("dir");
+        let alternate = root.with_file_name("relative-data-dir-alternate");
+        fs::create_dir_all(root.join("data")).expect("relative data directory");
+        fs::create_dir_all(&alternate).expect("alternate cwd");
+        let original_cwd = env::current_dir().expect("current cwd");
+        env::set_current_dir(&root).expect("enter relative root");
+        fs::write("data/accounts.json", "[]").expect("relative account snapshot");
+        let original_bytes = br#"{"images/original.png":["original"]}
+"#;
+        fs::write("data/image_tags.json", original_bytes).expect("relative tags snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(PathBuf::from("data/accounts.json")),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("relative state");
+        env::set_current_dir(&alternate).expect("switch cwd after state initialization");
+
+        let mut updated = Map::new();
+        updated.insert("images/original.png".to_owned(), json!(["updated"]));
+        let result = write_image_tags(&state, &updated);
+        env::set_current_dir(&original_cwd).expect("restore cwd");
+
+        assert!(result.is_ok(), "relative data write failed: {result:?}");
+        let written = fs::read(root.join("data/image_tags.json")).expect("stable target");
+        assert_ne!(written, original_bytes);
+        assert!(
+            !alternate.join("data/image_tags.json").exists(),
+            "cwd change redirected the replacement"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&alternate);
+    }
+
+    #[tokio::test]
+    async fn settings_use_initial_absolute_config_path_after_cwd_change() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let root = account_snapshot_path("stable-config-cwd-root").with_extension("dir");
+        let alternate = root.with_file_name("stable-config-cwd-alternate");
+        fs::create_dir_all(root.join("data")).expect("config data directory");
+        fs::create_dir_all(&alternate).expect("alternate cwd");
+        let original_cwd = env::current_dir().expect("current cwd");
+        env::set_current_dir(&root).expect("enter config root");
+        fs::write("data/accounts.json", "[]").expect("relative account snapshot");
+        let original_config = json!({
+            "third_party_apps": {"source": "initial"},
+            "proxy": "http://proxy.example.test:8080"
+        });
+        fs::write(
+            "data/config.json",
+            serde_json::to_vec(&original_config).expect("config json"),
+        )
+        .expect("config snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(PathBuf::from("data/accounts.json")),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        env::set_current_dir(&alternate).expect("switch cwd after state init");
+
+        let settings = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/settings")
+                    .header("authorization", "Bearer admin")
+                    .body(Body::empty())
+                    .expect("settings request"),
+            )
+            .await
+            .expect("settings response");
+        assert_eq!(settings.status(), StatusCode::OK);
+        let settings_body = settings
+            .into_body()
+            .collect()
+            .await
+            .expect("settings body")
+            .to_bytes();
+        let settings_value: Value = serde_json::from_slice(&settings_body).expect("settings json");
+        assert_eq!(
+            settings_value["config"]["third_party_apps"]["source"],
+            "initial"
+        );
+
+        let update = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/settings")
+                    .header("authorization", "Bearer admin")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "config": {"third_party_apps": {"source": "updated"}}
+                        }))
+                        .expect("settings update json"),
+                    ))
+                    .expect("settings update request"),
+            )
+            .await
+            .expect("settings update response");
+        assert_eq!(update.status(), StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &fs::read(root.join("data/config.json")).expect("root config"),
+            )
+            .expect("root config json")["third_party_apps"]["source"],
+            "updated"
+        );
+        assert!(!alternate.join("config.json").exists());
+
+        let apps = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/third-party-apps")
+                    .header("authorization", "Bearer admin")
+                    .body(Body::empty())
+                    .expect("third-party apps request"),
+            )
+            .await
+            .expect("third-party apps response");
+        assert_eq!(apps.status(), StatusCode::OK);
+        let apps_body = apps
+            .into_body()
+            .collect()
+            .await
+            .expect("third-party apps body")
+            .to_bytes();
+        let apps_value: Value = serde_json::from_slice(&apps_body).expect("third-party apps json");
+        assert_eq!(apps_value["third_party_apps"]["source"], "updated");
+
+        env::set_current_dir(&original_cwd).expect("restore cwd");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&alternate);
+    }
+
+    #[tokio::test]
+    async fn image_tag_replace_failure_preserves_old_snapshot_and_stale_temp() {
+        let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
+        let _test_cleanup = ImageTagTestCleanup::new();
+        let account_path = account_snapshot_path("image-tag-replace-failure");
+        let data_dir = account_path.parent().expect("data parent").to_owned();
+        fs::write(&account_path, "[]").expect("account snapshot");
+        let tags_path = data_dir.join("image_tags.json");
+        let original_bytes = br#"{"images/original.png":["original"]}
+"#;
+        fs::write(&tags_path, original_bytes).expect("original tags");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let mut updated = Map::new();
+        updated.insert("images/original.png".to_owned(), json!(["updated"]));
+
+        let stale_temp = tags_path.with_extension("json.tmp-stale");
+        let stale_bytes = b"preexisting temp canary";
+        fs::write(&stale_temp, stale_bytes).expect("stale temp");
+        *IMAGE_TAG_TEMP_PATH_OVERRIDE
+            .lock()
+            .expect("temp path override") = Some(stale_temp.clone());
+        assert!(write_image_tags(&state, &updated).is_err());
+        assert_eq!(fs::read(&tags_path).expect("old snapshot"), original_bytes);
+        assert_eq!(
+            fs::read(&stale_temp).expect("stale temp unchanged"),
+            stale_bytes
+        );
+
+        let old_modified = fs::metadata(&tags_path)
+            .expect("old metadata")
+            .modified()
+            .expect("old mtime");
+        IMAGE_TAG_REPLACE_FAILURE_HOOK.store(true, Ordering::SeqCst);
+        assert!(write_image_tags(&state, &updated).is_err());
+        assert_eq!(
+            fs::read(&tags_path).expect("old snapshot after replace failure"),
+            original_bytes
+        );
+        assert_eq!(
+            fs::metadata(&tags_path)
+                .expect("old metadata after replace failure")
+                .modified()
+                .expect("old mtime after replace failure"),
+            old_modified
+        );
+        let _ = fs::remove_file(&stale_temp);
+        assert!(!data_dir.read_dir().expect("data directory").any(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".json.tmp-")
+        }));
+        let _ = fs::remove_file(tags_path);
+        let _ = fs::remove_file(account_path);
     }
 
     #[tokio::test]
@@ -4744,13 +13974,14 @@ mod tests {
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
+        let response_status = response.status();
         let body = response
             .into_body()
             .collect()
             .await
             .expect("body")
             .to_bytes();
+        assert_eq!(response_status, StatusCode::OK);
         let value: Value = serde_json::from_slice(&body).expect("message response");
         assert_eq!(value["type"], "message");
         assert_eq!(value["role"], "assistant");
@@ -5476,7 +14707,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn shutdown_admission_fence_blocks_a_refresh_started_after_shutdown() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-catalog-shutdown-fence-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -5518,7 +14749,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn shutdown_cancels_background_catalog_refresh_owner() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-catalog-shutdown-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -5532,11 +14763,13 @@ data: [DONE]
         let upstream_started = Arc::new(Notify::new());
         let upstream_release = Arc::new(Notify::new());
         let upstream_canceled = Arc::new(Notify::new());
+        let upstream_ready = Arc::new(Notify::new());
         let completed_normally = Arc::new(AtomicBool::new(false));
         let started_for_upstream = upstream_started.clone();
         let release_for_upstream = upstream_release.clone();
         let canceled_for_upstream = upstream_canceled.clone();
         let completed_for_upstream = completed_normally.clone();
+        let ready_for_upstream = upstream_ready.clone();
         let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("upstream listener");
@@ -5558,10 +14791,16 @@ data: [DONE]
                     Html("<html></html>")
                 }
             });
-            axum::serve(upstream_listener, Router::new().route("/", root))
-                .await
-                .expect("upstream server");
+            let server = axum::serve(
+                upstream_listener,
+                Router::new()
+                    .route("/", root.clone())
+                    .route("/backend-api/models", root),
+            );
+            ready_for_upstream.notify_one();
+            server.await.expect("upstream server");
         });
+        upstream_ready.notified().await;
 
         let app_state = AppState::new(AppConfig {
             version: "test".to_owned(),
@@ -5575,10 +14814,23 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        assert!(app_state.account_type_catalog.enabled());
+        app_state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+        let (_, active_account_groups) = app_state
+            .account_store
+            .active_type_candidates()
+            .await
+            .expect("account snapshot remains readable");
+        assert_eq!(active_account_groups.len(), 1);
+        app_state.account_type_catalog.refresh_for_public().await;
+        tokio::time::timeout(Duration::from_secs(1), upstream_started.notified())
+            .await
+            .expect("catalog refresh must start before handoff");
         let app_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("app listener");
-        let app_address = app_listener.local_addr().expect("app address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let app = tokio::spawn(serve_state_with_bounded_shutdown(
             app_listener,
@@ -5588,19 +14840,6 @@ data: [DONE]
             },
             Duration::from_millis(20),
         ));
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .expect("client");
-        let response = client
-            .get(format!("http://{app_address}/v1/models"))
-            .header(header::AUTHORIZATION, "Bearer client")
-            .send()
-            .await
-            .expect("models response");
-        assert_eq!(response.status(), StatusCode::OK);
-        upstream_started.notified().await;
 
         shutdown_tx.send(()).expect("shutdown");
         tokio::time::timeout(Duration::from_secs(1), app)
@@ -5816,6 +15055,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn health_matches_public_shape_without_auth() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
         let response = state(Some("secret"))
             .router()
             .oneshot(
@@ -5835,6 +15075,7 @@ data: [DONE]
             .to_bytes();
         let value: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(value["status"], "degraded");
+        assert_eq!(value["healthy"], false);
         assert_eq!(value["accounts"]["total"], 0);
         assert!(value["proxy_runtime"]["enabled"].is_boolean());
 
@@ -5852,26 +15093,49 @@ data: [DONE]
             html.headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
         );
+        let html_body = html
+            .into_body()
+            .collect()
+            .await
+            .expect("html body")
+            .to_bytes();
+        let html_body = String::from_utf8(html_body.to_vec()).expect("utf8 html");
+        for marker in [
+            "<!DOCTYPE html>",
+            "号池健康监控",
+            "当前账号",
+            "账号类型分布",
+            "30s 自动刷新",
+            "/health?format=json",
+        ] {
+            assert!(html_body.contains(marker), "missing HTML marker: {marker}");
+        }
     }
 
     #[tokio::test]
     async fn health_reports_loaded_account_status_counts() {
-        let path = std::env::temp_dir().join(format!(
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-health-accounts-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
         ));
+        let sidecar = path
+            .parent()
+            .expect("cumulative sidecar parent")
+            .join(".cumulative_total");
         fs::write(
             &path,
             r#"{"items":[
-                {"access_token":"normal","status":"正常"},
+                {"access_token":"normal","status":"正常","type":"<script>health-html-sentinel</script>","quota":-3,"success":-1,"fail":"bad"},
                 {"access_token":"limited","status":"限流"},
                 {"access_token":"abnormal","status":"异常"},
                 {"access_token":"disabled","status":"禁用"}
-            ]}"#
+            ],"cumulative_total":7}"#
             .as_bytes(),
         )
         .expect("accounts snapshot");
+        fs::write(&sidecar, b"11").expect("cumulative sidecar");
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: None,
@@ -5907,7 +15171,381 @@ data: [DONE]
         assert_eq!(value["accounts"]["limited"], 1);
         assert_eq!(value["accounts"]["abnormal"], 1);
         assert_eq!(value["accounts"]["disabled"], 1);
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["healthy"], true);
+        assert_eq!(value["storage"]["backend"], "json");
+        assert_eq!(value["accounts"]["by_type"]["other"], 1);
+        assert_eq!(value["accounts"]["total_quota"], 0);
+        assert_eq!(value["accounts"]["total_success"], 0);
+        assert_eq!(value["accounts"]["total_fail"], 0);
+        assert_eq!(value["accounts"]["cumulative_total"], 11);
+        assert!(!value.to_string().contains("health-html-sentinel"));
+        fs::write(&sidecar, b"not-a-number").expect("invalid cumulative sidecar");
+        let invalid_sidecar = health_json(&state).await;
+        assert_eq!(invalid_sidecar["accounts"]["cumulative_total"], 7);
+        fs::write(
+            &sidecar,
+            vec![b'x'; (MAX_ACCOUNT_SNAPSHOT_BYTES as usize).saturating_add(1)],
+        )
+        .expect("oversized cumulative sidecar");
+        let oversized_sidecar = health_json(&state).await;
+        assert_eq!(oversized_sidecar["accounts"]["cumulative_total"], 7);
+        let html = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .expect("health HTML request"),
+            )
+            .await
+            .expect("health HTML response");
+        let html_body = html
+            .into_body()
+            .collect()
+            .await
+            .expect("health HTML body")
+            .to_bytes();
+        let html_body = String::from_utf8(html_body.to_vec()).expect("health HTML utf8");
+        assert!(html_body.contains("other"));
+        assert!(!html_body.contains("health-html-sentinel"));
         fs::remove_file(path).expect("cleanup");
+        fs::remove_file(sidecar).expect("sidecar cleanup");
+    }
+
+    #[tokio::test]
+    async fn health_fail_closed_for_corrupt_and_oversized_snapshots_and_projects_proxy() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let accounts_path = account_snapshot_path("health-snapshot-contract");
+        let parent = accounts_path.parent().expect("snapshot parent").to_owned();
+        let auth_path = parent.join("auth.json");
+        let models_path = parent.join("models.json");
+        let config_path = parent.join("config.json");
+        let accounts = r#"{"items":[{"access_token":"health-active","status":"正常"}]}"#;
+        let auth = serde_json::to_vec(&json!({
+            "items": [{
+                "id": "health-user",
+                "name": "health",
+                "role": "user",
+                "enabled": true,
+                "key_hash": auth_key_hash("health-key"),
+            }]
+        }))
+        .expect("auth snapshot");
+        let models = br#"{"data":[{"id":"gpt-health"}]}"#;
+        fs::write(&accounts_path, accounts).expect("accounts snapshot");
+        fs::write(&auth_path, &auth).expect("auth snapshot");
+        fs::write(&models_path, models).expect("models snapshot");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&json!({
+                "proxy_runtime": {
+                    "enabled": true,
+                    "proxy_url": "http://proxy.example:8080",
+                    "clearance": {
+                        "enabled": true,
+                        "mode": "manual",
+                        "cf_clearance": "health-private-canary"
+                    }
+                }
+            }))
+            .expect("runtime config"),
+        )
+        .expect("runtime config file");
+        let state = AppState::new(AppConfig {
+            version: "health-snapshot-contract".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: Some(auth_path.clone()),
+            models_path: Some(models_path.clone()),
+            accounts_path: Some(accounts_path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+
+        let healthy = health_json(&state).await;
+        assert_eq!(healthy["status"], "ok");
+        assert_eq!(healthy["healthy"], true);
+        assert_eq!(
+            healthy["proxy_runtime"],
+            json!({
+                "enabled": true,
+                "clearance_enabled": true,
+            })
+        );
+        assert!(!healthy.to_string().contains("health-private-canary"));
+
+        fs::write(&accounts_path, b"{broken").expect("corrupt accounts snapshot");
+        let corrupt_accounts = health_json(&state).await;
+        assert_eq!(corrupt_accounts["status"], "degraded");
+        assert_eq!(corrupt_accounts["healthy"], false);
+        assert_eq!(corrupt_accounts["accounts"]["total"], 0);
+        assert_eq!(corrupt_accounts["storage"]["health"]["status"], "unhealthy");
+
+        fs::write(&accounts_path, accounts).expect("restore accounts snapshot");
+        fs::write(&auth_path, b"{broken").expect("corrupt auth snapshot");
+        let corrupt_auth = health_json(&state).await;
+        assert_eq!(corrupt_auth["status"], "degraded");
+        assert_eq!(corrupt_auth["storage"]["health"]["status"], "unhealthy");
+
+        fs::write(&auth_path, &auth).expect("restore auth snapshot");
+        fs::write(
+            &models_path,
+            vec![b'x'; (MAX_MODEL_SNAPSHOT_BYTES as usize).saturating_add(1)],
+        )
+        .expect("oversized model snapshot");
+        let oversized_models = health_json(&state).await;
+        assert_eq!(oversized_models["status"], "degraded");
+        assert_eq!(oversized_models["storage"]["health"]["status"], "unhealthy");
+
+        fs::write(&models_path, models).expect("restore models snapshot");
+        fs::write(
+            &accounts_path,
+            vec![b'x'; (MAX_ACCOUNT_SNAPSHOT_BYTES as usize).saturating_add(1)],
+        )
+        .expect("oversized account snapshot");
+        let oversized_accounts = health_json(&state).await;
+        assert_eq!(oversized_accounts["status"], "degraded");
+        assert_eq!(oversized_accounts["healthy"], false);
+        assert_eq!(oversized_accounts["accounts"]["total"], 0);
+        assert_eq!(
+            oversized_accounts["storage"]["health"]["status"],
+            "unhealthy"
+        );
+        assert!(
+            !oversized_accounts
+                .to_string()
+                .contains("health-private-canary")
+        );
+
+        for path in [accounts_path, auth_path, models_path, config_path] {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_storage_timeout_does_not_release_worker_permit_early() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let hook = HealthBlockingTestHook {
+            version: "health-storage-permit-test".to_owned(),
+            started: Arc::new(Notify::new()),
+            starts: Arc::new(AtomicUsize::new(0)),
+            block: Arc::new(AtomicBool::new(true)),
+        };
+        *HEALTH_STORAGE_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook.clone());
+        let _cleanup = HealthHookCleanup {
+            storage: true,
+            accounts: false,
+        };
+        let state = AppState::new(AppConfig {
+            version: hook.version.clone(),
+            auth_key: None,
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let app = state.router();
+        let first = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri("/health?format=json")
+                        .body(Body::empty())
+                        .expect("first health request"),
+                )
+                .await
+                .expect("first health response")
+            }
+        });
+        hook.started.notified().await;
+        let _first = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first health timeout")
+            .expect("first health task");
+
+        let mut saturated = Vec::new();
+        for _ in 0..3 {
+            let app = state.router();
+            saturated.push(tokio::spawn(async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri("/health?format=json")
+                        .body(Body::empty())
+                        .expect("saturated health request"),
+                )
+                .await
+                .expect("saturated health response")
+            }));
+        }
+        for task in saturated {
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("saturated health timeout")
+                .expect("saturated health task");
+        }
+        assert_eq!(
+            hook.starts.load(Ordering::SeqCst),
+            1,
+            "concurrent health requests must not create more blocking storage probes than the semaphore capacity"
+        );
+
+        let acquire_attempt = tokio::time::timeout(
+            Duration::from_millis(100),
+            HEALTH_STORAGE_SEMAPHORE.clone().acquire_owned(),
+        )
+        .await;
+        let permit_released_early = acquire_attempt.is_ok();
+        hook.block.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !permit_released_early,
+            "a timed-out health probe must retain its semaphore permit until its blocking worker exits"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_account_timeout_does_not_release_worker_permit_early() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let path = account_snapshot_path("health-account-permit");
+        fs::write(
+            &path,
+            r#"{"items":[{"access_token":"health-account","status":"正常"}]}"#,
+        )
+        .expect("accounts snapshot");
+        let hook = HealthBlockingTestHook {
+            version: "health-account-permit-test".to_owned(),
+            started: Arc::new(Notify::new()),
+            starts: Arc::new(AtomicUsize::new(0)),
+            block: Arc::new(AtomicBool::new(true)),
+        };
+        *HEALTH_ACCOUNTS_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook.clone());
+        let _cleanup = HealthHookCleanup {
+            storage: false,
+            accounts: true,
+        };
+        let state = AppState::new(AppConfig {
+            version: hook.version.clone(),
+            auth_key: None,
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let first = tokio::spawn({
+            let app = state.router();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri("/health?format=json")
+                        .body(Body::empty())
+                        .expect("health request"),
+                )
+                .await
+                .expect("health response")
+            }
+        });
+        hook.started.notified().await;
+        let _first = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("health request timeout")
+            .expect("health task");
+        let acquire_attempt = tokio::time::timeout(
+            Duration::from_millis(100),
+            HEALTH_ACCOUNTS_SEMAPHORE.clone().acquire_owned(),
+        )
+        .await;
+        let permit_released_early = acquire_attempt.is_ok();
+        hook.block.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !permit_released_early,
+            "a timed-out account probe must retain its semaphore permit until its blocking worker exits"
+        );
+        let _permit = tokio::time::timeout(
+            Duration::from_secs(2),
+            HEALTH_ACCOUNTS_SEMAPHORE.clone().acquire_owned(),
+        )
+        .await
+        .expect("account permit release timeout")
+        .expect("account semaphore closed");
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn health_account_stats_are_bounded_off_event_loop() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let path = account_snapshot_path("health-account-bounded");
+        fs::write(
+            &path,
+            r#"{"items":[{"access_token":"normal","status":"正常"}]}"#,
+        )
+        .expect("accounts snapshot");
+        let hook = HealthBlockingTestHook {
+            version: "health-account-bounded-test".to_owned(),
+            started: Arc::new(Notify::new()),
+            starts: Arc::new(AtomicUsize::new(0)),
+            block: Arc::new(AtomicBool::new(true)),
+        };
+        *HEALTH_ACCOUNTS_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook.clone());
+        let _cleanup = HealthHookCleanup {
+            storage: false,
+            accounts: true,
+        };
+        let state = AppState::new(AppConfig {
+            version: hook.version.clone(),
+            auth_key: None,
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let app = state.router();
+        let mut request = tokio::spawn(async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/health?format=json")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response")
+        });
+        hook.started.notified().await;
+        let bounded = tokio::time::timeout(Duration::from_millis(700), &mut request).await;
+        hook.block.store(false, Ordering::SeqCst);
+        if bounded.is_err() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), request)
+                .await
+                .expect("blocked health task cleanup")
+                .expect("blocked health task");
+        }
+        let _ = fs::remove_file(path);
+        assert!(
+            bounded.is_ok(),
+            "account statistics and cumulative reads must not block the Tokio worker past the health deadline"
+        );
     }
 
     #[tokio::test]
@@ -6267,7 +15905,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn auth_snapshot_controls_the_real_chat_route() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-auth-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
@@ -6397,7 +16035,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn legacy_auth_key_survives_invalid_isolated_snapshot() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-legacy-auth-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
@@ -6458,7 +16096,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn auth_reload_singleflight_fences_old_publish_and_old_auth() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-auth-race-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
@@ -6559,7 +16197,7 @@ data: [DONE]
 
     #[test]
     fn malformed_auth_snapshot_fails_closed_at_startup() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-auth-invalid-{}.json",
             std::process::id()
         ));
@@ -6582,7 +16220,7 @@ data: [DONE]
     #[test]
     fn model_snapshot_uses_the_public_allowlist_and_bounds() {
         let canary = "model-internal-canary";
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
@@ -6644,7 +16282,7 @@ data: [DONE]
 
     #[test]
     fn public_models_recompute_stale_static_account_type_metadata() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-stale-types-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
@@ -6688,7 +16326,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn public_models_does_not_advertise_static_anonymous_without_ready_catalog() {
-        let models_path = std::env::temp_dir().join(format!(
+        let models_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-static-anonymous-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -6759,7 +16397,7 @@ data: [DONE]
     fn model_text_limits_count_unicode_characters() {
         let id = "测".repeat(MAX_MODEL_TEXT_LENGTH);
         let too_long = "超".repeat(MAX_MODEL_TEXT_LENGTH + 1);
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-unicode-{}-{}.json",
             std::process::id(),
             std::time::SystemTime::now()
@@ -6794,7 +16432,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn models_route_reloads_generation_and_fails_closed_on_bad_snapshot() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-reload-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -6866,7 +16504,7 @@ data: [DONE]
 
     #[test]
     fn malformed_model_snapshot_fails_closed_at_startup() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-invalid-{}.json",
             std::process::id()
         ));
@@ -6983,7 +16621,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn account_snapshot_filters_status_and_model_and_lease_releases() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-accounts-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -7045,7 +16683,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn account_store_capability_filter_is_source_safe_and_fail_closed() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-capability-filter-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -7107,7 +16745,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn account_snapshot_rejects_explicit_invalid_statuses_and_defaults_missing_status() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-accounts-status-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -7144,7 +16782,7 @@ data: [DONE]
 
     #[test]
     fn account_snapshot_rejects_duplicate_tokens_even_with_conflicting_status() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-accounts-duplicate-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -7166,7 +16804,7 @@ data: [DONE]
 
     #[test]
     fn legacy_oauth_login_snapshot_is_normalized_to_codex_capability() {
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-accounts-oauth-source-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -8362,10 +18000,6 @@ data: [DONE]
                     .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
                     .route("/backend-api/models", authenticated_models)
                     .route(
-                        "/backend-api/codex/models",
-                        get(|| async { Json(json!({"models": [{"slug": "catalog-model"}]})) }),
-                    )
-                    .route(
                         "/backend-anon/sentinel/chat-requirements/prepare",
                         anonymous_prepare,
                     )
@@ -8379,7 +18013,7 @@ data: [DONE]
             .await
             .expect("native server");
         });
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-native-accounts-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -8801,10 +18435,6 @@ data: [DONE]
                 Router::new()
                     .route("/", bootstrap)
                     .route("/backend-api/models", models)
-                    .route(
-                        "/backend-api/codex/models",
-                        get(|| async { Json(json!({"models": [{"slug": "gpt-test"}]})) }),
-                    )
                     .route("/backend-api/sentinel/chat-requirements/prepare", prepare)
                     .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
                     .route("/backend-api/conversation", conversation),
@@ -8812,7 +18442,7 @@ data: [DONE]
             .await
             .expect("native server");
         });
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-anthropic-native-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -9179,6 +18809,59 @@ data: [DONE]
     }
 
     #[test]
+    fn native_chat_web_search_options_are_converted_to_codex_tool() {
+        let payload = validate_chat_payload(json!({
+            "model": "gpt-test",
+            "messages": [{"role":"user","content":"latest rust news"}],
+            "web_search_options": {
+                "search_context_size": "high",
+                "user_location": {
+                    "type": "approximate",
+                    "approximate": {"country":"CN","city":"Shanghai"}
+                }
+            }
+        }))
+        .expect("Chat search payload");
+        let converted = native_codex_response_payload(&payload).expect("Codex search payload");
+        assert_eq!(converted["tools"][0]["type"], "web_search");
+        assert_eq!(converted["tools"][0]["search_context_size"], "high");
+        assert_eq!(converted["tools"][0]["user_location"]["country"], "CN");
+        assert_eq!(converted["tools"][0]["user_location"]["city"], "Shanghai");
+    }
+
+    #[test]
+    fn native_responses_accepts_multimodal_input_and_rich_history() {
+        let object = validate_responses_payload(json!({
+            "model": "gpt-test",
+            "input": [
+                {"type":"input_text","text":"describe this"},
+                {"type":"input_image","image_url":"data:image/png;base64,AQI=","detail":"high"},
+                {"type":"input_audio","audio_url":"data:audio/wav;base64,AQI="},
+                {"type":"message","role":"system","content":"follow the policy","status":"completed"}
+            ],
+            "include": ["web_search_call.results"],
+            "context_management": [{"type":"compaction","compact_threshold":1000}],
+            "prompt_cache_key": "cache-key",
+            "service_tier": "priority",
+            "text": {"verbosity":"low","format":{"type":"json_schema","name":"answer","schema":{},"strict":true}},
+            "tools": [{"type":"image_generation","action":"auto"}]
+        }))
+        .expect("Responses payload");
+        let converted = native_codex_responses_payload(&object).expect("native Responses payload");
+        assert_eq!(converted["input"][0]["type"], "message");
+        assert_eq!(converted["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(converted["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(converted["input"][0]["content"][2]["type"], "input_audio");
+        assert_eq!(converted["input"][1]["role"], "developer");
+        assert_eq!(converted["include"][1], "web_search_call.results");
+        assert_eq!(converted["context_management"][0]["type"], "compaction");
+        assert_eq!(converted["prompt_cache_key"], "cache-key");
+        assert_eq!(converted["service_tier"], "priority");
+        assert_eq!(converted["text"]["format"]["type"], "json_schema");
+        assert_eq!(converted["tools"][0]["type"], "image_generation");
+    }
+
+    #[test]
     fn native_payload_rejects_developer_messages_without_codex_route() {
         let payload = validate_chat_payload(json!({
             "model": "auto",
@@ -9387,6 +19070,648 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn native_codex_chat_stream_projects_function_call_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    get(|| async {
+                        let events = [
+                            json!({"type":"response.created","response":{"id":"resp-tool","model":"gpt-test","created_at":1700000000},"sequence_number":0}),
+                            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":""},"sequence_number":1}),
+                            json!({"type":"response.function_call_arguments.delta","item_id":"fc-1","output_index":0,"delta":"{\"q\":\"rust\"}","sequence_number":2}),
+                            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{\"q\":\"rust\"}"},"sequence_number":3}),
+                            json!({"type":"response.completed","sequence_number":4,"response":{"id":"resp-tool","model":"gpt-test","output":[{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{\"q\":\"rust\"}"}]} }),
+                        ]
+                        .into_iter()
+                        .map(|event| format!("data: {}\n\n", serde_json::to_string(&event).expect("event")))
+                        .collect::<String>();
+                        ([(header::CONTENT_TYPE, "text/event-stream")], Body::from(events))
+                    }),
+                ),
+            )
+            .await
+            .expect("server");
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("upstream response");
+        let response =
+            native_codex_stream_response(response, None, "gpt-test".to_owned(), false, 0);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("stream body")
+            .to_bytes();
+        let text = String::from_utf8(body.to_vec()).expect("utf8 stream");
+        assert!(text.contains(r#""tool_calls":[{"index":0,"id":"call-1""#));
+        assert!(text.contains(r#""arguments":"{\"q\":\"rust\"}""#));
+        assert!(text.contains(r#""finish_reason":"tool_calls""#));
+        assert!(text.contains("data: [DONE]"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn native_codex_responses_stream_projects_public_events_and_rejects_unknown_events() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_server = calls.clone();
+        let server = tokio::spawn(async move {
+            let route = get(move || {
+                let call = calls_for_server.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let frame = |event: Value| {
+                        format!(
+                            "data: {}\n\n",
+                            serde_json::to_string(&event).expect("event JSON")
+                        )
+                    };
+                    let body = if call == 0 {
+                        vec![
+                            json!({
+                                "type": "response.created",
+                                "sequence_number": 0,
+                                "response": {
+                                    "id": "resp-stream",
+                                    "model": "gpt-test",
+                                    "status": "in_progress",
+                                    "error": null,
+                                    "usage": null,
+                                    "private": "must-not-leak"
+                                }
+                            }),
+                            json!({"type":"response.metadata","private":"must-not-leak"}),
+                            json!({
+                                "type": "response.output_text.delta",
+                                "content_index": 0,
+                                "item_id": "msg-1",
+                                "delta": "hello",
+                                "logprobs": [],
+                                "output_index": 0,
+                                "sequence_number": 1
+                            }),
+                            json!({
+                                "type": "response.completed",
+                                "sequence_number": 2,
+                                "response": {
+                                    "id": "resp-stream",
+                                    "model": "gpt-test",
+                                    "status": "completed",
+                                    "error": null,
+                                    "incomplete_details": null,
+                                    "parallel_tool_calls": true,
+                                    "private": "must-not-leak",
+                                    "usage": {
+                                        "input_tokens": 1,
+                                        "output_tokens": 1,
+                                        "total_tokens": 2,
+                                        "private": "usage-private",
+                                        "input_tokens_details": {
+                                            "cached_tokens": 1,
+                                            "private": "usage-detail-private"
+                                        },
+                                        "output_tokens_details": {
+                                            "reasoning_tokens": 1,
+                                            "private": "usage-output-detail-private"
+                                        }
+                                    },
+                                    "output": [
+                                        {
+                                            "type": "web_search_call",
+                                            "id": "ws-1",
+                                            "status": "completed",
+                                            "private": "item-private",
+                                            "action": {
+                                                "type": "search",
+                                                "query": "rust",
+                                                "queries": ["rust"],
+                                                "url": "https://example.com",
+                                                "private": "action-private"
+                                            }
+                                        },
+                                        {
+                                            "type": "message",
+                                            "id": "msg-1",
+                                            "role": "assistant",
+                                            "status": "completed",
+                                            "private": "message-private",
+                                            "arguments": "message-arguments-private",
+                                            "result": "message-result-private",
+                                            "operation": {"type": "message-operation-private"},
+                                            "environment": {"type": "message-environment-private"},
+                                            "code": "message-code-private",
+                                            "content": [{
+                                                "type": "output_text",
+                                                "text": "hello",
+                                                "private": "part-private",
+                                                "annotations": [{
+                                                    "type": "url_citation",
+                                                    "url": "https://example.com",
+                                                    "title": "Example",
+                                                    "start_index": 0,
+                                                    "end_index": 5,
+                                                    "private": "annotation-private"
+                                                }],
+                                                "logprobs": [{
+                                                    "token": "hello",
+                                                    "logprob": -0.1,
+                                                    "bytes": [104],
+                                                    "private": "logprob-private",
+                                                    "top_logprobs": [{
+                                                        "token": "hello",
+                                                        "logprob": -0.1,
+                                                        "private": "top-logprob-private"
+                                                    }]
+                                                }]
+                                            }]
+                                        },
+                                        {
+                                            "type": "shell_call",
+                                            "id": "shell-1",
+                                            "call_id": "shell-call-1",
+                                            "status": "completed",
+                                            "action": {},
+                                            "environment": {
+                                                "type": "container",
+                                                "text": "linux",
+                                                "private": "environment-private",
+                                                "output": "environment-output-private"
+                                            },
+                                            "operation": {
+                                                "type": "operation",
+                                                "private": "operation-private",
+                                                "output": "operation-output-private"
+                                            },
+                                            "summary": [{
+                                                "type": "summary",
+                                                "text": "summary-public",
+                                                "private": "summary-private",
+                                                "output": "summary-output-private"
+                                            }],
+                                            "output": [{
+                                                "type": "nested",
+                                                "private": "nested-output-private"
+                                            }],
+                                            "result": "result-public"
+                                        },
+                                        {
+                                            "type": "computer_call",
+                                            "id": "computer-1",
+                                            "call_id": "computer-call-1",
+                                            "pending_safety_checks": [{
+                                                "type": "safety_check",
+                                                "code": "confirm",
+                                                "private": "safety-private"
+                                            }],
+                                            "status": "completed"
+                                        },
+                                        {
+                                            "type": "reasoning",
+                                            "id": "reason-1",
+                                            "summary": [{
+                                                "type": "summary_text",
+                                                "text": "summary-public",
+                                                "private": "summary-private"
+                                            }]
+                                        },
+                                        {
+                                            "type": "computer_call_output",
+                                            "id": "computer-output-1",
+                                            "call_id": "computer-call-1",
+                                            "output": {
+                                                "type": "computer_result",
+                                                "text": "clicked",
+                                                "private": "computer-output-private"
+                                            },
+                                            "status": "completed"
+                                        },
+                                        {
+                                            "type": "apply_patch_call",
+                                            "id": "patch-1",
+                                            "call_id": "patch-call-1",
+                                            "operation": {
+                                                "type": "patch",
+                                                "path": "README.md",
+                                                "patch": "@@ -1 +1 @@",
+                                                "private": "operation-private"
+                                            },
+                                            "status": "completed"
+                                        },
+                                        {
+                                            "type": "apply_patch_call_output",
+                                            "id": "patch-output-1",
+                                            "call_id": "patch-call-1",
+                                            "status": "completed"
+                                        },
+                                        {
+                                            "type": "code_interpreter_call",
+                                            "id": "code-1",
+                                            "code": "print(1)",
+                                            "container_id": "container-1",
+                                            "outputs": [{
+                                                "type": "logs",
+                                                "text": "stdout",
+                                                "private": "outputs-private"
+                                            }],
+                                            "status": "completed"
+                                        },
+                                        {
+                                            "type": "tool_search_output",
+                                            "id": "tools-1",
+                                            "call_id": "tools-call-1",
+                                            "execution": "server",
+                                            "status": "completed",
+                                            "tools": [{
+                                                "type": "function",
+                                                "name": "lookup",
+                                                "description": "lookup",
+                                                "strict": true,
+                                                "private": "tool-private",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "private": "schema-root-private",
+                                                    "properties": {
+                                                        "q": {
+                                                            "type": "string",
+                                                            "description": "query",
+                                                            "private": "schema-private"
+                                                        }
+                                                    },
+                                                    "required": ["q"],
+                                                    "additionalProperties": false
+                                                }
+                                            }],
+                                            "private": "tool-item-private"
+                                        }
+                                    ]
+                                }
+                            }),
+                        ]
+                        .into_iter()
+                        .map(&frame)
+                        .collect::<String>()
+                    } else if call == 1 {
+                        vec![
+                            json!({
+                                "type": "response.created",
+                                "sequence_number": 0,
+                                "response": {"id": "resp-unknown"}
+                            }),
+                            json!({"type":"response.future_event","future":true}),
+                        ]
+                        .into_iter()
+                        .map(&frame)
+                        .collect::<String>()
+                    } else if call == 2 {
+                        vec![
+                            json!({
+                                "type": "response.created",
+                                "sequence_number": 0,
+                                "response": {"id": "resp-error"}
+                            }),
+                            json!({
+                                "type": "response.incomplete",
+                                "sequence_number": 1,
+                                "response": {
+                                    "id": "resp-error",
+                                    "status": "incomplete",
+                                    "error": {"code": "upstream_error"},
+                                    "incomplete_details": {"reason": "max_output_tokens"},
+                                    "output": []
+                                }
+                            }),
+                        ]
+                        .into_iter()
+                        .map(&frame)
+                        .collect::<String>()
+                    } else {
+                        vec![
+                            json!({
+                                "type": "response.created",
+                                "sequence_number": 0,
+                                "response": {
+                                    "id": "resp-missing-status",
+                                    "status": "in_progress",
+                                    "error": null,
+                                    "incomplete_details": null,
+                                    "usage": null
+                                }
+                            }),
+                            json!({
+                                "type": "response.incomplete",
+                                "sequence_number": 1,
+                                "response": {
+                                    "id": "resp-missing-status",
+                                    "incomplete_details": {"private": "incomplete-private"},
+                                    "usage": null,
+                                    "output": []
+                                }
+                            }),
+                        ]
+                        .into_iter()
+                        .map(&frame)
+                        .collect::<String>()
+                    };
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(body),
+                    )
+                }
+            });
+            axum::serve(listener, Router::new().route("/", route))
+                .await
+                .expect("server");
+        });
+        let path = test_tmp_dir().join(format!(
+            "chatgpt2api-rust-responses-stream-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &path,
+            r#"[{"access_token":"codex-token","status":"正常","source_type":"codex","type":"free","models":["gpt-test"]}]"#,
+        )
+        .expect("accounts snapshot");
+        let store = AccountStore::load(Some(&path)).expect("account store");
+        let first_lease = store
+            .acquire_excluding_with_type_and_source_filter(
+                "gpt-test",
+                &HashSet::new(),
+                None,
+                Some("codex"),
+            )
+            .await
+            .expect("first lease");
+        let first_response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("first upstream response");
+        let first_body = native_codex_responses_stream_response(
+            first_response,
+            first_lease,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .into_body()
+        .collect()
+        .await
+        .expect("projected stream")
+        .to_bytes();
+        let first_text = String::from_utf8(first_body.to_vec()).expect("projected SSE");
+        assert!(first_text.contains("response.created"));
+        assert!(first_text.contains("response.output_text.delta"));
+        assert!(first_text.contains("response.completed"));
+        assert!(first_text.contains("resp-stream"));
+        assert!(!first_text.contains("response.metadata"));
+        for private in [
+            "must-not-leak",
+            "usage-private",
+            "usage-detail-private",
+            "usage-output-detail-private",
+            "item-private",
+            "message-private",
+            "message-arguments-private",
+            "message-result-private",
+            "message-operation-private",
+            "message-environment-private",
+            "message-code-private",
+            "action-private",
+            "part-private",
+            "annotation-private",
+            "logprob-private",
+            "top-logprob-private",
+            "environment-private",
+            "environment-output-private",
+            "operation-private",
+            "operation-output-private",
+            "summary-private",
+            "summary-output-private",
+            "nested-output-private",
+            "safety-private",
+            "computer-output-private",
+            "operation-private",
+            "outputs-private",
+            "tool-private",
+            "tool-item-private",
+            "schema-root-private",
+            "schema-private",
+            "incomplete-private",
+        ] {
+            assert!(
+                !first_text.contains(private),
+                "private field leaked: {private}"
+            );
+        }
+        let public_events = first_text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<Value>(data).expect("public event JSON"))
+            .collect::<Vec<_>>();
+        let created = public_events
+            .iter()
+            .find(|event| event["type"] == "response.created")
+            .expect("created event");
+        assert!(created["response"]["error"].is_null());
+        assert!(created["response"]["usage"].is_null());
+        let completed = public_events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("completed event");
+        assert_eq!(completed["response"]["status"], "completed");
+        assert_eq!(completed["response"]["usage"]["input_tokens"], 1);
+        assert_eq!(
+            completed["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+            1
+        );
+        assert_eq!(
+            completed["response"]["output"][0]["action"]["query"],
+            "rust"
+        );
+        assert_eq!(
+            completed["response"]["output"][1]["content"][0]["text"],
+            "hello"
+        );
+        assert_eq!(
+            completed["response"]["output"][1]["content"][0]["annotations"][0]["title"],
+            "Example"
+        );
+        assert_eq!(
+            completed["response"]["output"][1]["content"][0]["logprobs"][0]["top_logprobs"][0]["token"],
+            "hello"
+        );
+        assert!(
+            completed["response"]["output"][1]
+                .get("arguments")
+                .is_none()
+        );
+        assert!(completed["response"]["output"][1].get("result").is_none());
+        assert!(
+            completed["response"]["output"][1]
+                .get("operation")
+                .is_none()
+        );
+        assert!(
+            completed["response"]["output"][1]
+                .get("environment")
+                .is_none()
+        );
+        assert!(completed["response"]["output"][1].get("code").is_none());
+        assert_eq!(
+            completed["response"]["output"][2]["environment"]["type"],
+            "container"
+        );
+        assert_eq!(
+            completed["response"]["output"][2]["environment"]["text"],
+            "linux"
+        );
+        assert!(
+            completed["response"]["output"][2]
+                .get("operation")
+                .is_none()
+        );
+        assert!(completed["response"]["output"][2].get("summary").is_none());
+        assert!(completed["response"]["output"][2].get("output").is_none());
+        assert!(completed["response"]["output"][2].get("result").is_none());
+        assert_eq!(
+            completed["response"]["output"][3]["pending_safety_checks"][0]["code"],
+            "confirm"
+        );
+        assert_eq!(
+            completed["response"]["output"][4]["summary"][0]["text"],
+            "summary-public"
+        );
+        assert_eq!(
+            completed["response"]["output"][5]["output"]["text"],
+            "clicked"
+        );
+        assert_eq!(
+            completed["response"]["output"][6]["operation"]["path"],
+            "README.md"
+        );
+        assert_eq!(
+            completed["response"]["output"][6]["operation"]["patch"],
+            "@@ -1 +1 @@"
+        );
+        assert_eq!(
+            completed["response"]["output"][8]["outputs"][0]["text"],
+            "stdout"
+        );
+        assert_eq!(
+            completed["response"]["output"][9]["tools"][0]["parameters"]["properties"]["q"]["description"],
+            "query"
+        );
+        assert_eq!(store.inflight(), 0);
+
+        let second_lease = store
+            .acquire_excluding_with_type_and_source_filter(
+                "gpt-test",
+                &HashSet::new(),
+                None,
+                Some("codex"),
+            )
+            .await
+            .expect("second lease");
+        let second_response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("second upstream response");
+        let second_result = native_codex_responses_stream_response(
+            second_response,
+            second_lease,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .into_body()
+        .collect()
+        .await;
+        assert!(second_result.is_err(), "unknown event must fail closed");
+        assert_eq!(store.inflight(), 0);
+
+        let third_lease = store
+            .acquire_excluding_with_type_and_source_filter(
+                "gpt-test",
+                &HashSet::new(),
+                None,
+                Some("codex"),
+            )
+            .await
+            .expect("third lease");
+        let third_response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("third upstream response");
+        let third_result = native_codex_responses_stream_response(
+            third_response,
+            third_lease,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .into_body()
+        .collect()
+        .await;
+        assert!(third_result.is_err(), "terminal error must fail closed");
+        assert_eq!(store.inflight(), 0);
+
+        let fourth_lease = store
+            .acquire_excluding_with_type_and_source_filter(
+                "gpt-test",
+                &HashSet::new(),
+                None,
+                Some("codex"),
+            )
+            .await
+            .expect("fourth lease");
+        let fourth_response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .expect("fourth upstream response");
+        let fourth_body = native_codex_responses_stream_response(
+            fourth_response,
+            fourth_lease,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .into_body()
+        .collect()
+        .await
+        .expect("incomplete stream with missing status")
+        .to_bytes();
+        let fourth_text = String::from_utf8(fourth_body.to_vec()).expect("incomplete SSE");
+        let incomplete_event = fourth_text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<Value>(data).expect("incomplete event JSON"))
+            .find(|event| event["type"] == "response.incomplete")
+            .expect("incomplete event");
+        assert_eq!(incomplete_event["response"]["status"], "incomplete");
+        assert_eq!(
+            incomplete_event["response"]["incomplete_details"],
+            json!({})
+        );
+        assert!(incomplete_event["response"]["usage"].is_null());
+        assert!(!fourth_text.contains("incomplete-private"));
+        assert_eq!(store.inflight(), 0);
+
+        fs::remove_file(path).expect("cleanup");
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn native_bootstrap_body_timeout_releases_account_lease() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9409,7 +19734,7 @@ data: [DONE]
             .await
             .expect("server");
         });
-        let path = std::env::temp_dir().join(format!(
+        let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-timeout-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -9476,7 +19801,7 @@ data: [DONE]
                 .expect("server");
             });
 
-            let path = std::env::temp_dir().join(format!(
+            let path = test_tmp_dir().join(format!(
                 "chatgpt2api-rust-requirements-timeout-{}-{}.json",
                 std::process::id(),
                 NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -9627,10 +19952,6 @@ data: [DONE]
                     .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
                     .route("/backend-api/models", authenticated_models)
                     .route(
-                        "/backend-api/codex/models",
-                        get(|| async { Json(json!({"models": [{"slug": "catalog-model"}]})) }),
-                    )
-                    .route(
                         "/backend-anon/sentinel/chat-requirements/prepare",
                         anonymous_prepare,
                     )
@@ -9645,7 +19966,7 @@ data: [DONE]
             .expect("native server");
         });
 
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-native-failover-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -9800,10 +20121,6 @@ data: [DONE]
                     .route("/backend-api/sentinel/chat-requirements/finalize", finalize)
                     .route("/backend-api/models", authenticated_models)
                     .route(
-                        "/backend-api/codex/models",
-                        get(|| async { Json(json!({"models": [{"slug": "catalog-model"}]})) }),
-                    )
-                    .route(
                         "/backend-anon/sentinel/chat-requirements/prepare",
                         post(|| async { Json(json!({"prepare_token":"anonymous-prepare-token"})) }),
                     )
@@ -9818,7 +20135,7 @@ data: [DONE]
             .expect("native server");
         });
 
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-native-stage-failover-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -9876,7 +20193,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn native_chat_rejects_unsupported_model_after_catalog_is_ready() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-model-error-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -9913,10 +20230,6 @@ data: [DONE]
                         finalize.clone(),
                     )
                     .route("/backend-api/models", models.clone())
-                    .route(
-                        "/backend-api/codex/models",
-                        get(|| async { Json(json!({"models": [{"slug": "known-model"}]})) }),
-                    )
                     .route("/backend-anon/sentinel/chat-requirements/prepare", prepare)
                     .route(
                         "/backend-anon/sentinel/chat-requirements/finalize",
@@ -9969,12 +20282,13 @@ data: [DONE]
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
+        drop(state);
         fs::remove_file(account_path).expect("cleanup");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn native_chat_reports_pending_model_catalog_as_retryable() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-model-pending-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -10046,7 +20360,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn native_chat_uses_ready_anonymous_model_without_waiting_for_refresh() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-anonymous-ready-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -10182,6 +20496,9 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
         {
             let mut snapshot = state
                 .account_type_catalog
@@ -10245,7 +20562,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn native_chat_routes_anonymous_catalog_models_without_an_account() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-anonymous-chat-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -10367,7 +20684,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn native_chat_rejects_auto_without_catalog_ownership_before_upstream() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-auto-catalog-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -10522,8 +20839,8 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_models_catalog_uses_one_representative_per_source_capability() {
-        let account_path = std::env::temp_dir().join(format!(
+    async fn native_models_catalog_uses_one_representative_per_account_type() {
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-native-models-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -10531,8 +20848,8 @@ data: [DONE]
         fs::write(
             &account_path,
             r#"[
-                {"access_token":"web-token","status":"正常","type":"Pro","source_type":"web"},
                 {"access_token":"codex-token","status":"正常","type":"Pro","source_type":"codex","chatgpt_account_id":"codex-account"},
+                {"access_token":"web-token","status":"正常","type":"Pro","source_type":"web"},
                 {"access_token":"codex-no-id","status":"正常","type":"Plus","source_type":"codex"}
             ]"#,
         )
@@ -10553,9 +20870,6 @@ data: [DONE]
         let anon_model_paths = paths.clone();
         let auth_model_authorizations = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let auth_model_authorizations_for_upstream = auth_model_authorizations.clone();
-        let codex_model_paths = paths.clone();
-        let codex_model_calls = Arc::new(AtomicUsize::new(0));
-        let codex_model_calls_for_upstream = codex_model_calls.clone();
         let codex_chat_calls = Arc::new(AtomicUsize::new(0));
         let codex_chat_calls_for_upstream = codex_chat_calls.clone();
         let conversation_calls = Arc::new(AtomicUsize::new(0));
@@ -10637,95 +20951,30 @@ data: [DONE]
                                 assert!(authorization
                                     .as_deref()
                                     .is_some_and(|value| value.starts_with("Bearer ")));
-                                let account_id = request
-                                    .headers()
-                                    .get("ChatGPT-Account-ID")
-                                    .and_then(|value| value.to_str().ok());
-                                if authorization.as_deref() == Some("Bearer codex-token") {
-                                    assert_eq!(account_id, Some("codex-account"));
-                                } else {
-                                    assert!(account_id.is_none());
-                                }
+                                let expected_account_id = match authorization.as_deref() {
+                                    Some("Bearer codex-token") => Some("codex-account"),
+                                    _ => None,
+                                };
+                                assert_eq!(
+                                    request
+                                        .headers()
+                                        .get("ChatGPT-Account-ID")
+                                        .and_then(|value| value.to_str().ok()),
+                                    expected_account_id
+                                );
                                 auth_model_authorizations_for_upstream
                                     .lock()
                                     .expect("auth model calls lock")
                                     .push(authorization.clone().expect("authorization"));
                                 record(request, paths).await;
-                                let models = if authorization.as_deref() == Some("Bearer web-token") {
+                                let models = if authorization.as_deref() == Some("Bearer codex-token") {
                                     json!({"models":[
-                                        {"slug":"web-only-model","owned_by":"chatgpt"},
                                         {"slug":"collision-model","owned_by":"chatgpt"}
                                     ]})
                                 } else {
                                     json!({"models":[{"slug":"plus-auth-model","owned_by":"chatgpt"}]})
                                 };
                                 Json(models).into_response()
-                            }
-                        }),
-                    )
-                    .route(
-                        "/backend-api/codex/models",
-                        get(move |request: axum::extract::Request| {
-                            let paths = codex_model_paths.clone();
-                            let calls = codex_model_calls_for_upstream.clone();
-                            async move {
-                                calls.fetch_add(1, Ordering::SeqCst);
-                                let authorization = request
-                                    .headers()
-                                    .get(header::AUTHORIZATION)
-                                    .and_then(|value| value.to_str().ok())
-                                    .map(str::to_owned);
-                                let Some(authorization) = authorization.as_deref() else {
-                                    return StatusCode::BAD_REQUEST.into_response();
-                                };
-                                assert_eq!(
-                                    request
-                                        .headers()
-                                        .get(header::ACCEPT)
-                                        .and_then(|value| value.to_str().ok()),
-                                    Some("application/json")
-                                );
-                                assert_eq!(
-                                    request
-                                        .headers()
-                                        .get("originator")
-                                        .and_then(|value| value.to_str().ok()),
-                                    Some("codex_cli_rs")
-                                );
-                                if authorization == "Bearer codex-token" {
-                                    assert_eq!(
-                                        request
-                                            .headers()
-                                            .get("ChatGPT-Account-ID")
-                                            .and_then(|value| value.to_str().ok()),
-                                        Some("codex-account")
-                                    );
-                                } else if authorization == "Bearer web-token" {
-                                    assert!(request.headers().get("ChatGPT-Account-ID").is_none());
-                                } else {
-                                    assert_eq!(authorization, "Bearer codex-no-id");
-                                    assert!(request.headers().get("ChatGPT-Account-ID").is_none());
-                                }
-                                assert!(request
-                                    .uri()
-                                    .query()
-                                    .is_some_and(|query| query.starts_with("client_version=")));
-                                record(request, paths).await;
-                                let slug = if authorization == "Bearer web-token" {
-                                    "codex-only-model"
-                                } else if authorization == "Bearer codex-token" {
-                                    "collision-model"
-                                } else {
-                                    "plus-only-model"
-                                };
-                                Json(json!({
-                                    "models":[{
-                                        "slug":slug,
-                                        "visibility":"list",
-                                        "supported_in_api":true
-                                    }]
-                                }))
-                                    .into_response()
                             }
                         }),
                     )
@@ -10838,7 +21087,7 @@ data: [DONE]
         state
             .account_type_catalog
             .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
-        state.account_store.cursor.store(1, Ordering::Release);
+        state.account_store.cursor.store(0, Ordering::Release);
         let cold_chat = state
             .router()
             .oneshot(
@@ -10864,7 +21113,13 @@ data: [DONE]
             .clone();
         let mut auth_model_calls = auth_model_calls;
         auth_model_calls.sort();
-        assert_eq!(auth_model_calls, vec!["Bearer web-token".to_owned()]);
+        assert_eq!(
+            auth_model_calls,
+            vec![
+                "Bearer codex-no-id".to_owned(),
+                "Bearer codex-token".to_owned(),
+            ]
+        );
         state
             .account_type_catalog
             .refresh_inner_with_budget(Duration::from_secs(1))
@@ -10894,46 +21149,27 @@ data: [DONE]
             .iter()
             .filter_map(|item| item["id"].as_str())
             .collect::<HashSet<_>>();
-        assert!(ids.contains("native-anon-model"));
-        assert!(ids.contains("web-only-model"));
-        assert!(ids.contains("collision-model"));
-        assert!(ids.contains("plus-only-model"));
-        assert!(ids.contains("collision-model"));
         assert_eq!(
-            state
-                .account_type_catalog
-                .supported_types_for("web-only-model")
-                .expect("web group"),
-            HashSet::from(["pro".to_owned()])
+            ids.len(),
+            value["data"].as_array().expect("model data").len(),
+            "model union must be globally deduplicated"
         );
+        assert!(ids.contains("native-anon-model"));
+        assert!(ids.contains("collision-model"));
+        assert!(ids.contains("plus-auth-model"));
         assert_eq!(
             state
                 .account_type_catalog
                 .supported_types_for("collision-model")
-                .expect("codex group"),
+                .expect("pro group"),
             HashSet::from(["pro".to_owned()])
         );
         assert_eq!(
             state
                 .account_type_catalog
-                .supported_types_for("plus-only-model")
+                .supported_types_for("plus-auth-model")
                 .expect("plus group"),
             HashSet::from(["plus".to_owned()])
-        );
-        assert_eq!(codex_model_calls.load(Ordering::SeqCst), 2);
-        let codex_paths = paths
-            .lock()
-            .expect("path lock")
-            .iter()
-            .filter(|path| path.starts_with("/backend-api/codex/models?"))
-            .count();
-        assert_eq!(codex_paths, 2);
-        assert_eq!(
-            state
-                .account_type_catalog
-                .live_tokens_for("web-only-model")
-                .expect("web live tokens"),
-            HashSet::from(["web-token".to_owned(), "codex-token".to_owned()])
         );
         assert_eq!(
             state
@@ -10942,7 +21178,7 @@ data: [DONE]
                 .expect("shared type live tokens"),
             HashSet::from(["web-token".to_owned(), "codex-token".to_owned(),])
         );
-        state.account_store.cursor.store(1, Ordering::Release);
+        state.account_store.cursor.store(0, Ordering::Release);
         let chat = state
             .router()
             .oneshot(
@@ -10969,17 +21205,18 @@ data: [DONE]
         assert_eq!(chat_value["choices"][0]["message"]["content"], "codex ok");
         assert_eq!(codex_chat_calls.load(Ordering::SeqCst), 2);
         assert_eq!(conversation_calls.load(Ordering::SeqCst), 0);
-        state.account_store.cursor.store(1, Ordering::Release);
+        state.account_store.cursor.store(0, Ordering::Release);
         let codex_groups = state
             .account_type_catalog
             .supported_types_for("collision-model")
             .expect("codex route groups");
         let codex_lease = state
             .account_store
-            .acquire_excluding_with_type_filter(
+            .acquire_excluding_with_type_and_source_filter(
                 "collision-model",
                 &HashSet::new(),
                 Some(&codex_groups),
+                Some("codex"),
             )
             .await
             .expect("codex route lease");
@@ -10989,7 +21226,7 @@ data: [DONE]
         assert_eq!(codex_lease.chatgpt_account_id(), Some("codex-account"));
         drop(codex_lease);
 
-        state.account_store.cursor.store(1, Ordering::Release);
+        state.account_store.cursor.store(0, Ordering::Release);
         let chat_stream = state
             .router()
             .oneshot(
@@ -11047,14 +21284,22 @@ data: [DONE]
         assert!(
             paths.contains(&"/backend-api/models?history_and_training_disabled=false".to_owned())
         );
+        let auth_model_calls = auth_model_authorizations
+            .lock()
+            .expect("auth model calls lock")
+            .clone();
+        assert_eq!(auth_model_calls.len(), 2);
+        assert!(auth_model_calls.contains(&"Bearer codex-token".to_owned()));
+        assert!(auth_model_calls.contains(&"Bearer codex-no-id".to_owned()));
+        assert!(paths.contains(&"/backend-anon/models?iim=false&is_gizmo=false".to_owned()));
         assert_eq!(
             paths
                 .iter()
-                .filter(|path| path.starts_with("/backend-api/codex/models?client_version="))
+                .filter(|path| path.starts_with("/backend-anon/models?"))
                 .count(),
-            2
+            1,
+            "anonymous catalog is fetched once per refresh"
         );
-        assert!(paths.contains(&"/backend-anon/models?iim=false&is_gizmo=false".to_owned()));
         assert!(
             !paths
                 .iter()
@@ -11067,59 +21312,79 @@ data: [DONE]
         fs::remove_file(account_path).expect("cleanup");
     }
 
-    async fn assert_web_catalog_uses_only_web_endpoint() {
-        let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-web-source-catalog-{}-{}.json",
+    async fn single_web_catalog_case(source_type: &str) {
+        let account_path = test_tmp_dir().join(format!(
+            "chatgpt2api-rust-single-web-catalog-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(
             &account_path,
-            r#"[{"access_token":"representative","status":"正常","type":"Pro","source_type":"web"}]"#,
+            serde_json::to_vec(&json!([{
+                "access_token": "representative",
+                "status": "正常",
+                "type": "Pro",
+                "source_type": source_type,
+                "chatgpt_account_id": "account-id"
+            }]))
+            .expect("account JSON"),
         )
         .expect("account snapshot");
-
         let web_calls = Arc::new(AtomicUsize::new(0));
         let codex_calls = Arc::new(AtomicUsize::new(0));
+        let checks = Arc::new(StdMutex::new(Vec::<bool>::new()));
         let web_calls_for_upstream = web_calls.clone();
         let codex_calls_for_upstream = codex_calls.clone();
-        let upstream_ready = Arc::new(Notify::new());
-        let upstream_ready_for_task = upstream_ready.clone();
+        let checks_for_upstream = checks.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
         let address = listener.local_addr().expect("address");
         let upstream_task = tokio::spawn(async move {
-            upstream_ready_for_task.notify_one();
+            let checks = checks_for_upstream.clone();
+            let web = get(move |request: axum::extract::Request| {
+                let calls = web_calls_for_upstream.clone();
+                let checks = checks.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let valid = request
+                        .headers()
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("Bearer representative")
+                        && request.uri().query() == Some("history_and_training_disabled=false")
+                        && request
+                            .headers()
+                            .get("X-OpenAI-Target-Path")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("/backend-api/models")
+                        && request
+                            .headers()
+                            .get("X-OpenAI-Target-Route")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("/backend-api/models")
+                        && request
+                            .headers()
+                            .get("ChatGPT-Account-ID")
+                            .and_then(|value| value.to_str().ok())
+                            == Some("account-id");
+                    checks.lock().expect("checks lock").push(valid);
+                    Json(json!({"models":[{"slug":"web-catalog-model"}]}))
+                }
+            });
+            let codex_calls = codex_calls_for_upstream.clone();
             axum::serve(
                 listener,
                 Router::new()
                     .route("/", get(|| async { Html("<html></html>") }))
-                    .route(
-                        "/backend-api/sentinel/chat-requirements/prepare",
-                        post(|| async { Json(json!({"prepare_token":"prepare-token"})) }),
-                    )
-                    .route(
-                        "/backend-api/sentinel/chat-requirements/finalize",
-                        post(|| async { Json(json!({"token":"requirements-token"})) }),
-                    )
-                    .route(
-                        "/backend-api/models",
-                        get(move || {
-                            let calls = web_calls_for_upstream.clone();
-                            async move {
-                                calls.fetch_add(1, Ordering::SeqCst);
-                                Json(json!({"models":[{"slug":"web-model"}]}))
-                            }
-                        }),
-                    )
+                    .route("/backend-api/models", web)
                     .route(
                         "/backend-api/codex/models",
                         get(move || {
-                            let calls = codex_calls_for_upstream.clone();
+                            let calls = codex_calls.clone();
                             async move {
                                 calls.fetch_add(1, Ordering::SeqCst);
-                                Json(json!({"models":[{"slug":"must-not-be-requested","supported_in_api":true}]}))
+                                StatusCode::NOT_FOUND
                             }
                         }),
                     ),
@@ -11127,8 +21392,6 @@ data: [DONE]
             .await
             .expect("upstream server");
         });
-        upstream_ready.notified().await;
-
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: None,
@@ -11143,32 +21406,31 @@ data: [DONE]
         .expect("state");
         let candidates = vec![CatalogAccountCandidate {
             token: "representative".to_owned(),
-            source_type: "web".to_owned(),
-            chatgpt_account_id: None,
+            source_type: source_type.to_owned(),
+            chatgpt_account_id: Some("account-id".to_owned()),
         }];
-        let catalog = state.account_type_catalog.clone();
-        let fetch = tokio::spawn(async move {
-            catalog
-                .fetch_account_type_models(
-                    &"pro".to_owned(),
-                    &candidates,
-                    Instant::now() + Duration::from_secs(1),
-                )
-                .await
-        });
-        let result = fetch.await.expect("fetch task").expect("catalog result");
+        let result = state
+            .account_type_catalog
+            .fetch_account_type_models(
+                &"pro".to_owned(),
+                &candidates,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("authenticated Web catalog");
         assert_eq!(
             result
                 .0
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["web-model"]
+            vec!["web-catalog-model"]
         );
         assert!(result.2);
+        assert_eq!(result.1.candidates[0].token, "representative");
         assert_eq!(web_calls.load(Ordering::SeqCst), 1);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
-
+        assert_eq!(checks.lock().expect("checks lock").clone(), vec![true]);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
@@ -11176,279 +21438,22 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_catalog_web_representative_uses_only_web_endpoint() {
-        assert_web_catalog_uses_only_web_endpoint().await;
+    async fn native_catalog_web_source_uses_only_authenticated_web_endpoint() {
+        single_web_catalog_case("web").await;
     }
 
     #[tokio::test]
-    async fn native_catalog_codex_representative_uses_only_codex_endpoint() {
-        let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-codex-source-catalog-{}-{}.json",
-            std::process::id(),
-            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(
-            &account_path,
-            r#"[{"access_token":"representative","status":"正常","type":"Pro","source_type":"codex"}]"#,
-        )
-        .expect("account snapshot");
-        let web_finished = Arc::new(Notify::new());
-        let codex_started = Arc::new(Notify::new());
-        let release_codex = Arc::new(Notify::new());
-        let web_finished_for_upstream = web_finished.clone();
-        let codex_started_for_upstream = codex_started.clone();
-        let release_codex_for_upstream = release_codex.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr().expect("address");
-        let upstream_task = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/", get(|| async { Html("<html></html>") }))
-                    .route("/backend-api/models", get(move || {
-                        let finished = web_finished_for_upstream.clone();
-                        async move {
-                            finished.notify_one();
-                            Json(json!({"models":[{"slug":"web-fast-model"}]}))
-                        }
-                    }))
-                    .route("/backend-api/codex/models", get(move || {
-                        let started = codex_started_for_upstream.clone();
-                        let release = release_codex_for_upstream.clone();
-                        async move {
-                            started.notify_one();
-                            release.notified().await;
-                            Json(json!({"models":[{"slug":"codex-slow-model","supported_in_api":true}]}))
-                        }
-                    })),
-            )
-            .await
-            .expect("upstream server");
-        });
-        let state = AppState::new(AppConfig {
-            version: "test".to_owned(),
-            auth_key: None,
-            models: Vec::new(),
-            upstream_base_url: Some(format!("http://{address}")),
-            upstream_auth: None,
-            auth_keys_path: None,
-            models_path: None,
-            accounts_path: Some(account_path.clone()),
-            upstream_protocol: UpstreamProtocol::ChatGpt,
-        })
-        .expect("state");
-        state
-            .account_type_catalog
-            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
-        let candidates = vec![CatalogAccountCandidate {
-            token: "representative".to_owned(),
-            source_type: "codex".to_owned(),
-            chatgpt_account_id: None,
-        }];
-        let catalog = state.account_type_catalog.clone();
-        let fetch = tokio::spawn(async move {
-            catalog
-                .fetch_account_type_models(
-                    &"pro".to_owned(),
-                    &candidates,
-                    Instant::now() + Duration::from_secs(1),
-                )
-                .await
-        });
-        codex_started.notified().await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), web_finished.notified())
-                .await
-                .is_err(),
-            "Codex representatives must not call the Web endpoint"
-        );
-        assert!(!fetch.is_finished());
-        release_codex.notify_one();
-        let result = fetch.await.expect("fetch task").expect("catalog result");
-        assert_eq!(
-            result
-                .0
-                .into_iter()
-                .map(|model| model.id)
-                .collect::<HashSet<_>>(),
-            HashSet::from(["codex-slow-model".to_owned()])
-        );
-        assert!(result.2);
-        state.account_type_catalog.shutdown().await;
-        upstream_task.abort();
-        let _ = upstream_task.await;
-        fs::remove_file(account_path).expect("cleanup");
+    async fn native_catalog_codex_source_uses_only_authenticated_web_endpoint() {
+        single_web_catalog_case("codex").await;
     }
 
     #[tokio::test]
-    async fn native_catalog_unknown_source_fails_closed_without_endpoint() {
-        let state = AppState::new(AppConfig {
-            version: "test".to_owned(),
-            auth_key: None,
-            models: Vec::new(),
-            upstream_base_url: None,
-            upstream_auth: None,
-            auth_keys_path: None,
-            models_path: None,
-            accounts_path: None,
-            upstream_protocol: UpstreamProtocol::ChatGpt,
-        })
-        .expect("state");
-        let catalog = state.account_type_catalog.clone();
-        let candidates = vec![CatalogAccountCandidate {
-            token: "unknown-source-token".to_owned(),
-            source_type: "future-incompatible".to_owned(),
-            chatgpt_account_id: None,
-        }];
-        assert!(
-            catalog
-                .fetch_account_type_models(
-                    &"pro".to_owned(),
-                    &candidates,
-                    Instant::now() + Duration::from_secs(1),
-                )
-                .await
-                .is_none()
-        );
-        catalog.shutdown().await;
+    async fn native_catalog_unknown_source_uses_only_authenticated_web_endpoint() {
+        single_web_catalog_case("future-incompatible").await;
     }
 
     #[tokio::test]
-    async fn native_catalog_codex_timeout_does_not_probe_web_endpoint() {
-        let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-codex-source-timeout-{}-{}.json",
-            std::process::id(),
-            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(
-            &account_path,
-            r#"[{"access_token":"representative","status":"正常","type":"Pro","source_type":"codex"}]"#,
-        )
-        .expect("account snapshot");
-        let codex_started = Arc::new(Notify::new());
-        let codex_started_for_upstream = codex_started.clone();
-        let web_finished = Arc::new(Notify::new());
-        let web_finished_for_upstream = web_finished.clone();
-        let upstream_ready = Arc::new(Notify::new());
-        let upstream_ready_for_task = upstream_ready.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr().expect("address");
-        let upstream_task = tokio::spawn(async move {
-            upstream_ready_for_task.notify_one();
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/", get(|| async { Html("<html></html>") }))
-                    .route(
-                        "/backend-api/sentinel/chat-requirements/prepare",
-                        post(|| async { Json(json!({"prepare_token":"prepare-token"})) }),
-                    )
-                    .route(
-                        "/backend-api/sentinel/chat-requirements/finalize",
-                        post(|| async { Json(json!({"token":"requirements-token"})) }),
-                    )
-                    .route(
-                        "/backend-api/models",
-                        get(move || {
-                            let finished = web_finished_for_upstream.clone();
-                            async move {
-                                finished.notify_one();
-                                Json(json!({"models":[{"slug":"web-survives-timeout"}]}))
-                            }
-                        }),
-                    )
-                    .route(
-                        "/backend-api/codex/models",
-                        get(move || {
-                            let started = codex_started_for_upstream.clone();
-                            async move {
-                                started.notify_one();
-                                let first = stream::once(async {
-                                    Ok::<Bytes, std::convert::Infallible>(Bytes::from("{"))
-                                });
-                                let rest =
-                                    stream::pending::<Result<Bytes, std::convert::Infallible>>();
-                                (StatusCode::OK, Body::from_stream(first.chain(rest)))
-                                    .into_response()
-                            }
-                        }),
-                    ),
-            )
-            .await
-            .expect("upstream server");
-        });
-        upstream_ready.notified().await;
-
-        let state = AppState::new(AppConfig {
-            version: "test".to_owned(),
-            auth_key: None,
-            models: Vec::new(),
-            upstream_base_url: Some(format!("http://{address}")),
-            upstream_auth: None,
-            auth_keys_path: None,
-            models_path: None,
-            accounts_path: Some(account_path.clone()),
-            upstream_protocol: UpstreamProtocol::ChatGpt,
-        })
-        .expect("state");
-        state
-            .account_type_catalog
-            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
-        let candidates = vec![CatalogAccountCandidate {
-            token: "representative".to_owned(),
-            source_type: "codex".to_owned(),
-            chatgpt_account_id: None,
-        }];
-        let catalog = state.account_type_catalog.clone();
-        let fetch = tokio::spawn(async move {
-            catalog
-                .fetch_account_type_models(
-                    &"pro".to_owned(),
-                    &candidates,
-                    Instant::now() + Duration::from_millis(100),
-                )
-                .await
-        });
-        codex_started.notified().await;
-        let result = tokio::time::timeout(Duration::from_secs(1), fetch)
-            .await
-            .expect("catalog deadline")
-            .expect("fetch task");
-        assert!(
-            result.is_none(),
-            "a failed Codex source has no usable catalog"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), web_finished.notified())
-                .await
-                .is_err(),
-            "Codex representatives must not probe Web"
-        );
-
-        state.account_type_catalog.shutdown().await;
-        upstream_task.abort();
-        let _ = upstream_task.await;
-        fs::remove_file(account_path).expect("cleanup");
-    }
-
-    async fn catalog_endpoint_status_case(
-        web_status: StatusCode,
-        codex_status: StatusCode,
-    ) -> (Option<(HashSet<String>, bool)>, usize, usize) {
-        let account_path = std::env::temp_dir().join(format!(
-            "chatgpt2api-rust-web-source-status-{}-{}.json",
-            std::process::id(),
-            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(
-            &account_path,
-            r#"[{"access_token":"representative","status":"正常","type":"Pro"}]"#,
-        )
-        .expect("account snapshot");
+    async fn native_catalog_falls_back_to_next_same_type_candidate() {
         let web_calls = Arc::new(AtomicUsize::new(0));
         let codex_calls = Arc::new(AtomicUsize::new(0));
         let web_calls_for_upstream = web_calls.clone();
@@ -11458,33 +21463,34 @@ data: [DONE]
             .expect("listener");
         let address = listener.local_addr().expect("address");
         let upstream_task = tokio::spawn(async move {
+            let web_calls = web_calls_for_upstream.clone();
+            let web = get(move |headers: HeaderMap| {
+                let calls = web_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let token = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default();
+                    if token.ends_with("first") {
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                    Json(json!({"models":[{"slug":"fallback-web-model"}]})).into_response()
+                }
+            });
+            let codex_calls = codex_calls_for_upstream.clone();
             axum::serve(
                 listener,
                 Router::new()
                     .route("/", get(|| async { Html("<html></html>") }))
-                    .route(
-                        "/backend-api/models",
-                        get(move || {
-                            let calls = web_calls_for_upstream.clone();
-                            async move {
-                                calls.fetch_add(1, Ordering::SeqCst);
-                                if !web_status.is_success() {
-                                    return web_status.into_response();
-                                }
-                                Json(json!({"models":[{"slug":"web-model"}]})).into_response()
-                            }
-                        }),
-                    )
+                    .route("/backend-api/models", web)
                     .route(
                         "/backend-api/codex/models",
                         get(move || {
-                            let calls = codex_calls_for_upstream.clone();
+                            let calls = codex_calls.clone();
                             async move {
                                 calls.fetch_add(1, Ordering::SeqCst);
-                                if !codex_status.is_success() {
-                                    return codex_status.into_response();
-                                }
-                                Json(json!({"models":[{"slug":"codex-model","supported_in_api":true}]})).into_response()
+                                StatusCode::INTERNAL_SERVER_ERROR
                             }
                         }),
                     ),
@@ -11500,13 +21506,91 @@ data: [DONE]
             upstream_auth: None,
             auth_keys_path: None,
             models_path: None,
-            accounts_path: Some(account_path.clone()),
+            accounts_path: None,
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
-        state
+        let candidates = vec![
+            CatalogAccountCandidate {
+                token: "first".to_owned(),
+                source_type: "codex".to_owned(),
+                chatgpt_account_id: None,
+            },
+            CatalogAccountCandidate {
+                token: "second".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            },
+        ];
+        let result = state
             .account_type_catalog
-            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+            .fetch_account_type_models(
+                &"pro".to_owned(),
+                &candidates,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("same-type Web fallback");
+        assert_eq!(result.1.candidates[0].token, "second");
+        assert_eq!(result.0[0].id, "fallback-web-model");
+        assert_eq!(web_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+        state.account_type_catalog.shutdown().await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+    }
+
+    #[tokio::test]
+    async fn native_catalog_web_failure_returns_no_usable_group_without_codex_probe() {
+        let web_calls = Arc::new(AtomicUsize::new(0));
+        let codex_calls = Arc::new(AtomicUsize::new(0));
+        let web_calls_for_upstream = web_calls.clone();
+        let codex_calls_for_upstream = codex_calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            let web_calls = web_calls_for_upstream.clone();
+            let web = get(move || {
+                let calls = web_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::BAD_GATEWAY
+                }
+            });
+            let codex_calls = codex_calls_for_upstream.clone();
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", get(|| async { Html("<html></html>") }))
+                    .route("/backend-api/models", web)
+                    .route(
+                        "/backend-api/codex/models",
+                        get(move || {
+                            let calls = codex_calls.clone();
+                            async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            }
+                        }),
+                    ),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
         let candidates = vec![CatalogAccountCandidate {
             token: "representative".to_owned(),
             source_type: "web".to_owned(),
@@ -11517,41 +21601,196 @@ data: [DONE]
             .fetch_account_type_models(
                 &"pro".to_owned(),
                 &candidates,
-                Instant::now() + Duration::from_millis(500),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        assert!(result.is_none());
+        assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+        state.account_type_catalog.shutdown().await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+    }
+
+    async fn rate_limited_catalog_source_case(source_order: [&str; 2]) {
+        let account_path = test_tmp_dir().join(format!(
+            "chatgpt2api-rust-rate-limited-source-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let items = source_order
+            .into_iter()
+            .map(|source_type| {
+                json!({
+                    "access_token": format!("{source_type}-token"),
+                    "status": if source_type == "codex" { "限流" } else { "正常" },
+                    "type": "Pro",
+                    "source_type": source_type,
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &account_path,
+            serde_json::to_vec(&json!({"items": items})).expect("accounts JSON"),
+        )
+        .expect("accounts snapshot");
+        let web_calls = Arc::new(AtomicUsize::new(0));
+        let codex_calls = Arc::new(AtomicUsize::new(0));
+        let web_auth = Arc::new(StdMutex::new(Vec::<(bool, bool)>::new()));
+        let web_calls_for_upstream = web_calls.clone();
+        let codex_calls_for_upstream = codex_calls.clone();
+        let web_auth_for_upstream = web_auth.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            let web_auth = web_auth_for_upstream.clone();
+            let web = get(move |headers: HeaderMap| {
+                let calls = web_calls_for_upstream.clone();
+                let auth = web_auth.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let value = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|header| header.to_str().ok())
+                        .unwrap_or_default();
+                    let is_web = value == "Bearer web-token";
+                    let is_codex = value == "Bearer codex-token";
+                    auth.lock().expect("web auth lock").push((is_web, is_codex));
+                    if !(is_web || is_codex) {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    Json(json!({"models":[{"slug":"rate-limited-source-model"}]})).into_response()
+                }
+            });
+            let codex_calls = codex_calls_for_upstream.clone();
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", get(|| async { Html("<html></html>") }))
+                    .route("/backend-api/models", web)
+                    .route(
+                        "/backend-api/codex/models",
+                        get(move || {
+                            let calls = codex_calls.clone();
+                            async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                StatusCode::NOT_FOUND
+                            }
+                        }),
+                    )
+                    .route(
+                        "/backend-anon/models",
+                        get(|| async { Json(json!({"models": []})) }),
+                    ),
             )
             .await
-            .map(|(models, _, complete)| {
-                (models.into_iter().map(|model| model.id).collect(), complete)
-            });
-        let counts = (
-            web_calls.load(Ordering::SeqCst),
-            codex_calls.load(Ordering::SeqCst),
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .refresh_inner_with_budget(Duration::from_secs(1))
+            .await;
+        let groups = HashSet::from(["pro".to_owned()]);
+        assert_eq!(
+            state
+                .account_type_catalog
+                .source_types_for("rate-limited-source-model", Some(&groups)),
+            HashSet::from(["web".to_owned()])
+        );
+        assert!(
+            acquire_native_codex_lease(&state, "rate-limited-source-model", &HashSet::new())
+                .await
+                .is_none()
+        );
+        assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            web_auth.lock().expect("web auth lock").clone(),
+            vec![(true, false)]
+        );
+
+        let recovered_items = source_order
+            .into_iter()
+            .map(|source_type| {
+                json!({
+                    "access_token": format!("{source_type}-token"),
+                    "status": "正常",
+                    "type": "Pro",
+                    "source_type": source_type,
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::write(
+            &account_path,
+            serde_json::to_vec(&json!({"items": recovered_items}))
+                .expect("recovered accounts JSON"),
+        )
+        .expect("recovered accounts snapshot");
+        state
+            .account_type_catalog
+            .refresh_inner_with_budget(Duration::from_secs(1))
+            .await;
+        assert_eq!(
+            state
+                .account_type_catalog
+                .source_types_for("rate-limited-source-model", Some(&groups)),
+            HashSet::from(["web".to_owned(), "codex".to_owned()])
+        );
+        let codex_lease =
+            acquire_native_codex_lease(&state, "rate-limited-source-model", &HashSet::new())
+                .await
+                .expect("recovered Codex lease");
+        assert_eq!(codex_lease.source_type(), "codex");
+        drop(codex_lease);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+        let recovered_is_codex = source_order[0] == "codex";
+        assert_eq!(
+            web_auth.lock().expect("web auth lock").clone(),
+            vec![(true, false), (!recovered_is_codex, recovered_is_codex)]
         );
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
         fs::remove_file(account_path).expect("cleanup");
-        (result, counts.0, counts.1)
     }
 
     #[tokio::test]
-    async fn native_catalog_web_failure_does_not_fallback_across_transport() {
-        let (result, web_calls, codex_calls) =
-            catalog_endpoint_status_case(StatusCode::BAD_GATEWAY, StatusCode::OK).await;
-        assert!(result.is_none());
-        assert_eq!((web_calls, codex_calls), (1, 0));
+    async fn native_catalog_excludes_rate_limited_codex_until_recovered() {
+        rate_limited_catalog_source_case(["web", "codex"]).await;
     }
 
     #[tokio::test]
-    async fn native_catalog_web_failure_is_not_hidden_by_codex_success() {
-        let (result, web_calls, codex_calls) =
-            catalog_endpoint_status_case(StatusCode::BAD_GATEWAY, StatusCode::UNAUTHORIZED).await;
-        assert!(result.is_none());
-        assert_eq!((web_calls, codex_calls), (1, 0));
+    async fn native_catalog_excludes_rate_limited_codex_independent_of_account_order() {
+        rate_limited_catalog_source_case(["codex", "web"]).await;
     }
 
     #[tokio::test]
-    async fn native_catalog_web_source_falls_back_to_next_same_type_candidate() {
+    async fn native_catalog_source_capabilities_do_not_select_catalog_transport() {
+        let account_path = test_tmp_dir().join(format!(
+            "chatgpt2api-rust-source-capabilities-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &account_path,
+            r#"[{"access_token":"web-token","status":"正常","type":"Pro","source_type":"web"},{"access_token":"codex-token","status":"正常","type":"Pro","source_type":"codex"}]"#,
+        )
+        .expect("account snapshot");
         let web_calls = Arc::new(AtomicUsize::new(0));
         let codex_calls = Arc::new(AtomicUsize::new(0));
         let web_calls_for_upstream = web_calls.clone();
@@ -11561,38 +21800,27 @@ data: [DONE]
             .expect("listener");
         let address = listener.local_addr().expect("address");
         let upstream_task = tokio::spawn(async move {
+            let web_calls = web_calls_for_upstream.clone();
+            let web = get(move || {
+                let calls = web_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"models":[{"slug":"mixed-source-model"}]}))
+                }
+            });
+            let codex_calls = codex_calls_for_upstream.clone();
             axum::serve(
                 listener,
                 Router::new()
                     .route("/", get(|| async { Html("<html></html>") }))
-                    .route(
-                        "/backend-api/models",
-                        get(move |headers: HeaderMap| {
-                            let calls = web_calls_for_upstream.clone();
-                            async move {
-                                calls.fetch_add(1, Ordering::SeqCst);
-                                let token = headers
-                                    .get(header::AUTHORIZATION)
-                                    .and_then(|value| value.to_str().ok())
-                                    .unwrap_or_default();
-                                if token.ends_with("first") {
-                                    return StatusCode::BAD_GATEWAY.into_response();
-                                }
-                                Json(json!({
-                                    "models": [{"slug": "web-second-candidate"}]
-                                }))
-                                .into_response()
-                            }
-                        }),
-                    )
+                    .route("/backend-api/models", web)
                     .route(
                         "/backend-api/codex/models",
-                        get(move |headers: HeaderMap| {
-                            let calls = codex_calls_for_upstream.clone();
+                        get(move || {
+                            let calls = codex_calls.clone();
                             async move {
                                 calls.fetch_add(1, Ordering::SeqCst);
-                                let _ = headers;
-                                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                                StatusCode::NOT_FOUND
                             }
                         }),
                     ),
@@ -11600,7 +21828,6 @@ data: [DONE]
             .await
             .expect("upstream server");
         });
-
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: None,
@@ -11609,144 +21836,48 @@ data: [DONE]
             upstream_auth: None,
             auth_keys_path: None,
             models_path: None,
-            accounts_path: None,
+            accounts_path: Some(account_path.clone()),
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
         state
             .account_type_catalog
-            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
-        let candidates = vec![
-            CatalogAccountCandidate {
-                token: "first".to_owned(),
-                source_type: "web".to_owned(),
-                chatgpt_account_id: None,
-            },
-            CatalogAccountCandidate {
-                token: "second".to_owned(),
-                source_type: "web".to_owned(),
-                chatgpt_account_id: None,
-            },
-        ];
-        let result = state
-            .account_type_catalog
-            .fetch_account_type_models(
-                &"pro".to_owned(),
-                &candidates,
-                Instant::now() + Duration::from_secs(1),
-            )
-            .await
-            .expect("partial endpoint fallback remains usable");
-        let owners = result.1.clone();
-        assert_eq!(owners.candidates[0].token, "second");
+            .refresh_inner_with_budget(Duration::from_secs(1))
+            .await;
+        let groups = HashSet::from(["pro".to_owned()]);
         assert_eq!(
-            result
-                .0
-                .into_iter()
-                .map(|model| model.id)
-                .collect::<HashSet<_>>(),
-            HashSet::from(["web-second-candidate".to_owned()])
+            state
+                .account_type_catalog
+                .source_types_for("mixed-source-model", Some(&groups)),
+            HashSet::from(["web".to_owned(), "codex".to_owned()])
         );
-        assert!(result.2, "the second same-source representative succeeds");
-        assert_eq!(
-            (
-                web_calls.load(Ordering::SeqCst),
-                codex_calls.load(Ordering::SeqCst)
-            ),
-            (2, 0),
-            "a source group stops after its first successful candidate and never crosses transport"
+        assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            acquire_native_codex_lease(&state, "mixed-source-model", &HashSet::new())
+                .await
+                .is_some()
         );
-
+        assert!(
+            state
+                .account_store
+                .acquire_excluding_with_type_and_capability_filter(
+                    "mixed-source-model",
+                    &HashSet::new(),
+                    Some(&groups),
+                    Some("web"),
+                )
+                .await
+                .is_some()
+        );
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
+        fs::remove_file(account_path).expect("cleanup");
     }
-
-    #[tokio::test]
-    async fn native_catalog_codex_source_falls_back_to_next_same_type_candidate() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_upstream = calls.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr().expect("address");
-        let upstream_task = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                Router::new().route(
-                    "/backend-api/codex/models",
-                    get(move |headers: HeaderMap| {
-                        let calls = calls_for_upstream.clone();
-                        async move {
-                            let call = calls.fetch_add(1, Ordering::SeqCst);
-                            let token = headers
-                                .get(header::AUTHORIZATION)
-                                .and_then(|value| value.to_str().ok())
-                                .unwrap_or_default();
-                            if call == 0 {
-                                assert!(token.ends_with("first"));
-                                return StatusCode::BAD_GATEWAY.into_response();
-                            }
-                            assert!(token.ends_with("second"));
-                            Json(json!({
-                                "models": [{"slug":"codex-second-candidate","supported_in_api":true}]
-                            }))
-                            .into_response()
-                        }
-                    }),
-                ),
-            )
-            .await
-            .expect("upstream server");
-        });
-        let state = AppState::new(AppConfig {
-            version: "test".to_owned(),
-            auth_key: None,
-            models: Vec::new(),
-            upstream_base_url: Some(format!("http://{address}")),
-            upstream_auth: None,
-            auth_keys_path: None,
-            models_path: None,
-            accounts_path: None,
-            upstream_protocol: UpstreamProtocol::ChatGpt,
-        })
-        .expect("state");
-        state
-            .account_type_catalog
-            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
-        let candidates = vec![
-            CatalogAccountCandidate {
-                token: "first".to_owned(),
-                source_type: "codex".to_owned(),
-                chatgpt_account_id: None,
-            },
-            CatalogAccountCandidate {
-                token: "second".to_owned(),
-                source_type: "codex".to_owned(),
-                chatgpt_account_id: None,
-            },
-        ];
-        let result = state
-            .account_type_catalog
-            .fetch_account_type_models(
-                &"pro".to_owned(),
-                &candidates,
-                Instant::now() + Duration::from_secs(1),
-            )
-            .await
-            .expect("same-source fallback");
-        assert_eq!(result.0[0].id, "codex-second-candidate");
-        assert!(result.2);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(result.1.candidates[0].token, "second");
-        state.account_type_catalog.shutdown().await;
-        upstream_task.abort();
-        let _ = upstream_task.await;
-    }
-
     #[tokio::test]
     async fn native_catalog_web_source_does_not_require_chat_sentinel_handshake() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-model-catalog-no-sentinel-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -11846,7 +21977,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn public_models_native_cold_refresh_is_nonblocking_and_singleflight() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-native-public-cold-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -11931,6 +22062,9 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
         let request = || {
             axum::http::Request::builder()
                 .uri("/v1/models")
@@ -11962,7 +22096,9 @@ data: [DONE]
             }
         })
         .await
-        .expect("one native background owner should fetch anonymous plus two types");
+        .expect(
+            "one native background owner should fetch anonymous plus one Web endpoint per type",
+        );
         assert_eq!(model_fetches.load(Ordering::SeqCst), 3);
 
         state.account_type_catalog.shutdown().await;
@@ -11973,7 +22109,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn native_chat_waits_for_requested_type_when_another_type_is_ready() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-native-model-wait-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -11986,8 +22122,10 @@ data: [DONE]
 
         let plus_started = Arc::new(Notify::new());
         let plus_release = Arc::new(Notify::new());
+        let codex_catalog_calls = Arc::new(AtomicUsize::new(0));
         let plus_started_for_upstream = plus_started.clone();
         let plus_release_for_upstream = plus_release.clone();
+        let codex_catalog_calls_for_upstream = codex_catalog_calls.clone();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -12040,7 +22178,13 @@ data: [DONE]
                     .route("/backend-api/models", plus_models)
                     .route(
                         "/backend-api/codex/models",
-                        get(|| async { Json(json!({"models": [{"slug":"plus-model"}]})) }),
+                        get(move || {
+                            let calls = codex_catalog_calls_for_upstream.clone();
+                            async move {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            }
+                        }),
                     )
                     .route("/backend-anon/sentinel/chat-requirements/prepare", prepare)
                     .route(
@@ -12107,6 +22251,7 @@ data: [DONE]
             .expect("chat response");
         assert_eq!(response.status(), StatusCode::OK);
         let _ = response.into_body().collect().await.expect("response body");
+        assert_eq!(codex_catalog_calls.load(Ordering::SeqCst), 0);
 
         upstream_task.abort();
         let _ = upstream_task.await;
@@ -12115,7 +22260,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn codex_legacy_type_uses_the_python_free_catalog_group() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-codex-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -12203,7 +22348,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn model_catalog_preserves_python_reasoning_effort_aliases() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-model-reasoning-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -12283,7 +22428,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn unknown_account_type_case_variants_remain_distinct_catalog_types() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-unknown-case-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -12399,7 +22544,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn models_route_uses_one_representative_per_account_type() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-types-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -12533,14 +22678,16 @@ data: [DONE]
         assert_eq!(second_response.status(), StatusCode::OK);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
+        state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
+        drop(state);
         fs::remove_file(account_path).expect("cleanup");
     }
 
     #[tokio::test]
     async fn models_route_retries_until_success_within_a_type() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-failover-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -12636,14 +22783,16 @@ data: [DONE]
         assert!(ids.contains("free-model"));
         assert!(ids.contains("plus-model"));
         assert_eq!(calls.load(Ordering::SeqCst), 5);
+        state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
+        drop(state);
         fs::remove_file(account_path).expect("cleanup");
     }
 
     #[tokio::test]
     async fn failed_type_refresh_keeps_last_good_and_respects_backoff() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-backoff-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -12766,6 +22915,8 @@ data: [DONE]
         let third = state.router().oneshot(request()).await.expect("response");
         assert_eq!(third.status(), StatusCode::OK);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+        state.account_type_catalog.shutdown().await;
+        drop(state);
         upstream_task.abort();
         let _ = upstream_task.await;
         fs::remove_file(account_path).expect("cleanup");
@@ -12773,7 +22924,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn account_removal_updates_live_membership_without_erasing_catalog() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-membership-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -12872,7 +23023,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn bad_account_snapshot_clears_catalog_live_membership() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-invalid-membership-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -12965,7 +23116,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn late_catalog_result_cannot_publish_for_a_replaced_token_same_type() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-token-fence-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -13081,7 +23232,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn late_catalog_result_cannot_publish_for_a_replaced_account_id_same_token() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-account-id-fence-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -13209,7 +23360,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn concurrent_cold_model_reads_share_one_type_refresh() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-singleflight-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -13314,14 +23465,16 @@ data: [DONE]
             StatusCode::OK
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
-        fs::remove_file(account_path).expect("cleanup");
+        drop(state);
+        remove_test_file_after_release(&account_path).await;
     }
 
     #[tokio::test]
     async fn public_models_cold_refresh_is_nonblocking_and_singleflight() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-public-cold-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -13444,7 +23597,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn public_models_empty_cold_snapshot_returns_empty_without_waiting() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-public-empty-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -13555,7 +23708,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn anonymous_last_good_does_not_block_a_new_type_refresh() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-anonymous-ready-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -13682,7 +23835,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn cold_wait_never_publishes_torn_live_membership() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-live-membership-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -13765,7 +23918,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn cold_catalog_refresh_limits_concurrent_type_jobs() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-concurrency-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -13865,9 +24018,9 @@ data: [DONE]
         fs::remove_file(account_path).expect("cleanup");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cold_catalog_refresh_shared_deadline_sets_backoff() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-deadline-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -14006,7 +24159,7 @@ data: [DONE]
 
     #[tokio::test]
     async fn models_route_keeps_last_good_during_type_deadline_backoff_without_retry_storm() {
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-account-type-route-backoff-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -14282,7 +24435,7 @@ data: [DONE]
         });
         upstream_ready.notified().await;
 
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-codex-chat-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -14503,6 +24656,989 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn native_codex_image_generation_projects_image_tool_result() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let captured_payload = Arc::new(Mutex::new(None::<Value>));
+        let captured_payload_for_upstream = captured_payload.clone();
+        let upstream = tokio::spawn(async move {
+            let bootstrap = get(|| async {
+                Html(
+                    r#"<html data-build="c/test/_build"><script src="https://chatgpt.com/c/test/_sdk.js"></script></html>"#,
+                )
+            });
+            let models = get(|| async {
+                Json(json!({
+                    "models": [{"slug":"gpt-5.5","supported_in_api":true}]
+                }))
+            });
+            let responses = post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                let captured_payload = captured_payload_for_upstream.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer image-codex-token")
+                    );
+                    *captured_payload.lock().await = Some(payload);
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(
+                            "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-image\",\"model\":\"gpt-5.5\",\"status\":\"in_progress\"}}\n\n\
+                             data: {\"type\":\"response.output_item.done\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"id\":\"img-1\",\"status\":\"completed\",\"revised_prompt\":\"draw a cat\",\"result\":\"aW1hZ2U=\"}}\n\n\
+                             data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"resp-image\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"output\":[{\"type\":\"image_generation_call\",\"id\":\"img-1\",\"status\":\"completed\",\"revised_prompt\":\"draw a cat\",\"result\":\"aW1hZ2U=\"}]}}\n\n",
+                        ),
+                    )
+                        .into_response()
+                }
+            });
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", bootstrap)
+                    .route("/backend-api/models", models)
+                    .route("/backend-api/codex/responses", responses),
+            )
+            .await
+            .expect("upstream server");
+        });
+
+        let account_path = account_snapshot_path("native-codex-image-generation");
+        fs::write(
+            &account_path,
+            r#"[{"access_token":"image-codex-token","status":"正常","source_type":"codex","type":"plus"}]"#,
+        )
+        .expect("account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["codex-gpt-image-2".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"codex-gpt-image-2","prompt":"draw a cat"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let response_status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(response_status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).expect("image response");
+        assert_eq!(value["data"][0]["b64_json"], "aW1hZ2U=");
+        let payload = captured_payload
+            .lock()
+            .await
+            .clone()
+            .expect("captured payload");
+        assert_eq!(payload["tools"][0]["type"], "image_generation");
+        assert_eq!(payload["tools"][0]["action"], "generate");
+        assert_eq!(payload["input"][0]["content"][0]["text"], "draw a cat");
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        fs::remove_file(account_path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_web_image_generation_uses_conversation_and_file_download_flow() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_for_upstream = calls.clone();
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("png");
+        let png_for_upstream = png.clone();
+        let upstream = tokio::spawn(async move {
+            let calls_for_root = calls_for_upstream.clone();
+            let bootstrap = get(move || {
+                let calls = calls_for_root.clone();
+                async move {
+                    calls.lock().await.push("bootstrap".to_owned());
+                    Html("<html></html>")
+                }
+            });
+            let calls_for_requirements_prepare = calls_for_upstream.clone();
+            let requirements_prepare = post(move || {
+                let calls = calls_for_requirements_prepare.clone();
+                async move {
+                    calls.lock().await.push("requirements_prepare".to_owned());
+                    Json(json!({"prepare_token":"prepare-token"}))
+                }
+            });
+            let calls_for_requirements_finalize = calls_for_upstream.clone();
+            let requirements_finalize = post(move || {
+                let calls = calls_for_requirements_finalize.clone();
+                async move {
+                    calls.lock().await.push("requirements_finalize".to_owned());
+                    Json(json!({"token":"requirements-token"}))
+                }
+            });
+            let calls_for_prepare = calls_for_upstream.clone();
+            let prepare = post(move || {
+                let calls = calls_for_prepare.clone();
+                async move {
+                    calls.lock().await.push("image_prepare".to_owned());
+                    Json(json!({"conduit_token":"conduit-token"}))
+                }
+            });
+            let calls_for_run = calls_for_upstream.clone();
+            let run = post(move || {
+                let calls = calls_for_run.clone();
+                async move {
+                    calls.lock().await.push("image_run".to_owned());
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(
+                            "data: {\"conversation_id\":\"image-conversation\"}\n\n\
+                                   data: [DONE]\n\n",
+                        ),
+                    )
+                        .into_response()
+                }
+            });
+            let calls_for_poll = calls_for_upstream.clone();
+            let poll = get(move |AxumPath(conversation_id): AxumPath<String>| {
+                let calls = calls_for_poll.clone();
+                async move {
+                    assert_eq!(conversation_id, "image-conversation");
+                    calls.lock().await.push("image_poll".to_owned());
+                    Json(json!({
+                        "mapping": {
+                            "assistant": {
+                                "message": {
+                                    "content": {
+                                        "parts": [{
+                                            "content_type": "image_asset_pointer",
+                                            "asset_pointer": "file-service://image-file"
+                                        }]
+                                    }
+                                }
+                            }
+                        }
+                    }))
+                }
+            });
+            let calls_for_meta = calls_for_upstream.clone();
+            let file_meta = get(move |AxumPath(file_id): AxumPath<String>| {
+                let calls = calls_for_meta.clone();
+                async move {
+                    assert_eq!(file_id, "image-file");
+                    calls.lock().await.push("image_file_meta".to_owned());
+                    Json(json!({"download_url": format!("http://{address}/image-download")}))
+                }
+            });
+            let calls_for_download = calls_for_upstream.clone();
+            let image_download = get(move || {
+                let calls = calls_for_download.clone();
+                let png = png_for_upstream.clone();
+                async move {
+                    calls.lock().await.push("image_download".to_owned());
+                    ([(header::CONTENT_TYPE, "image/png")], png).into_response()
+                }
+            });
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", bootstrap)
+                    .route(
+                        "/backend-api/sentinel/chat-requirements/prepare",
+                        requirements_prepare,
+                    )
+                    .route(
+                        "/backend-api/sentinel/chat-requirements/finalize",
+                        requirements_finalize,
+                    )
+                    .route("/backend-api/f/conversation/prepare", prepare)
+                    .route("/backend-api/f/conversation", run)
+                    .route("/backend-api/conversation/{conversation_id}", poll)
+                    .route("/backend-api/files/{file_id}/download", file_meta)
+                    .route("/image-download", image_download),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let account_path = account_snapshot_path("native-web-image-generation");
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"wrong-codex-token","status":"正常","source_type":"codex","type":"free"},
+                {"access_token":"image-web-token","status":"正常","source_type":"web","type":"free"}
+            ]"#,
+        )
+        .expect("account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-5-5".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.router().oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-image-2","prompt":"draw a cat"}"#,
+                    ))
+                    .expect("request"),
+            ),
+        )
+        .await
+        .expect("response deadline")
+        .expect("response");
+        let response_status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert_eq!(response_status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).expect("image response");
+        assert_eq!(
+            value["data"][0]["b64_json"],
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        assert!(
+            value["data"][0]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("/images/"))
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+        assert!(
+            state
+                .account_store
+                .last_used_at("image-web-token")
+                .is_some()
+        );
+        assert!(
+            state
+                .account_store
+                .last_used_at("wrong-codex-token")
+                .is_none()
+        );
+        let calls = calls.lock().await;
+        assert_eq!(
+            calls.as_slice(),
+            [
+                "bootstrap",
+                "requirements_prepare",
+                "requirements_finalize",
+                "image_prepare",
+                "image_run",
+                "image_poll",
+                "image_file_meta",
+                "image_download"
+            ]
+        );
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        let data_dir = account_path.parent().expect("data dir");
+        fs::remove_dir_all(data_dir.join("images")).expect("image cleanup");
+        fs::remove_file(account_path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_codex_image_model_prefix_selects_exact_account_type() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let response_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+        let response_tokens_for_upstream = response_tokens.clone();
+        let upstream = tokio::spawn(async move {
+            let bootstrap = get(|| async { Html("<html></html>") });
+            let models = get(|| async {
+                Json(json!({"models":[{"slug":"gpt-5.5","supported_in_api":true}]}))
+            });
+            let requirements_prepare =
+                post(|| async { Json(json!({"prepare_token":"prepare-token"})) });
+            let requirements_finalize =
+                post(|| async { Json(json!({"token":"requirements-token"})) });
+            let responses = post(move |headers: HeaderMap| {
+                let response_tokens = response_tokens_for_upstream.clone();
+                async move {
+                    let token = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.strip_prefix("Bearer "))
+                        .unwrap_or_default()
+                        .to_owned();
+                    response_tokens.lock().await.push(token);
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(
+                            "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-image\",\"status\":\"in_progress\"}}\n\n\
+                             data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-image\",\"status\":\"completed\",\"output\":[{\"type\":\"image_generation_call\",\"id\":\"img-1\",\"status\":\"completed\",\"result\":\"aW1hZ2U=\"}]}}\n\n",
+                        ),
+                    )
+                        .into_response()
+                }
+            });
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", bootstrap)
+                    .route("/backend-api/models", models)
+                    .route(
+                        "/backend-api/sentinel/chat-requirements/prepare",
+                        requirements_prepare,
+                    )
+                    .route(
+                        "/backend-api/sentinel/chat-requirements/finalize",
+                        requirements_finalize,
+                    )
+                    .route("/backend-api/codex/responses", responses),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let account_path = account_snapshot_path("native-codex-image-plan-groups");
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"free-codex","status":"正常","source_type":"codex","type":"free","models":["gpt-5.5"]},
+                {"access_token":"plus-codex","status":"正常","source_type":"codex","type":"plus","models":["gpt-5.5"]},
+                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","models":["gpt-5.5"]},
+                {"access_token":"pro-codex","status":"正常","source_type":"codex","type":"pro","models":["gpt-5.5"]}
+            ]"#,
+        )
+        .expect("account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-5.5".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"codex-gpt-image-2","prompt":"draw"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.expect("body");
+        assert_eq!(
+            response_tokens.lock().await.last().map(String::as_str),
+            Some("plus-codex")
+        );
+        for (model, token) in [
+            ("plus-codex-gpt-image-2", "plus-codex"),
+            ("team-codex-gpt-image-2", "team-codex"),
+            ("pro-codex-gpt-image-2", "pro-codex"),
+        ] {
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/images/generations")
+                        .header(header::AUTHORIZATION, "Bearer client")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({"model":model,"prompt":"draw"}).to_string(),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "model={model}");
+            let _ = response.into_body().collect().await.expect("body");
+            let tokens = response_tokens.lock().await;
+            assert_eq!(
+                tokens.last().map(String::as_str),
+                Some(token),
+                "model={model}"
+            );
+        }
+        let tokens = response_tokens.lock().await.clone();
+        assert_eq!(
+            tokens,
+            ["plus-codex", "plus-codex", "team-codex", "pro-codex"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        );
+
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"free-codex","status":"正常","source_type":"codex","type":"free","models":["gpt-5.5"]},
+                {"access_token":"plus-codex","status":"正常","source_type":"codex","type":"plus","models":["gpt-5.5"]},
+                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","models":["gpt-5.5"]},
+                {"access_token":"pro-codex","status":"限流","source_type":"codex","type":"pro","models":["gpt-5.5"]}
+            ]"#,
+        )
+        .expect("account status update");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"pro-codex-gpt-image-2","prompt":"draw"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = response.into_body().collect().await.expect("body");
+        assert_eq!(response_tokens.lock().await.len(), 4);
+        assert_eq!(state.account_store.inflight(), 0);
+        for token in ["free-codex", "plus-codex", "team-codex", "pro-codex"] {
+            if token != "free-codex" {
+                assert!(state.account_store.last_used_at(token).is_some());
+            }
+        }
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        fs::remove_file(account_path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_image_models_advertise_only_requestable_account_groups() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream = tokio::spawn(async move {
+            let bootstrap = get(|| async { Html("<html></html>") });
+            let authenticated_models = get(|| async {
+                Json(json!({
+                    "models": [{"slug":"gpt-5.5","supported_in_api":true}]
+                }))
+            });
+            let anonymous_models = get(|| async { Json(json!({"models": []})) });
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", bootstrap)
+                    .route("/backend-api/models", authenticated_models)
+                    .route("/backend-anon/models", anonymous_models),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let account_path = account_snapshot_path("native-image-model-advertised-groups");
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"free-codex","status":"正常","source_type":"codex","type":"free","models":["gpt-5.5"]},
+                {"access_token":"plus-codex","status":"正常","source_type":"codex","type":"plus","models":["gpt-5.5"]},
+                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","models":["gpt-5.5"]},
+                {"access_token":"pro-codex-limited","status":"限流","source_type":"codex","type":"pro","models":["gpt-5.5"]},
+                {"access_token":"free-web","status":"正常","source_type":"web","type":"free","models":["gpt-5.5"]},
+                {"access_token":"plus-web","status":"正常","source_type":"web","type":"plus","models":["gpt-5.5"]}
+            ]"#,
+        )
+        .expect("account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-5.5".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("models json");
+        let data = value["data"].as_array().expect("model list");
+        let model = |id: &str| {
+            data.iter()
+                .find(|item| item["id"].as_str() == Some(id))
+                .unwrap_or_else(|| panic!("missing model {id}: {data:?}"))
+        };
+        assert_eq!(
+            model("codex-gpt-image-2")["supported_account_types"],
+            json!(["plus", "team"])
+        );
+        assert_eq!(
+            model("plus-codex-gpt-image-2")["supported_account_types"],
+            json!(["plus"])
+        );
+        assert_eq!(
+            model("team-codex-gpt-image-2")["supported_account_types"],
+            json!(["team"])
+        );
+        assert!(
+            data.iter()
+                .all(|item| item["id"].as_str() != Some("pro-codex-gpt-image-2"))
+        );
+        assert_eq!(
+            model("gpt-image-2")["supported_account_types"],
+            json!(["free", "plus"])
+        );
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        fs::remove_file(account_path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_codex_image_failure_falls_back_only_within_requested_group() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let response_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+        let response_tokens_for_upstream = response_tokens.clone();
+        let upstream = tokio::spawn(async move {
+            let bootstrap = get(|| async { Html("<html></html>") });
+            let models = get(|| async {
+                Json(json!({
+                    "models": [{"slug":"gpt-5.5","supported_in_api":true}]
+                }))
+            });
+            let requirements_prepare =
+                post(|| async { Json(json!({"prepare_token":"prepare-token"})) });
+            let requirements_finalize =
+                post(|| async { Json(json!({"token":"requirements-token"})) });
+            let responses = post(move |headers: HeaderMap| {
+                let response_tokens = response_tokens_for_upstream.clone();
+                async move {
+                    let token = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.strip_prefix("Bearer "))
+                        .unwrap_or_default()
+                        .to_owned();
+                    response_tokens.lock().await.push(token.clone());
+                    if token == "plus-bad" {
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from(
+                            "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-image-fallback\",\"status\":\"in_progress\"}}\n\n\
+                             data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-image-fallback\",\"status\":\"completed\",\"output\":[{\"type\":\"image_generation_call\",\"id\":\"img-1\",\"status\":\"completed\",\"result\":\"aW1hZ2U=\"}]}}\n\n",
+                        ),
+                    )
+                        .into_response()
+                }
+            });
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", bootstrap)
+                    .route("/backend-api/models", models)
+                    .route(
+                        "/backend-api/sentinel/chat-requirements/prepare",
+                        requirements_prepare,
+                    )
+                    .route(
+                        "/backend-api/sentinel/chat-requirements/finalize",
+                        requirements_finalize,
+                    )
+                    .route("/backend-api/codex/responses", responses),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let account_path = account_snapshot_path("native-codex-image-same-group-fallback");
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"plus-bad","status":"正常","source_type":"codex","type":"plus","models":["gpt-5.5"]},
+                {"access_token":"plus-good","status":"正常","source_type":"codex","type":"plus","models":["gpt-5.5"]},
+                {"access_token":"team-good","status":"正常","source_type":"codex","type":"team","models":["gpt-5.5"]}
+            ]"#,
+        )
+        .expect("account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-5.5".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        state
+            .account_type_catalog
+            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"plus-codex-gpt-image-2","prompt":"draw"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = response.into_body().collect().await.expect("body");
+        assert_eq!(
+            response_tokens.lock().await.clone(),
+            ["plus-bad", "plus-good"]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert!(state.account_store.last_used_at("plus-bad").is_none());
+        assert!(state.account_store.last_used_at("plus-good").is_some());
+        assert!(state.account_store.last_used_at("team-good").is_none());
+        assert_eq!(state.account_store.inflight(), 0);
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        fs::remove_file(account_path).expect("cleanup");
+    }
+
+    #[test]
+    fn native_image_request_accepts_web_model_url_and_stream_contract() {
+        let request = parse_native_image_request(
+            br#"{"model":"gpt-image-2","prompt":"draw","n":2,"size":"1024x1024","quality":"high","response_format":"url","output_format":"jpeg","output_compression":80,"background":"auto","stream":true}"#,
+            "images/generations",
+        )
+        .expect("supported web image options");
+        assert_eq!(request.model, "gpt-image-2");
+        assert_eq!(request.n, 2);
+        assert_eq!(request.size.as_deref(), Some("1024x1024"));
+        assert_eq!(request.response_format, "url");
+        assert_eq!(request.output_format, "jpeg");
+        assert_eq!(request.output_compression, Some(80));
+        assert!(request.stream);
+    }
+
+    #[test]
+    fn native_image_background_capability_matrix_is_backend_specific() {
+        let source_image = image::RgbaImage::from_fn(3, 5, |x, y| {
+            image::Rgba([
+                (x * 41 + y * 17) as u8,
+                (x * 13 + y * 29) as u8,
+                (x * 7 + y * 53) as u8,
+                if (x + y) % 2 == 0 { 0 } else { 255 },
+            ])
+        });
+        let mut source = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(source_image)
+            .write_to(&mut source, image::ImageFormat::Png)
+            .expect("source png");
+
+        let models = [
+            ("gpt-image-2", false),
+            ("codex-gpt-image-2", true),
+            ("plus-codex-gpt-image-2", true),
+            ("team-codex-gpt-image-2", true),
+            ("pro-codex-gpt-image-2", true),
+        ];
+        for (model, codex) in models {
+            for output_format in ["png", "webp", "jpeg"] {
+                let auto = parse_native_image_request(
+                    format!(
+                        r#"{{"model":"{model}","prompt":"draw","output_format":"{output_format}","background":"auto"}}"#
+                    )
+                    .as_bytes(),
+                    "images/generations",
+                )
+                .expect("auto is supported for every image backend");
+                assert_eq!(auto.codex, codex, "model={model}");
+
+                let transparent = parse_native_image_request(
+                    format!(
+                        r#"{{"model":"{model}","prompt":"draw","output_format":"{output_format}","background":"transparent"}}"#
+                    )
+                    .as_bytes(),
+                    "images/generations",
+                );
+                if !codex {
+                    let error = match transparent {
+                        Ok(_) => panic!("web background must fail before upstream"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(
+                        error.code(),
+                        "unsupported_capability",
+                        "model={model}, format={output_format}"
+                    );
+                    continue;
+                }
+                if output_format == "jpeg" {
+                    let error = match transparent {
+                        Ok(_) => panic!("JPEG cannot represent transparent alpha"),
+                        Err(error) => error,
+                    };
+                    assert_eq!(error.code(), "bad_request", "model={model}");
+                    continue;
+                }
+
+                let request = transparent.expect("Codex transparent output is supported");
+                assert!(request.codex);
+                let encoded = native_image_output(source.get_ref(), &request.output_format, None)
+                    .expect("Codex image output must remain encodable");
+                let decoded = image::load_from_memory(&encoded).expect("decode Codex image output");
+                assert_eq!((decoded.width(), decoded.height()), (3, 5));
+                assert!(decoded.has_alpha(), "format={output_format}");
+                assert!(decoded.to_rgba8().pixels().any(|pixel| pixel[3] < 255));
+            }
+        }
+    }
+
+    #[test]
+    fn native_image_output_honors_jpeg_compression() {
+        let image = image::RgbImage::from_fn(128, 128, |x, y| {
+            image::Rgb([
+                (x.wrapping_mul(17) ^ y.wrapping_mul(31)) as u8,
+                (x.wrapping_mul(7) + y.wrapping_mul(13)) as u8,
+                (x.wrapping_mul(3) ^ y.wrapping_mul(11)) as u8,
+            ])
+        });
+        let mut source = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut source, image::ImageFormat::Png)
+            .expect("source png");
+
+        let high_quality =
+            native_image_output(source.get_ref(), "jpeg", Some(100)).expect("high-quality jpeg");
+        let low_quality =
+            native_image_output(source.get_ref(), "jpeg", Some(10)).expect("low-quality jpeg");
+        assert_eq!(
+            image::guess_format(&high_quality).expect("jpeg format"),
+            image::ImageFormat::Jpeg
+        );
+        assert_eq!(
+            image::guess_format(&low_quality).expect("jpeg format"),
+            image::ImageFormat::Jpeg
+        );
+        assert!(
+            low_quality.len() < high_quality.len(),
+            "compression quality must affect encoded JPEG size"
+        );
+    }
+
+    #[test]
+    fn native_jpeg_quality_preserves_public_zero_and_one_inputs() {
+        assert_eq!(native_jpeg_quality(Some(0)).expect("quality zero"), 0);
+        assert_eq!(native_jpeg_quality(Some(1)).expect("quality one"), 1);
+        assert_eq!(native_jpeg_quality(None).expect("default quality"), 100);
+        assert!(native_jpeg_quality(Some(101)).is_err());
+
+        let image = image::RgbImage::from_fn(64, 64, |x, y| {
+            image::Rgb([
+                (x.wrapping_mul(17) ^ y.wrapping_mul(31)) as u8,
+                (x.wrapping_mul(7) + y.wrapping_mul(13)) as u8,
+                (x.wrapping_mul(3) ^ y.wrapping_mul(11)) as u8,
+            ])
+        });
+        let mut source = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut source, image::ImageFormat::Png)
+            .expect("source png");
+        let quality_zero =
+            native_image_output(source.get_ref(), "jpeg", Some(0)).expect("quality zero jpeg");
+        let quality_one =
+            native_image_output(source.get_ref(), "jpeg", Some(1)).expect("quality one jpeg");
+        assert_eq!(
+            quality_zero, quality_one,
+            "image 0.25 documents JPEG quality 1 as its lower bound; 0 is passed unchanged and has the same defined output"
+        );
+    }
+
+    #[test]
+    fn native_image_output_honors_webp_compression() {
+        let image = image::RgbImage::from_fn(128, 128, |x, y| {
+            image::Rgb([
+                (x.wrapping_mul(17) ^ y.wrapping_mul(31)) as u8,
+                (x.wrapping_mul(7) + y.wrapping_mul(13)) as u8,
+                (x.wrapping_mul(3) ^ y.wrapping_mul(11)) as u8,
+            ])
+        });
+        let mut source = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut source, image::ImageFormat::Png)
+            .expect("source png");
+
+        let high_quality =
+            native_image_output(source.get_ref(), "webp", Some(100)).expect("high-quality webp");
+        let low_quality =
+            native_image_output(source.get_ref(), "webp", Some(10)).expect("low-quality webp");
+        assert_eq!(
+            image::guess_format(&high_quality).expect("webp format"),
+            image::ImageFormat::WebP
+        );
+        assert_eq!(
+            image::guess_format(&low_quality).expect("webp format"),
+            image::ImageFormat::WebP
+        );
+        assert!(
+            low_quality.len() < high_quality.len(),
+            "compression quality must affect encoded WebP size"
+        );
+    }
+
+    #[test]
+    fn native_image_output_codec_boundaries_preserve_dimensions_alpha_and_limits() {
+        for (width, height) in [(1, 1), (3, 5)] {
+            let source_image = image::RgbaImage::from_fn(width, height, |x, y| {
+                image::Rgba([
+                    (x * 41 + y * 17) as u8,
+                    (x * 13 + y * 29) as u8,
+                    (x * 7 + y * 53) as u8,
+                    if (x + y) % 2 == 0 { 0 } else { 255 },
+                ])
+            });
+            let mut source = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(source_image)
+                .write_to(&mut source, image::ImageFormat::Png)
+                .expect("source png");
+
+            for quality in [0, 100] {
+                let jpeg = native_image_output(source.get_ref(), "jpeg", Some(quality))
+                    .expect("JPEG quality boundary");
+                let decoded_jpeg = image::load_from_memory(&jpeg).expect("decode JPEG");
+                assert_eq!(
+                    (decoded_jpeg.width(), decoded_jpeg.height()),
+                    (width, height)
+                );
+                assert!(!decoded_jpeg.has_alpha(), "JPEG must be RGB");
+
+                let webp = native_image_output(source.get_ref(), "webp", Some(quality))
+                    .expect("WebP quality boundary");
+                let decoded_webp = image::load_from_memory(&webp).expect("decode WebP");
+                assert_eq!(
+                    (decoded_webp.width(), decoded_webp.height()),
+                    (width, height)
+                );
+                assert!(
+                    decoded_webp.has_alpha(),
+                    "WebP must retain transparent alpha"
+                );
+                assert!(decoded_webp.to_rgba8().pixels().any(|pixel| pixel[3] < 255));
+            }
+        }
+
+        let oversized_input = vec![0u8; MAX_NATIVE_IMAGE_BYTES + 1];
+        assert!(native_image_output(&oversized_input, "png", None).is_err());
+
+        let oversized_pixels = image::ImageBuffer::from_pixel(5_001, 5_000, image::Luma([0u8]));
+        let mut oversized_pixel_png = Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(oversized_pixels)
+            .write_to(&mut oversized_pixel_png, image::ImageFormat::Png)
+            .expect("oversized pixel png");
+        assert!(native_image_output(oversized_pixel_png.get_ref(), "jpeg", None).is_err());
+        assert!(native_image_output(oversized_pixel_png.get_ref(), "png", None).is_err());
+    }
+
+    #[test]
+    fn native_image_request_rejects_non_string_model_and_task_only_controls() {
+        assert!(
+            parse_native_image_request(br#"{"model":123,"prompt":"draw"}"#, "images/generations")
+                .is_err()
+        );
+        assert!(
+            parse_native_image_request(
+                br#"{"model":"gpt-image-2","prompt":"draw","quality":{}}"#,
+                "images/generations"
+            )
+            .is_err()
+        );
+        assert!(parse_native_image_request(
+            br#"{"model":"gpt-image-2","prompt":"edit","client_task_id":"task-1","image":"aW1hZ2U="}"#,
+            "images/edits"
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
     async fn native_responses_codex_text_supports_nonstream_and_stream() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -14524,11 +25660,6 @@ data: [DONE]
             });
             let prepare = post(|| async { Json(json!({"prepare_token":"prepare-token"})) });
             let finalize = post(|| async { Json(json!({"token":"requirements-token"})) });
-            let models = get(|| async {
-                Json(json!({
-                    "models": [{"slug":"gpt-test","supported_in_api":true}]
-                }))
-            });
             let responses = post(move |headers: HeaderMap, Json(payload): Json<Value>| {
                 let response_calls = response_calls_for_upstream.clone();
                 let captured_payloads = captured_payloads_for_upstream.clone();
@@ -14595,14 +25726,13 @@ data: [DONE]
                             }))
                         }),
                     )
-                    .route("/backend-api/codex/models", models)
                     .route("/backend-api/codex/responses", responses),
             )
             .await
             .expect("upstream server");
         });
 
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-native-responses-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -14734,10 +25864,12 @@ data: [DONE]
         let payloads = captured_payloads.lock().await;
         assert_eq!(payloads.len(), 4);
         assert_eq!(payloads[0]["model"], "gpt-test");
-        assert_eq!(payloads[0]["input"], "hello");
-        assert_eq!(payloads[1]["input"], "error");
-        assert_eq!(payloads[2]["input"], "cancel");
-        assert_eq!(payloads[3]["input"], "hello");
+        assert_eq!(payloads[0]["input"][0]["type"], "message");
+        assert_eq!(payloads[0]["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(payloads[0]["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(payloads[1]["input"][0]["content"][0]["text"], "error");
+        assert_eq!(payloads[2]["input"][0]["content"][0]["text"], "cancel");
+        assert_eq!(payloads[3]["input"][0]["content"][0]["text"], "hello");
         for payload in payloads.iter().skip(1) {
             assert_eq!(payload["stream"], true);
         }
@@ -14836,6 +25968,852 @@ data: [DONE]
         fs::remove_file(account_path).expect("cleanup");
     }
 
+    #[test]
+    fn public_search_projection_skips_non_messages_and_unknown_urls() {
+        let secret_url = "https://secret.example/private";
+        let conversation = json!({
+            "mapping": {
+                "root": {"message": null},
+                "metadata-only": {"private": {"url": secret_url}},
+                "non-object": "ignored",
+                "assistant": {"message": {
+                    "id": "assistant-message-1",
+                    "author": {"role": "assistant"},
+                    "create_time": 1.0,
+                    "content": {"parts": ["answer"]},
+                    "metadata": {
+                        "finish_details": {"type": "finished_successfully"},
+                        "sources": [{"title": "Known", "url": "https://known.example/path#frag", "snippet": "known", "source_type": "web"}],
+                        "private": {"url": secret_url, "token": "credential-canary"}
+                    }
+                }}
+            }
+        });
+        let internal = extract_search_result("conversation-1", &conversation);
+        assert_eq!(internal["assistant_message_id"], "assistant-message-1");
+        assert_eq!(internal["create_time"], 1.0);
+        assert_eq!(internal["sources"][0]["source_type"], "web");
+        let projected = project_public_search_result(&internal);
+        assert_eq!(projected["answer"], "answer");
+        assert_eq!(
+            projected["sources"],
+            json!([{"title":"Known", "url":"https://known.example/path", "snippet":"known"}])
+        );
+        assert!(!projected.to_string().contains(secret_url));
+        assert!(!projected.to_string().contains("credential-canary"));
+        assert!(!projected.to_string().contains("assistant_message_id"));
+        assert!(!projected.to_string().contains("create_time"));
+        assert!(!projected.to_string().contains("source_type"));
+    }
+
+    #[test]
+    fn public_search_projection_is_bounded_and_drops_internal_fields() {
+        let secret = "search-public-secret";
+        let long = "x".repeat(NATIVE_SEARCH_MAX_FIELD_CHARS + 500);
+        let internal = json!({
+            "conversation_id": "not valid id",
+            "status": "in_progress",
+            "answer": "answer",
+            "assistant_message_id": secret,
+            "create_time": 123.0,
+            "access_token": secret,
+            "private": {"url": "https://secret.example/hidden"},
+            "sources": [
+                {"title": long, "url": "https://example.test/a#one", "snippet": long, "source_type": "web"},
+                {"title": "duplicate", "url": "https://example.test/a#two", "snippet": "drop", "source_type": "private"},
+                {"title": "bad", "url": "https://example.test/%GG", "snippet": "drop"}
+            ]
+        });
+        let projected = project_public_search_result(&internal);
+        assert_eq!(projected["answer"], "answer");
+        assert!(projected.get("conversation_id").is_none());
+        assert!(projected.get("status").is_none());
+        assert_eq!(projected["sources"].as_array().expect("sources").len(), 1);
+        assert_eq!(
+            projected["sources"][0]["title"]
+                .as_str()
+                .expect("title")
+                .chars()
+                .count(),
+            NATIVE_SEARCH_MAX_FIELD_CHARS
+        );
+        assert_eq!(
+            projected["sources"][0]["snippet"]
+                .as_str()
+                .expect("snippet")
+                .chars()
+                .count(),
+            NATIVE_SEARCH_MAX_FIELD_CHARS
+        );
+        let text = projected.to_string();
+        for canary in [secret, "source_type", "create_time", "private"] {
+            assert!(!text.contains(canary), "leaked {canary}");
+        }
+        let capped = project_public_search_result(&json!({
+            "answer": "answer",
+            "sources": (0..(NATIVE_SEARCH_MAX_SOURCES + 1))
+                .map(|index| json!({"url": format!("https://example.test/{index}")}))
+                .collect::<Vec<_>>()
+        }));
+        assert_eq!(
+            capped["sources"].as_array().expect("capped sources").len(),
+            NATIVE_SEARCH_MAX_SOURCES
+        );
+    }
+
+    #[test]
+    fn native_search_status_uses_bounded_known_container_fallback() {
+        let conversation = json!({
+            "mapping": {
+                "root": {"message": null},
+                "assistant": {"message": {
+                    "author": {"role": "assistant"},
+                    "content": {"parts": [{"status": "finished_partial_completion"}, "answer"]},
+                    "private": {"status": "must-not-use"}
+                }}
+            }
+        });
+        let internal = extract_search_result("conversation-1", &conversation);
+        assert_eq!(internal["status"], "finished_partial_completion");
+
+        let unsafe_only = json!({
+            "mapping": {"assistant": {"message": {
+                "author": {"role": "assistant"},
+                "content": {"parts": ["answer"]},
+                "private": {"status": "finished_successfully"}
+            }}}
+        });
+        assert_eq!(
+            extract_search_result("conversation-1", &unsafe_only)["status"],
+            ""
+        );
+    }
+
+    async fn search_sse_probe(
+        chunks: Vec<Bytes>,
+        hold_open: bool,
+        declared_length: Option<u64>,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let chunks = Arc::new(chunks);
+        let route = get(move || {
+            let chunks = chunks.clone();
+            async move {
+                let finite = stream::iter(
+                    chunks
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(Ok::<Bytes, io::Error>),
+                );
+                let body_stream: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>> =
+                    if hold_open {
+                        Box::pin(finite.chain(stream::pending::<Result<Bytes, io::Error>>()))
+                    } else {
+                        Box::pin(finite)
+                    };
+                let mut response = Body::from_stream(body_stream).into_response();
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                if let Some(length) = declared_length {
+                    response.headers_mut().insert(
+                        header::CONTENT_LENGTH,
+                        HeaderValue::from_str(&length.to_string()).expect("content length"),
+                    );
+                }
+                response
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/stream", route))
+                .await
+                .expect("SSE probe server");
+        });
+        let client = Client::new();
+        let response = client
+            .get(format!("http://{address}/stream"))
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = search_conversation_id_from_response(response, Instant::now() + timeout)
+            .await
+            .map_err(|_| "invalid search SSE".to_owned());
+        server.abort();
+        let _ = server.await;
+        result
+    }
+
+    async fn search_poll_probe(
+        statuses: Vec<StatusCode>,
+        payload: Value,
+        deadline_duration: Duration,
+        poll_interval: Duration,
+    ) -> (Result<Value, String>, usize) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("poll listener");
+        let address = listener.local_addr().expect("poll address");
+        let statuses = Arc::new(statuses);
+        let payload = Arc::new(payload);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route = get({
+            let statuses = statuses.clone();
+            let payload = payload.clone();
+            let calls = calls.clone();
+            move |headers: HeaderMap| {
+                let statuses = statuses.clone();
+                let payload = payload.clone();
+                let calls = calls.clone();
+                async move {
+                    assert_eq!(headers.get_all(header::REFERER).iter().count(), 1);
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
+                    let status = statuses.get(call).copied().unwrap_or(StatusCode::OK);
+                    if status.is_success() {
+                        Json((*payload).clone()).into_response()
+                    } else {
+                        status.into_response()
+                    }
+                }
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/__ready", get(|| async { StatusCode::NO_CONTENT }))
+                    .route("/backend-api/conversation/{conversation_id}", route),
+            )
+            .await
+            .expect("poll server");
+        });
+        let client = Client::new();
+        let context = NativeRequestContext::new();
+        let base_url = format!("http://{address}");
+        let ready = client
+            .get(format!("{base_url}/__ready"))
+            .send()
+            .await
+            .expect("poll server readiness");
+        assert_eq!(ready.status(), StatusCode::NO_CONTENT);
+        let result = native_search_poll(NativeSearchPollRequest {
+            client: &client,
+            base_url: &base_url,
+            token: "search-token",
+            account_id: None,
+            context: &context,
+            conversation_id: "poll-conversation".to_owned(),
+            deadline: Instant::now() + deadline_duration,
+            poll_interval,
+        })
+        .await
+        .map_err(|_| "poll failed".to_owned());
+        let call_count = calls.load(Ordering::SeqCst);
+        server.abort();
+        let _ = server.await;
+        (result, call_count)
+    }
+
+    async fn search_poll_raw_probe(
+        body: Bytes,
+        declared_length: Option<u64>,
+    ) -> (Result<Value, String>, usize) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("raw poll listener");
+        let address = listener.local_addr().expect("raw poll address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route = get({
+            let body = body.clone();
+            let calls = calls.clone();
+            move || {
+                let body = body.clone();
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let mut response = body.into_response();
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    if let Some(length) = declared_length {
+                        response.headers_mut().insert(
+                            header::CONTENT_LENGTH,
+                            HeaderValue::from_str(&length.to_string()).expect("content length"),
+                        );
+                    }
+                    response
+                }
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/__ready", get(|| async { StatusCode::NO_CONTENT }))
+                    .route("/backend-api/conversation/{conversation_id}", route),
+            )
+            .await
+            .expect("raw poll server");
+        });
+        let client = Client::new();
+        let context = NativeRequestContext::new();
+        let base_url = format!("http://{address}");
+        let ready = client
+            .get(format!("{base_url}/__ready"))
+            .send()
+            .await
+            .expect("poll server readiness");
+        assert_eq!(ready.status(), StatusCode::NO_CONTENT);
+        let result = native_search_poll(NativeSearchPollRequest {
+            client: &client,
+            base_url: &base_url,
+            token: "search-token",
+            account_id: None,
+            context: &context,
+            conversation_id: "poll-conversation".to_owned(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            poll_interval: Duration::ZERO,
+        })
+        .await
+        .map_err(|_| "poll failed".to_owned());
+        let call_count = calls.load(Ordering::SeqCst);
+        server.abort();
+        let _ = server.await;
+        (result, call_count)
+    }
+
+    #[tokio::test]
+    async fn native_search_poll_rejects_bad_json_and_oversize_bodies() {
+        let (result, calls) = search_poll_raw_probe(Bytes::from_static(b"not-json"), None).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+
+        let (result, calls) =
+            search_poll_raw_probe(Bytes::from(vec![b'x'; MAX_UPSTREAM_BODY_BYTES + 1]), None).await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    fn search_poll_payload(status: &str) -> Value {
+        json!({
+            "mapping": {"assistant": {"message": {
+                "id": "search-assistant",
+                "author": {"role": "assistant"},
+                "create_time": 1.0,
+                "content": {"parts": [{"status": status}, "stable answer"]}
+            }}}
+        })
+    }
+
+    #[tokio::test]
+    async fn native_search_poll_retries_transient_statuses_and_stable_answers() {
+        let transient = vec![
+            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
+            StatusCode::LOCKED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ];
+        let (result, calls) = search_poll_probe(
+            transient,
+            search_poll_payload("finished_successfully"),
+            Duration::from_secs(2),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(calls, 9);
+        assert_eq!(
+            result.expect("terminal poll")["status"],
+            "finished_successfully"
+        );
+
+        let (result, calls) = search_poll_probe(
+            Vec::new(),
+            search_poll_payload("in_progress"),
+            Duration::from_secs(2),
+            Duration::ZERO,
+        )
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(result.expect("stable poll")["answer"], "stable answer");
+
+        let (result, calls) = search_poll_probe(
+            vec![StatusCode::BAD_REQUEST],
+            search_poll_payload("finished_successfully"),
+            Duration::from_secs(2),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn native_search_poll_deadline_bounds_retry_sleep() {
+        let started = Instant::now();
+        let (result, calls) = search_poll_probe(
+            vec![StatusCode::TOO_MANY_REQUESTS],
+            search_poll_payload("finished_successfully"),
+            Duration::from_millis(25),
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn native_search_run_sse_handles_crlf_chunks_done_eof_and_deadline() {
+        let started = Instant::now();
+        let id = search_sse_probe(
+            vec![
+                Bytes::from_static(b"data: {\"conversation"),
+                Bytes::from_static(b"_id\":\"crlf-conversation\"}\r\n\r\n"),
+                Bytes::from_static(b"data: [DONE]\r\n\r\n"),
+            ],
+            true,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("CRLF SSE id");
+        assert_eq!(id, "crlf-conversation");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        assert_eq!(
+            search_sse_probe(
+                vec![Bytes::from_static(
+                    b"data: {\"conversation_id\":\"eof-conversation\"}\n\n"
+                )],
+                false,
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("EOF SSE id"),
+            "eof-conversation"
+        );
+        assert!(
+            search_sse_probe(
+                vec![Bytes::from_static(b"data: [DONE]\n\n")],
+                false,
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            search_sse_probe(
+                vec![Bytes::from_static(b"data: {not-json}\n\n")],
+                false,
+                None,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            search_sse_probe(
+                vec![Bytes::from_static(
+                    b"data: {\"conversation_id\":\"oversize\"}\n\n"
+                )],
+                false,
+                Some(MAX_UPSTREAM_BODY_BYTES as u64 + 1),
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            search_sse_probe(
+                vec![Bytes::from_static(
+                    b"data: {\"conversation_id\":\"held\"}\n\n"
+                )],
+                true,
+                None,
+                Duration::from_millis(50),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_search_rejects_invalid_prompts_before_any_upstream_call() {
+        let state = state(Some("client"));
+        let overlong = format!(
+            r#"{{"prompt":"{}"}}"#,
+            "x".repeat(MAX_REQUEST_BODY_BYTES + 1)
+        )
+        .into_bytes();
+        let cases = vec![
+            br#"{}"#.to_vec(),
+            br#"{"prompt":null}"#.to_vec(),
+            br#"{"prompt":[]}"#.to_vec(),
+            br#"{"prompt":""}"#.to_vec(),
+            br#"{"prompt":" \t\r\n "}"#.to_vec(),
+            overlong,
+            br#"["#.to_vec(),
+        ];
+        for body in cases {
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/search")
+                        .header(header::AUTHORIZATION, "Bearer client")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .expect("invalid search request"),
+                )
+                .await
+                .expect("invalid search response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        state.account_type_catalog.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_search_uses_web_prepare_run_poll_and_projects_public_sources() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let expected_referer = format!("http://{address}/c/search-conversation");
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_for_upstream = captured.clone();
+        let calls_for_upstream = calls.clone();
+        let upstream = tokio::spawn(async move {
+            let bootstrap = get(|| async { Html("<html></html>") });
+            let calls_for_sentinel_prepare = calls_for_upstream.clone();
+            let prepare = post(move || {
+                let calls = calls_for_sentinel_prepare.clone();
+                async move {
+                    calls.lock().await.push("sentinel_prepare".to_owned());
+                    Json(json!({"prepare_token":"prepare-token"}))
+                }
+            });
+            let calls_for_sentinel_finalize = calls_for_upstream.clone();
+            let finalize = post(move || {
+                let calls = calls_for_sentinel_finalize.clone();
+                async move {
+                    calls.lock().await.push("sentinel_finalize".to_owned());
+                    Json(json!({"token":"requirements-token"}))
+                }
+            });
+            let models = get(|| async {
+                Json(json!({"models":[{"slug":"gpt-5-5","supported_in_api":true}]}))
+            });
+            let calls_for_prepare = calls_for_upstream.clone();
+            let search_prepare = post(move |headers: HeaderMap, Json(_payload): Json<Value>| {
+                let calls = calls_for_prepare.clone();
+                async move {
+                    calls.lock().await.push("search_prepare".to_owned());
+                    if headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.contains("search-bad"))
+                    {
+                        return StatusCode::BAD_GATEWAY.into_response();
+                    }
+                    Json(json!({"conduit_token":"conduit-token"})).into_response()
+                }
+            });
+            let calls_for_run = calls_for_upstream.clone();
+            let captured_for_run = captured_for_upstream.clone();
+            let search_run = post(move |Json(payload): Json<Value>| {
+                let calls = calls_for_run.clone();
+                let captured = captured_for_run.clone();
+                async move {
+                    captured.lock().await.push(payload);
+                    calls.lock().await.push("search_run".to_owned());
+                    let first = stream::once(async {
+                        Ok::<Bytes, std::io::Error>(Bytes::from(
+                            "data: {\"conversation_id\":\"search-conversation\"}\n\n\
+                             data: [DONE]\n\n",
+                        ))
+                    });
+                    let rest = stream::pending::<Result<Bytes, std::io::Error>>();
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(first.chain(rest)),
+                    )
+                        .into_response()
+                }
+            });
+            let calls_for_poll = calls_for_upstream.clone();
+            let expected_referer_for_poll = expected_referer.clone();
+            let search_poll = get(
+                move |headers: HeaderMap, AxumPath(conversation_id): AxumPath<String>| {
+                    let calls = calls_for_poll.clone();
+                    let expected_referer = expected_referer_for_poll.clone();
+                    async move {
+                        assert_eq!(conversation_id, "search-conversation");
+                        assert_eq!(headers.get_all(header::REFERER).iter().count(), 1);
+                        assert_eq!(
+                            headers
+                                .get(header::REFERER)
+                                .and_then(|value| value.to_str().ok()),
+                            Some(expected_referer.as_str())
+                        );
+                        assert_eq!(
+                            headers
+                                .get(header::ACCEPT_LANGUAGE)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7")
+                        );
+                        assert_eq!(
+                            headers
+                                .get(header::CACHE_CONTROL)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("no-cache")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("Priority")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("u=1, i")
+                        );
+                        for name in [
+                            "Sec-Ch-Ua",
+                            "OAI-Device-Id",
+                            "OAI-Session-Id",
+                            "OAI-Client-Version",
+                            "OAI-Client-Build-Number",
+                        ] {
+                            assert!(headers.get(name).is_some(), "missing {name}");
+                        }
+                        calls.lock().await.push("search_poll".to_owned());
+                        let long_title = format!("Example {}", "x".repeat(5000));
+                        let long_snippet = "s".repeat(5000);
+                        Json(json!({
+                            "mapping": {"assistant": {"message": {
+                                "id":"assistant-1",
+                                "author":{"role":"assistant"},
+                                "create_time":123.0,
+                                "content":{"content_type":"text","parts":[
+                                    {"status":"finished_partial_completion"},
+                                    "Rust search answer https://example.com/article."
+                                ]},
+                                "metadata": {
+                                    "sources":[
+                                        {"title":long_title,"url":"https://example.com/article#one","snippet":long_snippet,"source_type":"web"},
+                                        {"title":"duplicate","url":"https://example.com/article#two","snippet":"drop","source_type":"web"},
+                                        {"title":"malformed","url":"https://example.com/%ZZ","snippet":"drop","source_type":"web"}
+                                    ],
+                                    "access_token":"must-not-leak",
+                                    "private":{"url":"https://secret.example/credential","status":"must-not-leak-status"}
+                                }
+                            }}},
+                            "access_token":"must-not-leak"
+                        }))
+                    }
+                },
+            );
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", bootstrap)
+                    .route(
+                        "/backend-api/sentinel/chat-requirements/prepare",
+                        prepare.clone(),
+                    )
+                    .route(
+                        "/backend-api/sentinel/chat-requirements/finalize",
+                        finalize.clone(),
+                    )
+                    .route("/backend-api/models", models)
+                    .route("/backend-api/f/conversation/prepare", search_prepare)
+                    .route("/backend-api/f/conversation", search_run)
+                    .route("/backend-api/conversation/{conversation_id}", search_poll),
+            )
+            .await
+            .expect("upstream server");
+        });
+
+        let account_path = test_tmp_dir().join(format!(
+            "chatgpt2api-rust-native-search-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"search-bad","status":"正常","source_type":"web","type":"free","models":["gpt-5-5"]},
+                {"access_token":"search-token","status":"正常","source_type":"web","type":"free","models":["gpt-5-5"]}
+            ]"#,
+        )
+        .expect("account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-5-5".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.router().oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/search")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"prompt":"latest rust"}"#))
+                    .expect("request"),
+            ),
+        )
+        .await
+        .expect("search response deadline")
+        .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let value: Value = serde_json::from_slice(&body).expect("search JSON");
+        assert_eq!(
+            value["answer"],
+            "Rust search answer https://example.com/article."
+        );
+        assert_eq!(value["conversation_id"], "search-conversation");
+        assert_eq!(value["status"], "finished_partial_completion");
+        assert_eq!(value["sources"].as_array().expect("sources").len(), 1);
+        assert_eq!(
+            value["sources"][0]["title"]
+                .as_str()
+                .expect("title")
+                .chars()
+                .count(),
+            NATIVE_SEARCH_MAX_FIELD_CHARS
+        );
+        assert!(
+            value["sources"][0]["title"]
+                .as_str()
+                .expect("title")
+                .starts_with("Example ")
+        );
+        assert_eq!(value["sources"][0]["url"], "https://example.com/article");
+        assert_eq!(
+            value["sources"][0]["snippet"]
+                .as_str()
+                .expect("snippet")
+                .chars()
+                .count(),
+            NATIVE_SEARCH_MAX_FIELD_CHARS
+        );
+        assert!(value.get("access_token").is_none());
+        assert!(value.get("assistant_message_id").is_none());
+        assert!(value.get("create_time").is_none());
+        assert!(value["sources"][0].get("source_type").is_none());
+        assert!(!value.to_string().contains("must-not-leak"));
+        let payloads = captured.lock().await;
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["model"], "gpt-5-5");
+        assert_eq!(payloads[0]["force_use_search"], true);
+        assert_eq!(
+            payloads[0]["messages"][0]["content"]["parts"][0],
+            "latest rust"
+        );
+        assert_eq!(payloads[0]["client_prepare_state"], "success");
+        let calls = calls.lock().await;
+        assert_eq!(
+            calls.as_slice(),
+            [
+                "search_prepare",
+                "search_prepare",
+                "sentinel_prepare",
+                "sentinel_finalize",
+                "search_run",
+                "search_poll"
+            ]
+        );
+        assert!(state.account_store.last_used_at("search-token").is_some());
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        fs::remove_file(account_path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn native_search_non_retryable_prepare_error_does_not_switch_accounts() {
+        let account_path = account_snapshot_path("native-search-nonretryable");
+        fs::write(
+            &account_path,
+            r#"[{"access_token":"only-search-token","status":"正常","source_type":"web","type":"free","models":["gpt-5-5"]}]"#,
+        )
+        .expect("account snapshot");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/backend-api/f/conversation/prepare",
+                    post(|| async { StatusCode::BAD_REQUEST }),
+                ),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-5-5".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let lease = state
+            .account_store
+            .acquire("gpt-5-5")
+            .await
+            .expect("search lease");
+        let result = native_search_attempt(
+            &state,
+            &lease,
+            "query",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert!(matches!(result, Err((_, false))));
+        drop(lease);
+        assert_eq!(state.account_store.inflight(), 0);
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        fs::remove_file(account_path).expect("cleanup");
+    }
+
     #[tokio::test]
     async fn native_responses_tools_route_through_codex_and_release_leases() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -14852,11 +26830,6 @@ data: [DONE]
             });
             let prepare = post(|| async { Json(json!({"prepare_token":"prepare-token"})) });
             let finalize = post(|| async { Json(json!({"token":"requirements-token"})) });
-            let models = get(|| async {
-                Json(json!({
-                    "models": [{"slug":"gpt-test","supported_in_api":true}]
-                }))
-            });
             let responses = post(move |Json(payload): Json<Value>| {
                 let captured = captured_for_upstream.clone();
                 async move {
@@ -14866,7 +26839,7 @@ data: [DONE]
                         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-search\"},\"sequence_number\":0}\n\n\
                          data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"sequence_number\":1,\"item\":{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}}}\n\n\
                          data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg-1\",\"content_index\":0,\"output_index\":1,\"delta\":\"Rust answer\",\"logprobs\":[],\"sequence_number\":2}\n\n\
-                         data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp-search\",\"usage\":{\"output_tokens\":4},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}},{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Rust answer\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\",\"start_index\":0,\"end_index\":4}]}]}]}}\n\n"
+                         data: {\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp-search\",\"usage\":{\"input_tokens\":2,\"output_tokens\":4,\"total_tokens\":6},\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws-1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"rust\"}},{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Rust answer\",\"annotations\":[{\"type\":\"url_citation\",\"url\":\"https://example.com\",\"title\":\"Example\",\"start_index\":0,\"end_index\":4}]}]}]}}\n\n"
                     } else {
                         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-function\"},\"sequence_number\":0}\n\n\
                          data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-function\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc-1\",\"call_id\":\"call-1\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"rust\\\"}\"}]}}\n\n"
@@ -14892,14 +26865,13 @@ data: [DONE]
                             }))
                         }),
                     )
-                    .route("/backend-api/codex/models", models)
                     .route("/backend-api/codex/responses", responses),
             )
             .await
             .expect("upstream server");
         });
 
-        let account_path = std::env::temp_dir().join(format!(
+        let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-native-responses-tools-{}-{}.json",
             std::process::id(),
             NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
@@ -15158,15 +27130,31 @@ data: [DONE]
         assert_eq!(payloads[1]["max_output_tokens"], 8);
         assert_eq!(payloads[2]["tools"][0]["type"], "web_search");
         assert_eq!(payloads[3]["tools"][0]["type"], "web_search");
-        assert!(payloads[4]["input"].as_array().unwrap().iter().any(|item| {
-            item["content"].as_array().unwrap().iter().any(|block| {
-                block["type"] == "input_text"
-                    && block["text"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .contains("Web search")
-            })
+        let replay_text = payloads[4]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|item| item["content"].as_array().into_iter().flatten())
+            .filter(|block| block["type"] == "output_text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            replay_text
+                .iter()
+                .any(|text| text.contains("Web search call ws-1: rust"))
+        );
+        assert!(replay_text.iter().any(|text| {
+            text.contains("Web search results for ws-1:")
+                && text.contains("Example: https://example.com Rust")
         }));
+        assert!(replay_text.iter().any(|text| text.contains("Rust answer")));
+        // Anthropic citations are validated on the replay blocks above; their URL is
+        // preserved losslessly in the structured web-search result text sent upstream.
+        assert!(
+            replay_text
+                .iter()
+                .any(|text| text.contains("https://example.com"))
+        );
         state.account_type_catalog.shutdown().await;
         upstream.abort();
         let _ = upstream.await;
@@ -15264,13 +27252,8 @@ data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp-se
             "model": "gpt-test",
             "input": [{"type": "function_call_output", "call_id": "call-1", "future": true}]
         }))
-        .expect("request object");
-        assert_eq!(
-            native_codex_responses_payload(&invalid)
-                .expect_err("unknown history field must fail closed")
-                .status,
-            StatusCode::BAD_REQUEST
-        );
+        .expect_err("unknown history field must fail closed at the public boundary");
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -15287,8 +27270,213 @@ data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp-se
                 .status,
             StatusCode::BAD_REQUEST
         );
-        let incomplete = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
-        assert!(native_codex_responses_json(incomplete, "gpt-test").is_err());
+        let missing_terminal = b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+        assert!(native_codex_responses_json(missing_terminal, "gpt-test").is_err());
+    }
+
+    #[test]
+    fn native_responses_incomplete_terminal_preserves_status_and_details() {
+        let incomplete = b"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-1\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"content_index\":0,\"item_id\":\"msg-1\",\"logprobs\":[],\"output_index\":0,\"sequence_number\":1,\"delta\":\"hello\"}\n\ndata: {\"type\":\"response.incomplete\",\"sequence_number\":2,\"response\":{\"id\":\"resp-1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[]}}\n\n";
+        let response = native_codex_responses_json(incomplete, "gpt-test")
+            .expect("incomplete is a valid terminal response");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(
+            response["incomplete_details"]["reason"],
+            "max_output_tokens"
+        );
+    }
+
+    #[test]
+    fn native_responses_public_projection_preserves_nulls_and_rejects_bad_lifecycle() {
+        let nullable = b"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-null\",\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null,\"usage\":null}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-null\",\"error\":null,\"incomplete_details\":null,\"usage\":null,\"output\":[]}}\n\n";
+        let response = native_codex_responses_json(nullable, "gpt-test")
+            .expect("nullable public response fields are valid");
+        assert!(response["error"].is_null());
+        assert!(response["incomplete_details"].is_null());
+        assert!(response["usage"].is_null());
+
+        let active_error = b"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-active-error\",\"error\":{\"code\":\"bad\"}}}\n\n";
+        assert!(native_codex_responses_json(active_error, "gpt-test").is_err());
+
+        let active_wrong_status = b"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-active-status\",\"status\":\"completed\"}}\n\n";
+        assert!(native_codex_responses_json(active_wrong_status, "gpt-test").is_err());
+
+        let active_incomplete = b"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-active-incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-active-incomplete\",\"output\":[]}}\n\n";
+        assert!(native_codex_responses_json(active_incomplete, "gpt-test").is_err());
+
+        let terminal_error = b"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-terminal-error\"}}\n\ndata: {\"type\":\"response.incomplete\",\"sequence_number\":1,\"response\":{\"id\":\"resp-terminal-error\",\"error\":{\"code\":\"bad\"},\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[]}}\n\n";
+        assert!(native_codex_responses_json(terminal_error, "gpt-test").is_err());
+
+        let terminal_wrong_status = b"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-terminal-status\"}}\n\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp-terminal-status\",\"status\":\"incomplete\",\"output\":[]}}\n\n";
+        assert!(native_codex_responses_json(terminal_wrong_status, "gpt-test").is_err());
+
+        let missing_status = b"data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp-missing-status\"}}\n\ndata: {\"type\":\"response.incomplete\",\"sequence_number\":1,\"response\":{\"id\":\"resp-missing-status\",\"incomplete_details\":{},\"usage\":null,\"output\":[]}}\n\n";
+        let response = native_codex_responses_json(missing_status, "gpt-test")
+            .expect("missing terminal status is normalized");
+        assert_eq!(response["status"], "incomplete");
+        assert_eq!(response["incomplete_details"], json!({}));
+        assert!(response["usage"].is_null());
+    }
+
+    #[test]
+    fn rust_codex_public_item_projection_is_discriminated_and_recursive() {
+        let canary = "rust-cross-type-item-canary owner@example.test";
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_public_items",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_public",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "visible message",
+                            "annotations": [{
+                                "type": "url_citation",
+                                "url": "https://example.test/source",
+                                "title": "Source",
+                                "start_index": 0,
+                                "end_index": 7,
+                                "nested_secret": canary
+                            }]
+                        }],
+                        "call_id": canary,
+                        "arguments": canary,
+                        "action": {"type": "search", "query": canary},
+                        "output": {"type": "result", "text": canary},
+                        "pending_safety_checks": [{"type": "safety", "message": canary}],
+                        "environment": {"type": "container", "id": canary},
+                        "operation": {"type": "patch", "path": canary}
+                    },
+                    {
+                        "type": "function_call",
+                        "id": "call_public",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "{\"query\":\"rust\"}",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": canary}],
+                        "role": "assistant",
+                        "annotations": [{"type": "url_citation", "url": canary}],
+                        "action": {"type": "search", "query": canary},
+                        "output": {"type": "result", "text": canary},
+                        "pending_safety_checks": [{"type": "safety", "message": canary}],
+                        "environment": {"type": "container", "id": canary},
+                        "operation": {"type": "patch", "path": canary}
+                    },
+                    {
+                        "type": "web_search_call",
+                        "id": "search_1",
+                        "action": {"type": "search", "query": "rust", "secret": canary},
+                        "status": "completed"
+                    },
+                    {
+                        "type": "shell_call",
+                        "id": "shell_1",
+                        "action": {"type": "command", "query": "echo"},
+                        "environment": {"type": "container", "id": "container_1", "secret": canary},
+                        "status": "completed"
+                    },
+                    {
+                        "type": "apply_patch_call",
+                        "id": "patch_1",
+                        "call_id": "call_patch",
+                        "operation": {"type": "patch", "path": "README.md", "secret": canary},
+                        "status": "completed"
+                    },
+                    {
+                        "type": "computer_call",
+                        "id": "computer_1",
+                        "call_id": "call_computer",
+                        "pending_safety_checks": [{
+                            "type": "safety",
+                            "id": "check_1",
+                            "reason": "review",
+                            "secret": canary
+                        }],
+                        "status": "completed"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "id": "output_1",
+                        "call_id": "call_1",
+                        "output": {"type": "result", "text": "ok", "secret": canary},
+                        "status": "completed"
+                    }
+                ]
+            }
+        });
+
+        let projected = project_codex_response_event(&event)
+            .expect("public event projection")
+            .expect("ordinary response event");
+        let output = projected["response"]["output"]
+            .as_array()
+            .expect("projected output array");
+        let public_message = &output[0];
+        assert_eq!(public_message["role"], "assistant");
+        assert_eq!(public_message["content"][0]["text"], "visible message");
+        assert_eq!(
+            public_message["content"][0]["annotations"][0]["url"],
+            "https://example.test/source"
+        );
+        for field in [
+            "call_id",
+            "arguments",
+            "action",
+            "output",
+            "pending_safety_checks",
+            "environment",
+            "operation",
+        ] {
+            assert!(
+                public_message.get(field).is_none(),
+                "message leaked {field}"
+            );
+        }
+
+        let public_function_call = &output[1];
+        assert_eq!(public_function_call["call_id"], "call_1");
+        assert_eq!(public_function_call["arguments"], "{\"query\":\"rust\"}");
+        for field in [
+            "content",
+            "role",
+            "annotations",
+            "action",
+            "output",
+            "pending_safety_checks",
+            "environment",
+            "operation",
+        ] {
+            assert!(
+                public_function_call.get(field).is_none(),
+                "function_call leaked {field}"
+            );
+        }
+
+        assert_eq!(output[2]["action"]["query"], "rust");
+        assert!(output[2]["action"].get("secret").is_none());
+        assert_eq!(output[3]["environment"]["id"], "container_1");
+        assert!(output[3]["environment"].get("secret").is_none());
+        assert_eq!(output[4]["operation"]["path"], "README.md");
+        assert!(output[4]["operation"].get("secret").is_none());
+        assert_eq!(output[5]["pending_safety_checks"][0]["reason"], "review");
+        assert!(
+            output[5]["pending_safety_checks"][0]
+                .get("secret")
+                .is_none()
+        );
+        assert_eq!(output[6]["output"]["text"], "ok");
+        assert!(output[6]["output"].get("secret").is_none());
+        assert!(
+            !serde_json::to_string(&projected)
+                .expect("projected JSON")
+                .contains(canary)
+        );
     }
 
     #[test]
@@ -15551,6 +27739,8 @@ data: {"type":"response.completed","sequence_number":13,"response":{"id":"resp-1
             json!({"type":"apply_patch_call","id":"patch-1","call_id":"call-7","operation":{},"status":"completed"}),
             json!({"type":"apply_patch_call_output","id":"patch-out-1","call_id":"call-7","status":"completed"}),
             json!({"type":"mcp_call","id":"mcp-1","arguments":"{}","name":"lookup","server_label":"server"}),
+            json!({"type":"mcp_call_output","call_id":"call-9","output":{"type":"result","content":[{"type":"text","text":"ok"}],"secret":"drop"}}),
+            json!({"type":"mcp_tool_call_output","call_id":"call-10","output":{"type":"result","content":[{"type":"text","text":"ok"}],"secret":"drop"}}),
             json!({"type":"mcp_list_tools","id":"mcp-list-1","server_label":"server","tools":[]}),
             json!({"type":"mcp_approval_request","id":"mcp-request-1","arguments":"{}","name":"lookup","server_label":"server"}),
             json!({"type":"mcp_approval_response","id":"mcp-response-1","approval_request_id":"mcp-request-1","approve":true}),
@@ -15591,6 +27781,48 @@ data: {"type":"response.completed","sequence_number":13,"response":{"id":"resp-1
         assert!(
             native_codex_responses_json(missing_completed_response.as_bytes(), "gpt-test").is_err()
         );
+    }
+
+    #[test]
+    fn native_responses_mcp_output_projection_is_type_specific_and_recursive() {
+        let body = br#"data: {"type":"response.created","response":{"id":"resp-1"},"sequence_number":0}
+
+data: {"type":"response.completed","sequence_number":1,"response":{"id":"resp-1","output":[{"type":"mcp_call_output","call_id":"call-1","output":{"type":"result","content":[{"type":"text","text":"ok","secret":"drop"}],"secret":"drop"}},{"type":"mcp_tool_call_output","call_id":"call-2","output":{"type":"result","content":[{"type":"text","text":"done","secret":"drop"}],"secret":"drop"}}]}}
+
+"#;
+        let response = native_codex_responses_json(body, "gpt-test")
+            .expect("MCP output variants must validate and project");
+        assert_eq!(
+            response["output"][0],
+            json!({
+                "type": "mcp_call_output",
+                "call_id": "call-1",
+                "output": {
+                    "type": "result",
+                    "content": [{"type": "text", "text": "ok"}]
+                }
+            })
+        );
+        assert_eq!(
+            response["output"][1],
+            json!({
+                "type": "mcp_tool_call_output",
+                "call_id": "call-2",
+                "output": {
+                    "type": "result",
+                    "content": [{"type": "text", "text": "done"}]
+                }
+            })
+        );
+        assert!(native_codex_responses_json(
+            br#"data: {"type":"response.created","response":{"id":"resp-1"}}
+
+data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"mcp_tool_call_output","call_id":"","output":{}}]}}
+
+"#,
+            "gpt-test"
+        )
+        .is_err());
     }
 
     #[test]

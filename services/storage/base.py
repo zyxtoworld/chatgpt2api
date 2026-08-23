@@ -41,10 +41,6 @@ class _CrossProcessPathWriteLock:
             try:
                 self._lock_path.parent.mkdir(parents=True, exist_ok=True)
                 handle = open(self._lock_path, "a+b")
-                if os.fstat(handle.fileno()).st_size == 0:
-                    handle.seek(0)
-                    handle.write(b"\0")
-                    handle.flush()
                 handle.seek(0)
                 os_lock_state = self._acquire_os_lock(handle)
                 self._handle = handle

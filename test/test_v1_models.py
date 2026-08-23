@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from unittest import mock
 
+import pytest
 import requests
 
 from services.protocol import openai_v1_models
+from test.utils import require_http_response
 
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
+AUTH_KEY = os.getenv("CHATGPT2API_LIVE_API_KEY", "")
+BASE_URL = os.getenv("CHATGPT2API_LIVE_BASE_URL", "")
 
 
 class ModelListTests(unittest.TestCase):
@@ -270,6 +273,7 @@ class ModelListTests(unittest.TestCase):
             result = openai_v1_models.list_models()
         self.assertEqual(result, {"object": "list", "data": []})
 
+    @pytest.mark.live_upstream
     def test_list_models_http(self):
         """测试通过 HTTP 接口获取模型列表。"""
         response = requests.get(
@@ -277,7 +281,7 @@ class ModelListTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {AUTH_KEY}"},
             timeout=30,
         )
-        print("http status:")
-        print(response.status_code)
-        print("http result:")
-        print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+        require_http_response(response, content_type="application/json")
+        payload = response.json()
+        self.assertEqual(payload.get("object"), "list")
+        self.assertIsInstance(payload.get("data"), list)

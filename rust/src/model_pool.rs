@@ -97,6 +97,10 @@ impl ModelStore {
             .models
             .clone()
     }
+
+    pub(super) fn configured_path(&self) -> Option<Arc<PathBuf>> {
+        self.path.clone()
+    }
 }
 
 pub(super) struct ModelCatalog;

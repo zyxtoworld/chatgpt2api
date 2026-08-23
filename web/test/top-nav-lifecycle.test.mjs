@@ -33,6 +33,13 @@ test("TopNav third-party reloads accept only the latest response for the session
   assert.deepEqual(events, ["latest"]);
 });
 
+test("TopNav aborts a third-party request when its session owner is cleaned up", () => {
+  assert.match(source, /thirdPartyAbortControllerRef/);
+  assert.match(source, /fetchThirdPartyApps\(abortController\.signal\)/);
+  assert.match(source, /thirdPartyAbortControllerRef\.current\?\.abort\(\);/);
+  assert.match(source, /return \(\) => \{[\s\S]*?thirdPartyAbortControllerRef\.current\?\.abort\(\);/);
+});
+
 test("logout drops all callbacks from the pending session validation", () => {
   const owner = createLatestActionOwner();
   const pending = owner.begin("/accounts");

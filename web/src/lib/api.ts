@@ -336,12 +336,12 @@ export async function login(authKey: string) {
   });
 }
 
-export async function fetchAccounts() {
-  return httpRequest<AccountListResponse>("/api/accounts");
+export async function fetchAccounts(signal?: AbortSignal) {
+  return httpRequest<AccountListResponse>("/api/accounts", { signal });
 }
 
-export async function fetchModels() {
-  return httpRequest<ModelListResponse>("/v1/models");
+export async function fetchModels(signal?: AbortSignal) {
+  return httpRequest<ModelListResponse>("/v1/models", { signal });
 }
 
 export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = []) {
@@ -521,8 +521,8 @@ export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
   });
 }
 
-export async function fetchSettingsConfig() {
-  return httpRequest<{ config: SettingsConfig }>("/api/settings");
+export async function fetchSettingsConfig(signal?: AbortSignal) {
+  return httpRequest<{ config: SettingsConfig }>("/api/settings", { signal });
 }
 
 export async function updateSettingsConfig(settings: SettingsConfig) {
@@ -532,8 +532,8 @@ export async function updateSettingsConfig(settings: SettingsConfig) {
   });
 }
 
-export async function fetchThirdPartyApps() {
-  return httpRequest<{ third_party_apps: ThirdPartyAppsSettings }>("/api/third-party-apps");
+export async function fetchThirdPartyApps(signal?: AbortSignal) {
+  return httpRequest<{ third_party_apps: ThirdPartyAppsSettings }>("/api/third-party-apps", { signal });
 }
 
 export async function testBackupConnection() {
@@ -656,12 +656,12 @@ export async function deleteToTarget(targetFreeMb: number) {
   );
 }
 
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
+export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }, signal?: AbortSignal) {
   const params = new URLSearchParams();
   if (filters.type) params.set("type", filters.type);
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
+  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`, { signal });
 }
 
 export async function deleteSystemLogs(ids: string[]) {
@@ -671,8 +671,8 @@ export async function deleteSystemLogs(ids: string[]) {
   });
 }
 
-export async function fetchUserKeys() {
-  return httpRequest<{ items: UserKey[] }>("/api/auth/users");
+export async function fetchUserKeys(signal?: AbortSignal) {
+  return httpRequest<{ items: UserKey[] }>("/api/auth/users", { signal });
 }
 
 export async function createUserKey(name: string) {
@@ -750,8 +750,8 @@ export async function deleteCPAPool(poolId: string) {
   });
 }
 
-export async function fetchCPAPoolFiles(poolId: string) {
-  return httpRequest<{ pool_id: string; files: CPARemoteFile[] }>(`/api/cpa/pools/${poolId}/files`);
+export async function fetchCPAPoolFiles(poolId: string, signal?: AbortSignal) {
+  return httpRequest<{ pool_id: string; files: CPARemoteFile[] }>(`/api/cpa/pools/${poolId}/files`, { signal });
 }
 
 export async function startCPAImport(poolId: string, names: string[]) {
@@ -952,8 +952,8 @@ export type ClearanceTestResult = {
   runtime: ProxyRuntimeStatus;
 };
 
-export async function fetchProxy() {
-  return httpRequest<{ proxy: ProxySettings }>("/api/proxy");
+export async function fetchProxy(signal?: AbortSignal) {
+  return httpRequest<{ proxy: ProxySettings }>("/api/proxy", { signal });
 }
 
 export async function updateProxy(updates: { enabled?: boolean; url?: string }) {

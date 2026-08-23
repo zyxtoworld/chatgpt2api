@@ -8,6 +8,7 @@ export function createOwnedQueryLoader({
   onFinish,
 }) {
   let loadingOwner = null;
+  let requestController = null;
 
   const run = async () => {
     const queryOwner = gate.beginQuery(domain);
@@ -15,15 +16,19 @@ export function createOwnedQueryLoader({
       return;
     }
 
+    requestController?.abort();
+    const controller = new AbortController();
+    requestController = controller;
     loadingOwner = queryOwner;
+    const ownsQuery = () => loadingOwner === queryOwner;
     onStart?.();
     try {
-      const value = await request();
-      if (gate.acceptsQuery(queryOwner)) {
+      const value = await request(controller.signal);
+      if (ownsQuery() && gate.acceptsQuery(queryOwner)) {
         onCommit?.(value);
       }
     } catch (error) {
-      if (gate.acceptsQuery(queryOwner)) {
+      if (ownsQuery() && gate.acceptsQuery(queryOwner)) {
         onError?.(error);
       }
     } finally {
@@ -31,12 +36,16 @@ export function createOwnedQueryLoader({
         loadingOwner = null;
         onFinish?.();
       }
+      if (requestController === controller) {
+        requestController = null;
+      }
     }
   };
 
   return {
     run,
     clearLoadingForMutation() {
+      requestController?.abort();
       if (loadingOwner === null) {
         return;
       }
@@ -44,6 +53,8 @@ export function createOwnedQueryLoader({
       onFinish?.();
     },
     cancel() {
+      requestController?.abort();
+      requestController = null;
       loadingOwner = null;
     },
   };

@@ -16,20 +16,15 @@ from services.model_service import (
     ModelCatalogService,
     ModelUnavailableError,
 )
-from services.openai_backend_api import (
-    CatalogConfigurationError,
-    CatalogIncompleteError,
-    InvalidAccessTokenError,
-    OpenAIBackendAPI,
-)
+from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 from services.storage.json_storage import JSONStorageBackend
 from utils.helper import UpstreamHTTPError
 
 # Contract provenance: upstream/main at dc105e51 (services/openai_backend_api.py)
 # uses one anonymous endpoint (/backend-anon/models?iim=false&is_gizmo=false)
 # and one authenticated Web endpoint (/backend-api/models?history_and_training_disabled=false).
-# Codex/API credentials use the dedicated Codex catalog and Web credentials
-# use the authenticated Web catalog; source capability is not a plan group.
+# The endpoint is selected only by whether access_token is present; source_type
+# is not a model-discovery transport selector.
 
 
 def model_list(*model_ids: str) -> dict:
@@ -104,12 +99,71 @@ class ModelCatalogServiceTests(unittest.TestCase):
             clock=lambda: self.now,
         )
 
-    def test_catalog_uses_account_text_eligibility_predicate(self) -> None:
+    def test_catalog_uses_model_status_not_conversation_text_predicate(self) -> None:
         with mock.patch.object(self.accounts, "_is_text_account_available", return_value=False):
             result = self.catalog.list_models()
 
-        self.assertEqual([item["id"] for item in result["data"]], ["anon", "shared"])
-        self.assertEqual(self.calls, [""])
+        self.assertEqual(
+            [item["id"] for item in result["data"]],
+            ["anon", "free-only", "plus-only", "pro-only", "shared"],
+        )
+        self.assertCountEqual(self.calls, ["", "free-bad", "free-good", "plus", "pro"])
+
+    def test_upstream_model_catalog_contract_ignores_source_for_group_fallback_and_merge(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "upstream-model-contract.json")
+        )
+        accounts.add_account_items(
+            [
+                {
+                    "access_token": "pro-codex-bad",
+                    "type": "Pro",
+                    "source_type": "codex",
+                    "status": "正常",
+                },
+                {
+                    "access_token": "pro-web-good",
+                    "type": "Pro",
+                    "source_type": "web",
+                    "status": "正常",
+                },
+            ]
+        )
+        accounts.refresh_access_token = lambda token, **_kwargs: token
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                if self.access_token == "pro-codex-bad":
+                    raise RuntimeError("first representative unavailable")
+                if self.access_token == "pro-web-good":
+                    return model_list("shared-model", "pro-model", "shared-model")
+                return model_list("shared-model", "anonymous-model", "anonymous-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+
+        result = catalog.list_models()
+
+        self.assertEqual(calls.count(""), 1)
+        self.assertEqual(
+            [token for token in calls if token],
+            ["pro-codex-bad", "pro-web-good"],
+        )
+        self.assertEqual(
+            [item["id"] for item in result["data"]],
+            ["anonymous-model", "pro-model", "shared-model"],
+        )
 
     def test_image_restore_at_does_not_disable_text_catalog_representative(self) -> None:
         accounts = AccountService(
@@ -155,7 +209,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertIn("pro-text-model", {item["id"] for item in result["data"]})
         self.assertCountEqual(calls, ["", "image-cooling"])
 
-    def test_limited_account_is_not_a_catalog_representative(self) -> None:
+    def test_limited_account_cannot_represent_text_catalog(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "limited-catalog-accounts.json")
         )
@@ -189,7 +243,49 @@ class ModelCatalogServiceTests(unittest.TestCase):
         result = catalog.list_models()
 
         self.assertIn("anonymous-only-model", {item["id"] for item in result["data"]})
-        self.assertEqual(calls, [""])
+        self.assertCountEqual(calls, [""])
+
+    def test_rate_limited_source_is_excluded_until_recovered(self) -> None:
+        accounts = AccountService(
+            JSONStorageBackend(Path(self.temp_dir.name) / "mixed-status-catalog-accounts.json")
+        )
+        accounts.add_account_items([
+            {"access_token": "web-pro", "type": "Pro", "source_type": "web", "status": "正常"},
+            {"access_token": "codex-pro", "type": "Pro", "source_type": "codex", "status": "限流"},
+        ])
+        calls: list[str] = []
+
+        class Backend:
+            def __init__(self, access_token: str = "") -> None:
+                self.access_token = access_token
+
+            def list_models(self, **_kwargs: object) -> dict:
+                calls.append(self.access_token)
+                return model_list("mixed-status-model")
+
+            def close(self) -> None:
+                pass
+
+        catalog = ModelCatalogService(
+            accounts,
+            backend_factory=Backend,
+            clock=lambda: self.now,
+        )
+
+        first = catalog.list_models()
+        self.assertIn("mixed-status-model", {item["id"] for item in first["data"]})
+        self.assertEqual(catalog._active_accounts_by_group(), {"Pro": ["web-pro"]})
+        self.assertEqual(calls, ["", "web-pro"])
+
+        accounts.update_account("codex-pro", {"status": "正常"})
+        self.now += 301
+        catalog.list_models(wait_for_cold=False)
+        self.assertTrue(catalog._refresh_done.wait(timeout=3))
+        self.assertEqual(
+            catalog._active_accounts_by_group(),
+            {"Pro": ["web-pro", "codex-pro"]},
+        )
+        self.assertEqual(calls, ["", "web-pro", "web-pro"])
 
     def test_anonymous_failure_preserves_authenticated_last_good_catalog(self) -> None:
         catalog = self.catalog
@@ -225,9 +321,9 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertIn("pro-only", ids)
         self.outcomes = original_outcomes
 
-    def test_dual_catalog_failure_keeps_last_good_type_snapshot(self) -> None:
+    def test_account_catalog_failure_keeps_last_good_type_snapshot(self) -> None:
         accounts = AccountService(
-            JSONStorageBackend(Path(self.temp_dir.name) / "dual-last-good-accounts.json")
+            JSONStorageBackend(Path(self.temp_dir.name) / "catalog-last-good-accounts.json")
         )
         accounts.add_account_items([
             {
@@ -265,8 +361,8 @@ class ModelCatalogServiceTests(unittest.TestCase):
             clock=lambda: now[0],
         )
         service.list_models()
-        catalog_outcome = RuntimeError("dual catalog temporarily unavailable")
-        now[0] += 2
+        catalog_outcome = RuntimeError("authenticated catalog temporarily unavailable")
+        now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
         service.list_models(wait_for_cold=False)
         self.assertTrue(service._refresh_done.wait(timeout=3))
 
@@ -276,9 +372,9 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertIn("anon-v1", ids)
         self.assertEqual(calls["catalog"], 2)
 
-    def test_partial_dual_catalog_is_not_published_ready_and_recovers(self) -> None:
+    def test_failed_account_type_is_not_published_ready_and_recovers(self) -> None:
         accounts = AccountService(
-            JSONStorageBackend(Path(self.temp_dir.name) / "partial-dual-catalog.json")
+            JSONStorageBackend(Path(self.temp_dir.name) / "failed-account-catalog.json")
         )
         accounts.add_account_items([
             {
@@ -289,7 +385,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
             },
         ])
         now = [1000.0]
-        catalog_complete = [False]
+        catalog_available = [False]
 
         class Backend:
             def __init__(self, access_token: str = "") -> None:
@@ -298,13 +394,12 @@ class ModelCatalogServiceTests(unittest.TestCase):
             def list_models(self, **_kwargs: object) -> dict:
                 return model_list("anonymous-v1")
 
-            def list_catalog_models(self, **_kwargs: object) -> dict:
-                if catalog_complete[0]:
-                    return model_list("pro-v1") | {"catalog_complete": True}
-                return model_list("pro-web-only") | {
-                    "catalog_complete": False,
-                    "catalog_failed_endpoints": ["codex"],
-                }
+            def list_models(self, **_kwargs: object) -> dict:
+                if not self.access_token:
+                    return model_list("anonymous-v1")
+                if catalog_available[0]:
+                    return model_list("pro-v1")
+                raise RuntimeError("authenticated catalog unavailable")
 
             def close(self) -> None:
                 pass
@@ -324,7 +419,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         )
         self.assertNotIn("Pro", service._ready_account_groups)
 
-        catalog_complete[0] = True
+        catalog_available[0] = True
         now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
         result = service.list_models()
         self.assertIn("pro-v1", {item["id"] for item in result["data"]})
@@ -384,7 +479,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         result = self.catalog.list_models()
         self.assertIn("pro-recovered", {item["id"] for item in result["data"]})
 
-    def test_same_type_across_sources_uses_one_web_catalog_representative(self) -> None:
+    def test_same_type_across_sources_uses_one_account_type_representative(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "source-groups-accounts.json")
         )
@@ -400,24 +495,14 @@ class ModelCatalogServiceTests(unittest.TestCase):
             },
             {"access_token": "codex-pro-2", "type": "pro", "source_type": "codex", "status": "正常"},
         ])
-        calls: list[tuple[str, object, object]] = []
+        calls: list[str] = []
 
         class Backend:
             def __init__(self, access_token: str = "") -> None:
                 self.access_token = access_token
 
             def list_models(self, **_kwargs: object) -> dict:
-                calls.append(
-                    (
-                        self.access_token,
-                        getattr(self, "_catalog_source_type", None),
-                        getattr(self, "_catalog_account_id", None),
-                    )
-                )
-                if self.access_token and not AccountService.is_web_backend_compatible(
-                    accounts.get_account(self.access_token)
-                ):
-                    raise RuntimeError("web catalog requires a Web-compatible representative")
+                calls.append(self.access_token)
                 return model_list(
                     "authenticated-pro-model"
                     if self.access_token
@@ -436,20 +521,8 @@ class ModelCatalogServiceTests(unittest.TestCase):
         result = catalog.list_models()
 
         self.assertEqual(
-            [token for token, _source, _account_id in calls if token],
+            [token for token in calls if token],
             ["web-pro"],
-        )
-        self.assertEqual(
-            [(token, source) for token, source, _account_id in calls if token],
-            [("web-pro", "web")],
-        )
-        self.assertEqual(
-            [
-                (token, source, account_id)
-                for token, source, account_id in calls
-                if token
-            ],
-            [("web-pro", "web", None)],
         )
         self.assertEqual(
             catalog.route_for_model("authenticated-pro-model").access_tokens,
@@ -460,9 +533,9 @@ class ModelCatalogServiceTests(unittest.TestCase):
             {"anonymous-model", "authenticated-pro-model"},
         )
 
-    def test_catalog_uses_one_source_compatible_representative_per_account_type(self) -> None:
+    def test_catalog_uses_one_representative_per_account_type(self) -> None:
         accounts = AccountService(
-            JSONStorageBackend(Path(self.temp_dir.name) / "dual-source-catalog-accounts.json")
+            JSONStorageBackend(Path(self.temp_dir.name) / "representative-catalog-accounts.json")
         )
         accounts.add_account_items([
             {"access_token": "pro-a", "type": "Pro", "status": "正常"},
@@ -496,9 +569,9 @@ class ModelCatalogServiceTests(unittest.TestCase):
         route = catalog.route_for_model("web-model")
         self.assertEqual(route.access_tokens, frozenset({"pro-a", "pro-b"}))
 
-    def test_codex_group_tries_next_representative_after_first_failure(self) -> None:
+    def test_same_type_group_tries_next_representative_after_first_failure(self) -> None:
         accounts = AccountService(
-            JSONStorageBackend(Path(self.temp_dir.name) / "codex-failover-accounts.json")
+            JSONStorageBackend(Path(self.temp_dir.name) / "same-type-failover-accounts.json")
         )
         accounts.add_account_items([
             {"access_token": "codex-bad", "type": "Pro", "source_type": "codex", "status": "正常"},
@@ -513,8 +586,8 @@ class ModelCatalogServiceTests(unittest.TestCase):
             def list_models(self, **_kwargs: object) -> dict:
                 calls.append(self.access_token)
                 if self.access_token == "codex-bad":
-                    raise RuntimeError("codex representative failed")
-                return model_list("codex-recovered-model")
+                    raise RuntimeError("first same-type representative failed")
+                return model_list("recovered-model")
 
             def close(self) -> None:
                 pass
@@ -530,7 +603,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(calls.count("codex-bad"), 1)
         self.assertEqual(calls.count("codex-good"), 1)
         self.assertEqual(
-            catalog.route_for_model("codex-recovered-model").access_tokens,
+            catalog.route_for_model("recovered-model").access_tokens,
             frozenset({"codex-bad", "codex-good"}),
         )
 
@@ -587,7 +660,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
         ids = {item["id"] for item in complete["data"]}
         self.assertTrue({"pro-real-1", "pro-real-2", "pro-real-3", "pro-real-4"} <= ids)
 
-    def test_invalid_representative_is_invalidated_and_does_not_block_other_groups(self) -> None:
+    def test_failed_representative_does_not_disable_other_groups(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "invalid-representative-accounts.json")
         )
@@ -614,24 +687,27 @@ class ModelCatalogServiceTests(unittest.TestCase):
             backend_factory=Backend,
             clock=lambda: self.now,
         )
-        result = catalog.list_models()
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
+        result = catalog.list_models(wait_for_cold=False)
 
         self.assertIn("free-live-model", {item["id"] for item in result["data"]})
-        self.assertNotIn("pro-invalid", catalog._active_accounts_by_group().get("Pro", []))
+        self.assertIn("pro-invalid", catalog._active_accounts_by_group().get("Pro", []))
         invalid_account = accounts.get_account("pro-invalid")
-        self.assertTrue(invalid_account is None or invalid_account.get("status") == "异常")
+        self.assertIsNotNone(invalid_account)
+        self.assertEqual(invalid_account.get("status"), "正常")
         self.assertEqual(
             catalog.route_for_model("free-live-model").access_tokens,
             frozenset({"free-live"}),
         )
 
-    def test_codex_catalog_401_does_not_invalidate_live_account(self) -> None:
+    def test_authenticated_catalog_401_does_not_invalidate_live_account(self) -> None:
         accounts = AccountService(
-            JSONStorageBackend(Path(self.temp_dir.name) / "codex-catalog-401-accounts.json")
+            JSONStorageBackend(Path(self.temp_dir.name) / "authenticated-catalog-401-accounts.json")
         )
         accounts.add_account_items([
             {
-                "access_token": "codex-catalog-401",
+                "access_token": "authenticated-catalog-401",
                 "type": "Pro",
                 "source_type": "codex",
                 "status": "正常",
@@ -643,15 +719,15 @@ class ModelCatalogServiceTests(unittest.TestCase):
             OpenAIBackendAPI._raise_on_error(
                 object.__new__(OpenAIBackendAPI),
                 response,
-                "/backend-api/codex/models",
+                "/backend-api/models",
             )
         catalog_error = raised.exception
 
-        class CodexCatalog401Backend:
+        class AuthenticatedCatalog401Backend:
             def __init__(self, access_token: str) -> None:
                 self.access_token = access_token
 
-            def list_catalog_models(self, **_kwargs: object) -> dict:
+            def list_models(self, **_kwargs: object) -> dict:
                 raise catalog_error
 
             def close(self) -> None:
@@ -661,19 +737,19 @@ class ModelCatalogServiceTests(unittest.TestCase):
         with mock.patch.object(accounts, "remove_invalid_token", remove_invalid):
             catalog = ModelCatalogService(
                 accounts,
-                backend_factory=CodexCatalog401Backend,
+                backend_factory=AuthenticatedCatalog401Backend,
             )
             result = catalog._fetch_account_type_models(
                 "Pro",
-                ("codex-catalog-401",),
+                ("authenticated-catalog-401",),
                 time.monotonic() + 5,
             )
 
         self.assertIsNone(result.models)
         remove_invalid.assert_not_called()
-        self.assertEqual(accounts.get_account("codex-catalog-401").get("status"), "正常")
+        self.assertEqual(accounts.get_account("authenticated-catalog-401").get("status"), "正常")
 
-    def test_invalid_group_removal_does_not_freeze_remaining_catalog_refresh(self) -> None:
+    def test_failed_group_does_not_freeze_remaining_catalog_refresh(self) -> None:
         accounts = AccountService(
             JSONStorageBackend(Path(self.temp_dir.name) / "invalid-group-refresh-accounts.json")
         )
@@ -708,26 +784,28 @@ class ModelCatalogServiceTests(unittest.TestCase):
             cache_ttl_seconds=1,
             clock=lambda: now[0],
         )
-        first = catalog.list_models()
+        with self.assertRaises(ModelCatalogPendingError):
+            catalog.list_models()
+        first = catalog.list_models(wait_for_cold=False)
         self.assertIn("free-v1", {item["id"] for item in first["data"]})
         self.assertEqual(
             catalog._account_signature,
-            catalog._signature({"free": ["free-live"]}),
+            catalog._signature({"free": ["free-live"], "Pro": ["pro-invalid"]}),
         )
 
-        outcomes[""] = model_list("anonymous-v2")
-        outcomes["free-live"] = model_list("free-v2")
-        now[0] += 2
+        outcomes["pro-invalid"] = model_list("pro-recovered")
+        now[0] += model_service_module.MODEL_CATALOG_RETRY_BACKOFF_SECS + 0.1
         catalog.list_models(wait_for_cold=False)
         self.assertTrue(catalog._refresh_done.wait(timeout=3))
         second = catalog.list_models(wait_for_cold=False)
 
-        self.assertIn("free-v2", {item["id"] for item in second["data"]})
-        self.assertNotIn("free-v1", {item["id"] for item in second["data"]})
+        second_ids = {item["id"] for item in second["data"]}
+        self.assertIn("free-v1", second_ids)
+        self.assertIn("pro-recovered", second_ids)
         self.assertTrue(catalog._catalog_complete)
         self.assertEqual(
             catalog._account_signature,
-            catalog._signature({"free": ["free-live"]}),
+            catalog._signature({"free": ["free-live"], "Pro": ["pro-invalid"]}),
         )
 
     def test_transient_representative_failures_do_not_disable_accounts(self) -> None:
@@ -1307,7 +1385,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         self.assertEqual(calls, ["canonical"])
 
-    def test_group_configuration_failure_does_not_retry_every_candidate(self) -> None:
+    def test_group_failure_tries_every_candidate_until_success_or_exhaustion(self) -> None:
         class Accounts:
             def refresh_access_token(self, token: str, **_kwargs: object) -> str:
                 return token
@@ -1321,9 +1399,9 @@ class ModelCatalogServiceTests(unittest.TestCase):
             def __init__(self, access_token: str = "") -> None:
                 self.access_token = access_token
 
-            def list_catalog_models(self, **_kwargs: object) -> dict:
+            def list_models(self, **_kwargs: object) -> dict:
                 calls.append(self.access_token)
-                raise CatalogConfigurationError("codex models client version is required")
+                raise RuntimeError("authenticated catalog unavailable")
 
             def close(self) -> None:
                 pass
@@ -1331,12 +1409,12 @@ class ModelCatalogServiceTests(unittest.TestCase):
         catalog = ModelCatalogService(Accounts(), backend_factory=Backend)
         result = catalog._fetch_account_type_models(
             "free",
-            tuple(f"token-{index}" for index in range(1494)),
+            tuple(f"token-{index}" for index in range(3)),
             time.monotonic() + 10,
         )
 
         self.assertIsNone(result.models)
-        self.assertEqual(calls, ["token-0"])
+        self.assertEqual(calls, ["token-0", "token-1", "token-2"])
 
     def test_synchronous_failed_type_without_last_good_reopens_on_next_read(self) -> None:
         accounts = AccountService(
@@ -1510,6 +1588,7 @@ class ModelCatalogServiceTests(unittest.TestCase):
 
         with (
             mock.patch.object(self.catalog, "_submit_refresh_future", side_effect=submit_refresh),
+            mock.patch.object(self.catalog, "_deadline_clock", return_value=5000.0),
             self.assertRaises(model_service_module.ModelCatalogRefreshTimeout),
         ):
             self.catalog._refresh(
@@ -1522,6 +1601,85 @@ class ModelCatalogServiceTests(unittest.TestCase):
         self.assertEqual(len(submitted), 3)
         self.assertTrue(submitted[0].done())
         self.assertTrue(all(future.cancelled() for future in submitted[1:]))
+
+    def test_refresh_rejects_done_anonymous_future_after_deadline(self) -> None:
+        submitted: list[Future] = []
+
+        def submit_refresh(_func, *_args, **_kwargs):
+            future = Future()
+            future.set_result(model_list("anonymous"))
+            submitted.append(future)
+            return future
+
+        with (
+            mock.patch.object(self.catalog, "_submit_refresh_future", side_effect=submit_refresh),
+            mock.patch.object(self.catalog, "_deadline_clock", return_value=5000.0),
+            self.assertRaises(model_service_module.ModelCatalogRefreshTimeout),
+        ):
+            self.catalog._refresh(
+                self.catalog._active_accounts_by_type(),
+                {},
+                {},
+                deadline=4999.0,
+            )
+
+        self.assertEqual(len(submitted), 1)
+        self.assertTrue(submitted[0].done())
+        self.assertFalse(submitted[0].cancelled())
+
+    def test_refresh_rejects_done_account_future_after_deadline(self) -> None:
+        submitted: list[Future] = []
+        deadline_values = iter([5000.0, 5000.0, 5001.0])
+        deadline_reads: list[float] = []
+
+        class SpyAccountResult:
+            account_type = "free"
+            resolved_token = "free-good"
+            expected_account = object()
+
+            def __init__(self) -> None:
+                self.models_read = False
+
+            @property
+            def models(self):
+                self.models_read = True
+                return model_list("free-model")
+
+        account_result = SpyAccountResult()
+
+        def submit_refresh(_func, *_args, **_kwargs):
+            future = Future()
+            if not submitted:
+                future.set_result(model_list("anonymous"))
+            else:
+                future.set_result(account_result)
+            submitted.append(future)
+            return future
+
+        def deadline_clock() -> float:
+            value = next(deadline_values)
+            deadline_reads.append(value)
+            return value
+
+        with (
+            mock.patch.object(self.catalog, "_submit_refresh_future", side_effect=submit_refresh),
+            mock.patch.object(self.catalog, "_deadline_clock", side_effect=deadline_clock),
+            self.assertRaises(model_service_module.ModelCatalogRefreshTimeout),
+        ):
+            self.catalog._refresh(
+                {"free": ["free-good"]},
+                {},
+                {},
+                deadline=5001.0,
+            )
+
+        self.assertEqual(deadline_reads, [5000.0, 5000.0, 5001.0])
+        with self.assertRaises(StopIteration):
+            next(deadline_values)
+        self.assertEqual(len(submitted), 2)
+        self.assertTrue(all(future.done() for future in submitted))
+        self.assertFalse(any(future.cancelled() for future in submitted))
+        self.assertFalse(account_result.models_read)
 
     def test_refresh_admission_timeout_backs_off_types_that_never_got_a_slot(self) -> None:
         accounts = AccountService(

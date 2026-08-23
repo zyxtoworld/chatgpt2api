@@ -1288,7 +1288,6 @@ class RequestValidationContractTests(unittest.TestCase):
         unsupported_options = (
             {"input_fidelity": "high"},
             {"input_image_mask": {"image_url": "data:image/png;base64,aW1hZ2U="}},
-            {"background": "transparent"},
             {"moderation": "low"},
             {"partial_images": 1},
             {"output_format": "png", "output_compression": 50},
@@ -1307,6 +1306,82 @@ class RequestValidationContractTests(unittest.TestCase):
 
             self.assertEqual(raised.exception.status_code, 400)
             backend.assert_not_called()
+
+    def test_responses_codex_image_tool_accepts_transparent_png_and_webp(self) -> None:
+        seen = []
+
+        def image_outputs(request):
+            seen.append(request)
+            yield ImageOutput(
+                kind="result",
+                model=request.model,
+                index=1,
+                total=1,
+                data=[{"b64_json": "aW1hZ2U="}],
+            )
+
+        for output_format in ("png", "webp"):
+            with mock.patch.object(
+                openai_v1_response,
+                "stream_image_outputs_with_pool",
+                side_effect=image_outputs,
+            ) as backend:
+                response = openai_v1_response.handle({
+                    "model": "gpt-5",
+                    "input": "draw a cat",
+                    "tools": [{
+                        "type": "image_generation",
+                        "model": "pro-codex-gpt-image-2",
+                        "background": "transparent",
+                        "output_format": output_format,
+                    }],
+                })
+
+            self.assertIsInstance(response, dict)
+            backend.assert_called_once()
+            self.assertEqual(seen[-1].model, "pro-codex-gpt-image-2")
+            self.assertEqual(seen[-1].background, "transparent")
+            self.assertEqual(seen[-1].output_format, output_format)
+
+    def test_responses_web_image_tool_rejects_non_auto_background(self) -> None:
+        for output_format in ("png", "webp", "jpeg"):
+            with (
+                self.subTest(output_format=output_format),
+                mock.patch.object(openai_v1_response, "stream_image_outputs_with_pool") as backend,
+                self.assertRaises(HTTPException) as raised,
+            ):
+                openai_v1_response.handle({
+                    "model": "gpt-5",
+                    "input": "draw a cat",
+                    "tools": [{
+                        "type": "image_generation",
+                        "model": "gpt-image-2",
+                        "background": "transparent",
+                        "output_format": output_format,
+                    }],
+                })
+
+            self.assertEqual(raised.exception.status_code, 400)
+            backend.assert_not_called()
+
+    def test_responses_codex_transparent_jpeg_is_rejected(self) -> None:
+        with (
+            mock.patch.object(openai_v1_response, "stream_image_outputs_with_pool") as backend,
+            self.assertRaises(HTTPException) as raised,
+        ):
+            openai_v1_response.handle({
+                "model": "gpt-5",
+                "input": "draw a cat",
+                "tools": [{
+                    "type": "image_generation",
+                    "model": "codex-gpt-image-2",
+                    "background": "transparent",
+                    "output_format": "jpeg",
+                }],
+            })
+
+        self.assertEqual(raised.exception.status_code, 400)
+        backend.assert_not_called()
 
     def test_public_ai_routes_reject_unhonored_parameters_before_backend_selection(self) -> None:
         app = FastAPI()

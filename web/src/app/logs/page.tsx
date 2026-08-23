@@ -71,10 +71,15 @@ function LogsContent() {
   const logQueryRef = useRef<{ type: string; startDate: string; endDate: string }>({ type: LogType.Call, startDate: "", endDate: "" });
   const logRequestGateRef = useRef(createRequestGate(logQueryKey(LogType.Call, "", "")));
   const logMutationGateRef = useRef(createMutationRequestGate());
+  const logAbortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const mutationGate = logMutationGateRef.current;
-    return () => mutationGate.cancel();
+    return () => {
+      mutationGate.cancel();
+      logAbortControllerRef.current?.abort();
+      logAbortControllerRef.current = null;
+    };
   }, []);
 
   const updateLogQuery = useCallback((next: { type: string; startDate: string; endDate: string }) => {
@@ -101,10 +106,16 @@ function LogsContent() {
     if (!queryOwner.allowed) return;
     const request = logRequestGateRef.current.begin(logQueryKey(query.type, query.startDate, query.endDate));
     if (request.sequence === null) return;
+    logAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    logAbortControllerRef.current = abortController;
     setIsLoading(true);
     const accepts = () => logMutationGateRef.current.acceptsQuery(queryOwner) && logRequestGateRef.current.isCurrent(request);
     try {
-      const data = await fetchSystemLogs({ type: query.type, start_date: query.startDate, end_date: query.endDate });
+      const data = await fetchSystemLogs(
+        { type: query.type, start_date: query.startDate, end_date: query.endDate },
+        abortController.signal,
+      );
       if (!accepts()) return;
       setItems(data.items);
       setSelectedIds((current) => current.filter((id) => data.items.some((item) => item.id === id)));
@@ -114,6 +125,9 @@ function LogsContent() {
       toast.error(error instanceof Error ? error.message : "加载日志失败");
     } finally {
       if (accepts()) setIsLoading(false);
+      if (logAbortControllerRef.current === abortController) {
+        logAbortControllerRef.current = null;
+      }
     }
   }, []);
 
@@ -141,6 +155,8 @@ function LogsContent() {
     if (ids.length === 0) return;
     const mutationOwner = logMutationGateRef.current.beginMutation();
     if (!mutationOwner.accepted) return;
+    logAbortControllerRef.current?.abort();
+    logAbortControllerRef.current = null;
     setIsDeleting(true);
     try {
       const data = await deleteSystemLogs(ids);

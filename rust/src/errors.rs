@@ -40,6 +40,15 @@ impl ApiError {
             retry_after: None,
         }
     }
+    pub(super) fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            kind: "invalid_request_error",
+            code: "not_found",
+            message: "The requested resource was not found.",
+            retry_after: None,
+        }
+    }
     pub(super) fn unsupported_capability() -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -92,6 +101,24 @@ impl ApiError {
             code: "model_catalog_pending",
             message: "The model catalog is still warming up. Please try again shortly.",
             retry_after: Some("5"),
+        }
+    }
+
+    pub(super) fn websocket_parts(&self) -> (&'static str, &'static str, &'static str) {
+        (self.kind, self.code, self.message)
+    }
+
+    pub(super) fn websocket_custom(
+        kind: &'static str,
+        code: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind,
+            code,
+            message,
+            retry_after: None,
         }
     }
 

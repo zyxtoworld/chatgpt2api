@@ -49,16 +49,31 @@ let backupRunOwner: unknown = null;
 let backupDeleteOwner: unknown = null;
 let backupTestOwner: unknown = null;
 let backupWriteSettled: Promise<void> | null = null;
+let backupQueryController: AbortController | null = null;
 let backupOperationsGeneration = 0;
 let configLoadingOwner: unknown = null;
 let configWriteOwner: unknown = null;
 let configWriteSettled: Promise<void> | null = null;
+let configQueryController: AbortController | null = null;
 let settingsInitializationGeneration = 0;
 let imageStoragePresentationGeneration = 0;
 let poolSaveOwner: unknown = null;
 let poolDeleteOwner: unknown = null;
 let poolImportOwner: unknown = null;
 let poolFilesOwner: unknown = null;
+let poolListController: AbortController | null = null;
+let poolFilesController: AbortController | null = null;
+
+function abortController(controller: AbortController | null) {
+  controller?.abort();
+}
+
+function abortPoolQueries() {
+  abortController(poolListController);
+  abortController(poolFilesController);
+  poolListController = null;
+  poolFilesController = null;
+}
 
 function beginBackupMutation() {
   const writeOwner = backupWriteGate.beginMutation();
@@ -70,6 +85,8 @@ function beginBackupMutation() {
     backupWriteGate.finishMutation(writeOwner);
     return null;
   }
+  abortController(backupQueryController);
+  backupQueryController = null;
   let resolveSettled!: () => void;
   const settled = new Promise<void>((resolve) => {
     resolveSettled = resolve;
@@ -519,10 +536,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!configRequestGate.acceptsQuery(queryOwner)) {
       return;
     }
+    abortController(configQueryController);
+    const requestController = new AbortController();
+    configQueryController = requestController;
     configLoadingOwner = queryOwner;
     set({ isLoadingConfig: true });
     try {
-      const data = await fetchSettingsConfig();
+      const data = await fetchSettingsConfig(requestController.signal);
       const normalized = normalizeConfig(data.config);
       if (configRequestGate.acceptsQuery(queryOwner)) {
         set({
@@ -534,6 +554,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         toast.error(error instanceof Error ? error.message : "加载系统配置失败");
       }
     } finally {
+      if (configQueryController === requestController) {
+        configQueryController = null;
+      }
       if (configLoadingOwner === queryOwner && configRequestGate.acceptsQuery(queryOwner)) {
         configLoadingOwner = null;
         set({ isLoadingConfig: false });
@@ -542,6 +565,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   cancelConfigOperations: () => {
+    abortController(configQueryController);
+    configQueryController = null;
     configLoadingOwner = null;
     configRequestGate.cancel();
     set({ isLoadingConfig: false });
@@ -575,6 +600,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     configWriteSettled = writeSettled;
     configWriteOwner = writeOwner;
     configLoadingOwner = null;
+    abortController(configQueryController);
+    configQueryController = null;
     set({ isLoadingConfig: false, isSavingConfig: true });
     try {
       const data = await updateSettingsConfig({
@@ -1033,6 +1060,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!queryOwner.allowed) {
       return;
     }
+    abortController(backupQueryController);
+    const requestController = new AbortController();
+    backupQueryController = requestController;
     if (!silent) {
       backupLoadingOwner = queryOwner;
       set({ isLoadingBackups: true });
@@ -1051,6 +1081,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         toast.error(error instanceof Error ? error.message : "加载备份列表失败");
       }
     } finally {
+      if (backupQueryController === requestController) {
+        backupQueryController = null;
+      }
       if (!silent && backupLoadingOwner === queryOwner) {
         backupLoadingOwner = null;
         set({ isLoadingBackups: false });
@@ -1063,6 +1096,8 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   cancelBackupOperations: () => {
+    abortController(backupQueryController);
+    backupQueryController = null;
     backupOperationsGeneration += 1;
     backupRequestGate.cancel();
     backupLoadingOwner = null;
@@ -1177,6 +1212,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!queryOwner.allowed) {
       return;
     }
+    abortController(poolListController);
+    const requestController = new AbortController();
+    poolListController = requestController;
     if (!silent) {
       poolLoadingOwner = queryOwner;
       set({ isLoadingPools: true });
@@ -1192,6 +1230,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         toast.error(error instanceof Error ? error.message : "加载 CPA 连接失败");
       }
     } finally {
+      if (poolListController === requestController) {
+        poolListController = null;
+      }
       if (!silent && poolLoadingOwner === queryOwner) {
         poolLoadingOwner = null;
         set({ isLoadingPools: false });
@@ -1204,6 +1245,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   },
 
   cancelPoolOperations: () => {
+    abortPoolQueries();
     poolRequestGate.cancel();
     poolLoadingOwner = null;
     poolSaveOwner = null;
@@ -1271,6 +1313,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.error("已有 CPA 操作正在进行，请稍候");
       return;
     }
+    abortPoolQueries();
     poolLoadingOwner = null;
     poolSaveOwner = mutationOwner;
     set({ isLoadingPools: false, isSavingPool: true });
@@ -1315,6 +1358,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.error("已有 CPA 操作正在进行，请稍候");
       return;
     }
+    abortPoolQueries();
     poolLoadingOwner = null;
     poolDeleteOwner = mutationOwner;
     set({ isLoadingPools: false, deletingId: pool.id });
@@ -1342,10 +1386,13 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     if (!queryOwner.allowed) {
       return;
     }
+    abortController(poolFilesController);
+    const requestController = new AbortController();
+    poolFilesController = requestController;
     poolFilesOwner = queryOwner;
     set({ loadingFilesId: pool.id });
     try {
-      const data = await fetchCPAPoolFiles(pool.id);
+      const data = await fetchCPAPoolFiles(pool.id, requestController.signal);
       if (!poolRequestGate.acceptsQuery(queryOwner)) {
         return;
       }
@@ -1368,6 +1415,9 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         toast.error(error instanceof Error ? error.message : "读取远程账号失败");
       }
     } finally {
+      if (poolFilesController === requestController) {
+        poolFilesController = null;
+      }
       if (poolFilesOwner === queryOwner) {
         poolFilesOwner = null;
         set({ loadingFilesId: null });
@@ -1423,6 +1473,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       toast.error("已有 CPA 操作正在进行，请稍候");
       return;
     }
+    abortPoolQueries();
     poolLoadingOwner = null;
     poolImportOwner = mutationOwner;
     set({ isLoadingPools: false, isStartingImport: true });

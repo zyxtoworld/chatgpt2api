@@ -769,6 +769,29 @@ class ImageAPIFormatContractTests(unittest.TestCase):
         self.assertEqual(result["quality"], "high")
         self.assertEqual(result["background"], "opaque")
 
+    def test_jpeg_compression_zero_and_one_keep_distinct_inputs_and_defined_output(self) -> None:
+        outputs = {}
+        for compression in (0, 1):
+            result = format_image_result(
+                [{"b64_json": base64.b64encode(PNG_BYTES).decode("ascii")}],
+                "cat",
+                "b64_json",
+                output_format="jpeg",
+                output_compression=compression,
+                background="auto",
+            )
+            decoded = base64.b64decode(result["data"][0]["b64_json"])
+            with Image.open(io.BytesIO(decoded)) as image:
+                self.assertEqual(image.format, "JPEG")
+            outputs[compression] = decoded
+
+        self.assertEqual(set(outputs), {0, 1})
+        self.assertEqual(
+            outputs[0],
+            outputs[1],
+            "Pillow defines JPEG quality 0 at the same lower bound as quality 1",
+        )
+
     def test_generation_preserves_supported_official_image_fields(self) -> None:
         seen: list[dict[str, object]] = []
         app = FastAPI()

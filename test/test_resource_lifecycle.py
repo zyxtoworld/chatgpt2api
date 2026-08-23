@@ -1448,7 +1448,21 @@ class ResourceLifecycleTests(unittest.TestCase):
         command = json.loads(command_line.removeprefix("CMD "))
 
         self.assertNotIn("--access-log", command)
-        self.assertIn("--no-access-log", command)
+        self.assertEqual(
+            command,
+            [
+                "uv",
+                "run",
+                "--no-sync",
+                "uvicorn",
+                "main:app",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "80",
+                "--no-access-log",
+            ],
+        )
 
     def test_responses_websocket_connections_are_globally_bounded(self) -> None:
         class FakeWebSocket:

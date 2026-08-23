@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import anyio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -139,6 +140,15 @@ class ProxyRuntimeApiTests(unittest.TestCase):
         app = FastAPI()
         app.include_router(system_module.create_router("9.9.9-test"))
         self.client = TestClient(app)
+
+        def assert_health_probes_quiescent() -> None:
+            if not anyio.run(system_module.wait_for_health_probe_tasks):
+                raise AssertionError("health probe workers remained active after TestClient cleanup")
+
+        # TestClient.close must run before patchers stop.  The subsequent global
+        # drain also covers workers registered by a different portal event loop.
+        self.addCleanup(assert_health_probes_quiescent)
+        self.addCleanup(self.client.close)
 
     def test_proxy_test_can_use_active_runtime_when_url_is_empty(self) -> None:
         response = self.client.post("/api/proxy/test", headers=AUTH_HEADERS, json={})

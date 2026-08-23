@@ -1,6 +1,6 @@
 use std::io;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::{ApiError, native_completion_id, native_message_id, sse_delimiter};
 
@@ -12,6 +12,7 @@ pub(super) fn native_codex_responses_json(
     let mut text = String::new();
     let mut response_id = None;
     let mut completed_response = None;
+    let mut terminal_status = None;
     let mut terminal = false;
     while let Some((position, delimiter_length)) = sse_delimiter(&buffer) {
         let event = buffer.drain(..position).collect::<Vec<_>>();
@@ -30,8 +31,7 @@ pub(super) fn native_codex_responses_json(
         if terminal {
             return Err(ApiError::upstream());
         }
-        let rule = response_event_rule(event_type).ok_or_else(ApiError::upstream)?;
-        validate_response_event(&value, event_type, rule)?;
+        validate_codex_response_event(&value).map_err(|_| ApiError::upstream())?;
         match event_type {
             "response.created" | "response.in_progress" => {
                 let response = value
@@ -62,8 +62,23 @@ pub(super) fn native_codex_responses_json(
                 }
                 terminal = true;
                 completed_response = Some(Value::Object(response.clone()));
+                terminal_status = Some("completed");
             }
-            "response.failed" | "response.incomplete" | "error" => {
+            "response.incomplete" => {
+                let response = value
+                    .get("response")
+                    .and_then(Value::as_object)
+                    .ok_or_else(ApiError::upstream)?;
+                if let Some(output) = response.get("output") {
+                    for item in output.as_array().ok_or_else(ApiError::upstream)? {
+                        validate_output_item(item)?;
+                    }
+                }
+                terminal = true;
+                completed_response = Some(Value::Object(response.clone()));
+                terminal_status = Some("incomplete");
+            }
+            "response.failed" | "error" => {
                 return Err(ApiError::upstream());
             }
             "response.output_item.added" | "response.output_item.done" => {
@@ -139,7 +154,10 @@ pub(super) fn native_codex_responses_json(
         .unwrap_or_else(native_completion_id);
     response.insert("id".to_owned(), Value::String(response_id));
     response.insert("object".to_owned(), json!("response"));
-    response.insert("status".to_owned(), json!("completed"));
+    response.insert(
+        "status".to_owned(),
+        json!(terminal_status.unwrap_or("completed")),
+    );
     if response.get("model").and_then(Value::as_str).is_none() {
         response.insert(
             "model".to_owned(),
@@ -152,7 +170,7 @@ pub(super) fn native_codex_responses_json(
             json!([{
                 "type": "message",
                 "id": format!("msg_{}", native_message_id()),
-                "status": "completed",
+                "status": terminal_status.unwrap_or("completed"),
                 "role": "assistant",
                 "content": [{
                     "type": "output_text",
@@ -162,7 +180,9 @@ pub(super) fn native_codex_responses_json(
             }]),
         );
     }
-    Ok(Value::Object(response))
+    let response = Value::Object(response);
+    normalize_terminal_response(&response, terminal_status.unwrap_or("completed"))
+        .map_err(|_| ApiError::upstream())
 }
 
 #[derive(Clone, Copy)]
@@ -788,6 +808,10 @@ const CUSTOM_TOOL_CALL_OUTPUT_ITEM_FIELDS: &[FieldRule] = &[
     field("output", FieldKind::Any),
     field("status", FieldKind::String),
 ];
+const MCP_CALL_OUTPUT_ITEM_FIELDS: &[FieldRule] = &[
+    field("call_id", FieldKind::String),
+    field("output", FieldKind::Object),
+];
 
 const OUTPUT_ITEM_RULES: &[OutputItemRule] = &[
     OutputItemRule {
@@ -883,6 +907,14 @@ const OUTPUT_ITEM_RULES: &[OutputItemRule] = &[
         fields: MCP_CALL_ITEM_FIELDS,
     },
     OutputItemRule {
+        name: "mcp_call_output",
+        fields: MCP_CALL_OUTPUT_ITEM_FIELDS,
+    },
+    OutputItemRule {
+        name: "mcp_tool_call_output",
+        fields: MCP_CALL_OUTPUT_ITEM_FIELDS,
+    },
+    OutputItemRule {
         name: "mcp_list_tools",
         fields: MCP_LIST_TOOLS_ITEM_FIELDS,
     },
@@ -948,7 +980,981 @@ fn validate_output_item(value: &Value) -> Result<(), ApiError> {
     for field_rule in rule.fields {
         validate_field(value, *field_rule)?;
     }
+    if kind == "message" {
+        let content = object
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(ApiError::upstream)?;
+        for part in content {
+            let part = part.as_object().ok_or_else(ApiError::upstream)?;
+            match part.get("type").and_then(Value::as_str) {
+                Some("output_text") => {
+                    if !part.get("text").is_some_and(Value::is_string)
+                        || part
+                            .get("annotations")
+                            .is_some_and(|value| !value.is_array())
+                        || part.get("logprobs").is_some_and(|value| !value.is_array())
+                    {
+                        return Err(ApiError::upstream());
+                    }
+                    if let Some(annotations) = part.get("annotations").and_then(Value::as_array) {
+                        for annotation in annotations {
+                            let annotation =
+                                annotation.as_object().ok_or_else(ApiError::upstream)?;
+                            if annotation.get("type").and_then(Value::as_str).is_none()
+                                || annotation
+                                    .get("url")
+                                    .is_some_and(|value| !value.is_string())
+                                || annotation
+                                    .get("title")
+                                    .is_some_and(|value| !value.is_string())
+                                || annotation
+                                    .get("start_index")
+                                    .is_some_and(|value| value.as_u64().is_none())
+                                || annotation
+                                    .get("end_index")
+                                    .is_some_and(|value| value.as_u64().is_none())
+                            {
+                                return Err(ApiError::upstream());
+                            }
+                        }
+                    }
+                }
+                Some("refusal") => {
+                    if !part.get("refusal").is_some_and(Value::is_string) {
+                        return Err(ApiError::upstream());
+                    }
+                }
+                _ => return Err(ApiError::upstream()),
+            }
+        }
+    }
+    if matches!(kind, "mcp_call_output" | "mcp_tool_call_output")
+        && object
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(ApiError::upstream());
+    }
     Ok(())
+}
+
+fn validate_codex_usage(value: &Value) -> Result<(), ApiError> {
+    let object = value.as_object().ok_or_else(ApiError::upstream)?;
+    for field in ["input_tokens", "output_tokens", "total_tokens"] {
+        if object
+            .get(field)
+            .is_none_or(|value| value.as_u64().is_none())
+        {
+            return Err(ApiError::upstream());
+        }
+    }
+    for (field, required, optional) in [
+        (
+            "input_tokens_details",
+            "cached_tokens",
+            ["cache_write_tokens", "text_tokens", "image_tokens"].as_slice(),
+        ),
+        (
+            "output_tokens_details",
+            "reasoning_tokens",
+            ["text_tokens", "image_tokens"].as_slice(),
+        ),
+    ] {
+        let Some(details) = object.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let details = details.as_object().ok_or_else(ApiError::upstream)?;
+        if details
+            .get(required)
+            .is_none_or(|value| value.as_u64().is_none())
+            || optional.iter().any(|name| {
+                details
+                    .get(*name)
+                    .is_some_and(|value| value.as_u64().is_none())
+            })
+        {
+            return Err(ApiError::upstream());
+        }
+    }
+    Ok(())
+}
+
+fn validate_response_envelope(
+    value: &Value,
+    expected_status: Option<&str>,
+) -> Result<(), ApiError> {
+    let response = value
+        .get("response")
+        .and_then(Value::as_object)
+        .ok_or_else(ApiError::upstream)?;
+    if response
+        .get("id")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+        || response.get("model").is_some_and(|value| {
+            !value.is_null() && value.as_str().is_none_or(|v| v.trim().is_empty())
+        })
+        || response
+            .get("created_at")
+            .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+        || response
+            .get("status")
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        || response
+            .get("output")
+            .is_some_and(|value| !value.is_array())
+        || response
+            .get("error")
+            .is_some_and(|value| !value.is_null() && !value.is_object())
+    {
+        return Err(ApiError::upstream());
+    }
+    if let Some(status) = expected_status {
+        if response.get("error").is_some_and(|value| !value.is_null()) {
+            return Err(ApiError::upstream());
+        }
+        if response
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value != status)
+        {
+            return Err(ApiError::upstream());
+        }
+        if status == "completed" {
+            if response
+                .get("incomplete_details")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err(ApiError::upstream());
+            }
+        } else if let Some(details) = response
+            .get("incomplete_details")
+            .filter(|value| !value.is_null())
+        {
+            let details = details.as_object().ok_or_else(ApiError::upstream)?;
+            if details.get("reason").is_some_and(|value| {
+                !value.is_null()
+                    && !matches!(value.as_str(), Some("max_output_tokens" | "content_filter"))
+            }) {
+                return Err(ApiError::upstream());
+            }
+        }
+    }
+    if let Some(output) = response.get("output").and_then(Value::as_array) {
+        for item in output {
+            validate_output_item(item)?;
+        }
+    }
+    if let Some(usage) = response.get("usage").filter(|value| !value.is_null()) {
+        validate_codex_usage(usage)?;
+    }
+    Ok(())
+}
+
+fn validate_active_response_envelope(value: &Value) -> Result<(), ApiError> {
+    validate_response_envelope(value, Some("in_progress"))?;
+    let response = value
+        .get("response")
+        .and_then(Value::as_object)
+        .ok_or_else(ApiError::upstream)?;
+    if response.get("error").is_some_and(|value| !value.is_null())
+        || response
+            .get("incomplete_details")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err(ApiError::upstream());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_codex_response_event(value: &Value) -> Result<&str, io::Error> {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("malformed Codex event type"))?;
+    let rule = response_event_rule(event_type)
+        .ok_or_else(|| io::Error::other("unknown Codex response event"))?;
+    validate_response_event(value, event_type, rule)
+        .map_err(|_| io::Error::other("malformed Codex response event"))?;
+    if matches!(
+        event_type,
+        "response.output_item.added" | "response.output_item.done"
+    ) {
+        validate_output_item(
+            value
+                .get("item")
+                .ok_or_else(|| io::Error::other("malformed Codex output item"))?,
+        )
+        .map_err(|_| io::Error::other("malformed Codex output item"))?;
+    }
+    match event_type {
+        "response.created" | "response.in_progress" => validate_active_response_envelope(value),
+        "response.completed" => validate_response_envelope(value, Some("completed")),
+        "response.incomplete" => validate_response_envelope(value, Some("incomplete")),
+        _ => Ok(()),
+    }
+    .map_err(|_| io::Error::other("malformed Codex response envelope"))?;
+    Ok(event_type)
+}
+
+const PUBLIC_EVENT_FIELDS: &[&str] = &[
+    "type",
+    "sequence_number",
+    "response",
+    "item",
+    "output_index",
+    "content_index",
+    "item_id",
+    "delta",
+    "text",
+    "arguments",
+    "part",
+    "code",
+    "message",
+    "param",
+    "error",
+];
+
+const PUBLIC_RESPONSE_FIELDS: &[&str] = &[
+    "id",
+    "object",
+    "created_at",
+    "status",
+    "error",
+    "incomplete_details",
+    "model",
+    "output",
+    "parallel_tool_calls",
+    "usage",
+];
+
+const PUBLIC_MESSAGE_ITEM_FIELDS: &[&str] = &["type", "id", "role", "content", "phase", "status"];
+const PUBLIC_FILE_SEARCH_ITEM_FIELDS: &[&str] = &["type", "id", "queries", "status"];
+const PUBLIC_FUNCTION_CALL_ITEM_FIELDS: &[&str] = &[
+    "type",
+    "id",
+    "call_id",
+    "name",
+    "description",
+    "namespace",
+    "arguments",
+    "encrypted_function_args",
+    "status",
+];
+const PUBLIC_FUNCTION_CALL_OUTPUT_ITEM_FIELDS: &[&str] =
+    &["type", "id", "call_id", "output", "status"];
+const PUBLIC_WEB_SEARCH_ITEM_FIELDS: &[&str] = &["type", "id", "action", "status"];
+const PUBLIC_COMPUTER_CALL_ITEM_FIELDS: &[&str] =
+    &["type", "id", "call_id", "pending_safety_checks", "status"];
+const PUBLIC_COMPUTER_CALL_OUTPUT_ITEM_FIELDS: &[&str] =
+    &["type", "id", "call_id", "output", "status"];
+const PUBLIC_REASONING_ITEM_FIELDS: &[&str] = &[
+    "type",
+    "id",
+    "summary",
+    "content",
+    "encrypted_content",
+    "status",
+];
+const PUBLIC_PROGRAM_ITEM_FIELDS: &[&str] = &["type", "id", "call_id", "code", "fingerprint"];
+const PUBLIC_PROGRAM_OUTPUT_ITEM_FIELDS: &[&str] = &["type", "id", "call_id", "result", "status"];
+const PUBLIC_TOOL_SEARCH_CALL_ITEM_FIELDS: &[&str] =
+    &["type", "id", "call_id", "status", "execution", "arguments"];
+const PUBLIC_TOOL_SEARCH_OUTPUT_ITEM_FIELDS: &[&str] =
+    &["type", "id", "call_id", "status", "execution", "tools"];
+const PUBLIC_ADDITIONAL_TOOLS_ITEM_FIELDS: &[&str] = &["type", "id", "role", "tools"];
+const PUBLIC_COMPACTION_ITEM_FIELDS: &[&str] = &["type", "id", "encrypted_content"];
+const PUBLIC_IMAGE_GENERATION_ITEM_FIELDS: &[&str] =
+    &["type", "id", "status", "revised_prompt", "result"];
+const PUBLIC_CODE_INTERPRETER_ITEM_FIELDS: &[&str] =
+    &["type", "id", "code", "container_id", "outputs", "status"];
+const PUBLIC_LOCAL_SHELL_ITEM_FIELDS: &[&str] = &["type", "id", "action", "call_id", "status"];
+const PUBLIC_LOCAL_SHELL_OUTPUT_ITEM_FIELDS: &[&str] = &["type", "id", "output"];
+const PUBLIC_SHELL_ITEM_FIELDS: &[&str] =
+    &["type", "id", "action", "call_id", "environment", "status"];
+const PUBLIC_SHELL_OUTPUT_ITEM_FIELDS: &[&str] = &[
+    "type",
+    "id",
+    "call_id",
+    "max_output_length",
+    "output",
+    "status",
+];
+const PUBLIC_APPLY_PATCH_ITEM_FIELDS: &[&str] = &["type", "id", "call_id", "operation", "status"];
+const PUBLIC_APPLY_PATCH_OUTPUT_ITEM_FIELDS: &[&str] = &["type", "id", "call_id", "status"];
+const PUBLIC_MCP_CALL_ITEM_FIELDS: &[&str] = &["type", "id", "arguments", "name", "server_label"];
+const PUBLIC_MCP_LIST_TOOLS_ITEM_FIELDS: &[&str] = &["type", "id", "server_label", "tools"];
+const PUBLIC_MCP_APPROVAL_REQUEST_ITEM_FIELDS: &[&str] =
+    &["type", "id", "arguments", "name", "server_label"];
+const PUBLIC_MCP_APPROVAL_RESPONSE_ITEM_FIELDS: &[&str] =
+    &["type", "id", "approval_request_id", "approve"];
+const PUBLIC_CUSTOM_TOOL_CALL_ITEM_FIELDS: &[&str] = &[
+    "type",
+    "id",
+    "call_id",
+    "name",
+    "namespace",
+    "input",
+    "status",
+];
+const PUBLIC_CUSTOM_TOOL_CALL_OUTPUT_ITEM_FIELDS: &[&str] =
+    &["type", "id", "call_id", "name", "output", "status"];
+const PUBLIC_MCP_CALL_OUTPUT_ITEM_FIELDS: &[&str] = &["type", "call_id", "output"];
+
+const PUBLIC_CONTENT_FIELDS: &[&str] = &[
+    "type",
+    "text",
+    "annotations",
+    "logprobs",
+    "image_url",
+    "detail",
+    "audio_url",
+    "encrypted_content",
+];
+const PUBLIC_ANNOTATION_FIELDS: &[&str] = &["type", "url", "title", "start_index", "end_index"];
+const PUBLIC_LOGPROB_FIELDS: &[&str] = &["token", "logprob", "bytes", "top_logprobs"];
+const PUBLIC_ERROR_FIELDS: &[&str] = &["type", "code", "message", "param"];
+const PUBLIC_USAGE_FIELDS: &[&str] = &[
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "input_tokens_details",
+    "output_tokens_details",
+];
+const PUBLIC_USAGE_DETAIL_FIELDS: &[&str] = &[
+    "cached_tokens",
+    "cache_write_tokens",
+    "text_tokens",
+    "image_tokens",
+    "reasoning_tokens",
+];
+const PUBLIC_ACTION_FIELDS: &[&str] = &["type", "query", "queries", "url", "pattern"];
+const PUBLIC_ENVIRONMENT_FIELDS: &[&str] = &[
+    "type",
+    "id",
+    "name",
+    "container_id",
+    "shell",
+    "working_directory",
+    "env",
+    "network",
+    "timeout",
+    "description",
+    "text",
+];
+const PUBLIC_OPERATION_FIELDS: &[&str] = &[
+    "type",
+    "id",
+    "operation",
+    "path",
+    "patch",
+    "status",
+    "command",
+    "description",
+    "text",
+];
+const PUBLIC_SAFETY_CHECK_FIELDS: &[&str] = &["type", "id", "code", "message", "reason"];
+const PUBLIC_OUTPUT_FIELDS: &[&str] = &[
+    "type",
+    "id",
+    "text",
+    "logs",
+    "files",
+    "stdout",
+    "stderr",
+    "command",
+    "exit_code",
+    "status",
+    "mime_type",
+    "filename",
+    "url",
+    "data",
+    "content",
+];
+const PUBLIC_TOOL_DEFINITION_FIELDS: &[&str] = &[
+    "type",
+    "name",
+    "description",
+    "parameters",
+    "strict",
+    "defer_loading",
+];
+const PUBLIC_TOOL_SCHEMA_FIELDS: &[&str] = &[
+    "type",
+    "properties",
+    "required",
+    "items",
+    "additionalProperties",
+    "description",
+    "title",
+    "pattern",
+    "enum",
+    "const",
+    "oneOf",
+    "anyOf",
+    "allOf",
+    "minLength",
+    "maxLength",
+    "minimum",
+    "maximum",
+];
+const PUBLIC_TOOL_SCHEMA_STRING_FIELDS: &[&str] = &["description", "title", "pattern"];
+const PUBLIC_TOOL_SCHEMA_NUMBER_FIELDS: &[&str] = &["minLength", "maxLength", "minimum", "maximum"];
+const PUBLIC_STRING_FIELDS: &[&str] = &[
+    "type",
+    "id",
+    "object",
+    "status",
+    "model",
+    "role",
+    "phase",
+    "item_id",
+    "call_id",
+    "name",
+    "namespace",
+    "delta",
+    "text",
+    "arguments",
+    "encrypted_content",
+    "result",
+    "revised_prompt",
+    "execution",
+    "detail",
+    "image_url",
+    "audio_url",
+    "code",
+    "message",
+    "param",
+    "url",
+    "title",
+    "query",
+    "pattern",
+    "description",
+    "path",
+    "patch",
+    "command",
+    "stdout",
+    "stderr",
+    "logs",
+    "mime_type",
+    "filename",
+    "reason",
+];
+const PUBLIC_INTEGER_FIELDS: &[&str] = &[
+    "sequence_number",
+    "output_index",
+    "content_index",
+    "created_at",
+    "start_index",
+    "end_index",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "cache_write_tokens",
+    "text_tokens",
+    "image_tokens",
+    "reasoning_tokens",
+    "max_output_length",
+    "exit_code",
+    "timeout",
+];
+
+fn has_field(fields: &[&str], field: &str) -> bool {
+    fields.contains(&field)
+}
+
+fn project_public_integer(value: &Value) -> Result<Value, ()> {
+    value.as_u64().map(Value::from).ok_or(())
+}
+
+fn project_public_number(value: &Value) -> Result<Value, ()> {
+    value.is_number().then(|| value.clone()).ok_or(())
+}
+
+fn project_public_array(value: &Value) -> Result<&Vec<Value>, ()> {
+    value.as_array().ok_or(())
+}
+
+fn project_public_annotation(value: &Value) -> Result<Value, ()> {
+    project_public_object(value, PUBLIC_ANNOTATION_FIELDS)
+}
+
+fn project_public_environment(value: &Value) -> Result<Value, ()> {
+    project_public_object(value, PUBLIC_ENVIRONMENT_FIELDS)
+}
+
+fn project_public_operation(value: &Value) -> Result<Value, ()> {
+    project_public_object(value, PUBLIC_OPERATION_FIELDS)
+}
+
+fn project_public_safety_checks(value: &Value) -> Result<Value, ()> {
+    let values = project_public_array(value)?;
+    Ok(Value::Array(
+        values
+            .iter()
+            .map(|value| project_public_object(value, PUBLIC_SAFETY_CHECK_FIELDS))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+fn project_public_outputs(value: &Value) -> Result<Value, ()> {
+    let values = project_public_array(value)?;
+    Ok(Value::Array(
+        values
+            .iter()
+            .map(|value| project_public_object(value, PUBLIC_OUTPUT_FIELDS))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+fn project_public_output_object(value: &Value) -> Result<Value, ()> {
+    project_public_object(value, PUBLIC_OUTPUT_FIELDS)
+}
+
+fn project_public_item_output(value: &Value) -> Result<Value, ()> {
+    if value.is_null() || value.is_string() || value.is_number() || value.is_boolean() {
+        return Ok(value.clone());
+    }
+    if value.is_object() {
+        return project_public_output_object(value);
+    }
+    project_public_outputs(value)
+}
+
+fn public_item_fields(item_type: &str) -> Option<&'static [&'static str]> {
+    Some(match item_type {
+        "message" => PUBLIC_MESSAGE_ITEM_FIELDS,
+        "file_search_call" => PUBLIC_FILE_SEARCH_ITEM_FIELDS,
+        "function_call" => PUBLIC_FUNCTION_CALL_ITEM_FIELDS,
+        "function_call_output" => PUBLIC_FUNCTION_CALL_OUTPUT_ITEM_FIELDS,
+        "web_search_call" => PUBLIC_WEB_SEARCH_ITEM_FIELDS,
+        "computer_call" => PUBLIC_COMPUTER_CALL_ITEM_FIELDS,
+        "computer_call_output" => PUBLIC_COMPUTER_CALL_OUTPUT_ITEM_FIELDS,
+        "reasoning" => PUBLIC_REASONING_ITEM_FIELDS,
+        "program" => PUBLIC_PROGRAM_ITEM_FIELDS,
+        "program_output" => PUBLIC_PROGRAM_OUTPUT_ITEM_FIELDS,
+        "tool_search_call" => PUBLIC_TOOL_SEARCH_CALL_ITEM_FIELDS,
+        "tool_search_output" => PUBLIC_TOOL_SEARCH_OUTPUT_ITEM_FIELDS,
+        "additional_tools" => PUBLIC_ADDITIONAL_TOOLS_ITEM_FIELDS,
+        "compaction" => PUBLIC_COMPACTION_ITEM_FIELDS,
+        "image_generation_call" => PUBLIC_IMAGE_GENERATION_ITEM_FIELDS,
+        "code_interpreter_call" => PUBLIC_CODE_INTERPRETER_ITEM_FIELDS,
+        "local_shell_call" => PUBLIC_LOCAL_SHELL_ITEM_FIELDS,
+        "local_shell_call_output" => PUBLIC_LOCAL_SHELL_OUTPUT_ITEM_FIELDS,
+        "shell_call" => PUBLIC_SHELL_ITEM_FIELDS,
+        "shell_call_output" => PUBLIC_SHELL_OUTPUT_ITEM_FIELDS,
+        "apply_patch_call" => PUBLIC_APPLY_PATCH_ITEM_FIELDS,
+        "apply_patch_call_output" => PUBLIC_APPLY_PATCH_OUTPUT_ITEM_FIELDS,
+        "mcp_call" => PUBLIC_MCP_CALL_ITEM_FIELDS,
+        "mcp_call_output" | "mcp_tool_call_output" => PUBLIC_MCP_CALL_OUTPUT_ITEM_FIELDS,
+        "mcp_list_tools" => PUBLIC_MCP_LIST_TOOLS_ITEM_FIELDS,
+        "mcp_approval_request" => PUBLIC_MCP_APPROVAL_REQUEST_ITEM_FIELDS,
+        "mcp_approval_response" => PUBLIC_MCP_APPROVAL_RESPONSE_ITEM_FIELDS,
+        "custom_tool_call" => PUBLIC_CUSTOM_TOOL_CALL_ITEM_FIELDS,
+        "custom_tool_call_output" => PUBLIC_CUSTOM_TOOL_CALL_OUTPUT_ITEM_FIELDS,
+        _ => return None,
+    })
+}
+
+fn project_public_logprob(value: &Value) -> Result<Value, ()> {
+    let object = value.as_object().ok_or(())?;
+    let mut projected = Map::new();
+    for field in PUBLIC_LOGPROB_FIELDS {
+        let Some(child) = object.get(*field) else {
+            continue;
+        };
+        let value = match *field {
+            "token" => child.is_string().then(|| child.clone()).ok_or(())?,
+            "logprob" => project_public_number(child)?,
+            "bytes" => {
+                let bytes = project_public_array(child)?;
+                Value::Array(
+                    bytes
+                        .iter()
+                        .map(project_public_integer)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+            "top_logprobs" => {
+                let values = project_public_array(child)?;
+                Value::Array(
+                    values
+                        .iter()
+                        .map(project_public_logprob)
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
+            _ => unreachable!(),
+        };
+        projected.insert((*field).to_owned(), value);
+    }
+    Ok(Value::Object(projected))
+}
+
+fn project_public_tool_schema(value: &Value) -> Result<Value, ()> {
+    let object = value.as_object().ok_or(())?;
+    let mut projected = Map::new();
+    for (field, child) in object {
+        if !has_field(PUBLIC_TOOL_SCHEMA_FIELDS, field) {
+            continue;
+        }
+        let projected_child = if has_field(PUBLIC_TOOL_SCHEMA_STRING_FIELDS, field) {
+            child
+                .as_str()
+                .map(|value| Value::String(value.to_owned()))
+                .ok_or(())?
+        } else if field == "type" {
+            match child {
+                Value::String(_) => child.clone(),
+                Value::Array(values) if values.iter().all(Value::is_string) => child.clone(),
+                _ => return Err(()),
+            }
+        } else if field == "properties" {
+            let properties = child.as_object().ok_or(())?;
+            let mut projected_properties = Map::new();
+            for (name, schema) in properties {
+                if !schema.is_object() {
+                    continue;
+                }
+                projected_properties.insert(name.clone(), project_public_tool_schema(schema)?);
+            }
+            Value::Object(projected_properties)
+        } else if field == "required" {
+            let required = project_public_array(child)?;
+            Value::Array(
+                required
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(|value| Value::String(value.to_owned()))
+                            .ok_or(())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else if field == "items" {
+            project_public_tool_schema(child)?
+        } else if field == "additionalProperties" {
+            if child.is_boolean() {
+                child.clone()
+            } else {
+                project_public_tool_schema(child)?
+            }
+        } else if matches!(field.as_str(), "oneOf" | "anyOf" | "allOf") {
+            let values = project_public_array(child)?;
+            Value::Array(
+                values
+                    .iter()
+                    .map(project_public_tool_schema)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        } else if field == "enum" {
+            let values = project_public_array(child)?;
+            if values
+                .iter()
+                .any(|value| value.is_object() || value.is_array())
+            {
+                return Err(());
+            }
+            child.clone()
+        } else if field == "const" {
+            if child.is_object() || child.is_array() {
+                return Err(());
+            }
+            child.clone()
+        } else if has_field(PUBLIC_TOOL_SCHEMA_NUMBER_FIELDS, field) {
+            project_public_number(child)?
+        } else {
+            unreachable!()
+        };
+        projected.insert(field.clone(), projected_child);
+    }
+    Ok(Value::Object(projected))
+}
+
+fn project_public_object(value: &Value, fields: &[&str]) -> Result<Value, ()> {
+    let object = value.as_object().ok_or(())?;
+    let mut projected = Map::new();
+    for field in fields {
+        let Some(child) = object.get(*field) else {
+            continue;
+        };
+        projected.insert(
+            (*field).to_owned(),
+            project_public_value(child, Some(field))?,
+        );
+    }
+    Ok(Value::Object(projected))
+}
+
+fn project_public_value(value: &Value, field: Option<&str>) -> Result<Value, ()> {
+    let Some(field) = field else {
+        return Ok(value.clone());
+    };
+    if matches!(field, "error" | "item" | "response" | "usage")
+        && !value.is_null()
+        && !value.is_object()
+    {
+        return Err(());
+    }
+    if value.is_null()
+        && matches!(
+            field,
+            "error"
+                | "item"
+                | "response"
+                | "usage"
+                | "action"
+                | "tool_definition"
+                | "input_tokens_details"
+                | "output_tokens_details"
+                | "part"
+                | "annotation"
+        )
+    {
+        return Ok(Value::Null);
+    }
+    match field {
+        "output" => {
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let values = project_public_array(value)?;
+            Ok(Value::Array(
+                values
+                    .iter()
+                    .map(project_public_item)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        "tools" => {
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let values = project_public_array(value)?;
+            Ok(Value::Array(
+                values
+                    .iter()
+                    .map(|value| project_public_object(value, PUBLIC_TOOL_DEFINITION_FIELDS))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        "content" | "annotations" => {
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let values = project_public_array(value)?;
+            Ok(Value::Array(
+                values
+                    .iter()
+                    .map(|value| {
+                        if field == "content" {
+                            project_public_content(value)
+                        } else {
+                            project_public_annotation(value)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        "queries" => {
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let values = project_public_array(value)?;
+            Ok(Value::Array(
+                values
+                    .iter()
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .map(|value| Value::String(value.to_owned()))
+                            .ok_or(())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        "logprobs" => {
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let values = project_public_array(value)?;
+            Ok(Value::Array(
+                values
+                    .iter()
+                    .map(project_public_logprob)
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
+        "incomplete_details" => {
+            if value.is_null() {
+                return Ok(Value::Null);
+            }
+            let object = value.as_object().ok_or(())?;
+            match object.get("reason") {
+                None | Some(Value::Null) => Ok(json!({})),
+                Some(Value::String(reason))
+                    if matches!(reason.as_str(), "max_output_tokens" | "content_filter") =>
+                {
+                    Ok(json!({"reason": reason}))
+                }
+                _ => Err(()),
+            }
+        }
+        "parameters" => project_public_tool_schema(value),
+        "environment" => project_public_environment(value),
+        "operation" => project_public_operation(value),
+        "pending_safety_checks" => project_public_safety_checks(value),
+        "outputs" | "files" => project_public_outputs(value),
+        "parallel_tool_calls" | "strict" | "defer_loading" => {
+            value.is_boolean().then(|| value.clone()).ok_or(())
+        }
+        _ if has_field(PUBLIC_STRING_FIELDS, field) => {
+            value.is_string().then(|| value.clone()).ok_or(())
+        }
+        _ if has_field(PUBLIC_INTEGER_FIELDS, field) => project_public_integer(value),
+        _ if field == "error" => project_public_object(value, PUBLIC_ERROR_FIELDS),
+        _ if field == "usage" => project_public_object(value, PUBLIC_USAGE_FIELDS),
+        _ if matches!(field, "input_tokens_details" | "output_tokens_details") => {
+            project_public_object(value, PUBLIC_USAGE_DETAIL_FIELDS)
+        }
+        _ if field == "action" => project_public_object(value, PUBLIC_ACTION_FIELDS),
+        _ if field == "tool_definition" => {
+            project_public_object(value, PUBLIC_TOOL_DEFINITION_FIELDS)
+        }
+        _ if field == "item" => project_public_item(value),
+        _ if field == "response" => project_public_object(value, PUBLIC_RESPONSE_FIELDS),
+        _ if matches!(field, "part" | "annotation") => {
+            let fields = if field == "part" {
+                PUBLIC_CONTENT_FIELDS
+            } else {
+                PUBLIC_ANNOTATION_FIELDS
+            };
+            project_public_object(value, fields)
+        }
+        _ if value.is_object() => project_public_object(value, PUBLIC_CONTENT_FIELDS),
+        _ if value.is_array() => Ok(Value::Array(
+            value
+                .as_array()
+                .expect("array checked")
+                .iter()
+                .map(|value| project_public_value(value, Some(field)))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn project_public_content(value: &Value) -> Result<Value, ()> {
+    project_public_object(value, PUBLIC_CONTENT_FIELDS)
+}
+
+fn project_public_item(value: &Value) -> Result<Value, ()> {
+    let object = value.as_object().ok_or(())?;
+    let item_type = object.get("type").and_then(Value::as_str).ok_or(())?;
+    let fields = public_item_fields(item_type).ok_or(())?;
+    let mut projected = Map::new();
+    for field in fields {
+        let Some(child) = object.get(*field) else {
+            continue;
+        };
+        let child = match (item_type, *field) {
+            ("shell_call", "environment") => project_public_environment(child)?,
+            ("apply_patch_call", "operation") => project_public_operation(child)?,
+            ("computer_call", "pending_safety_checks") => project_public_safety_checks(child)?,
+            ("code_interpreter_call", "outputs") | ("shell_call_output", "output") => {
+                project_public_outputs(child)?
+            }
+            ("computer_call_output", "output") => project_public_output_object(child)?,
+            ("function_call_output", "output")
+            | ("custom_tool_call_output", "output")
+            | ("mcp_call_output", "output")
+            | ("mcp_tool_call_output", "output")
+            | ("local_shell_call_output", "output") => project_public_item_output(child)?,
+            _ => project_public_value(child, Some(field))?,
+        };
+        projected.insert((*field).to_owned(), child);
+    }
+    Ok(Value::Object(projected))
+}
+
+fn project_public_response(value: &Value) -> Result<Value, ()> {
+    project_public_object(value, PUBLIC_RESPONSE_FIELDS)
+}
+
+fn normalize_terminal_response(value: &Value, expected_status: &str) -> Result<Value, ()> {
+    let raw = value.as_object().ok_or(())?;
+    if raw.get("error").is_some_and(|value| !value.is_null())
+        || raw
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != expected_status)
+        || (expected_status == "completed"
+            && raw
+                .get("incomplete_details")
+                .is_some_and(|value| !value.is_null()))
+    {
+        return Err(());
+    }
+    let mut response = project_public_response(value)?;
+    let object = response.as_object_mut().ok_or(())?;
+    object.insert(
+        "status".to_owned(),
+        Value::String(expected_status.to_owned()),
+    );
+    if expected_status == "incomplete"
+        && let Some(details) = value.get("incomplete_details")
+        && !details.is_null()
+    {
+        object.insert(
+            "incomplete_details".to_owned(),
+            project_public_value(details, Some("incomplete_details"))?,
+        );
+    }
+    Ok(response)
+}
+
+pub(super) fn project_codex_response_event(value: &Value) -> Result<Option<Value>, io::Error> {
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| io::Error::other("malformed Codex response event"))?;
+    if matches!(
+        event_type,
+        "response.metadata" | "codex.response.metadata" | "responsesapi.websocket_timing"
+    ) {
+        return Ok(None);
+    }
+    let object = value
+        .as_object()
+        .ok_or_else(|| io::Error::other("malformed Codex response event"))?;
+    let mut projected = Map::new();
+    for field in PUBLIC_EVENT_FIELDS {
+        let Some(child) = object.get(*field) else {
+            continue;
+        };
+        let child = if *field == "response"
+            && matches!(event_type, "response.completed" | "response.incomplete")
+        {
+            normalize_terminal_response(
+                child,
+                if event_type == "response.completed" {
+                    "completed"
+                } else {
+                    "incomplete"
+                },
+            )
+            .map_err(|_| io::Error::other("malformed Codex response projection"))?
+        } else {
+            project_public_value(child, Some(field))
+                .map_err(|_| io::Error::other("malformed Codex response projection"))?
+        };
+        projected.insert((*field).to_owned(), child);
+    }
+    Ok(Some(Value::Object(projected)))
 }
 
 pub(super) fn native_codex_response_to_chat(

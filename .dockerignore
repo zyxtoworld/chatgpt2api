@@ -1,5 +1,6 @@
 .git
 .gitignore
+.local/
 .idea
 .venv
 __pycache__

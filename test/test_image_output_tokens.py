@@ -1,33 +1,35 @@
-import json
-import urllib.error
-import urllib.request
+"""Opt-in live contract for image URL output and token accounting."""
 
-from test.utils import BASE_URL, load_auth_key
+from __future__ import annotations
+
+import pytest
+import requests
+
+from test.live_contract_support import bearer_headers, live_base_url
+from test.utils import require_http_response
 
 
-def main() -> None:
-    payload = {
-        "prompt": "一只橘猫坐在窗台上，午后阳光，写实摄影",
-        "model": "gpt-image-2",
-        "n": 1,
-        "response_format": "url",
-    }
-    request = urllib.request.Request(
-        BASE_URL + "/v1/images/generations",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json", "Authorization": f"Bearer {load_auth_key()}"},
-        method="POST",
+@pytest.mark.live_upstream
+def test_image_generation_url_response_is_successful_and_nonempty():
+    response = requests.post(
+        f"{live_base_url()}/v1/images/generations",
+        headers=bearer_headers(),
+        json={
+            "prompt": "一只橘猫坐在窗台上，午后阳光，写实摄影",
+            "model": "gpt-image-2",
+            "n": 1,
+            "response_format": "url",
+        },
+        timeout=300,
     )
+    require_http_response(response, content_type="application/json")
     try:
-        with urllib.request.urlopen(request) as response:
-            body = response.read().decode()
-    except urllib.error.HTTPError as error:
-        body = error.read().decode()
-    try:
-        print(json.dumps(json.loads(body), ensure_ascii=False, indent=2))
-    except json.JSONDecodeError:
-        print(body)
-
-
-if __name__ == "__main__":
-    main()
+        payload = response.json()
+    finally:
+        response.close()
+    assert isinstance(payload, dict)
+    assert isinstance(payload.get("usage"), dict)
+    data = payload.get("data")
+    assert isinstance(data, list) and data
+    urls = [str(item.get("url") or "") for item in data if isinstance(item, dict)]
+    assert urls and all(url.startswith(("http://", "https://", "/")) for url in urls)

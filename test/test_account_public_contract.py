@@ -222,6 +222,84 @@ class AccountPublicContractTests(unittest.TestCase):
         )
         add_accounts.assert_not_called()
 
+    def test_create_validates_element_types_and_keeps_python_token_contract(self) -> None:
+        with (
+            mock.patch.object(accounts_module.account_service, "add_account_items") as add_items,
+            mock.patch.object(accounts_module.account_service, "add_accounts") as add_accounts,
+            mock.patch.object(accounts_module.account_service, "refresh_accounts") as refresh_accounts,
+        ):
+            for body in (
+                {"tokens": ["valid-token", 42]},
+                {"accounts": [{"access_token": "valid-token"}, "not-an-object"]},
+            ):
+                with self.subTest(body=body):
+                    response = self.client.post(
+                        "/api/accounts",
+                        headers=AUTH_HEADERS,
+                        json=body,
+                    )
+                    self.assertEqual(response.status_code, 422, response.text)
+            add_items.assert_not_called()
+            add_accounts.assert_not_called()
+            refresh_accounts.assert_not_called()
+
+    def test_create_accepts_access_token_alias_ignores_token_field_and_refreshes_tokens_first(self) -> None:
+        batches: list[list[dict]] = []
+        refresh_calls: list[list[str]] = []
+
+        def add_account_items(items: list[dict]) -> dict:
+            batches.append(items)
+            normalized_items = []
+            for item in items:
+                token = item.get("access_token")
+                if not isinstance(token, str) or not token.strip():
+                    token = item.get("accessToken")
+                if not isinstance(token, str) or not token.strip():
+                    continue
+                normalized_items.append(
+                    {"access_token": token.strip(), "type": "free", "status": "正常"}
+                )
+            return {
+                "added": len(items),
+                "skipped": 0,
+                "items": normalized_items,
+            }
+
+        def refresh_accounts(tokens: list[str]) -> dict:
+            refresh_calls.append(tokens)
+            return {"refreshed": 0, "errors": [], "items": []}
+
+        with (
+            mock.patch.object(accounts_module.account_service, "add_account_items", side_effect=add_account_items),
+            mock.patch.object(accounts_module.account_service, "refresh_accounts", side_effect=refresh_accounts),
+            mock.patch.object(
+                accounts_module.account_service,
+                "add_accounts",
+                side_effect=AssertionError("mixed create must use one account-item batch"),
+            ),
+        ):
+            response = self.client.post(
+                "/api/accounts",
+                headers=AUTH_HEADERS,
+                json={
+                    "tokens": ["token-extra", "token-shared", "token-extra"],
+                    "accounts": [
+                        {"access_token": "token-shared", "type": "free"},
+                        {"accessToken": "token-alias", "type": "plus"},
+                        {"token": "must-be-ignored", "type": "pro"},
+                    ],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [item.get("access_token") for item in batches[0]],
+            ["token-shared", None, None, "token-extra"],
+        )
+        self.assertEqual(batches[0][1]["accessToken"], "token-alias")
+        self.assertEqual(batches[0][2]["token"], "must-be-ignored")
+        self.assertEqual(refresh_calls, [["token-extra", "token-shared", "token-alias"]])
+
     def test_create_rejects_container_account_token_before_service_calls(self) -> None:
         canary = "api-account-token-container-canary"
         with (

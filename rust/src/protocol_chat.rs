@@ -1,3 +1,4 @@
+use super::protocol_codex_payload::native_codex_tool;
 use super::{ApiError, Map, Value, native_message_id, sse_delimiter};
 use base64::Engine;
 use serde_json::json;
@@ -54,6 +55,16 @@ pub(crate) fn native_conversation_payload(object: &Map<String, Value>) -> Result
         .get("tools")
         .and_then(Value::as_array)
         .is_some_and(|tools| !tools.is_empty())
+        || object.keys().any(|key| {
+            matches!(
+                key.as_str(),
+                "web_search_options"
+                    | "prompt_cache_key"
+                    | "response_format"
+                    | "service_tier"
+                    | "verbosity"
+            )
+        })
     {
         return Err(ApiError::unavailable());
     }
@@ -672,68 +683,25 @@ fn valid_chat_tools(value: &Value) -> bool {
     let Some(tools) = value.as_array() else {
         return false;
     };
-    tools.iter().all(|tool| {
-        let Some(tool) = tool.as_object() else {
-            return false;
-        };
-        let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
-            return false;
-        };
-        if tool_type.trim().is_empty() {
-            return false;
-        }
-        if tool_type != "function" {
-            // The Python Chat contract only has a validated function-tool
-            // path here.  Unknown tool types must not be forwarded to an
-            // upstream boundary that the canary does not implement.
-            return false;
-        }
-        if tool.keys().any(|key| key != "type" && key != "function") {
-            return false;
-        }
-        let Some(function) = tool.get("function").and_then(Value::as_object) else {
-            return false;
-        };
-        if function.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "name" | "description" | "parameters" | "strict"
-            )
-        }) {
-            return false;
-        }
-        if function
-            .get("name")
-            .and_then(Value::as_str)
-            .is_none_or(|name| name.trim().is_empty())
-        {
-            return false;
-        }
-        if function
-            .get("description")
-            .is_some_and(|description| !description.is_null() && !description.is_string())
-        {
-            return false;
-        }
-        if function
-            .get("parameters")
-            .is_some_and(|parameters| !parameters.is_null() && !parameters.is_object())
-        {
-            return false;
-        }
-        !function
-            .get("strict")
-            .is_some_and(|strict| !strict.is_null() && !strict.is_boolean())
-    })
+    tools.iter().all(|tool| native_codex_tool(tool).is_ok())
 }
 
-fn has_function_tool(value: Option<&Value>) -> bool {
+fn has_native_tool(value: Option<&Value>) -> bool {
     value.and_then(Value::as_array).is_some_and(|tools| {
         tools.iter().any(|tool| {
             tool.as_object()
                 .and_then(|tool| tool.get("type"))
                 .and_then(Value::as_str)
-                == Some("function")
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "function"
+                            | "web_search"
+                            | "web_search_preview"
+                            | "web_search_preview_2025_03_11"
+                            | "web_search_2025_08_26"
+                    )
+                })
         })
     })
 }
@@ -827,14 +795,19 @@ fn validate_chat_options(object: &Map<String, Value>) -> Result<(), ApiError> {
         "n",
         "parallel_tool_calls",
         "prompt",
+        "prompt_cache_key",
         "reasoning",
         "reasoning_effort",
+        "response_format",
+        "service_tier",
         "store",
         "stream",
         "stream_options",
         "thinking_effort",
         "tool_choice",
         "tools",
+        "verbosity",
+        "web_search_options",
     ];
     if object
         .iter()
@@ -877,12 +850,15 @@ fn validate_chat_options(object: &Map<String, Value>) -> Result<(), ApiError> {
     {
         return Err(ApiError::invalid_request());
     }
-    let contains_function_tool = has_function_tool(object.get("tools"));
+    let contains_native_tool = has_native_tool(object.get("tools"))
+        || object
+            .get("web_search_options")
+            .is_some_and(|value| !value.is_null());
     let has_native_feature = has_native_chat_feature(object.get("messages"));
     if let Some(value) = object.get("tool_choice")
         && !value.is_null()
-        && (((contains_function_tool || has_native_feature) && value.as_str() != Some("auto"))
-            || (!contains_function_tool && !has_native_feature && value.as_str() != Some("none")))
+        && (((contains_native_tool || has_native_feature) && value.as_str() != Some("auto"))
+            || (!contains_native_tool && !has_native_feature && value.as_str() != Some("none")))
     {
         return Err(ApiError::invalid_request());
     }
@@ -927,6 +903,100 @@ fn validate_chat_options(object: &Map<String, Value>) -> Result<(), ApiError> {
     }
     if effort_sources > 1 {
         return Err(ApiError::invalid_request());
+    }
+    if object
+        .get("prompt_cache_key")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+        || object.get("service_tier").is_some_and(|value| {
+            !value.is_null()
+                && !matches!(
+                    value.as_str(),
+                    Some("default" | "fast" | "priority" | "flex")
+                )
+        })
+        || object.get("verbosity").is_some_and(|value| {
+            !value.is_null() && !matches!(value.as_str(), Some("low" | "medium" | "high"))
+        })
+    {
+        return Err(ApiError::invalid_request());
+    }
+    if let Some(response_format) = object
+        .get("response_format")
+        .filter(|value| !value.is_null())
+    {
+        let response_format = response_format
+            .as_object()
+            .ok_or_else(ApiError::invalid_request)?;
+        let format_type = response_format
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(ApiError::invalid_request)?;
+        match format_type {
+            "text" if response_format.len() == 1 => {}
+            "json_schema" => {
+                let schema = response_format
+                    .get("json_schema")
+                    .and_then(Value::as_object)
+                    .ok_or_else(ApiError::invalid_request)?;
+                if response_format
+                    .keys()
+                    .any(|key| key != "type" && key != "json_schema")
+                    || schema
+                        .keys()
+                        .any(|key| !matches!(key.as_str(), "name" | "schema" | "strict"))
+                    || schema
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_none_or(|name| name.trim().is_empty())
+                    || !schema.get("schema").is_some_and(Value::is_object)
+                    || schema
+                        .get("strict")
+                        .is_some_and(|value| !value.is_boolean())
+                {
+                    return Err(ApiError::invalid_request());
+                }
+            }
+            _ => return Err(ApiError::invalid_request()),
+        }
+    }
+    if let Some(options) = object
+        .get("web_search_options")
+        .filter(|value| !value.is_null())
+    {
+        let options = options.as_object().ok_or_else(ApiError::invalid_request)?;
+        if options
+            .keys()
+            .any(|key| !matches!(key.as_str(), "search_context_size" | "user_location"))
+            || options
+                .get("search_context_size")
+                .is_some_and(|value| !matches!(value.as_str(), Some("low" | "medium" | "high")))
+        {
+            return Err(ApiError::invalid_request());
+        }
+        if let Some(location) = options
+            .get("user_location")
+            .filter(|value| !value.is_null())
+        {
+            let location = location.as_object().ok_or_else(ApiError::invalid_request)?;
+            if location
+                .keys()
+                .any(|key| !matches!(key.as_str(), "type" | "approximate"))
+                || location.get("type").and_then(Value::as_str) != Some("approximate")
+            {
+                return Err(ApiError::invalid_request());
+            }
+            let approximate = location
+                .get("approximate")
+                .and_then(Value::as_object)
+                .ok_or_else(ApiError::invalid_request)?;
+            if approximate
+                .keys()
+                .any(|key| !matches!(key.as_str(), "city" | "country" | "region" | "timezone"))
+                || approximate.values().any(|value| !value.is_string())
+            {
+                return Err(ApiError::invalid_request());
+            }
+        }
     }
     if let Some(value) = object.get("stream_options")
         && !value.is_null()

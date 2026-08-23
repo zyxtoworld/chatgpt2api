@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import unittest
 
+import pytest
 import requests
 
-from utils.helper import save_images_from_text
+from test.utils import decode_image_data_urls, iter_sse_data, require_http_response, require_stream_response
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
+AUTH_KEY = os.getenv("CHATGPT2API_LIVE_API_KEY", "")
+BASE_URL = os.getenv("CHATGPT2API_LIVE_BASE_URL", "")
 
 
 class ChatCompletionsTests(unittest.TestCase):
+    @pytest.mark.live_upstream
     def test_text_completion_http(self):
         """测试文本对话的非流式 HTTP 调用。"""
         response = requests.post(
@@ -28,11 +31,17 @@ class ChatCompletionsTests(unittest.TestCase):
             },
             timeout=300,
         )
-        print("text non-stream status:")
-        print(response.status_code)
-        print("text non-stream result:")
-        print(json.dumps(response.json(), ensure_ascii=False, indent=2))
+        require_http_response(response, content_type="application/json")
+        payload = response.json()
+        self.assertEqual(payload.get("object"), "chat.completion")
+        choices = payload.get("choices")
+        self.assertIsInstance(choices, list)
+        self.assertTrue(choices)
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        self.assertIsInstance(message, dict)
+        self.assertTrue(str(message.get("content") or "").strip() or message.get("tool_calls"))
 
+    @pytest.mark.live_upstream
     def test_text_completion_stream_http(self):
         """测试文本对话的流式 HTTP 调用。"""
         response = requests.post(
@@ -50,13 +59,42 @@ class ChatCompletionsTests(unittest.TestCase):
             stream=True,
             timeout=300,
         )
-        print("text stream status:")
-        print(response.status_code)
-        print("text stream result:")
-        for line in response.iter_lines():
-            if line:
-                print(line.decode("utf-8", errors="replace"))
+        require_stream_response(response)
+        saw_done = False
+        content_parts: list[str] = []
+        finish_reasons: list[str] = []
+        stream_errors: list[object] = []
+        parse_errors: list[str] = []
+        try:
+            for payload_text in iter_sse_data(response):
+                if payload_text == "[DONE]":
+                    saw_done = True
+                    break
+                try:
+                    payload = json.loads(payload_text)
+                except Exception as exc:
+                    parse_errors.append(type(exc).__name__)
+                    continue
+                if "error" in payload:
+                    stream_errors.append(str(payload.get("type") or "error"))
+                choices = payload.get("choices")
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    choice = choices[0]
+                    delta = choice.get("delta")
+                    if isinstance(delta, dict):
+                        content_parts.append(str(delta.get("content") or ""))
+                    finish_reason = choice.get("finish_reason")
+                    if isinstance(finish_reason, str):
+                        finish_reasons.append(finish_reason)
+        finally:
+            response.close()
+        self.assertTrue(saw_done)
+        self.assertIn("stop", finish_reasons)
+        self.assertTrue("".join(content_parts).strip())
+        self.assertFalse(stream_errors)
+        self.assertFalse(parse_errors, parse_errors)
 
+    @pytest.mark.live_upstream
     def test_image_completion_http(self):
         """测试图片对话的非流式 HTTP 调用。"""
         response = requests.post(
@@ -71,15 +109,15 @@ class ChatCompletionsTests(unittest.TestCase):
             },
             timeout=300,
         )
+        require_http_response(response, content_type="application/json")
         payload = response.json()
         content = str((((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or ""))
-        saved_paths = save_images_from_text(content, "chat_completions_image_non_stream")
-        print("image non-stream status:")
-        print(response.status_code)
-        print("image non-stream saved files:")
-        for path in saved_paths:
-            print(path)
+        self.assertEqual(payload.get("object"), "chat.completion")
+        self.assertIn("data:image/", content)
+        decoded_images = decode_image_data_urls(content)
+        self.assertGreater(len(decoded_images), 0, "图片响应没有可解码的 data URL。")
 
+    @pytest.mark.live_upstream
     def test_image_completion_stream_http(self):
         """测试图片对话的流式 HTTP 调用。"""
         response = requests.post(
@@ -96,30 +134,39 @@ class ChatCompletionsTests(unittest.TestCase):
             stream=True,
             timeout=300,
         )
+        require_stream_response(response)
         parts: list[str] = []
-        started_at = time.time()
-        print("image stream status:")
-        print(response.status_code)
-        print("image stream chunks:")
-        for line in response.iter_lines():
-            if not line:
-                continue
-            text = line.decode("utf-8", errors="replace")
-            print(f"{time.time() - started_at:6.2f}s {text}")
-            if not text.startswith("data:"):
-                continue
-            payload = text[5:].strip()
-            if payload == "[DONE]":
-                break
-            try:
-                chunk = json.loads(payload)
-            except Exception:
-                continue
-            delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
-            content = str(delta.get("content") or "")
-            if content:
-                parts.append(content)
-        saved_paths = save_images_from_text("".join(parts), "chat_completions_image_stream")
-        print("image stream saved files:")
-        for path in saved_paths:
-            print(path)
+        saw_done = False
+        finish_reasons: list[str] = []
+        stream_errors: list[object] = []
+        parse_errors: list[str] = []
+        try:
+            for payload in iter_sse_data(response):
+                if payload == "[DONE]":
+                    saw_done = True
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except Exception as exc:
+                    parse_errors.append(type(exc).__name__)
+                    continue
+                delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
+                content = str(delta.get("content") or "")
+                if content:
+                    parts.append(content)
+                if "error" in chunk:
+                    stream_errors.append(str(chunk.get("type") or "error"))
+                choices = chunk.get("choices")
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    finish_reason = choices[0].get("finish_reason")
+                    if isinstance(finish_reason, str):
+                        finish_reasons.append(finish_reason)
+        finally:
+            response.close()
+        self.assertTrue(saw_done)
+        self.assertIn("stop", finish_reasons)
+        self.assertIn("data:image/", "".join(parts))
+        self.assertFalse(stream_errors)
+        self.assertFalse(parse_errors, parse_errors)
+        decoded_images = decode_image_data_urls("".join(parts))
+        self.assertGreater(len(decoded_images), 0, "图片流没有可解码的 data URL。")

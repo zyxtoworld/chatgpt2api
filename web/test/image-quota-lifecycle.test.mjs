@@ -16,6 +16,15 @@ test("image quota loads use a cancellable latest owner", () => {
   assert.match(source, /quotaOwnerRef/);
   assert.match(source, /quotaOwner\.cancel\(\)/);
   assert.match(source, /quotaOwner\.accepts\(requestOwner\)/);
+  assert.match(source, /quotaAbortControllerRef/);
+  assert.match(source, /fetchAccounts\(abortController\.signal\)/);
+  assert.match(source, /quotaAbortControllerRef\.current\?\.abort\(\)/);
+});
+
+test("image model loading cancels its request on cleanup", () => {
+  assert.match(source, /modelAbortControllerRef/);
+  assert.match(source, /fetchModels\(abortController\.signal\)/);
+  assert.match(source, /modelAbortControllerRef\.current\?\.abort\(\)/);
 });
 
 test("a stale quota response cannot overwrite a newer quota", () => {

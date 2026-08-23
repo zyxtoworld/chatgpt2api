@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from services.account_service import account_service
-from services.model_service import model_catalog_service
+from services.model_service import ModelCatalogPendingError, model_catalog_service
 from services.openai_backend_api import _parse_model_created
 from utils.helper import CODEX_IMAGE_MODEL
 
@@ -83,9 +83,18 @@ def _public_model_item(item: object) -> dict[str, Any] | None:
 
 def list_models() -> dict[str, Any]:
     # Cold discovery must not turn an empty catalog into a successful response.
-    # Once a snapshot exists, the service still returns it without waiting for
-    # unrelated type refreshes.
-    result = model_catalog_service.list_models(wait_for_cold=True)
+    # If one account type fails while another type (or anonymous discovery) is
+    # already usable, publish that safe partial snapshot instead of hiding the
+    # working type behind the failed representative.  The service still raises
+    # when there is no usable snapshot at all.
+    try:
+        result = model_catalog_service.list_models(wait_for_cold=True)
+    except ModelCatalogPendingError:
+        partial = model_catalog_service.list_models(wait_for_cold=False)
+        partial_data = partial.get("data") if isinstance(partial, dict) else None
+        if not isinstance(partial_data, list) or not partial_data:
+            raise
+        result = partial
     if not isinstance(result, dict):
         return {"object": "list", "data": []}
     data = result.get("data")

@@ -40,7 +40,7 @@ chmod 600 config.json
 docker compose up -d
 ```
 
-启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。Compose 使用固定的 `/app/config.json`，不需要额外的配置目录或路径环境变量。
+启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。当前 `latest` 镜像的主服务入口是 Rust release 二进制；Compose 使用固定的 `/app/config.json` 和 `/app/data`，不需要额外的配置目录或路径环境变量。
 
 - Web 面板：`http://localhost:3000`
 - API 地址：`http://localhost:3000/v1`
@@ -85,6 +85,18 @@ cd chatgpt2api/web
 bun install
 bun run dev
 ```
+
+### 测试分层
+
+默认 `pytest` 只运行不访问真实 ChatGPT 上游的确定性程序测试；服务生命周期、格式转换、SSE 终态、工具和网页搜索由本地 fake transport 集成测试覆盖。
+
+`test/test_v1_*.py` 中直接请求 `localhost:8000` 的真实上游 smoke 用例统一标记为 `live_upstream`，默认会显示跳过原因，不会把 HTTP 502 或只打印响应当成通过。需要真实账号验收时，先按隔离数据目录启动服务，再显式运行：
+
+```bash
+CHATGPT2API_LIVE_UPSTREAM=1 CHATGPT2API_LIVE_BASE_URL=https://<explicit-host> CHATGPT2API_LIVE_CODEX_BASE_URL=https://<explicit-codex-host> CHATGPT2API_LIVE_API_KEY=<ephemeral-key> uv run pytest -m live_upstream test/test_v1_chat_completions.py test/test_v1_images_generations.py test/test_v1_images_edits.py test/test_v1_messages.py test/test_v1_models.py test/test_v1_responses.py test/test_codex_4k.py test/test_generations.py test/test_image.py test/test_image_output_tokens.py test/test_gpt_ppt.py test/test_gpt_psd.py
+```
+
+`CHATGPT2API_LIVE_BASE_URL`、`CHATGPT2API_LIVE_CODEX_BASE_URL` 与 `CHATGPT2API_LIVE_API_KEY` 必须显式提供；缺少任一项时 collection 直接失败，绝不回落到 localhost。命令不会打印或保存密钥，图片只在内存中校验，不写 `data/output`、`utils/output` 或调用者当前目录；真实上游验收与默认完整 pytest 是两个独立门。
 
 后续更新新版本：
 

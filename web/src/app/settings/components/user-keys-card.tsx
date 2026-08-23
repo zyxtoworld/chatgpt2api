@@ -39,6 +39,7 @@ function formatDateTime(value?: string | null) {
 
 export function UserKeysCard() {
   const requestGateRef = useRef(createMutationRequestGate());
+  const loadAbortControllerRef = useRef<AbortController | null>(null);
   const loadingOwnerRef = useRef<unknown>(null);
   const mutationOwnerRef = useRef<unknown>(null);
   const [items, setItems] = useState<UserKey[]>([]);
@@ -59,10 +60,13 @@ export function UserKeysCard() {
     if (!queryOwner.allowed) {
       return;
     }
+    loadAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    loadAbortControllerRef.current = abortController;
     loadingOwnerRef.current = queryOwner;
     setIsLoading(true);
     try {
-      const data = await fetchUserKeys();
+      const data = await fetchUserKeys(abortController.signal);
       if (gate.acceptsQuery(queryOwner)) {
         setItems(data.items);
       }
@@ -75,6 +79,9 @@ export function UserKeysCard() {
         loadingOwnerRef.current = null;
         setIsLoading(false);
       }
+      if (loadAbortControllerRef.current === abortController) {
+        loadAbortControllerRef.current = null;
+      }
     }
   };
 
@@ -83,6 +90,8 @@ export function UserKeysCard() {
     const cancelInitialLoad = scheduleOwnedMicrotask(() => load());
     return () => {
       cancelInitialLoad();
+      loadAbortControllerRef.current?.abort();
+      loadAbortControllerRef.current = null;
       loadingOwnerRef.current = null;
       mutationOwnerRef.current = null;
       gate.cancel();
@@ -95,6 +104,8 @@ export function UserKeysCard() {
       toast.error("已有用户密钥操作正在进行，请稍候");
       return null;
     }
+    loadAbortControllerRef.current?.abort();
+    loadAbortControllerRef.current = null;
     loadingOwnerRef.current = null;
     mutationOwnerRef.current = owner;
     setIsLoading(false);

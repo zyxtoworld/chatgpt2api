@@ -102,6 +102,7 @@ def _clean_channel_id(value: object) -> str:
             value
             if len(value) <= _MAX_CHANNEL_ID_LENGTH
             and all("0" <= char <= "9" for char in value)
+            and not value.startswith("0")
             and value.lstrip("0")
             else ""
         )
@@ -650,7 +651,7 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
 
     deadline = time.monotonic() + CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS
     catalogs: list[dict] = []
-    model_tokens: dict[int, tuple[str, str]] = {}
+    model_tokens: dict[int, str] = {}
     with _admin_session(server, deadline=deadline) as (session, base_url, headers):
         for channel_id in selected:
             try:
@@ -669,10 +670,7 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
                     "models": [],
                     "models_loaded": False,
                 })
-                model_tokens[catalog_index] = (
-                    credential["access_token"],
-                    credential.get("account_id", ""),
-                )
+                model_tokens[catalog_index] = credential["access_token"]
             except Exception as exc:
                 if time.monotonic() >= deadline:
                     raise CCLoadError("ccLoad channel model list timed out") from exc
@@ -692,10 +690,9 @@ def list_remote_channel_models(server: dict, channel_ids: list[str]) -> list[dic
 
     futures = {}
     try:
-        for catalog_index, (access_token, account_id) in model_tokens.items():
+        for catalog_index, access_token in model_tokens.items():
             futures[_submit_channel_model_ids(
                 access_token,
-                account_id=account_id,
                 deadline=deadline,
             )] = catalog_index
         for future in as_completed(futures, timeout=_remaining_timeout(deadline, CCLOAD_CHANNEL_BROWSE_TIMEOUT_SECS)):
@@ -795,14 +792,9 @@ def _fetch_remote_credential(
 
 def _channel_model_ids(
         access_token: str,
-        *,
-        account_id: str = "",
         deadline: float | None = None,
 ) -> list[str]:
     backend = OpenAIBackendAPI(access_token=access_token)
-    backend._catalog_source_type = "codex"
-    if account_id:
-        backend._catalog_account_id = account_id
     try:
         payload = backend.list_models(timeout_secs=30.0, deadline=deadline)
     except Exception as exc:
@@ -822,7 +814,6 @@ def _channel_model_ids(
 def _submit_channel_model_ids(
         access_token: str,
         *,
-        account_id: str = "",
         deadline: float,
 ):
     remaining = _remaining_timeout(deadline, float("inf"))
@@ -832,7 +823,6 @@ def _submit_channel_model_ids(
         future = _CCLOAD_MODEL_EXECUTOR.submit(
             _channel_model_ids,
             access_token,
-            account_id=account_id,
             deadline=deadline,
         )
     except BaseException:

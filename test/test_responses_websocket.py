@@ -293,6 +293,86 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
         self.assertEqual(projected["response"]["incomplete_details"], {"reason": "content_filter"})
         self.assertNotIn("internal_detail", json.dumps(projected))
 
+    def test_public_event_normalizes_lifecycle_and_preserves_nullable_fields(self) -> None:
+        completed = responses_websocket_module.project_public_codex_response_event({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-completed-nullable",
+                "error": None,
+                "incomplete_details": None,
+                "usage": None,
+                "output": [],
+            },
+        })
+        self.assertEqual(completed["response"]["status"], "completed")
+        self.assertIsNone(completed["response"]["error"])
+        self.assertIsNone(completed["response"]["incomplete_details"])
+        self.assertIsNone(completed["response"]["usage"])
+
+        incomplete = responses_websocket_module.project_public_codex_response_event({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp-incomplete-nullable",
+                "incomplete_details": {},
+                "usage": None,
+                "output": [],
+            },
+        })
+        self.assertEqual(incomplete["response"]["status"], "incomplete")
+        self.assertEqual(incomplete["response"]["incomplete_details"], {})
+        self.assertIsNone(incomplete["response"]["usage"])
+
+        active = responses_websocket_module.project_public_codex_response_event({
+            "type": "response.created",
+            "response": {
+                "id": "resp-active-nullable",
+                "error": None,
+                "incomplete_details": None,
+                "usage": None,
+                "output": [],
+            },
+        })
+        self.assertNotIn("status", active["response"])
+        self.assertIsNone(active["response"]["error"])
+        self.assertIsNone(active["response"]["incomplete_details"])
+        self.assertIsNone(active["response"]["usage"])
+
+        malformed = [
+            {
+                "type": "response.created",
+                "response": {"id": "resp-active-status", "status": "completed"},
+            },
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp-active-error",
+                    "error": {"type": "internal", "message": "private"},
+                },
+            },
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp-active-incomplete-details",
+                    "incomplete_details": {"reason": "content_filter"},
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-terminal-error",
+                    "error": {"type": "internal", "message": "private"},
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {"id": "resp-terminal-status", "status": "incomplete"},
+            },
+        ]
+        for event in malformed:
+            with self.subTest(event=event):
+                with self.assertRaisesRegex(RuntimeError, "malformed"):
+                    responses_websocket_module.project_public_codex_response_event(event)
+
     def test_public_event_rejects_scalar_error_and_output_items(self) -> None:
         canary = "responses-error-output-canary owner@example.test"
         cases = [
@@ -367,6 +447,100 @@ class ResponsesWebSocketContractTests(unittest.TestCase):
             "https://example.test",
         )
         self.assertNotIn("internal_secret", json.dumps(projected))
+
+    def test_public_event_uses_discriminated_item_projection(self) -> None:
+        event = {
+            "type": "response.completed",
+            "response": {
+                "id": "resp-discriminated",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "message-1",
+                        "role": "assistant",
+                        "arguments": "message-arguments-private",
+                        "result": "message-result-private",
+                        "operation": {"type": "message-operation-private"},
+                        "environment": {"type": "message-environment-private"},
+                        "code": "message-code-private",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    },
+                    {
+                        "type": "shell_call",
+                        "id": "shell-1",
+                        "call_id": "shell-call-1",
+                        "status": "completed",
+                        "action": {"type": "shell", "query": "echo hi", "private": "action-private"},
+                        "environment": {
+                            "type": "container",
+                            "text": "linux",
+                            "private": "environment-private",
+                        },
+                        "operation": {"type": "wrong-item-private"},
+                    },
+                    {
+                        "type": "computer_call",
+                        "id": "computer-1",
+                        "call_id": "computer-call-1",
+                        "pending_safety_checks": [{
+                            "type": "safety_check",
+                            "code": "confirm",
+                            "private": "safety-private",
+                        }],
+                        "status": "completed",
+                    },
+                    {
+                        "type": "apply_patch_call",
+                        "id": "patch-1",
+                        "call_id": "patch-call-1",
+                        "operation": {
+                            "type": "patch",
+                            "path": "README.md",
+                            "patch": "@@ -1 +1 @@",
+                            "private": "operation-private",
+                        },
+                        "status": "completed",
+                    },
+                    {
+                        "type": "code_interpreter_call",
+                        "id": "code-1",
+                        "code": "print(1)",
+                        "container_id": "container-1",
+                        "outputs": [{"type": "logs", "text": "stdout", "private": "outputs-private"}],
+                        "status": "completed",
+                    },
+                ],
+            },
+        }
+
+        projected = responses_websocket_module.project_public_codex_response_event(event)
+        output = projected["response"]["output"]
+        self.assertEqual(output[0]["content"][0]["text"], "hello")
+        for field in ("arguments", "result", "operation", "environment", "code"):
+            self.assertNotIn(field, output[0])
+        self.assertEqual(output[1]["environment"]["type"], "container")
+        self.assertEqual(output[1]["environment"]["text"], "linux")
+        self.assertNotIn("operation", output[1])
+        self.assertEqual(output[2]["pending_safety_checks"][0]["code"], "confirm")
+        self.assertEqual(output[3]["operation"]["path"], "README.md")
+        self.assertEqual(output[3]["operation"]["patch"], "@@ -1 +1 @@")
+        self.assertEqual(output[4]["outputs"][0]["text"], "stdout")
+        rendered = json.dumps(projected)
+        for canary in (
+            "message-arguments-private",
+            "message-result-private",
+            "message-operation-private",
+            "message-environment-private",
+            "message-code-private",
+            "action-private",
+            "environment-private",
+            "wrong-item-private",
+            "safety-private",
+            "operation-private",
+            "outputs-private",
+        ):
+            self.assertNotIn(canary, rendered)
 
     def test_public_event_preserves_legal_tool_search_output_definitions(self) -> None:
         event = {

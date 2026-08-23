@@ -172,6 +172,8 @@ function AccountsPageContent() {
   const mountedRef = useRef(false);
   const activePollersRef = useRef(new Set<{ stop: () => void }>());
   const accountListGateRef = useRef(createMutationRequestGate());
+  const accountListAbortControllerRef = useRef<AbortController | null>(null);
+  const modelAbortControllerRef = useRef<AbortController | null>(null);
   const accountListLoadingOwnerRef = useRef<unknown>(null);
   const accountMutationOwnerRef = useRef<AccountMutationOwner | null>(null);
   const accountProxyTestOwnerRef = useRef(createLatestActionOwner());
@@ -223,6 +225,10 @@ function AccountsPageContent() {
         poller.stop();
       }
       pollers.clear();
+      accountListAbortControllerRef.current?.abort();
+      accountListAbortControllerRef.current = null;
+      modelAbortControllerRef.current?.abort();
+      modelAbortControllerRef.current = null;
       accountListLoadingOwnerRef.current = null;
       accountMutationOwnerRef.current = null;
       progressOwnerRef.current = null;
@@ -238,6 +244,8 @@ function AccountsPageContent() {
       return null;
     }
     accountMutationOwnerRef.current = owner;
+    accountListAbortControllerRef.current?.abort();
+    accountListAbortControllerRef.current = null;
     accountListLoadingOwnerRef.current = null;
     if (mountedRef.current) {
       setIsLoading(false);
@@ -269,12 +277,15 @@ function AccountsPageContent() {
     const gate = accountListGateRef.current;
     const queryOwner = gate.beginQuery("list");
     if (!queryOwner.allowed) return;
+    accountListAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    accountListAbortControllerRef.current = abortController;
     if (!silent) {
       accountListLoadingOwnerRef.current = queryOwner;
       setIsLoading(true);
     }
     try {
-      const data = await fetchAccounts();
+      const data = await fetchAccounts(abortController.signal);
       if (!gate.acceptsQuery(queryOwner)) return;
       setAccounts(data.items);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
@@ -288,6 +299,9 @@ function AccountsPageContent() {
         accountListLoadingOwnerRef.current = null;
         setIsLoading(false);
       }
+      if (accountListAbortControllerRef.current === abortController) {
+        accountListAbortControllerRef.current = null;
+      }
     }
   };
 
@@ -295,22 +309,29 @@ function AccountsPageContent() {
     if (!mountedRef.current) {
       return;
     }
+    modelAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    modelAbortControllerRef.current = abortController;
+    const ownsModelRequest = () => modelAbortControllerRef.current === abortController;
     setIsLoadingModels(true);
     try {
-      const data = await fetchModels();
-      if (!mountedRef.current) {
+      const data = await fetchModels(abortController.signal);
+      if (!mountedRef.current || !ownsModelRequest()) {
         return;
       }
       setAvailableModels(Array.isArray(data.data) ? data.data : []);
     } catch (error) {
-      if (!mountedRef.current) {
+      if (!mountedRef.current || !ownsModelRequest()) {
         return;
       }
       const message = error instanceof Error ? error.message : "加载模型列表失败";
       toast.error(message);
     } finally {
-      if (mountedRef.current) {
+      if (mountedRef.current && ownsModelRequest()) {
         setIsLoadingModels(false);
+      }
+      if (ownsModelRequest()) {
+        modelAbortControllerRef.current = null;
       }
     }
   };
@@ -736,12 +757,20 @@ function AccountsPageContent() {
       // 等待后台线程完成，再拉取最新数据
       await new Promise<void>((resolve) => setTimeout(resolve, 500));
       if (!acceptsAccountMutation(mutationOwner)) return;
+      accountListAbortControllerRef.current?.abort();
+      const freshAbortController = new AbortController();
+      accountListAbortControllerRef.current = freshAbortController;
       try {
-        const freshData = await fetchAccounts();
+        const freshData = await fetchAccounts(freshAbortController.signal);
         if (!acceptsAccountMutation(mutationOwner)) return;
         setAccounts(freshData.items);
         setSelectedIds((prev) => prev.filter((id) => freshData.items.some((item) => item.access_token === id)));
       } catch { /* 静默失败 */ }
+      finally {
+        if (accountListAbortControllerRef.current === freshAbortController) {
+          accountListAbortControllerRef.current = null;
+        }
+      }
 
       if (!acceptsAccountMutation(mutationOwner)) return;
       setProgress({

@@ -65,13 +65,18 @@ export function SearchPanel() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [startedAt, setStartedAt] = useState(0);
   const searchOwnerRef = useRef(createLatestActionOwner());
+  const searchAbortControllerRef = useRef<AbortController | null>(null);
   const searched = loading || !!result || !!error;
   const safeSources = useMemo(() => normalizeSearchSources(result?.sources), [result?.sources]);
 
   useEffect(() => {
     const searchOwner = searchOwnerRef.current;
     searchOwner.activate();
-    return () => searchOwner.cancel();
+    return () => {
+      searchOwner.cancel();
+      searchAbortControllerRef.current?.abort();
+      searchAbortControllerRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -84,6 +89,8 @@ export function SearchPanel() {
     setPrompt(value);
     if (!loading) return;
     searchOwnerRef.current.invalidate();
+    searchAbortControllerRef.current?.abort();
+    searchAbortControllerRef.current = null;
     setLoading(false);
   };
 
@@ -92,6 +99,9 @@ export function SearchPanel() {
     if (!value || loading) return;
     const searchOwner = searchOwnerRef.current;
     const requestOwner = searchOwner.begin();
+    searchAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    searchAbortControllerRef.current = abortController;
     const start = Date.now();
     setStartedAt(start);
     setElapsedMs(0);
@@ -99,7 +109,7 @@ export function SearchPanel() {
     setError("");
     setResult(null);
     try {
-      const data = await httpRequest<SearchResult>("/v1/search", { method: "POST", body: { prompt: value } });
+      const data = await httpRequest<SearchResult>("/v1/search", { method: "POST", body: { prompt: value }, signal: abortController.signal });
       if (searchOwner.accepts(requestOwner)) {
         setResult(data);
       }
@@ -111,6 +121,9 @@ export function SearchPanel() {
       if (searchOwner.accepts(requestOwner)) {
         setElapsedMs(Date.now() - start);
         setLoading(false);
+      }
+      if (searchAbortControllerRef.current === abortController) {
+        searchAbortControllerRef.current = null;
       }
     }
   };

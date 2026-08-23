@@ -93,7 +93,13 @@ class ModelPublicProjectionContractTests(unittest.TestCase):
                 "pro" not in item.get("supported_account_types", [])
                 for item in response.json()["data"]
             ))
-            self.assertNotIn("Pro", catalog._active_accounts_by_group())
+            # A failed representative closes only that account type's model
+            # capability.  It must remain eligible for bounded retry/fallback
+            # and must not mutate the live account into an invalid state.
+            self.assertEqual(
+                catalog._active_accounts_by_group()["Pro"],
+                ["pro-invalid"],
+            )
             self.assertEqual(
                 catalog.route_for_model("free-live-model").access_tokens,
                 frozenset({"free-live"}),
@@ -130,7 +136,7 @@ class ModelPublicProjectionContractTests(unittest.TestCase):
         self.assertEqual(response.json()["error"]["code"], "upstream_error")
         self.assertIn("warming up", response.json()["error"]["message"])
         self.assertEqual(response.headers.get("retry-after"), "5")
-        self.assertEqual(calls, [True])
+        self.assertEqual(calls, [True, False])
 
     def test_backend_catalog_route_rejects_container_model_fields(self) -> None:
         secret = "backend-model-container-canary"

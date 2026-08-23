@@ -132,20 +132,35 @@ def test_bind_mounted_config_rejects_hardlinked_target(tmp_path: Path) -> None:
     assert alias_path.read_text(encoding="utf-8") == original_payload
 
 
-def test_container_runtime_uses_the_frozen_environment_without_syncing_dependencies() -> None:
+def test_container_runtime_keeps_python_until_rust_parity_gate_is_closed() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-    assert "RUN uv sync --frozen --no-dev --no-install-project" in dockerfile
-    assert 'CMD ["uv", "run", "--no-sync", "uvicorn"' in dockerfile
+    assert "FROM --platform=$TARGETPLATFORM python:3.13-slim AS app" in dockerfile
+    assert "uv sync --frozen --no-dev --no-install-project" in dockerfile
+    assert 'CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--no-access-log"]' in dockerfile
+    assert "rust-build" not in dockerfile
+    assert "chatgpt2api-rust" not in dockerfile
 
 
-def test_container_carries_the_pinned_codex_models_client_version() -> None:
+def test_container_carries_the_pinned_codex_client_version() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     workflow = (ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")
 
-    assert "ARG CODEX_MODELS_CLIENT_VERSION" in dockerfile
-    assert "CODEX_MODELS_CLIENT_VERSION=${CODEX_MODELS_CLIENT_VERSION}" in dockerfile
-    assert "CODEX_MODELS_CLIENT_VERSION=0.147.0" in workflow
+    assert "ARG CODEX_CLIENT_VERSION" in dockerfile
+    assert "CODEX_CLIENT_VERSION=${CODEX_CLIENT_VERSION}" in dockerfile
+    assert "CODEX_CLIENT_VERSION=0.147.0" in workflow
+    assert "CODEX_MODELS_CLIENT_VERSION" not in dockerfile
+    assert "CODEX_MODELS_CLIENT_VERSION" not in workflow
+
+
+def test_rust_release_matrix_keeps_unimplemented_public_contracts_as_hard_blocks() -> None:
+    matrix = (ROOT / "docs" / "rust-production-capability-matrix.md").read_text(encoding="utf-8")
+    assert "WebSocket /v1/responses" in matrix
+    assert "GET/HEAD /files/{file_path}" in matrix
+    assert "POST /api/images/download" in matrix
+    assert "CPA" in matrix and "Sub2API" in matrix and "CCLoad" in matrix
+    assert "当前结论：Rust 目录模型端点修复是有效的局部修复" in matrix
+    assert matrix.count("| 阻断 |") >= 10
 
 
 def test_container_frontend_build_uses_the_bun_lock() -> None:

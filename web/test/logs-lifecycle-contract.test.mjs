@@ -23,6 +23,14 @@ test("logs list and delete share query/mutation ownership", () => {
   assert.match(source, /onClick=\{\(\) => void confirmDelete\(\)\} disabled=\{isDeleting/);
 });
 
+test("logs list aborts its request when the page owner is cleaned up", () => {
+  assert.match(source, /logAbortControllerRef/);
+  assert.match(source, /fetchSystemLogs\(\s*\{[\s\S]*?\},\s*abortController\.signal\s*,?\s*\)/);
+  assert.match(source, /logAbortControllerRef\.current\?\.abort\(\);/);
+  assert.match(source, /return \(\) => \{[\s\S]*?logAbortControllerRef\.current\?\.abort\(\);/);
+  assert.match(source, /const mutationOwner = logMutationGateRef\.current\.beginMutation\(\);[\s\S]*?logAbortControllerRef\.current\?\.abort\(\);/);
+});
+
 test("a late logs query is dropped and the production coordinator reloads the current filter", () => {
   const gate = createMutationRequestGate();
   const oldQuery = gate.beginQuery("list");

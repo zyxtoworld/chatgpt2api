@@ -72,6 +72,7 @@ function messageImages(message: ChatMessage): string[] {
 
 export function ChatPanel() {
   const chatRequestGateRef = useRef(createChatPanelRequestGate());
+  const chatAbortControllerRef = useRef<AbortController | null>(null);
   const pendingImageReadsRef = useRef(0);
   const [model, setModel] = useState("auto");
   const [reasoningEffort, setReasoningEffort] = useState("");
@@ -88,6 +89,8 @@ export function ChatPanel() {
     requestGate.activate();
     return () => {
       requestGate.cancel();
+      chatAbortControllerRef.current?.abort();
+      chatAbortControllerRef.current = null;
     };
   }, []);
 
@@ -124,6 +127,9 @@ export function ChatPanel() {
     if (!text && !selectedImages.length) return;
     const requestGate = chatRequestGateRef.current;
     const requestOwner = requestGate.beginChat();
+    chatAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    chatAbortControllerRef.current = abortController;
     const content: string | ChatContentPart[] = selectedImages.length
       ? [
           ...(text ? [{ type: "text" as const, text }] : []),
@@ -142,7 +148,7 @@ export function ChatPanel() {
         messages: nextMessages,
         ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       };
-      const result = await httpRequest<ChatCompletionResponse>("/v1/chat/completions", { method: "POST", body });
+      const result = await httpRequest<ChatCompletionResponse>("/v1/chat/completions", { method: "POST", body, signal: abortController.signal });
       if (requestGate.acceptsChat(requestOwner)) {
         setRaw(result);
         setMessages([...nextMessages, { role: "assistant", content: String(result.choices?.[0]?.message?.content || "") }]);
@@ -155,12 +161,17 @@ export function ChatPanel() {
       if (requestGate.acceptsChat(requestOwner)) {
         setLoading(false);
       }
+      if (chatAbortControllerRef.current === abortController) {
+        chatAbortControllerRef.current = null;
+      }
     }
   };
 
   const clearChat = () => {
     const requestGate = chatRequestGateRef.current;
     requestGate.clear();
+    chatAbortControllerRef.current?.abort();
+    chatAbortControllerRef.current = null;
     pendingImageReadsRef.current = 0;
     setPendingImageReads(0);
     setMessages([]);

@@ -138,6 +138,17 @@ def _health_probe_owner() -> _HealthProbeOwner:
         return owner
 
 
+def _health_probe_owners_snapshot() -> tuple[_HealthProbeOwner, ...]:
+    """Return live owners so shutdown can drain probes created by other loops."""
+    with _HEALTH_PROBE_OWNERS_LOCK:
+        owners: list[_HealthProbeOwner] = []
+        for owner_ref in _HEALTH_PROBE_OWNERS.values():
+            owner = owner_ref()
+            if owner is not None:
+                owners.append(owner)
+        return tuple(owners)
+
+
 def _consume_health_task_result(owner: _HealthProbeOwner, stage: str, task: Future) -> None:
     with owner.tasks_lock:
         if owner.tasks.get(stage) is task:
@@ -149,27 +160,28 @@ def _consume_health_task_result(owner: _HealthProbeOwner, stage: str, task: Futu
 
 
 async def wait_for_health_probe_tasks(timeout: float = _HEALTH_SHUTDOWN_TIMEOUT_SECONDS) -> bool:
-    """Wait briefly for this event loop's workers without abandoning them."""
-    owner = _health_probe_owner()
+    """Wait briefly for all loop owners without abandoning their workers."""
     deadline = anyio.current_time() + timeout
     while True:
-        with owner.tasks_lock:
-            tasks = tuple(owner.tasks.items())
-        if not tasks:
-            break
-        for stage, task in tasks:
-            if task.done():
-                _consume_health_task_result(owner, stage, task)
-        with owner.tasks_lock:
-            pending_stages = tuple(owner.tasks)
-        if not pending_stages:
-            break
+        pending: list[tuple[_HealthProbeOwner, str, Future]] = []
+        for owner in _health_probe_owners_snapshot():
+            with owner.tasks_lock:
+                tasks = tuple(owner.tasks.items())
+            for stage, task in tasks:
+                if task.done():
+                    _consume_health_task_result(owner, stage, task)
+                else:
+                    pending.append((owner, stage, task))
+        if not pending:
+            return True
         remaining = max(0.0, deadline - anyio.current_time())
         if remaining <= 0:
-            logger.warning("health probe shutdown timed out", extra={"pending_stages": pending_stages})
+            logger.warning(
+                "health probe shutdown timed out",
+                extra={"pending_stages": tuple(stage for _, stage, _ in pending)},
+            )
             return False
         await asyncio.sleep(min(0.01, remaining))
-    return True
 
 
 async def _bounded_health_io(
@@ -334,6 +346,11 @@ def _validate_settings_update_fields(payload: dict[str, object]) -> None:
 
 class ProxyTestRequest(BaseModel):
     url: str = ""
+
+
+class ProxySettingsRequest(BaseModel):
+    enabled: StrictBool | None = None
+    url: str | None = None
 
 
 class ClearanceTestRequest(BaseModel):
@@ -604,6 +621,33 @@ def create_router(app_version: str) -> APIRouter:
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail={"error": "配置更新失败，请稍后重试"}) from exc
+
+    @router.get("/api/proxy")
+    async def get_proxy_settings(authorization: str | None = Header(default=None)):
+        await require_admin_async(authorization)
+        public_config = await run_system_management_io(config.get)
+        url = str(public_config.get("proxy") or "").strip()
+        return {"proxy": {"enabled": bool(url), "url": url}}
+
+    @router.post("/api/proxy")
+    async def save_proxy_settings(
+        body: ProxySettingsRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        await require_admin_async(authorization)
+        current = await run_system_management_io(config.get_proxy_settings)
+        url = current
+        if body.url is not None:
+            url = body.url.strip()
+        if body.enabled is False:
+            url = ""
+        try:
+            await run_system_management_io(config.update, {"proxy": url})
+            public_config = await run_system_management_io(config.get)
+        except (PublicSafeValueError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail={"error": "代理配置更新失败，请稍后重试"}) from exc
+        public_url = str(public_config.get("proxy") or "").strip()
+        return {"proxy": {"enabled": bool(public_url), "url": public_url}}
 
     @router.get("/api/images")
     async def get_images(request: Request, start_date: str = "", end_date: str = "", authorization: str | None = Header(default=None)):

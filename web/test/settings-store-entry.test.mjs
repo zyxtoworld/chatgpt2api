@@ -124,6 +124,76 @@ test("malformed numeric config values fail closed instead of publishing NaN", as
   }
 });
 
+test("config cleanup aborts the in-flight request, not only its late state write", async () => {
+  const originalRequest = request.request;
+  let requestConfig;
+  request.request = (config) => {
+    requestConfig = config;
+    return new Promise(() => {});
+  };
+
+  try {
+    useSettingsStore.getState().cancelConfigOperations();
+    useSettingsStore.getState().loadConfig();
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.ok(requestConfig?.signal instanceof AbortSignal);
+    assert.equal(requestConfig.signal.aborted, false);
+    useSettingsStore.getState().cancelConfigOperations();
+    assert.equal(requestConfig.signal.aborted, true);
+  } finally {
+    request.request = originalRequest;
+    useSettingsStore.getState().cancelConfigOperations();
+  }
+});
+
+test("CPA list cleanup aborts the in-flight request, not only its late state write", async () => {
+  const originalRequest = request.request;
+  let requestConfig;
+  request.request = (config) => {
+    requestConfig = config;
+    return new Promise(() => {});
+  };
+
+  try {
+    const pollController = new AbortController();
+    useSettingsStore.getState().cancelPoolOperations();
+    useSettingsStore.getState().loadPools(true, pollController.signal);
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.ok(requestConfig?.signal instanceof AbortSignal);
+    assert.equal(requestConfig.signal.aborted, false);
+    pollController.abort();
+    useSettingsStore.getState().cancelPoolOperations();
+    assert.equal(requestConfig.signal.aborted, true);
+  } finally {
+    request.request = originalRequest;
+    useSettingsStore.getState().cancelPoolOperations();
+  }
+});
+
+test("backup list cleanup aborts the in-flight request, not only its late state write", async () => {
+  const originalRequest = request.request;
+  let requestConfig;
+  request.request = (config) => {
+    requestConfig = config;
+    return new Promise(() => {});
+  };
+
+  try {
+    const pollController = new AbortController();
+    useSettingsStore.getState().cancelBackupOperations();
+    useSettingsStore.getState().loadBackups(true, pollController.signal);
+    await new Promise((resolve) => queueMicrotask(resolve));
+    assert.ok(requestConfig?.signal instanceof AbortSignal);
+    assert.equal(requestConfig.signal.aborted, false);
+    pollController.abort();
+    useSettingsStore.getState().cancelBackupOperations();
+    assert.equal(requestConfig.signal.aborted, true);
+  } finally {
+    request.request = originalRequest;
+    useSettingsStore.getState().cancelBackupOperations();
+  }
+});
+
 test("settings config save admits one writer and reopens after it finishes", async () => {
   const originalRequest = request.request;
   const calls = [];

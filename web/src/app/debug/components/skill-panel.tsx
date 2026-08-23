@@ -22,13 +22,15 @@ export function SkillPanel() {
 
   useEffect(() => {
     let cancelled = false;
-    void fetchSettingsConfig()
+    const controller = new AbortController();
+    void fetchSettingsConfig(controller.signal)
       .then((data) => {
         if (!cancelled) setConfiguredBaseUrl(normalizeSkillBaseUrl(data.config?.base_url));
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, []);
 

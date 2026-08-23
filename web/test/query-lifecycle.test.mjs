@@ -6,10 +6,12 @@ import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "../src/lib/query
 
 function deferred() {
   let resolve;
-  const promise = new Promise((nextResolve) => {
+  let reject;
+  const promise = new Promise((nextResolve, nextReject) => {
     resolve = nextResolve;
+    reject = nextReject;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 test("owned list loading clears on mutation and an old query cannot clear a newer owner", async () => {
@@ -56,6 +58,45 @@ test("owned list loading clears on mutation and an old query cannot clear a newe
   await secondLoad;
   assert.equal(loading, false);
   assert.deepEqual(committed, [{ id: "new" }]);
+});
+
+test("owned query cancellation aborts the request body owner", async () => {
+  const gate = createMutationRequestGate();
+  const pending = deferred();
+  let requestSignal;
+  const loader = createOwnedQueryLoader({
+    gate,
+    request: (signal) => {
+      requestSignal = signal;
+      return pending.promise;
+    },
+  });
+
+  const run = loader.run();
+  assert.ok(requestSignal instanceof AbortSignal);
+  loader.cancel();
+  assert.equal(requestSignal.aborted, true);
+  pending.resolve("late");
+  await run;
+});
+
+test("owned query cancellation suppresses a late request error", async () => {
+  const gate = createMutationRequestGate();
+  const pending = deferred();
+  let errors = 0;
+  const loader = createOwnedQueryLoader({
+    gate,
+    request: () => pending.promise,
+    onError: () => {
+      errors += 1;
+    },
+  });
+
+  const run = loader.run();
+  loader.cancel();
+  pending.reject(new Error("late cancellation error"));
+  await run;
+  assert.equal(errors, 0);
 });
 
 test("a proxy-style save remains authoritative over a late initial settings read", async () => {

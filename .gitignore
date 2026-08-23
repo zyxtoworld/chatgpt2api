@@ -34,3 +34,10 @@ git_cache/
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
+
+# Local Rust migration/test evidence (never runtime or release assets)
+rust-*.log
+rust-*.log.exit
+
+# Project-local Codex artifacts, temporary files, recovery copies, and secrets
+/.local/

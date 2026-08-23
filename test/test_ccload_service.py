@@ -294,7 +294,8 @@ class CCLoadServiceContractTests(unittest.TestCase):
             ("١٢", ""),
             ("１２", ""),
             ("000", ""),
-            ("0007", "0007"),
+            ("0007", ""),
+            ("7", "7"),
             ("9" * 64, "9" * 64),
             ("9" * 65, ""),
             (10**63, "1" + "0" * 63),
@@ -391,14 +392,12 @@ class CCLoadServiceContractTests(unittest.TestCase):
         self.assertEqual(models, ["valid-channel-model"])
         self.assertNotIn(canary, repr(models))
 
-    def test_channel_model_ids_binds_codex_catalog_identity(self) -> None:
+    def test_channel_model_ids_does_not_bind_source_specific_catalog_identity(self) -> None:
         class CapturingBackend:
             instances: list["CapturingBackend"] = []
 
             def __init__(self, access_token: str = ""):
                 self.access_token = access_token
-                self._catalog_source_type = ""
-                self._catalog_account_id = ""
                 self.closed = False
                 self.__class__.instances.append(self)
 
@@ -411,15 +410,12 @@ class CCLoadServiceContractTests(unittest.TestCase):
         with mock.patch.object(ccload_module, "OpenAIBackendAPI", CapturingBackend):
             models = ccload_module._channel_model_ids(
                 "channel-token",
-                account_id="channel-account",
             )
 
         self.assertEqual(models, ["codex-model"])
         self.assertEqual(len(CapturingBackend.instances), 1)
         backend = CapturingBackend.instances[0]
         self.assertEqual(backend.access_token, "channel-token")
-        self.assertEqual(backend._catalog_source_type, "codex")
-        self.assertEqual(backend._catalog_account_id, "channel-account")
         self.assertTrue(backend.closed)
 
     def test_expired_browse_deadline_does_not_start_unbounded_logout_cleanup(self) -> None:

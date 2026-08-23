@@ -14,6 +14,22 @@ test("accounts initial loads belong to the current setup and cancel on cleanup",
   assert.match(text, /cancelInitialLoad\(\);/);
   assert.doesNotMatch(text, /didLoadRef/);
   assert.match(text, /mountedRef\.current/);
+  assert.match(text, /accountListAbortControllerRef/);
+  assert.match(text, /modelAbortControllerRef/);
+  assert.match(text, /fetchAccounts\(abortController\.signal\)/);
+  assert.match(text, /fetchModels\(abortController\.signal\)/);
+  assert.match(text, /accountListAbortControllerRef\.current\?\.abort\(\);/);
+  assert.match(text, /modelAbortControllerRef\.current\?\.abort\(\);/);
+});
+
+test("a superseded model request cannot publish abort error or clear the latest busy state", () => {
+  const text = readFileSync(sourcePath, "utf8");
+  const start = text.indexOf("const loadModels = async () => {");
+  const end = text.indexOf("\n  };", start) + 5;
+  const body = text.slice(start, end);
+  assert.ok(start >= 0, "loadModels must remain a separately owned operation");
+  assert.match(body, /modelAbortControllerRef\.current === abortController/);
+  assert.match(body, /!mountedRef\.current \|\| !ownsModelRequest\(\)/);
 });
 
 test("account writes use one mutation owner and guard late results", () => {

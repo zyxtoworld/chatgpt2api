@@ -209,6 +209,11 @@ class DatabaseStorageBackend(StorageBackend):
             if index.get("unique")
             and index.get("column_names") == ["access_token_hash"]
         ]
+        sqlite_needs_rebuild = dialect == "sqlite" and (
+            hash_needs_not_null
+            or bool(raw_token_constraints)
+            or not isinstance(token_column.get("type"), Text)
+        )
 
         with self.engine.begin() as connection:
             if hash_column is None:
@@ -246,7 +251,7 @@ class DatabaseStorageBackend(StorageBackend):
                     updates,
                 )
 
-            if dialect == "sqlite" and hash_needs_not_null:
+            if sqlite_needs_rebuild:
                 migration_table = "accounts__chatgpt2api_token_migration"
                 connection.execute(text(f"DROP TABLE IF EXISTS {migration_table}"))
                 connection.execute(
@@ -295,6 +300,14 @@ class DatabaseStorageBackend(StorageBackend):
                         "ALTER TABLE accounts MODIFY access_token_hash CHAR(64) NOT NULL"
                     )
                 )
+
+            # A recovered SQLite midstate may already have the digest column
+            # and unique index while the legacy raw-token index remains. The
+            # normal SQLite rebuild removes it, but this partial state does
+            # not need a rebuild; drop the redundant index only after the
+            # digest identity is verified and unique.
+            if dialect == "sqlite" and raw_token_indexes:
+                self._drop_raw_token_indexes(connection, raw_token_indexes, dialect)
 
             # MySQL cannot convert an indexed VARCHAR column to TEXT while the
             # old raw-token index still exists.  Drop it only after the digest

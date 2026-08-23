@@ -14,12 +14,7 @@ import anyio
 
 from services.account_service import AccountService, account_service
 from services.model_contract import parse_model_text
-from services.openai_backend_api import (
-    CatalogConfigurationError,
-    CatalogIncompleteError,
-    InvalidAccessTokenError,
-    OpenAIBackendAPI,
-)
+from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.error_response import PublicSafeErrorMarker
 from services.protocol.reasoning_effort import (
     canonical_conversation_effort,
@@ -150,30 +145,21 @@ class ModelCatalogService:
         return models
 
     def _active_accounts_by_group(self) -> dict[str, list[str]]:
-        groups: dict[AccountModelGroup, list[tuple[int, str]]] = {}
+        groups: dict[AccountModelGroup, list[str]] = {}
         for account in self._accounts.list_accounts():
-            if not isinstance(account, dict) or not self._accounts._is_text_account_available(account):
+            if not isinstance(account, dict):
+                continue
+            if str(account.get("status") or "正常").strip() in {"禁用", "限流", "异常"}:
                 continue
             access_token = str(account.get("access_token") or "").strip()
             account_type = self._accounts._normalize_account_type(account.get("type"))
             if access_token and account_type:
-                # Web-compatible credentials must be the representative when
-                # a type mixes Web and Codex accounts.  The catalog Web
-                # endpoint is guarded at transport level; choosing a Codex
-                # token first only creates a guaranteed failed attempt and can
-                # leave a cold catalog pending even though a valid Web token
-                # exists.  Keep Codex candidates as bounded fallback for
-                # all-Codex types or after Web candidates fail.
-                priority = 0 if AccountService.is_web_backend_compatible(account) else 1
-                groups.setdefault(account_type, []).append((priority, access_token))
+                # The upstream catalog is grouped only by normalized plan type.
+                # Preserve account order: source_type selects conversation
+                # capability, never the model-discovery endpoint.
+                groups.setdefault(account_type, []).append(access_token)
         return {
-            account_type: [
-                token
-                for _priority, token in sorted(
-                    dict.fromkeys(candidates),
-                    key=lambda item: (item[0], item[1]),
-                )
-            ]
+            account_type: list(dict.fromkeys(candidates))
             for account_type, candidates in groups.items()
         }
 
@@ -204,40 +190,15 @@ class ModelCatalogService:
         self,
         access_token: str = "",
         *,
-        source_type: str | None = None,
-        account: object | None = None,
         deadline: float | None = None,
     ) -> dict[str, dict[str, Any]]:
         backend = self._backend_factory(access_token=access_token)
-        catalog_account_id = None
-        if isinstance(account, dict):
-            raw_account_id = account.get("account_id") or account.get("chatgpt_account_id")
-            if isinstance(raw_account_id, str) and raw_account_id.strip():
-                catalog_account_id = raw_account_id.strip()
-        setattr(backend, "_catalog_account_id", catalog_account_id)
-        if access_token:
-            account_source = (
-                AccountService._normalize_source_type(
-                    account.get("source_type") if isinstance(account, dict) else source_type
-                )
-            )
-            setattr(backend, "_catalog_source_type", account_source)
-        elif source_type:
-            setattr(backend, "_catalog_source_type", source_type)
         try:
-            list_catalog = getattr(backend, "list_catalog_models", None)
-            raw_models = (
-                list_catalog(deadline=deadline)
-                if access_token and callable(list_catalog)
-                else backend.list_models(deadline=deadline)
-            )
-            if (
-                access_token
-                and callable(list_catalog)
-                and isinstance(raw_models, dict)
-                and raw_models.get("catalog_complete") is False
-            ):
-                raise CatalogIncompleteError("authenticated model catalog is incomplete")
+            # Upstream's production model directory has one authenticated Web
+            # endpoint.  Codex is a conversation transport, not a second model
+            # discovery source; keep discovery identical for every account
+            # source_type.
+            raw_models = backend.list_models(deadline=deadline)
             models = self._model_map(raw_models)
             if not models:
                 # A successful HTTP response with no usable model is not a
@@ -294,8 +255,6 @@ class ModelCatalogService:
                     raise RuntimeError("representative account disappeared")
                 models = self._fetch_models(
                     resolved_token,
-                    source_type="web",
-                    account=expected_account,
                     deadline=deadline,
                 )
                 return _IncrementalAccountTypeCatalogResult(
@@ -306,38 +265,6 @@ class ModelCatalogService:
                 )
             except Exception as exc:  # noqa: BLE001 - try the bounded fallback
                 last_error = exc
-                if isinstance(exc, CatalogConfigurationError):
-                    # This is a deployment-wide preflight failure, not an
-                    # account-specific upstream failure.  Retrying interchangeable
-                    # tokens only creates a request storm.
-                    break
-                # The Codex models endpoint has an independent auth contract.
-                # A 401 there does not prove that the ChatGPT token is dead:
-                # the official Codex tracker documents releases where the
-                # same fresh token still works for core Responses.  Only a
-                # token-invalid response from a general/account endpoint may
-                # trigger the destructive invalid-account transition.
-                invalidates_account = not (
-                    isinstance(exc, InvalidAccessTokenError)
-                    and getattr(exc, "path", "") == "/backend-api/codex/models"
-                )
-                if (
-                    isinstance(exc, InvalidAccessTokenError)
-                    and invalidates_account
-                    and expected_account is not None
-                ):
-                    try:
-                        self._accounts.remove_invalid_token(
-                            resolved_token,
-                            "model_catalog",
-                            quiet=True,
-                            expected_account=expected_account,
-                        )
-                    except Exception as transition_error:  # noqa: BLE001 - preserve the 401 owner error
-                        logger.warning({
-                            "event": "model_catalog_invalid_transition_failed",
-                            "error_type": type(transition_error).__name__,
-                        })
                 logger.warning({
                     "event": "model_catalog_account_failed",
                     "account_type": account_type,
@@ -401,30 +328,18 @@ class ModelCatalogService:
         anonymous_succeeded = False
         futures = []
         try:
-            anonymous_future = self._submit_refresh_future(
-                self._fetch_models,
-                submit_deadline=deadline,
-                deadline=deadline,
-            )
-            futures.append(anonymous_future)
-            account_futures = {}
-            for account_type, access_tokens in sorted(groups.items()):
-                future = self._submit_refresh_future(
-                    self._fetch_account_type_models,
-                    account_type,
-                    tuple(access_tokens),
-                    deadline,
-                    submit_deadline=deadline,
-                )
-                futures.append(future)
-                account_futures[future] = account_type
-
             def remaining() -> float:
                 value = deadline - self._deadline_clock()
                 if value <= 0:
                     raise ModelCatalogRefreshTimeout("model catalog refresh timed out")
                 return value
 
+            anonymous_future = self._submit_refresh_future(
+                self._fetch_models,
+                submit_deadline=deadline,
+                deadline=deadline,
+            )
+            futures.append(anonymous_future)
             try:
                 anonymous_models = anonymous_future.result(timeout=remaining())
             except TimeoutError as exc:
@@ -437,6 +352,18 @@ class ModelCatalogService:
                 anonymous_models = previous_anonymous_models
             else:
                 anonymous_succeeded = isinstance(anonymous_models, dict)
+
+            account_futures = {}
+            for account_type, access_tokens in sorted(groups.items()):
+                future = self._submit_refresh_future(
+                    self._fetch_account_type_models,
+                    account_type,
+                    tuple(access_tokens),
+                    deadline,
+                    submit_deadline=deadline,
+                )
+                futures.append(future)
+                account_futures[future] = account_type
 
             pending = set(account_futures)
             while pending:

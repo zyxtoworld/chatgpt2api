@@ -155,6 +155,158 @@ def test_database_storage_legacy_migration_is_idempotent(tmp_path) -> None:
     assert second_indexes == first_indexes
 
 
+def test_database_storage_sqlite_midstate_removes_legacy_raw_token_index(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'midstate.db'}"
+    engine = create_engine(database_url)
+    token = "midstate-token"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "access_token TEXT NOT NULL, "
+                "access_token_hash CHAR(64) NOT NULL, "
+                "data TEXT NOT NULL)"
+            )
+        )
+        connection.execute(
+            text("CREATE UNIQUE INDEX ix_accounts_access_token ON accounts (access_token)")
+        )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX ux_accounts_access_token_hash "
+                "ON accounts (access_token_hash)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO accounts (access_token, access_token_hash, data) "
+                "VALUES (:token, :token_hash, :data)"
+            ),
+            {
+                "token": token,
+                "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+                "data": json.dumps({"access_token": token}),
+            },
+        )
+    engine.dispose()
+
+    backend = DatabaseStorageBackend(database_url)
+    try:
+        indexes = inspect(backend.engine).get_indexes("accounts")
+        assert not any(
+            index.get("unique") and index.get("column_names") == ["access_token"]
+            for index in indexes
+        )
+        assert any(
+            index.get("unique")
+            and index.get("column_names") == ["access_token_hash"]
+            for index in indexes
+        )
+    finally:
+        backend.close()
+
+
+def test_database_storage_sqlite_midstate_rebuilds_legacy_raw_token_type(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'midstate-varchar.db'}"
+    engine = create_engine(database_url)
+    token = "midstate-varchar-token"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "access_token VARCHAR(2048) NOT NULL, "
+                "access_token_hash CHAR(64) NOT NULL, "
+                "data TEXT NOT NULL)"
+            )
+        )
+        connection.execute(
+            text("CREATE UNIQUE INDEX ix_accounts_access_token ON accounts (access_token)")
+        )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX ux_accounts_access_token_hash "
+                "ON accounts (access_token_hash)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO accounts (access_token, access_token_hash, data) "
+                "VALUES (:token, :token_hash, :data)"
+            ),
+            {
+                "token": token,
+                "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+                "data": json.dumps({"access_token": token}),
+            },
+        )
+    engine.dispose()
+
+    backend = DatabaseStorageBackend(database_url)
+    try:
+        columns = {
+            column["name"]: column
+            for column in inspect(backend.engine).get_columns("accounts")
+        }
+        indexes = inspect(backend.engine).get_indexes("accounts")
+        assert isinstance(columns["access_token"]["type"], Text)
+        assert not any(index.get("column_names") == ["access_token"] for index in indexes)
+        assert any(
+            index.get("unique")
+            and index.get("column_names") == ["access_token_hash"]
+            for index in indexes
+        )
+        assert backend.load_accounts() == [{"access_token": token}]
+    finally:
+        backend.close()
+
+
+def test_database_storage_sqlite_midstate_removes_legacy_raw_token_constraint(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'midstate-constraint.db'}"
+    engine = create_engine(database_url)
+    token = "midstate-constraint-token"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE accounts ("
+                "id INTEGER PRIMARY KEY, "
+                "access_token TEXT NOT NULL UNIQUE, "
+                "access_token_hash CHAR(64) NOT NULL, "
+                "data TEXT NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO accounts (access_token, access_token_hash, data) "
+                "VALUES (:token, :token_hash, :data)"
+            ),
+            {
+                "token": token,
+                "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+                "data": json.dumps({"access_token": token}),
+            },
+        )
+    engine.dispose()
+
+    backend = DatabaseStorageBackend(database_url)
+    try:
+        inspector = inspect(backend.engine)
+        constraints = inspector.get_unique_constraints("accounts")
+        indexes = inspector.get_indexes("accounts")
+        assert not any(
+            constraint.get("column_names") == ["access_token"]
+            for constraint in constraints
+        )
+        assert any(
+            index.get("unique")
+            and index.get("column_names") == ["access_token_hash"]
+            for index in indexes
+        )
+    finally:
+        backend.close()
+
+
 def test_database_storage_concurrent_legacy_startup_is_serialized(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'concurrent-legacy.db'}"
     legacy_engine = create_engine(database_url)

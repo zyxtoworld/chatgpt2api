@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import unittest
 
+import pytest
 import requests
 
 from test.fixtures.image_inputs import image_fixture_bytes
-from test.utils import save_image
+from test.utils import decode_image_payload, iter_sse_data, require_http_response, require_stream_response
 from utils.log import logger
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
+AUTH_KEY = os.getenv("CHATGPT2API_LIVE_API_KEY", "")
+BASE_URL = os.getenv("CHATGPT2API_LIVE_BASE_URL", "")
 
 
 def load_asset_bytes(name: str) -> bytes:
@@ -23,11 +25,12 @@ def summarize_chunk(chunk: dict[str, object]) -> dict[str, object]:
         "type": chunk.get("type"),
         "partial_image_index": chunk.get("partial_image_index"),
         "has_b64_json": bool(chunk.get("b64_json")),
-        "usage": chunk.get("usage"),
+        "has_usage": "usage" in chunk,
     }
 
 
 class ImageEditsTests(unittest.TestCase):
+    @pytest.mark.live_upstream
     def test_image_edit_http(self):
         """测试图片编辑的非流式 HTTP 调用。"""
         response = requests.post(
@@ -42,22 +45,22 @@ class ImageEditsTests(unittest.TestCase):
             files={"image": ("chery_studio.png", load_asset_bytes("chery_studio.png"), "image/png")},
             timeout=300,
         )
-        self.assertEqual(response.status_code, 200, response.text)
+        require_http_response(response, content_type="application/json")
         payload = response.json()
-        saved_paths = []
+        decoded_images: list[bytes] = []
         for index, item in enumerate(payload.get("data") or [], start=1):
             b64_json = str((item or {}).get("b64_json") or "")
             if b64_json:
-                saved_paths.append(save_image(b64_json, f"images_edits_non_stream_{index}"))
-        self.assertGreater(len(saved_paths), 0, "非流式接口未输出图片。")
+                decoded_images.append(decode_image_payload(b64_json))
+        self.assertGreater(len(decoded_images), 0, "非流式接口未输出图片。")
         logger.info({
             "event": "test_images_edits_non_stream_done",
             "status_code": response.status_code,
             "created": payload.get("created"),
-            "saved_paths": [str(path) for path in saved_paths],
-            "image_count": len(saved_paths),
+            "image_count": len(decoded_images),
         })
 
+    @pytest.mark.live_upstream
     def test_image_edit_stream_http(self):
         """测试图片编辑的流式 HTTP 调用。"""
         response = requests.post(
@@ -78,36 +81,30 @@ class ImageEditsTests(unittest.TestCase):
             timeout=300,
         )
         image_items: list[dict[str, object]] = []
-        stream_errors: list[dict[str, object]] = []
-        started_at = time.time()
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertTrue(
-            response.headers.get("content-type", "").startswith("text/event-stream"),
-            response.headers.get("content-type", ""),
-        )
+        stream_errors: list[str] = []
+        parse_errors: list[str] = []
+        completed_events = 0
+        require_stream_response(response)
         logger.info({
             "event": "test_images_edits_stream_start",
             "status_code": response.status_code,
             "content_type": response.headers.get("content-type"),
         })
         try:
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                text = line.decode("utf-8", errors="replace")
-                if not text.startswith("data:"):
-                    continue
-                payload = text[5:].strip()
+            for payload in iter_sse_data(response):
+                if payload == "[DONE]":
+                    break
                 try:
                     chunk = json.loads(payload)
-                except Exception:
+                except Exception as exc:
+                    parse_errors.append(type(exc).__name__)
                     continue
-                elapsed = time.time() - started_at
                 if chunk.get("type") == "error":
-                    stream_errors.append(chunk)
+                    stream_errors.append("error")
+                if chunk.get("type") == "image_edit.completed":
+                    completed_events += 1
                 logger.info({
                     "event": "test_images_edits_stream_chunk",
-                    "elapsed_seconds": round(elapsed, 2),
                     "chunk": summarize_chunk(chunk),
                 })
                 if chunk.get("type") == "image_edit.completed" and chunk.get("b64_json"):
@@ -115,17 +112,17 @@ class ImageEditsTests(unittest.TestCase):
         finally:
             response.close()
 
-        saved_paths = []
-        for index, item in enumerate(image_items, start=1):
-            b64_json = str(item.get("b64_json") or "")
-            if b64_json:
-                saved_paths.append(save_image(b64_json, f"images_edits_stream_{index}"))
-        self.assertFalse(stream_errors, f"流式接口返回错误: {stream_errors}")
-        self.assertGreater(len(saved_paths), 0, "流式接口未输出图片。")
+        decoded_images = [
+            decode_image_payload(str(item.get("b64_json") or ""))
+            for item in image_items
+        ]
+        self.assertFalse(stream_errors, f"流式接口返回错误类型: {stream_errors}")
+        self.assertFalse(parse_errors, parse_errors)
+        self.assertGreater(completed_events, 0, "流式接口缺少 image_edit.completed 终态。")
+        self.assertGreater(len(decoded_images), 0, "流式接口未输出图片。")
         logger.info({
             "event": "test_images_edits_stream_done",
-            "saved_paths": [str(path) for path in saved_paths],
-            "image_count": len(saved_paths),
+            "image_count": len(decoded_images),
         })
 
 

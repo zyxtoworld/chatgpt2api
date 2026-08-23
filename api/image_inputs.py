@@ -22,7 +22,7 @@ from services.protocol.image_options import (
     normalize_supported_image_moderation,
     normalize_supported_partial_images,
 )
-from utils.helper import is_supported_image_model
+from utils.helper import is_codex_image_model, is_supported_image_model
 from utils.image_tokens import _decode_bounded_base64
 
 ImageInput = tuple[bytes, str, str]
@@ -154,7 +154,11 @@ def validate_image_api_options(payload: dict[str, Any], *, editing: bool = False
             output_compression,
             payload["output_format"],
         )
-        payload["background"] = normalize_supported_image_background(payload.get("background"))
+        payload["background"] = normalize_supported_image_background(
+            payload.get("background"),
+            allow_non_auto=is_codex_image_model(payload.get("model")),
+            output_format=payload["output_format"],
+        )
         payload["moderation"] = normalize_supported_image_moderation(payload.get("moderation"))
         payload["partial_images"] = normalize_supported_partial_images(partial_images)
     except PublicSafeValueError as exc:

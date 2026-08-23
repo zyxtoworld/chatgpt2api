@@ -338,18 +338,15 @@ class ProxySettingsStore:
             provider = self._get_provider(flaresolverr_url)
             new_bundle = provider.get_clearance(target_url, proxy_url=profile.proxy_url, timeout_sec=profile.timeout_sec)
             if new_bundle is not None:
-                expires_at = time.time() + profile.refresh_interval if profile.refresh_interval else None
-                if (
-                    not new_bundle.target_host
-                    or normalize_proxy_url(new_bundle.proxy_url) != normalize_proxy_url(profile.proxy_url)
-                    or new_bundle.expires_at != expires_at
-                ):
-                    new_bundle = replace(
-                        new_bundle,
-                        target_host=new_bundle.target_host or target_host,
-                        proxy_url=profile.proxy_url,
-                        expires_at=expires_at,
-                    )
+                refresh_time = time.time()
+                expires_at = refresh_time + profile.refresh_interval if profile.refresh_interval else None
+                new_bundle = replace(
+                    new_bundle,
+                    target_host=new_bundle.target_host or target_host,
+                    proxy_url=profile.proxy_url,
+                    created_at=refresh_time,
+                    expires_at=expires_at,
+                )
                 if not self._set_cached_bundle_if_current(key, new_bundle, generation):
                     return None
                 return new_bundle

@@ -1,1 +1,6 @@
 /target/
+*.log
+*.log.exit
+.codex-aiarm-*
+codex-aiarm-askpass.go
+.migration-evidence.ps1

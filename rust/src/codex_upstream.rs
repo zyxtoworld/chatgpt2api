@@ -29,10 +29,18 @@ pub(crate) fn native_browser_headers(
     request: RequestBuilder,
     context: &NativeRequestContext,
 ) -> RequestBuilder {
+    native_browser_headers_with_referer(request, context, "https://chatgpt.com/")
+}
+
+pub(crate) fn native_browser_headers_with_referer(
+    request: RequestBuilder,
+    context: &NativeRequestContext,
+    referer: &str,
+) -> RequestBuilder {
     request
         .header(header::USER_AGENT, NATIVE_USER_AGENT)
         .header("Origin", NATIVE_ORIGIN)
-        .header("Referer", "https://chatgpt.com/")
+        .header(header::REFERER, referer)
         .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7")
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")
@@ -57,7 +65,7 @@ pub(crate) fn native_browser_headers(
 }
 
 pub(super) fn codex_client_version() -> Option<String> {
-    env::var("CODEX_MODELS_CLIENT_VERSION")
+    env::var("CODEX_CLIENT_VERSION")
         .ok()
         .and_then(|value| parse_codex_client_version(Some(&value)))
 }
@@ -325,6 +333,78 @@ fn native_tool_output(content: Option<&Value>) -> Result<String, ApiError> {
     }
 }
 
+fn native_chat_web_search_tool(options: &Value) -> Result<Value, ApiError> {
+    let options = options.as_object().ok_or_else(ApiError::invalid_request)?;
+    if options
+        .keys()
+        .any(|key| !matches!(key.as_str(), "search_context_size" | "user_location"))
+    {
+        return Err(ApiError::invalid_request());
+    }
+    let mut tool = Map::new();
+    tool.insert("type".to_owned(), json!("web_search"));
+    if let Some(value) = options.get("search_context_size") {
+        tool.insert("search_context_size".to_owned(), value.clone());
+    }
+    if let Some(location) = options
+        .get("user_location")
+        .filter(|value| !value.is_null())
+    {
+        let location = location.as_object().ok_or_else(ApiError::invalid_request)?;
+        let approximate = location
+            .get("approximate")
+            .and_then(Value::as_object)
+            .ok_or_else(ApiError::invalid_request)?;
+        let mut normalized = Map::new();
+        normalized.insert("type".to_owned(), json!("approximate"));
+        for field in ["city", "country", "region", "timezone"] {
+            if let Some(value) = approximate.get(field) {
+                normalized.insert(field.to_owned(), value.clone());
+            }
+        }
+        tool.insert("user_location".to_owned(), Value::Object(normalized));
+    }
+    native_codex_tool(&Value::Object(tool))
+}
+
+fn native_chat_response_text(value: &Value) -> Result<Option<Value>, ApiError> {
+    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(ApiError::invalid_request)?;
+    match kind {
+        "text" if object.len() == 1 => Ok(None),
+        "json_schema" => {
+            let schema = object
+                .get("json_schema")
+                .and_then(Value::as_object)
+                .ok_or_else(ApiError::invalid_request)?;
+            if object
+                .keys()
+                .any(|key| key != "type" && key != "json_schema")
+                || schema
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "name" | "schema" | "strict"))
+                || schema
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| name.trim().is_empty())
+                || !schema.get("schema").is_some_and(Value::is_object)
+                || schema
+                    .get("strict")
+                    .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(ApiError::invalid_request());
+            }
+            let mut format = schema.clone();
+            format.insert("type".to_owned(), json!("json_schema"));
+            Ok(Some(json!({"format": format})))
+        }
+        _ => Err(ApiError::invalid_request()),
+    }
+}
+
 pub(super) fn native_codex_response_payload(
     object: &Map<String, Value>,
 ) -> Result<Value, ApiError> {
@@ -363,14 +443,41 @@ pub(super) fn native_codex_response_payload(
     if let Some(max_tokens) = object.get("max_tokens").filter(|value| !value.is_null()) {
         payload["max_output_tokens"] = max_tokens.clone();
     }
-    if let Some(tools) = object.get("tools").filter(|value| !value.is_null()) {
-        let tools = tools.as_array().ok_or_else(ApiError::invalid_request)?;
-        payload["tools"] = Value::Array(
+    let mut tools = object
+        .get("tools")
+        .filter(|value| !value.is_null())
+        .map(|value| value.as_array().ok_or_else(ApiError::invalid_request))
+        .transpose()?
+        .map(|tools| {
             tools
                 .iter()
                 .map(native_codex_tool)
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(options) = object
+        .get("web_search_options")
+        .filter(|value| !value.is_null())
+    {
+        let web_tool = native_chat_web_search_tool(options)?;
+        if let Some(existing) = tools
+            .iter_mut()
+            .find(|tool| tool.get("type").and_then(Value::as_str) == Some("web_search"))
+        {
+            if let (Some(existing), Some(web_tool)) =
+                (existing.as_object_mut(), web_tool.as_object())
+            {
+                for (key, value) in web_tool {
+                    existing.insert(key.clone(), value.clone());
+                }
+            }
+        } else {
+            tools.push(web_tool);
+        }
+    }
+    if !tools.is_empty() {
+        payload["tools"] = Value::Array(tools);
     }
     if let Some(choice) = object.get("tool_choice").filter(|value| !value.is_null()) {
         let valid_choice = matches!(choice.as_str(), Some("auto"))
@@ -387,6 +494,47 @@ pub(super) fn native_codex_response_payload(
         .or_else(|| object.get("thinking_effort").and_then(Value::as_str))
     {
         payload["reasoning"] = json!({"effort": effort});
+    }
+    if let Some(reasoning) = object.get("reasoning").filter(|value| !value.is_null()) {
+        payload["reasoning"] = reasoning.clone();
+    }
+    if let Some(prompt_cache_key) = object
+        .get("prompt_cache_key")
+        .filter(|value| !value.is_null())
+    {
+        payload["prompt_cache_key"] = prompt_cache_key.clone();
+    }
+    if let Some(service_tier) = object.get("service_tier").filter(|value| !value.is_null()) {
+        payload["service_tier"] = match service_tier.as_str() {
+            Some("fast") => json!("priority"),
+            Some("default") => Value::Null,
+            Some("priority" | "flex") => service_tier.clone(),
+            _ => return Err(ApiError::invalid_request()),
+        };
+        if payload["service_tier"].is_null() {
+            payload
+                .as_object_mut()
+                .expect("payload object")
+                .remove("service_tier");
+        }
+    }
+    if let Some(verbosity) = object.get("verbosity").filter(|value| !value.is_null()) {
+        payload["text"] = json!({"verbosity": verbosity});
+    }
+    if let Some(response_format) = object
+        .get("response_format")
+        .filter(|value| !value.is_null())
+        && let Some(text) = native_chat_response_text(response_format)?
+    {
+        let mut merged = payload
+            .get("text")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(format) = text.get("format") {
+            merged.insert("format".to_owned(), format.clone());
+        }
+        payload["text"] = Value::Object(merged);
     }
     Ok(payload)
 }

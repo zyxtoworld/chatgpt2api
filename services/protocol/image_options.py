@@ -83,14 +83,21 @@ def normalize_image_output_compression(value: object, output_format: str) -> int
     return value
 
 
-def normalize_supported_image_background(value: object) -> str:
+def normalize_supported_image_background(
+    value: object,
+    *,
+    allow_non_auto: bool = False,
+    output_format: str = "png",
+) -> str:
     if value is None or value == "":
         return "auto"
     if not isinstance(value, str) or value.strip() not in {"auto", "opaque", "transparent"}:
         raise PublicSafeValueError("background must be auto, opaque, or transparent")
     background = value.strip()
-    if background != "auto":
+    if background != "auto" and not allow_non_auto:
         raise PublicSafeValueError("background control is not supported by the upstream image backend")
+    if allow_non_auto and background == "transparent" and output_format == "jpeg":
+        raise PublicSafeValueError("transparent background requires png or webp output")
     return background
 
 

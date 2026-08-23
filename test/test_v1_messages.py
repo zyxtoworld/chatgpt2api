@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
-import time
+import os
 import unittest
 
+import pytest
 import requests
 
-AUTH_KEY = "chatgpt2api"
-BASE_URL = "http://localhost:8000"
+from test.utils import iter_sse_data, require_http_response, require_stream_response
+
+AUTH_KEY = os.getenv("CHATGPT2API_LIVE_API_KEY", "")
+BASE_URL = os.getenv("CHATGPT2API_LIVE_BASE_URL", "")
 MODEL = "auto"
 
 
@@ -19,6 +22,7 @@ class AnthropicMessagesTests(unittest.TestCase):
             "anthropic-version": "2023-06-01",
         }
 
+    @pytest.mark.live_upstream
     def test_message_http(self):
         """测试 Anthropic Messages 的非流式 HTTP 调用。"""
         response = requests.post(
@@ -32,17 +36,18 @@ class AnthropicMessagesTests(unittest.TestCase):
             },
             timeout=300,
         )
-        print("messages non-stream status:")
-        print(response.status_code)
-        print("messages non-stream result:")
-        try:
-            print(json.dumps(response.json(), ensure_ascii=False, indent=2))
-        except Exception:
-            print(response.text)
+        require_http_response(response, content_type="application/json")
+        payload = response.json()
+        self.assertEqual(payload.get("type"), "message")
+        content = payload.get("content")
+        self.assertIsInstance(content, list)
+        self.assertTrue(content)
+        self.assertTrue(any(isinstance(block, dict) and str(block.get("text") or "").strip() for block in content))
+        self.assertIn(payload.get("stop_reason"), {"end_turn", "tool_use", "max_tokens"})
 
+    @pytest.mark.live_upstream
     def test_message_stream_http(self):
         """测试 Anthropic Messages 的流式 HTTP 调用。"""
-        started_at = time.time()
         response = requests.post(
             f"{BASE_URL}/v1/messages",
             headers=self._headers(),
@@ -56,30 +61,43 @@ class AnthropicMessagesTests(unittest.TestCase):
             stream=True,
             timeout=300,
         )
-        headers_at = time.time()
-        print("messages stream status:")
-        print(response.status_code)
-        print("messages stream content-type:")
-        print(response.headers.get("content-type", ""))
-        print("messages stream response headers:")
-        print(f"{headers_at - started_at:6.2f}s")
-        if response.status_code != 200:
-            print(response.text)
-            return
-        print("messages stream chunks:")
-        for line in response.iter_lines(chunk_size=1):
-            if not line:
-                continue
-            text = line.decode("utf-8", errors="replace")
-            print(f"{time.time() - started_at:6.2f}s {text}")
-            if not text.startswith("data:"):
-                continue
-            try:
-                payload = json.loads(text[5:].strip())
-            except Exception:
-                continue
-            if payload.get("type") == "message_stop":
-                break
+        require_stream_response(response)
+        event_types: list[str] = []
+        text_deltas: list[str] = []
+        stop_reasons: list[str] = []
+        stream_errors: list[str] = []
+        parse_errors: list[str] = []
+        try:
+            for payload_text in iter_sse_data(response):
+                try:
+                    payload = json.loads(payload_text)
+                except Exception as exc:
+                    parse_errors.append(type(exc).__name__)
+                    continue
+                event_type = payload.get("type")
+                if isinstance(event_type, str):
+                    event_types.append(event_type)
+                if event_type == "error":
+                    stream_errors.append("error")
+                if event_type == "content_block_delta":
+                    delta = payload.get("delta")
+                    if isinstance(delta, dict):
+                        text_deltas.append(str(delta.get("text") or ""))
+                if event_type == "message_delta":
+                    delta = payload.get("delta")
+                    if isinstance(delta, dict) and isinstance(delta.get("stop_reason"), str):
+                        stop_reasons.append(delta["stop_reason"])
+                if payload.get("type") == "message_stop":
+                    break
+        finally:
+            response.close()
+        self.assertIn("message_start", event_types)
+        self.assertIn("content_block_delta", event_types)
+        self.assertIn("message_stop", event_types)
+        self.assertTrue(any(text_deltas))
+        self.assertTrue(stop_reasons)
+        self.assertFalse(stream_errors)
+        self.assertFalse(parse_errors, parse_errors)
 
 
 if __name__ == "__main__":
