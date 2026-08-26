@@ -9635,7 +9635,7 @@ fn health_accounts(state: &AppState) -> Value {
         health_accounts_test_hook.filter(|hook| hook.version == state.config.version)
     {
         hook.starts.fetch_add(1, Ordering::SeqCst);
-        hook.started.notify_waiters();
+        hook.started.notify_one();
         while hook.block.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -9665,7 +9665,7 @@ fn health_storage(state: &AppState) -> (Value, bool) {
     if let Some(hook) = health_storage_test_hook.filter(|hook| hook.version == state.config.version)
     {
         hook.starts.fetch_add(1, Ordering::SeqCst);
-        hook.started.notify_waiters();
+        hook.started.notify_one();
         while hook.block.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -22665,7 +22665,9 @@ data: [DONE]
                 .expect("first health response")
             }
         });
-        hook.started.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
+            .await
+            .expect("storage health hook did not start within two seconds");
         let _first = tokio::time::timeout(Duration::from_secs(2), first)
             .await
             .expect("first health timeout")
@@ -22758,7 +22760,9 @@ data: [DONE]
                 .expect("health response")
             }
         });
-        hook.started.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
+            .await
+            .expect("account health hook did not start within two seconds");
         let _first = tokio::time::timeout(Duration::from_secs(2), first)
             .await
             .expect("health request timeout")
@@ -22830,7 +22834,9 @@ data: [DONE]
             .await
             .expect("health response")
         });
-        hook.started.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
+            .await
+            .expect("account health statistics hook did not start within two seconds");
         let bounded = tokio::time::timeout(Duration::from_millis(700), &mut request).await;
         hook.block.store(false, Ordering::SeqCst);
         if bounded.is_err() {
