@@ -131,9 +131,9 @@ def _json_direct_writer(
     barrier = Path(barrier_text)
     (barrier / "json-direct-ready").write_text("ready", encoding="ascii")
     deadline = time.monotonic() + 10
-    while not (barrier / "json-cas-ready-cas").exists():
+    while not (barrier / "json-cas-entered-save").exists():
         if time.monotonic() >= deadline:
-            raise TimeoutError("JSON direct/CAS readiness timeout")
+            raise TimeoutError("JSON CAS lock-entry timeout")
         time.sleep(0.005)
     (barrier / "json-direct-attempted").write_text("attempted", encoding="ascii")
     try:

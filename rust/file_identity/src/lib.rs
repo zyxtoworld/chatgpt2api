@@ -844,10 +844,17 @@ pub fn open_regular_file_for_replace_at(
     directory: &DirectoryHandle,
     name: &OsStr,
 ) -> io::Result<File> {
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, OPEN_EXISTING};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_READ_ATTRIBUTES, FILE_READ_DATA, OPEN_EXISTING,
+    };
 
     let path = entry_path(directory, name)?;
-    let file = open_with_delete_share(&path, DELETE | FILE_READ_ATTRIBUTES, OPEN_EXISTING, false)?;
+    let file = open_with_delete_share(
+        &path,
+        DELETE | FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+        OPEN_EXISTING,
+        false,
+    )?;
     validate_regular_file(file)
 }
 
@@ -908,7 +915,7 @@ pub fn create_regular_file_at(directory: &DirectoryHandle, name: &OsStr) -> io::
     };
 
     let path = entry_path(directory, name)?;
-    let file = open_with_flags(
+    let file = open_with_delete_share(
         &path,
         FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE,
         CREATE_NEW,

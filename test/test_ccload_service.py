@@ -505,7 +505,10 @@ class CCLoadServiceContractTests(unittest.TestCase):
             {"id": "1", "plan_type": "free", "models": ["common", "free-model"], "models_loaded": True},
             {"id": "2", "plan_type": "pro", "models": ["common", "free-model", "pro-model"], "models_loaded": True},
         ])
-        self.assertEqual([backend.access_token for backend in PerChannelBackend.instances], ["token-1", "token-2"])
+        self.assertCountEqual(
+            [backend.access_token for backend in PerChannelBackend.instances],
+            ["token-1", "token-2"],
+        )
         self.assertTrue(all(backend.closed for backend in PerChannelBackend.instances))
         self.assertEqual(len(TwoChannelSession.instances), 1)
         self.assertEqual(

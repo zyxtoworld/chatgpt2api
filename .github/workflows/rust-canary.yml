@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - "rust/**"
+      - "scripts/install_pinned_openssl.sh"
       - ".github/workflows/rust-canary.yml"
   pull_request:
     paths:
       - "rust/**"
+      - "scripts/install_pinned_openssl.sh"
       - ".github/workflows/rust-canary.yml"
   workflow_dispatch:
 
@@ -31,6 +33,9 @@ jobs:
         uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: rust
+      - name: Install pinned OpenSSL
+        run: bash scripts/install_pinned_openssl.sh
+        working-directory: .
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check

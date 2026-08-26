@@ -48,6 +48,10 @@ jobs:
         with:
           bun-version: "1.4.0"
 
+      - name: Install pinned OpenSSL
+        run: bash scripts/install_pinned_openssl.sh
+        working-directory: .
+
       - name: Python tests
         run: uv run pytest -q
 

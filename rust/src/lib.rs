@@ -3255,20 +3255,50 @@ fn atomic_replace_checked_with_limit(
     }
     let temp = next_atomic_temp_path(path, use_image_test_hooks);
     let temp_name = temp.file_name().ok_or_else(ApiError::unavailable)?;
-    let mut file = match create_regular_file_at(&parent._file, temp_name) {
+    let mut writer = match create_regular_file_at(&parent._file, temp_name) {
         Ok(file) => file,
         Err(_error) => {
             return Err(ApiError::unavailable());
         }
     };
     if !checked_directory_still_same(&parent) {
-        remove_temp_file(&parent, temp_name, Some(&file));
+        remove_temp_file(&parent, temp_name, Some(&writer));
         return Err(ApiError::unavailable());
     }
-    if file.write_all(bytes).is_err() || file.flush().is_err() || file.sync_all().is_err() {
-        remove_temp_file(&parent, temp_name, Some(&file));
+    if writer.write_all(bytes).is_err() || writer.flush().is_err() || writer.sync_all().is_err() {
+        remove_temp_file(&parent, temp_name, Some(&writer));
         return Err(ApiError::unavailable());
     }
+    let temporary_identity = match kernel_path_identity(&writer) {
+        Ok(identity) => identity,
+        Err(error) => {
+            remove_temp_file(&parent, temp_name, Some(&writer));
+            return Err(error);
+        }
+    };
+    // The creation handle is intentionally write-only on Unix. Reopen the
+    // exact directory entry before reading or handing it to the rename
+    // primitive; this also gives Windows the DELETE-capable handle required
+    // by replace_file_at.
+    let file = match open_regular_file_for_replace_at(&parent._file, temp_name) {
+        Ok(file) => file,
+        Err(_error) => {
+            // Keep the original creation handle alive until the reopen has
+            // succeeded.  It is the only handle whose identity is known to
+            // be ours, so a failed reopen must clean through that handle and
+            // never fall back to an unbound path delete.
+            remove_temp_file(&parent, temp_name, Some(&writer));
+            return Err(ApiError::unavailable());
+        }
+    };
+    if kernel_path_identity(&file).ok() != Some(temporary_identity) {
+        // The name was rebound while the creation handle was still alive.
+        // Dispose the original object through its bound handle; never
+        // dispose the newly opened object, which is not ours.
+        remove_temp_file(&parent, temp_name, Some(&writer));
+        return Err(ApiError::unavailable());
+    }
+    drop(writer);
     let mut verification = match file.try_clone() {
         Ok(file) => file,
         Err(_) => {
@@ -3298,13 +3328,6 @@ fn atomic_replace_checked_with_limit(
         return Err(ApiError::unavailable());
     }
     drop(verification);
-    let temporary_identity = match kernel_path_identity(&file) {
-        Ok(identity) => identity,
-        Err(error) => {
-            remove_temp_file(&parent, temp_name, Some(&file));
-            return Err(error);
-        }
-    };
 
     #[cfg(test)]
     let _rebound_parent = if use_image_test_hooks {
@@ -14731,6 +14754,23 @@ mod tests {
     }
 
     #[test]
+    fn atomic_replace_reopens_write_only_temp_before_verification() {
+        let path = account_snapshot_path("atomic-reopen-write-only");
+        let parent = path.parent().expect("atomic replacement parent").to_owned();
+        fs::write(&path, b"old\n").expect("initial atomic replacement target");
+
+        atomic_replace_checked_with_limit(&path, b"new\n", 64, false)
+            .expect("atomic replacement reopens a readable temporary handle");
+        assert_eq!(
+            fs::read(&path).expect("read committed atomic replacement"),
+            b"new\n"
+        );
+
+        fs::remove_file(&path).expect("remove atomic replacement target");
+        fs::remove_dir_all(parent).expect("remove atomic replacement parent");
+    }
+
+    #[test]
     fn account_snapshot_paths_isolate_parent_directory_rebinds() {
         let test_root = test_tmp_dir();
         let first = account_snapshot_path("parent-isolation-first");
@@ -17351,12 +17391,15 @@ else:
             0x8d, 0xe8, 0x39, 0xb1,
         ];
 
-        let openssl_path = Path::new(OPENSSL_PATH);
+        let openssl_path = env::var_os("CHATGPT2API_TEST_OPENSSL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(OPENSSL_PATH));
         assert!(
             openssl_path.is_file(),
-            "pinned OpenSSL runtime is missing: {OPENSSL_PATH}"
+            "pinned OpenSSL runtime is missing: {:?}; set CHATGPT2API_TEST_OPENSSL_PATH for the verified CI runtime",
+            openssl_path
         );
-        let version = std::process::Command::new(openssl_path)
+        let version = std::process::Command::new(&openssl_path)
             .arg("version")
             .output()
             .expect("run pinned OpenSSL version");
@@ -17368,7 +17411,7 @@ else:
 
         let run_openssl =
             |decrypt: bool, input: &[u8], passphrase: &str, fixed_salt: Option<&str>| {
-                let mut command = std::process::Command::new(openssl_path);
+                let mut command = std::process::Command::new(&openssl_path);
                 command
                     .arg("enc")
                     .args(decrypt.then_some(["-d"]).into_iter().flatten())
