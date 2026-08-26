@@ -241,11 +241,13 @@ def test_json_save_does_not_write_foreign_parent_after_rebind_before_temp_creati
             root.symlink_to(foreign, target_is_directory=True)
         return result
 
-    with (
-        mock.patch.object(Path, "mkdir", autospec=True, side_effect=rebind_after_mkdir),
-        pytest.raises(OSError),
-    ):
-        save(new_value)
+    path_lock = backend._scope_path_locks[kind]
+    with path_lock:
+        with (
+            mock.patch.object(Path, "mkdir", autospec=True, side_effect=rebind_after_mkdir),
+            pytest.raises(OSError),
+        ):
+            save(new_value)
 
     assert rebound
     assert root.is_symlink()
@@ -1010,7 +1012,6 @@ def test_json_direct_save_shares_cas_mutation_lock(tmp_path, kind: str) -> None:
         initial = [{"access_token": "token-old", "name": "old"}]
         cas_value = [{"access_token": "token-cas", "name": "cas"}]
         direct_value = [{"access_token": "token-direct", "name": "direct"}]
-        scope = "accounts"
         final_load = backend.load_accounts
     else:
         save = backend.save_auth_keys
@@ -1019,7 +1020,6 @@ def test_json_direct_save_shares_cas_mutation_lock(tmp_path, kind: str) -> None:
         initial = [{"id": "key-old", "role": "user", "key_hash": "hash-old", "enabled": True}]
         cas_value = [{"id": "key-cas", "role": "user", "key_hash": "hash-cas", "enabled": True}]
         direct_value = [{"id": "key-direct", "role": "user", "key_hash": "hash-direct", "enabled": True}]
-        scope = "auth_keys"
         final_load = backend.load_auth_keys
 
     save(initial)
@@ -1071,11 +1071,32 @@ def test_json_direct_save_shares_cas_mutation_lock(tmp_path, kind: str) -> None:
     backend._mutation_lock = tracked_mutation_lock
     original_write = backend._save_json_value
 
-    def observed_write(path, value):
+    expected_path = backend.file_path if kind == "accounts" else backend.auth_keys_path
+    expected_max_bytes = (
+        json_storage_module.ACCOUNT_SNAPSHOT_MAX_BYTES
+        if kind == "accounts"
+        else json_storage_module._AUTH_KEYS_MAX_BYTES
+    )
+
+    def observed_write(
+        path,
+        value,
+        *,
+        max_bytes: int,
+        cumulative_total: int | None = None,
+    ):
+        assert path == expected_path
+        assert max_bytes == expected_max_bytes
+        assert cumulative_total is None
         if threading.get_ident() == thread_ids.get("direct"):
             direct_write_attempted.set()
             progress.set()
-        return original_write(path, value)
+        return original_write(
+            path,
+            value,
+            max_bytes=max_bytes,
+            cumulative_total=cumulative_total,
+        )
 
     backend._save_json_value = observed_write
 
@@ -1435,7 +1456,6 @@ def test_json_storage_rejects_dangling_snapshot_symlink_instead_of_treating_it_a
 def test_json_storage_dangling_path_branch_fails_closed_without_symlink_support(tmp_path, kind) -> None:
     accounts_path = tmp_path / "accounts.json"
     auth_keys_path = tmp_path / "auth_keys.json"
-    target = accounts_path if kind == "accounts" else auth_keys_path
     backend = JSONStorageBackend(accounts_path, auth_keys_path)
     loader = backend.load_accounts if kind == "accounts" else backend.load_auth_keys
 

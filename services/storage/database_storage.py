@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -25,9 +26,30 @@ from services.url_utils import redact_url_credentials
 
 Base = declarative_base()
 
+_SCHEMA_LOCK_NAMESPACE = b"chatgpt2api-storage-schema-v1"
+_SCHEMA_LOCK_WAIT_SECONDS = 10.0
+_SCHEMA_LOCK_POLL_SECONDS = 0.05
+_MYSQL_SCHEMA_LOCK_PREFIX = "chatgpt2api-schema-v1-"
+
 
 def _access_token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _schema_lock_digest(database_name: str) -> bytes:
+    return hashlib.sha256(
+        _SCHEMA_LOCK_NAMESPACE + b"\0" + database_name.encode("utf-8")
+    ).digest()
+
+
+def _postgres_schema_lock_key(database_name: str) -> int:
+    return int.from_bytes(_schema_lock_digest(database_name)[:8], "big", signed=True)
+
+
+def _mysql_schema_lock_name(database_name: str) -> str:
+    digest = _schema_lock_digest(database_name).hex()
+    available = 64 - len(_MYSQL_SCHEMA_LOCK_PREFIX)
+    return _MYSQL_SCHEMA_LOCK_PREFIX + digest[:available]
 
 
 class AccountModel(Base):
@@ -123,40 +145,88 @@ class DatabaseStorageBackend(StorageBackend):
             return
 
         connection = self.engine.connect()
-        lock_name = "chatgpt2api-schema-" + hashlib.sha256(
-            self.database_url.encode("utf-8")
-        ).hexdigest()[:48]
-        acquired = False
-        try:
-            if dialect == "postgresql":
-                connection.execute(
-                    text("SELECT pg_advisory_lock(hashtext(:lock_name))"),
-                    {"lock_name": lock_name},
-                )
-                acquired = True
-            else:
-                result = connection.execute(
-                    text("SELECT GET_LOCK(:lock_name, 60)"),
-                    {"lock_name": lock_name[:64]},
-                ).scalar()
-                if result != 1:
-                    raise StorageDataError()
-                acquired = True
-            yield
-        finally:
+        if dialect == "postgresql":
+            transaction = None
             try:
-                if acquired and dialect == "postgresql":
-                    connection.execute(
-                        text("SELECT pg_advisory_unlock(hashtext(:lock_name))"),
-                        {"lock_name": lock_name},
-                    )
-                elif acquired:
-                    connection.execute(
-                        text("SELECT RELEASE_LOCK(:lock_name)"),
-                        {"lock_name": lock_name[:64]},
-                    )
+                transaction = connection.begin()
+                database_name = connection.execute(
+                    text("SELECT current_database()")
+                ).scalar()
+                if not isinstance(database_name, str) or not database_name:
+                    raise StorageDataError()
+                lock_key = _postgres_schema_lock_key(database_name)
+                connection.execute(text("SET LOCAL statement_timeout = 10000"))
+                deadline = time.monotonic() + _SCHEMA_LOCK_WAIT_SECONDS
+                while True:
+                    acquired = connection.execute(
+                        text("SELECT pg_try_advisory_xact_lock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    ).scalar()
+                    if acquired is True:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise StorageDataError()
+                    time.sleep(min(_SCHEMA_LOCK_POLL_SECONDS, remaining))
+                yield
+            except BaseException:
+                if transaction is not None:
+                    try:
+                        transaction.rollback()
+                    except BaseException as rollback_error:
+                        connection.invalidate(rollback_error)
+                raise
+            else:
+                try:
+                    transaction.commit()
+                except BaseException as commit_error:
+                    connection.invalidate(commit_error)
+                    raise
             finally:
                 connection.close()
+            return
+
+        acquired = False
+        body_failed = False
+        release_error = None
+        try:
+            database_name = connection.execute(text("SELECT DATABASE()")).scalar()
+            if not isinstance(database_name, str) or not database_name:
+                raise StorageDataError()
+            lock_name = _mysql_schema_lock_name(database_name)
+            try:
+                result = connection.execute(
+                    text("SELECT GET_LOCK(:lock_name, 10)"),
+                    {"lock_name": lock_name},
+                ).scalar()
+            except BaseException as acquire_error:
+                connection.invalidate(acquire_error)
+                raise StorageDataError() from None
+            if result != 1:
+                raise StorageDataError()
+            acquired = True
+            connection.detach()
+            try:
+                yield
+            except BaseException:
+                body_failed = True
+                raise
+        finally:
+            if acquired:
+                try:
+                    released = connection.execute(
+                        text("SELECT RELEASE_LOCK(:lock_name)"),
+                        {"lock_name": lock_name},
+                    ).scalar()
+                    if released != 1:
+                        release_error = StorageDataError()
+                except BaseException as error:
+                    release_error = error
+                if release_error is not None:
+                    connection.invalidate(release_error)
+            connection.close()
+            if release_error is not None and not body_failed:
+                raise StorageDataError() from None
 
     def _ensure_account_token_schema(self) -> None:
         """Migrate legacy token columns and install the database identity index."""

@@ -2,21 +2,26 @@
 #![recursion_limit = "256"]
 
 mod account_pool;
+mod account_snapshot;
 mod codex_sse;
 mod codex_upstream;
 mod config;
+mod editable_file_generation;
 mod errors;
 mod management;
 mod model_pool;
 mod native_pow;
+mod opened_file_response;
 mod protocol_anthropic;
 mod protocol_chat;
 mod protocol_codex_payload;
 mod protocol_responses;
 mod responses_websocket;
 mod shutdown;
+mod storage;
 use account_pool::{
     AccountLease, AccountModelGroup, AccountRecord, AccountStore, CatalogAccountCandidate,
+    parse_backend_snapshot,
 };
 #[cfg(test)]
 use codex_sse::native_codex_text;
@@ -68,20 +73,27 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use axum::routing::any;
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{DefaultBodyLimit, Path as AxumPath, Query, State, ws::WebSocketUpgrade},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::{
+        DefaultBodyLimit, FromRequest, Multipart, Path as AxumPath, Query, Request as AxumRequest,
+        State, ws::WebSocketUpgrade,
+    },
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
 use base64::Engine as _;
 use file_identity::{
-    DirectoryHandle, create_regular_file_at, identity as kernel_identity, open_directory,
-    open_or_create_directory, open_regular_file_at, open_regular_file_for_lock_at,
-    open_regular_file_for_replace_at, open_regular_file_for_replace_check_at, remove_file_at,
-    remove_open_file_at, replace_file_at,
+    DirectoryHandle, FileVersion, Identity, create_regular_file_at, directory_identity_at,
+    identity as kernel_identity, open_directory, open_or_create_directory, open_regular_file_at,
+    open_regular_file_for_delete_at, open_regular_file_for_lock_at,
+    open_regular_file_for_replace_at, open_regular_file_for_replace_check_at, remove_directory_at,
+    remove_file_at, remove_open_file_at, replace_file_at, version as kernel_file_version,
 };
 use fs2::FileExt;
 use futures_util::{Stream, StreamExt, stream, stream::FuturesUnordered};
@@ -91,6 +103,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sha3::Sha3_512;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, Semaphore};
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
@@ -102,9 +115,10 @@ pub const MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AUTH_KEYS_BYTES: u64 = 1024 * 1024;
 const MAX_AUTH_KEYS: usize = 10_000;
 const MAX_AUTH_KEY_NAME_LENGTH: usize = 128;
-const MAX_ACCOUNT_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_ACCOUNTS: usize = 10_000;
+const MAX_ACCOUNT_SNAPSHOT_BYTES: u64 = account_snapshot::MAX_BYTES;
+const MAX_ACCOUNTS: usize = account_snapshot::MAX_RECORDS;
 const MAX_ACCOUNT_TOKEN_LENGTH: usize = 16 * 1024;
+const MAX_CUMULATIVE_TOTAL_BYTES: u64 = 64;
 const MAX_MODEL_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 const MAX_MODELS: usize = 10_000;
 const MAX_MODEL_TEXT_LENGTH: usize = 256;
@@ -117,6 +131,22 @@ const MAX_IMAGE_TAG_LENGTH: usize = 256;
 const MAX_IMAGE_REL_LENGTH: usize = 1024;
 const MAX_NATIVE_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 const MAX_NATIVE_IMAGE_PIXELS: u64 = 25_000_000;
+const MAX_NATIVE_IMAGE_MULTIPART_IMAGE_COUNT: usize = 16;
+const MAX_NATIVE_IMAGE_MULTIPART_MASK_COUNT: usize = 1;
+const MAX_NATIVE_IMAGE_MULTIPART_PARTS: usize = 1_000;
+const MAX_NATIVE_IMAGE_MULTIPART_OPTION_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+const MAX_NATIVE_IMAGE_MULTIPART_HEADER_BYTES: usize = 16 * 1024;
+// The request budget is derived from the public per-file/count contract.  The
+// multipart path streams each field to this service-owned directory, so this
+// is a disk/input budget rather than a promise to keep the whole body in RAM.
+const MAX_NATIVE_IMAGE_MULTIPART_TOTAL_BYTES: usize = MAX_NATIVE_IMAGE_BYTES
+    * (MAX_NATIVE_IMAGE_MULTIPART_IMAGE_COUNT + MAX_NATIVE_IMAGE_MULTIPART_MASK_COUNT)
+    + MAX_NATIVE_IMAGE_MULTIPART_OPTION_BYTES;
+const MAX_NATIVE_IMAGE_REQUEST_BYTES: usize =
+    MAX_NATIVE_IMAGE_MULTIPART_TOTAL_BYTES + 4 * 1024 * 1024;
+const MAX_NATIVE_IMAGE_REFERENCE_TEXT_BYTES: usize = MAX_NATIVE_IMAGE_BYTES.div_ceil(3) * 4 + 64;
+const MAX_NATIVE_IMAGE_DECODE_ALLOC_BYTES: u64 = MAX_NATIVE_IMAGE_PIXELS * 4;
 const MAX_EDITABLE_TASK_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_EDITABLE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_EDITABLE_TASKS: usize = 5_000;
@@ -143,6 +173,7 @@ const NATIVE_POW_MAX_CONCURRENCY: usize = 4;
 const MAX_TURNSTILE_DX_CHARS: usize = 2 * 1024 * 1024;
 const MAX_TURNSTILE_INSTRUCTIONS: usize = 100_000;
 const MAX_TURNSTILE_VALUE_STRING_CHARS: usize = 64 * 1024;
+type HealthSnapshotSync = Arc<dyn Fn() + Send + Sync>;
 static NATIVE_POW_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(NATIVE_POW_MAX_CONCURRENCY)));
 static AUTH_WRITE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
@@ -150,10 +181,8 @@ static LOCAL_WRITE_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
 static REGISTRY_MUTATION_GATES: LazyLock<StdMutex<HashMap<PathBuf, Arc<StdMutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 static IMAGE_TAGS_MUTATION_GATE: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
-static HEALTH_STORAGE_SEMAPHORE: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(1)));
-static HEALTH_ACCOUNTS_SEMAPHORE: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(1)));
+static BACKUP_OWNER_GATES: LazyLock<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -172,6 +201,105 @@ static HEALTH_ACCOUNTS_TEST_HOOK: LazyLock<StdMutex<Option<HealthBlockingTestHoo
     LazyLock::new(|| StdMutex::new(None));
 #[cfg(test)]
 static HEALTH_TEST_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+#[cfg(test)]
+static BACKUP_TEST_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+#[cfg(test)]
+static BACKUP_CRYPT_TEST_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_IMAGE_TEMP_FAILPOINT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct NativeImageTempFailpointGuard;
+
+#[cfg(test)]
+impl Drop for NativeImageTempFailpointGuard {
+    fn drop(&mut self) {
+        NATIVE_IMAGE_TEMP_FAILPOINT.with(|configured| {
+            *configured.borrow_mut() = None;
+        });
+    }
+}
+
+#[cfg(test)]
+fn install_native_image_temp_failpoint(stage: &'static str) -> NativeImageTempFailpointGuard {
+    NATIVE_IMAGE_TEMP_FAILPOINT.with(|configured| {
+        *configured.borrow_mut() = Some(stage);
+    });
+    NativeImageTempFailpointGuard
+}
+
+#[cfg(test)]
+fn native_image_temp_failpoint(stage: &'static str) -> io::Result<()> {
+    NATIVE_IMAGE_TEMP_FAILPOINT.with(|configured| {
+        let mut configured = configured.borrow_mut();
+        if *configured == Some(stage) {
+            *configured = None;
+            return Err(io::Error::other(format!(
+                "native image temp failpoint: {stage}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(test))]
+fn native_image_temp_failpoint(_stage: &'static str) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ValidatedFileRebindTestHook {
+    path: PathBuf,
+    replacement: Arc<StdMutex<Option<Vec<u8>>>>,
+    fires: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+static VALIDATED_FILE_REBIND_TEST_HOOK: LazyLock<StdMutex<Option<ValidatedFileRebindTestHook>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+static ACCOUNT_DOCUMENT_PARSE_COUNTS: LazyLock<StdMutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+#[cfg(test)]
+static AUTH_DOCUMENT_PARSE_COUNTS: LazyLock<StdMutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+#[cfg(test)]
+static MODEL_DOCUMENT_PARSE_COUNTS: LazyLock<StdMutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+#[cfg(test)]
+struct ValidatedFileRebindTestGuard;
+
+#[cfg(test)]
+impl Drop for ValidatedFileRebindTestGuard {
+    fn drop(&mut self) {
+        *VALIDATED_FILE_REBIND_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn install_validated_file_rebind_test_hook(
+    path: PathBuf,
+    replacement: Vec<u8>,
+) -> (ValidatedFileRebindTestGuard, Arc<AtomicUsize>) {
+    let fires = Arc::new(AtomicUsize::new(0));
+    *VALIDATED_FILE_REBIND_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ValidatedFileRebindTestHook {
+        path,
+        replacement: Arc::new(StdMutex::new(Some(replacement))),
+        fires: fires.clone(),
+    });
+    (ValidatedFileRebindTestGuard, fires)
+}
 
 #[cfg(test)]
 static IMAGE_TAG_READ_REBIND_HOOK: LazyLock<StdMutex<Option<(PathBuf, PathBuf)>>> =
@@ -252,6 +380,7 @@ struct OAuthSession {
 struct AuthSnapshot {
     generation: u64,
     fingerprint: [u8; 32],
+    file_version: Option<FileVersion>,
     valid: bool,
     records: Vec<AuthRecord>,
 }
@@ -280,11 +409,40 @@ struct AuthMutationTestHook {
     fail_before_write: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct HealthSnapshotPublishTestHook {
+    after_accounts: Arc<Notify>,
+    release_before_auth: Arc<Notify>,
+    pause_between: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct HealthSnapshotInvalidationTestHook {
+    after_accounts: Arc<Notify>,
+    release_before_auth: Arc<Notify>,
+    pause_between: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+static HEALTH_SNAPSHOT_INVALIDATION_TEST_HOOK: LazyLock<
+    StdMutex<Option<HealthSnapshotInvalidationTestHook>>,
+> = LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+#[derive(Clone)]
+struct HealthRefreshCoordinatorTestHook {
+    before_generation: Arc<Notify>,
+}
+
 #[derive(Clone)]
 struct AuthStore {
     path: Option<Arc<PathBuf>>,
+    backend: Option<Arc<storage::StorageBackend>>,
     snapshot: Arc<RwLock<AuthSnapshot>>,
     reload_gate: Arc<Mutex<()>>,
+    health_snapshot_sync: Arc<RwLock<Option<HealthSnapshotSync>>>,
     #[cfg(test)]
     test_hook: Arc<RwLock<Option<AuthReloadTestHook>>>,
     #[cfg(test)]
@@ -293,20 +451,24 @@ struct AuthStore {
 
 impl AuthStore {
     fn load(path: Option<&Path>) -> Result<Self, AppInitError> {
-        let (records, fingerprint) = if let Some(path) = path {
-            read_auth_snapshot(path)?
+        let (records, fingerprint, file_version) = if let Some(path) = path {
+            let (records, fingerprint, file_version) = read_auth_snapshot(path)?;
+            (records, fingerprint, Some(file_version))
         } else {
-            (Vec::new(), [0; 32])
+            (Vec::new(), [0; 32], None)
         };
         Ok(Self {
             path: path.map(|path| Arc::new(path.to_owned())),
+            backend: None,
             snapshot: Arc::new(RwLock::new(AuthSnapshot {
                 generation: 0,
                 fingerprint,
+                file_version,
                 valid: true,
                 records,
             })),
             reload_gate: Arc::new(Mutex::new(())),
+            health_snapshot_sync: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             test_hook: Arc::new(RwLock::new(None)),
             #[cfg(test)]
@@ -314,33 +476,119 @@ impl AuthStore {
         })
     }
 
+    async fn load_backend(backend: Arc<storage::StorageBackend>) -> Result<Self, AppInitError> {
+        let loaded = backend
+            .load_auth_keys()
+            .await
+            .map_err(|_| AppInitError::StorageBackend)?;
+        let (records, fingerprint) = parse_auth_backend_snapshot(loaded)?;
+        Ok(Self {
+            path: None,
+            backend: Some(backend),
+            snapshot: Arc::new(RwLock::new(AuthSnapshot {
+                generation: 0,
+                fingerprint,
+                file_version: None,
+                valid: true,
+                records,
+            })),
+            reload_gate: Arc::new(Mutex::new(())),
+            health_snapshot_sync: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            test_hook: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            mutation_test_hook: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    fn install_health_snapshot_sync(&self, sync: HealthSnapshotSync) {
+        *self
+            .health_snapshot_sync
+            .write()
+            .expect("auth health snapshot sync lock") = Some(sync);
+    }
+
+    fn notify_health_snapshot_sync(&self) {
+        let sync = self
+            .health_snapshot_sync
+            .read()
+            .expect("auth health snapshot sync lock")
+            .clone();
+        if let Some(sync) = sync {
+            sync();
+        }
+    }
+
     async fn reload(&self) -> bool {
+        if self.backend.is_some() {
+            return self.snapshot.read().expect("auth snapshot lock").valid;
+        }
         let Some(path) = self.path.clone() else {
             return true;
         };
         let _reload_guard = self.reload_gate.lock().await;
+        let version_path = path.clone();
+        let version =
+            tokio::task::spawn_blocking(move || validated_file_version(&version_path)).await;
+        let Ok(Ok(version)) = version else {
+            self.invalidate_snapshot();
+            return false;
+        };
+        {
+            let snapshot = self.snapshot.read().expect("auth snapshot lock");
+            if snapshot.valid && snapshot.file_version == Some(version) {
+                return true;
+            }
+        }
         let result = tokio::task::spawn_blocking(move || read_auth_snapshot(&path)).await;
 
         #[cfg(test)]
         self.pause_before_publish().await;
 
-        let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
-        match result {
-            Ok(Ok((records, fingerprint))) => {
-                if !snapshot.valid || snapshot.fingerprint != fingerprint {
-                    snapshot.generation = snapshot.generation.saturating_add(1);
-                    snapshot.fingerprint = fingerprint;
-                    snapshot.records = records;
-                    snapshot.valid = true;
+        let valid = {
+            let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
+            match result {
+                Ok(Ok((records, fingerprint, file_version))) => {
+                    if !snapshot.valid
+                        || snapshot.fingerprint != fingerprint
+                        || snapshot.file_version != Some(file_version)
+                    {
+                        snapshot.generation = snapshot.generation.saturating_add(1);
+                        snapshot.fingerprint = fingerprint;
+                        snapshot.file_version = Some(file_version);
+                        snapshot.records = records;
+                        snapshot.valid = true;
+                    }
+                    true
                 }
-                true
+                _ => {
+                    snapshot.generation = snapshot.generation.saturating_add(1);
+                    snapshot.valid = false;
+                    snapshot.records.clear();
+                    false
+                }
             }
-            _ => {
-                snapshot.generation = snapshot.generation.saturating_add(1);
-                snapshot.valid = false;
-                snapshot.records.clear();
-                false
-            }
+        };
+        self.notify_health_snapshot_sync();
+        valid
+    }
+
+    async fn lock_reload_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.reload_gate.clone().lock_owned().await
+    }
+
+    fn publish_validated_backend_snapshot_silent(
+        &self,
+        records: Vec<AuthRecord>,
+        fingerprint: [u8; 32],
+    ) {
+        let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
+        if !snapshot.valid || snapshot.fingerprint != fingerprint {
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.fingerprint = fingerprint;
+            snapshot.file_version = None;
+            snapshot.records = records;
+            snapshot.valid = true;
         }
     }
 
@@ -443,11 +691,45 @@ impl AuthStore {
             .collect()
     }
 
+    fn raw_records(&self) -> Vec<Value> {
+        self.snapshot
+            .read()
+            .expect("auth snapshot lock")
+            .records
+            .iter()
+            .map(|record| record.raw.clone())
+            .collect()
+    }
+
     fn invalidate_snapshot(&self) {
-        let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
-        snapshot.generation = snapshot.generation.saturating_add(1);
-        snapshot.valid = false;
-        snapshot.records.clear();
+        self.invalidate_snapshot_silent();
+        self.notify_health_snapshot_sync();
+    }
+
+    fn invalidate_snapshot_silent(&self) {
+        {
+            let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.valid = false;
+            snapshot.records.clear();
+        }
+    }
+
+    fn health_validated(&self) -> bool {
+        if self.backend.is_some() {
+            return self.snapshot.read().expect("auth snapshot lock").valid;
+        }
+        let Some(path) = self.path.as_deref() else {
+            return self.snapshot.read().expect("auth snapshot lock").valid;
+        };
+        let expected = {
+            let snapshot = self.snapshot.read().expect("auth snapshot lock");
+            if !snapshot.valid {
+                return false;
+            }
+            snapshot.file_version
+        };
+        expected.is_some_and(|expected| validated_file_version(path).ok() == Some(expected))
     }
 
     #[cfg(test)]
@@ -487,13 +769,70 @@ impl AuthStore {
     where
         F: FnOnce(&mut Vec<Value>) -> Result<R, ApiError>,
     {
+        if let Some(backend) = self.backend.clone() {
+            let _write_guard = self.reload_gate.lock().await;
+            let loaded = backend.load_auth_keys().await.map_err(|_| {
+                self.invalidate_snapshot();
+                ApiError::unavailable()
+            })?;
+            let expected_fingerprint = loaded.revision;
+            let mut records = loaded.records;
+            parse_auth_backend_snapshot(storage::StorageSnapshot {
+                records: records.clone(),
+                revision: expected_fingerprint,
+                cumulative_total: None,
+            })
+            .map_err(|_| {
+                self.invalidate_snapshot();
+                ApiError::unavailable()
+            })?;
+            let result = mutator(&mut records)?;
+            if records.len() > MAX_AUTH_KEYS {
+                return Err(ApiError::invalid_request());
+            }
+            let candidate = storage::StorageSnapshot {
+                records: records.clone(),
+                revision: expected_fingerprint,
+                cumulative_total: None,
+            };
+            parse_auth_backend_snapshot(candidate).map_err(|_| ApiError::invalid_request())?;
+
+            #[cfg(test)]
+            self.pause_before_mutation_cas().await;
+
+            #[cfg(test)]
+            if self.should_fail_mutation_write() {
+                return Err(ApiError::unavailable());
+            }
+
+            let saved = backend
+                .save_auth_keys(expected_fingerprint, records)
+                .await
+                .map_err(|_| {
+                    self.invalidate_snapshot();
+                    ApiError::unavailable()
+                })?;
+            let (parsed, fingerprint) = parse_auth_backend_snapshot(saved).map_err(|_| {
+                self.invalidate_snapshot();
+                ApiError::unavailable()
+            })?;
+            let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.fingerprint = fingerprint;
+            snapshot.file_version = None;
+            snapshot.records = parsed;
+            snapshot.valid = true;
+            drop(snapshot);
+            self.notify_health_snapshot_sync();
+            return Ok(result);
+        }
         let Some(path) = self.path.clone() else {
             return Err(ApiError::unsupported_capability());
         };
         let _write_guard = self.reload_gate.lock().await;
         let _file_lock = acquire_path_write_lock(path.as_ref()).await?;
         let read_path = path.as_ref().clone();
-        let (mut document, _parsed, expected_fingerprint) =
+        let (mut document, _parsed, expected_fingerprint, _expected_version) =
             tokio::task::spawn_blocking(move || read_auth_document(&read_path))
                 .await
                 .map_err(|_| ApiError::unavailable())?
@@ -522,8 +861,8 @@ impl AuthStore {
 
         let target = path.as_ref().clone();
         let items = Value::Array(records);
-        let (parsed, fingerprint) = tokio::task::spawn_blocking(move || {
-            let (_, current_fingerprint) =
+        let (parsed, fingerprint, file_version) = tokio::task::spawn_blocking(move || {
+            let (_, current_fingerprint, _current_version) =
                 read_auth_snapshot(&target).map_err(|_| AuthMutationFailure::FailClosed)?;
             if current_fingerprint != expected_fingerprint {
                 return Err(AuthMutationFailure::FailClosed);
@@ -550,7 +889,7 @@ impl AuthStore {
             if committed.1 != written_fingerprint {
                 return Err(AuthMutationFailure::FailClosed);
             }
-            Ok((written_records, committed.1))
+            Ok((written_records, committed.1, committed.2))
         })
         .await
         .map_err(|_| ApiError::unavailable())?
@@ -565,26 +904,33 @@ impl AuthStore {
         let mut snapshot = self.snapshot.write().expect("auth snapshot lock");
         snapshot.generation = snapshot.generation.saturating_add(1);
         snapshot.fingerprint = fingerprint;
+        snapshot.file_version = Some(file_version);
         snapshot.records = parsed;
         snapshot.valid = true;
+        drop(snapshot);
+        self.notify_health_snapshot_sync();
         Ok(result)
     }
 }
 
-fn read_auth_document(path: &Path) -> Result<(Value, Vec<AuthRecord>, [u8; 32]), AppInitError> {
-    let parent = checked_parent_identity(path)
-        .map_err(|_| AppInitError::AuthSnapshot)?
-        .ok_or(AppInitError::AuthSnapshot)?;
-    let name = path.file_name().ok_or(AppInitError::AuthSnapshot)?;
-    let file = open_regular_file_at(&parent._file, name).map_err(|_| AppInitError::AuthSnapshot)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_AUTH_KEYS_BYTES + 1)
-        .read_to_end(&mut bytes)
+fn parse_auth_backend_snapshot(
+    snapshot: storage::StorageSnapshot,
+) -> Result<(Vec<AuthRecord>, [u8; 32]), AppInitError> {
+    let bytes = serde_json::to_vec(&json!({"items": snapshot.records}))
         .map_err(|_| AppInitError::AuthSnapshot)?;
-    if bytes.len() as u64 > MAX_AUTH_KEYS_BYTES {
-        return Err(AppInitError::AuthSnapshot);
-    }
-    parse_auth_document_bytes(&bytes)
+    let (_, records, _) = parse_auth_document_bytes(&bytes)?;
+    Ok((records, snapshot.revision))
+}
+
+fn read_auth_document(
+    path: &Path,
+) -> Result<(Value, Vec<AuthRecord>, [u8; 32], FileVersion), AppInitError> {
+    let (bytes, version) = read_bounded_validated_file(path, MAX_AUTH_KEYS_BYTES)
+        .map_err(|()| AppInitError::AuthSnapshot)?;
+    #[cfg(test)]
+    record_document_parse(&AUTH_DOCUMENT_PARSE_COUNTS, path);
+    let (value, records, fingerprint) = parse_auth_document_bytes(&bytes)?;
+    Ok((value, records, fingerprint, version))
 }
 
 fn parse_auth_document_bytes(
@@ -631,36 +977,73 @@ fn parse_auth_document_bytes(
     Ok((value, records, fingerprint))
 }
 
-fn read_auth_snapshot(path: &Path) -> Result<(Vec<AuthRecord>, [u8; 32]), AppInitError> {
-    let (_, records, fingerprint) = read_auth_document(path)?;
-    Ok((records, fingerprint))
+fn read_auth_snapshot(
+    path: &Path,
+) -> Result<(Vec<AuthRecord>, [u8; 32], FileVersion), AppInitError> {
+    let (_, records, fingerprint, version) = read_auth_document(path)?;
+    Ok((records, fingerprint, version))
 }
 
 fn read_account_document(
     path: &Path,
-) -> Result<(Value, Vec<AccountRecord>, [u8; 32]), AppInitError> {
-    let parent = checked_parent_identity(path)
-        .map_err(|_| AppInitError::AccountSnapshot)?
-        .ok_or(AppInitError::AccountSnapshot)?;
-    let name = path.file_name().ok_or(AppInitError::AccountSnapshot)?;
-    let file =
-        open_regular_file_at(&parent._file, name).map_err(|_| AppInitError::AccountSnapshot)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_ACCOUNT_SNAPSHOT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| AppInitError::AccountSnapshot)?;
-    if bytes.len() as u64 > MAX_ACCOUNT_SNAPSHOT_BYTES {
-        return Err(AppInitError::AccountSnapshot);
+) -> Result<(Value, Vec<AccountRecord>, [u8; 32], FileVersion), AppInitError> {
+    let (bytes, version) = read_bounded_validated_file(path, MAX_ACCOUNT_SNAPSHOT_BYTES)
+        .map_err(|()| AppInitError::AccountSnapshot)?;
+    #[cfg(test)]
+    {
+        let mut counts = ACCOUNT_DOCUMENT_PARSE_COUNTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = counts.entry(path.to_owned()).or_default();
+        *count = count.saturating_add(1);
     }
-    parse_account_document_bytes(&bytes)
+    let (value, records, fingerprint) = parse_account_document_bytes(&bytes)?;
+    Ok((value, records, fingerprint, version))
+}
+
+#[cfg(test)]
+fn account_document_parse_count(path: &Path) -> usize {
+    document_parse_count(&ACCOUNT_DOCUMENT_PARSE_COUNTS, path)
+}
+
+#[cfg(test)]
+fn auth_document_parse_count(path: &Path) -> usize {
+    document_parse_count(&AUTH_DOCUMENT_PARSE_COUNTS, path)
+}
+
+#[cfg(test)]
+fn record_model_document_parse(path: &Path) {
+    record_document_parse(&MODEL_DOCUMENT_PARSE_COUNTS, path);
+}
+
+#[cfg(test)]
+fn model_document_parse_count(path: &Path) -> usize {
+    document_parse_count(&MODEL_DOCUMENT_PARSE_COUNTS, path)
+}
+
+#[cfg(test)]
+fn record_document_parse(counts: &StdMutex<HashMap<PathBuf, usize>>, path: &Path) {
+    let mut counts = counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let count = counts.entry(path.to_owned()).or_default();
+    *count = count.saturating_add(1);
+}
+
+#[cfg(test)]
+fn document_parse_count(counts: &StdMutex<HashMap<PathBuf, usize>>, path: &Path) -> usize {
+    counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .copied()
+        .unwrap_or_default()
 }
 
 fn parse_account_document_bytes(
     bytes: &[u8],
 ) -> Result<(Value, Vec<AccountRecord>, [u8; 32]), AppInitError> {
-    if bytes.len() as u64 > MAX_ACCOUNT_SNAPSHOT_BYTES {
-        return Err(AppInitError::AccountSnapshot);
-    }
+    account_snapshot::validate_bytes(bytes).map_err(|()| AppInitError::AccountSnapshot)?;
     let fingerprint = Sha256::digest(bytes).into();
     let value: Value = serde_json::from_slice(bytes).map_err(|_| AppInitError::AccountSnapshot)?;
     let items = match &value {
@@ -746,9 +1129,17 @@ fn parse_account_document_bytes(
     Ok((value, records, fingerprint))
 }
 
-fn read_account_snapshot(path: &Path) -> Result<(Vec<AccountRecord>, [u8; 32]), AppInitError> {
-    let (_, records, fingerprint) = read_account_document(path)?;
-    Ok((records, fingerprint))
+fn read_account_snapshot(
+    path: &Path,
+) -> Result<(Vec<AccountRecord>, [u8; 32], FileVersion, u64), AppInitError> {
+    let (value, records, fingerprint, version) = read_account_document(path)?;
+    let total = records.len() as u64;
+    let cumulative_total = value
+        .get("cumulative_total")
+        .and_then(Value::as_u64)
+        .unwrap_or(total)
+        .max(total);
+    Ok((records, fingerprint, version, cumulative_total))
 }
 
 fn normalize_source_type(value: Option<&Value>) -> Result<String, AppInitError> {
@@ -827,20 +1218,191 @@ fn normalize_account_type(value: Option<&Value>) -> Result<String, AppInitError>
 }
 
 #[derive(Clone)]
+struct HealthSnapshotCache {
+    accounts: Value,
+    account_count: usize,
+    auth_key_count: usize,
+    local_snapshot_available: bool,
+}
+
+fn health_accounts_from_stats(
+    health: &account_pool::AccountHealthStats,
+    cumulative_total: u64,
+) -> Value {
+    json!({
+        "total": health.total,
+        "cumulative_total": cumulative_total,
+        "active": health.active,
+        "limited": health.limited,
+        "abnormal": health.abnormal,
+        "disabled": health.disabled,
+        "total_quota": health.total_quota,
+        "total_success": health.total_success,
+        "total_fail": health.total_fail,
+        "by_type": health.by_type.clone(),
+    })
+}
+
+fn sync_health_snapshot_cache(
+    cache: &StdMutex<HealthSnapshotCache>,
+    account_store: &AccountStore,
+    auth_store: &AuthStore,
+) {
+    let accounts_valid = account_store.health_validated();
+    let auth_valid = auth_store.health_validated();
+    let mut target = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    target.local_snapshot_available = accounts_valid && auth_valid;
+    target.account_count = if accounts_valid {
+        account_store.records().len()
+    } else {
+        0
+    };
+    target.auth_key_count = if auth_valid {
+        auth_store.public_records().len()
+    } else {
+        0
+    };
+    target.accounts = if accounts_valid {
+        let health = account_store.health_stats();
+        health_accounts_from_stats(&health, health.cumulative_total)
+    } else {
+        empty_health_accounts()
+    };
+}
+
+async fn invalidate_health_snapshot_pair(
+    cache: &StdMutex<HealthSnapshotCache>,
+    account_store: &AccountStore,
+    auth_store: &AuthStore,
+) {
+    account_store.invalidate_silent();
+    #[cfg(test)]
+    {
+        let hook = HEALTH_SNAPSHOT_INVALIDATION_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook
+            && hook.pause_between.swap(false, Ordering::SeqCst)
+        {
+            hook.after_accounts.notify_one();
+            hook.release_before_auth.notified().await;
+        }
+    }
+    auth_store.invalidate_snapshot_silent();
+    sync_health_snapshot_cache(cache, account_store, auth_store);
+}
+
+fn health_snapshot_cache_from_stores(
+    account_store: &AccountStore,
+    auth_store: &AuthStore,
+) -> HealthSnapshotCache {
+    let health = account_store.health_stats();
+    HealthSnapshotCache {
+        accounts: health_accounts_from_stats(&health, health.cumulative_total),
+        account_count: health.total as usize,
+        auth_key_count: auth_store.public_records().len(),
+        local_snapshot_available: account_store.health_validated() && auth_store.health_validated(),
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     config: Arc<AppConfig>,
     config_path: Arc<PathBuf>,
     data_dir: Arc<PathBuf>,
+    storage_backend: Option<Arc<storage::StorageBackend>>,
     auth_store: Arc<AuthStore>,
     account_store: Arc<AccountStore>,
     account_progress: Arc<Mutex<HashMap<String, Value>>>,
     oauth_sessions: Arc<Mutex<HashMap<String, OAuthSession>>>,
     models: Arc<ModelStore>,
     account_type_catalog: Arc<AccountTypeCatalog>,
+    editable_workers: Arc<editable_file_generation::EditableWorkers>,
+    http_admission_open: Arc<AtomicBool>,
+    health_snapshot_gate: Arc<tokio::sync::RwLock<()>>,
+    health_snapshot_cache: Arc<StdMutex<HealthSnapshotCache>>,
+    health_storage_semaphore: Arc<Semaphore>,
+    health_accounts_semaphore: Arc<Semaphore>,
     client: Client,
+    #[cfg(test)]
+    health_snapshot_publish_test_hook: Arc<RwLock<Option<HealthSnapshotPublishTestHook>>>,
+    #[cfg(test)]
+    health_refresh_coordinator_test_hook: Arc<RwLock<Option<HealthRefreshCoordinatorTestHook>>>,
 }
 
 impl AppState {
+    pub async fn from_environment(config: AppConfig) -> Result<Self, AppInitError> {
+        let initial_cwd = env::current_dir().map_err(|_| AppInitError::StorageBackend)?;
+        let data_dir = config::runtime_data_dir();
+        let data_dir = if data_dir.is_absolute() {
+            data_dir
+        } else {
+            initial_cwd.join(data_dir)
+        };
+        let backend_type = env::var("STORAGE_BACKEND").unwrap_or_else(|_| "json".to_owned());
+        let database_url = env::var("DATABASE_URL").ok();
+        let backend = if backend_type.trim().eq_ignore_ascii_case("git") {
+            let repo_url = env::var("GIT_REPO_URL").unwrap_or_default();
+            let token = env::var("GIT_TOKEN").unwrap_or_default();
+            let branch = env::var("GIT_BRANCH").unwrap_or_else(|_| "main".to_owned());
+            let file_path =
+                env::var("GIT_FILE_PATH").unwrap_or_else(|_| "accounts.json".to_owned());
+            let auth_keys_file_path =
+                env::var("GIT_AUTH_KEYS_FILE_PATH").unwrap_or_else(|_| "auth_keys.json".to_owned());
+            Some(Arc::new(
+                storage::StorageBackend::connect_git(
+                    &repo_url,
+                    &token,
+                    &branch,
+                    &file_path,
+                    &auth_keys_file_path,
+                    &data_dir.join("git_cache"),
+                )
+                .await
+                .map_err(|_| AppInitError::StorageBackend)?,
+            ))
+        } else {
+            if backend_type.trim().eq_ignore_ascii_case("json") || backend_type.trim().is_empty() {
+                let resolve = |path: PathBuf| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        initial_cwd.join(path)
+                    }
+                };
+                let accounts_path = config
+                    .accounts_path
+                    .clone()
+                    .map(resolve)
+                    .unwrap_or_else(|| data_dir.join("accounts.json"));
+                let auth_keys_path = config
+                    .auth_keys_path
+                    .clone()
+                    .map(resolve)
+                    .unwrap_or_else(|| data_dir.join("auth_keys.json"));
+                Some(Arc::new(
+                    storage::StorageBackend::connect_json(&accounts_path, &auth_keys_path)
+                        .map_err(|_| AppInitError::StorageBackend)?,
+                ))
+            } else {
+                storage::StorageBackend::connect_configured(
+                    &backend_type,
+                    database_url.as_deref(),
+                    &data_dir,
+                )
+                .await
+                .map_err(|_| AppInitError::StorageBackend)?
+            }
+        };
+        match backend {
+            Some(backend) => Self::new_with_storage_backend(config, backend, data_dir).await,
+            None => Self::new(config),
+        }
+    }
+
     pub fn new(mut config: AppConfig) -> Result<Self, AppInitError> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -860,8 +1422,8 @@ impl AppState {
                 *path = initial_cwd.join(&*path);
             }
         }
-        let auth_store = AuthStore::load(config.auth_keys_path.as_deref())?;
-        let account_store = AccountStore::load(config.accounts_path.as_deref())?;
+        let auth_store = Arc::new(AuthStore::load(config.auth_keys_path.as_deref())?);
+        let account_store = Arc::new(AccountStore::load(config.accounts_path.as_deref())?);
         let models = ModelStore::load(config.models_path.as_deref(), &config.models)?;
         let data_dir = config
             .accounts_path
@@ -876,11 +1438,204 @@ impl AppState {
             initial_cwd.join(data_dir)
         };
         let config_path = absolute_legacy_config_path(&initial_cwd, &data_dir);
+        editable_file_generation::recover_unfinished(&data_dir)
+            .map_err(|_| AppInitError::EditableTaskSnapshot)?;
         let account_type_catalog = AccountTypeCatalog::new(
-            Arc::new(account_store.clone()),
+            account_store.clone(),
             client.clone(),
             config.upstream_base_url.clone(),
             config.accounts_path.is_some(),
+            config.upstream_protocol,
+            codex_client_version(),
+        );
+        let health_snapshot_cache = Arc::new(StdMutex::new(health_snapshot_cache_from_stores(
+            account_store.as_ref(),
+            auth_store.as_ref(),
+        )));
+        let cache_sync: HealthSnapshotSync = {
+            let cache = health_snapshot_cache.clone();
+            let account_store = Arc::downgrade(&account_store);
+            let auth_store = Arc::downgrade(&auth_store);
+            Arc::new(move || {
+                if let (Some(account_store), Some(auth_store)) =
+                    (account_store.upgrade(), auth_store.upgrade())
+                {
+                    sync_health_snapshot_cache(&cache, &account_store, &auth_store);
+                }
+            })
+        };
+        account_store.install_health_snapshot_sync(cache_sync.clone());
+        auth_store.install_health_snapshot_sync(cache_sync);
+        Ok(Self {
+            config: Arc::new(config),
+            config_path: Arc::new(config_path),
+            data_dir: Arc::new(data_dir),
+            storage_backend: None,
+            auth_store,
+            account_store,
+            account_progress: Arc::new(Mutex::new(HashMap::new())),
+            oauth_sessions: Arc::new(Mutex::new(HashMap::new())),
+            models: Arc::new(models),
+            account_type_catalog: Arc::new(account_type_catalog),
+            editable_workers: Arc::new(editable_file_generation::EditableWorkers::new()),
+            http_admission_open: Arc::new(AtomicBool::new(true)),
+            health_snapshot_gate: Arc::new(tokio::sync::RwLock::new(())),
+            health_snapshot_cache,
+            health_storage_semaphore: Arc::new(Semaphore::new(1)),
+            health_accounts_semaphore: Arc::new(Semaphore::new(1)),
+            client,
+            #[cfg(test)]
+            health_snapshot_publish_test_hook: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            health_refresh_coordinator_test_hook: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    pub(crate) async fn new_with_storage_backend(
+        mut config: AppConfig,
+        backend: Arc<storage::StorageBackend>,
+        data_dir: PathBuf,
+    ) -> Result<Self, AppInitError> {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(AppInitError::Client)?;
+        let initial_cwd = env::current_dir().map_err(|_| AppInitError::StorageBackend)?;
+        for path in [
+            config.auth_keys_path.as_mut(),
+            config.models_path.as_mut(),
+            config.accounts_path.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !path.is_absolute() {
+                *path = initial_cwd.join(&*path);
+            }
+        }
+        let data_dir = if data_dir.is_absolute() {
+            data_dir
+        } else {
+            initial_cwd.join(data_dir)
+        };
+        let auth_store = Arc::new(AuthStore::load_backend(backend.clone()).await?);
+        let account_store = Arc::new(AccountStore::load_backend(backend.clone()).await?);
+        let health_snapshot_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let health_snapshot_cache = Arc::new(StdMutex::new(health_snapshot_cache_from_stores(
+            &account_store,
+            &auth_store,
+        )));
+        let coordinator_accounts = account_store.clone();
+        let coordinator_auth = auth_store.clone();
+        let coordinator_gate = health_snapshot_gate.clone();
+        #[cfg(test)]
+        let health_refresh_coordinator_test_hook: Arc<
+            RwLock<Option<HealthRefreshCoordinatorTestHook>>,
+        > = Arc::new(RwLock::new(None));
+        #[cfg(test)]
+        let coordinator_test_hook = health_refresh_coordinator_test_hook.clone();
+        let coordinator: storage::HealthRefreshCoordinator = Arc::new(move || {
+            let coordinator_accounts = coordinator_accounts.clone();
+            let coordinator_auth = coordinator_auth.clone();
+            let coordinator_gate = coordinator_gate.clone();
+            #[cfg(test)]
+            let coordinator_test_hook = coordinator_test_hook.clone();
+            Box::pin(async move {
+                #[cfg(test)]
+                if let Some(hook) = coordinator_test_hook
+                    .read()
+                    .expect("health coordinator hook")
+                    .clone()
+                {
+                    hook.before_generation.notify_one();
+                }
+                let generation_guard = coordinator_gate.write_owned().await;
+                let account_guard = coordinator_accounts.lock_reload_gate().await;
+                let auth_guard = coordinator_auth.lock_reload_gate().await;
+                Box::new((generation_guard, account_guard, auth_guard))
+                    as storage::HealthRefreshPermit
+            })
+        });
+        backend.install_health_refresh_coordinator(coordinator);
+        let publisher_accounts = account_store.clone();
+        let publisher_auth = auth_store.clone();
+        let publisher_cache = health_snapshot_cache.clone();
+        #[cfg(test)]
+        let health_snapshot_publish_test_hook: Arc<
+            RwLock<Option<HealthSnapshotPublishTestHook>>,
+        > = Arc::new(RwLock::new(None));
+        #[cfg(test)]
+        let publisher_test_hook = health_snapshot_publish_test_hook.clone();
+        let publisher: storage::HealthSnapshotPublisher = Arc::new(move |accounts, auth_keys| {
+            let publisher_accounts = publisher_accounts.clone();
+            let publisher_auth = publisher_auth.clone();
+            let publisher_cache = publisher_cache.clone();
+            #[cfg(test)]
+            let publisher_test_hook = publisher_test_hook.clone();
+            Box::pin(async move {
+                let Ok((account_records, account_fingerprint, cumulative_total)) =
+                    parse_backend_snapshot(accounts)
+                else {
+                    return false;
+                };
+                let Ok((auth_records, auth_fingerprint)) = parse_auth_backend_snapshot(auth_keys)
+                else {
+                    return false;
+                };
+                publisher_accounts.publish_validated_backend_snapshot_silent(
+                    account_records,
+                    account_fingerprint,
+                    cumulative_total,
+                );
+                #[cfg(test)]
+                {
+                    let hook = publisher_test_hook
+                        .read()
+                        .expect("health snapshot publish hook")
+                        .clone();
+                    if let Some(hook) = hook
+                        && hook.pause_between.swap(false, Ordering::SeqCst)
+                    {
+                        hook.after_accounts.notify_one();
+                        hook.release_before_auth.notified().await;
+                    }
+                }
+                publisher_auth
+                    .publish_validated_backend_snapshot_silent(auth_records, auth_fingerprint);
+                sync_health_snapshot_cache(&publisher_cache, &publisher_accounts, &publisher_auth);
+                true
+            })
+        });
+        backend.install_health_snapshot_publisher(publisher);
+        let cache_sync: HealthSnapshotSync = {
+            let cache = health_snapshot_cache.clone();
+            let account_store = Arc::downgrade(&account_store);
+            let auth_store = Arc::downgrade(&auth_store);
+            Arc::new(move || {
+                if let (Some(account_store), Some(auth_store)) =
+                    (account_store.upgrade(), auth_store.upgrade())
+                {
+                    sync_health_snapshot_cache(&cache, &account_store, &auth_store);
+                }
+            })
+        };
+        account_store.install_health_snapshot_sync(cache_sync.clone());
+        auth_store.install_health_snapshot_sync(cache_sync);
+        let validator: storage::HealthSnapshotValidator = Arc::new(|accounts, auth_keys| {
+            parse_backend_snapshot(accounts.clone()).is_ok()
+                && parse_auth_backend_snapshot(auth_keys.clone()).is_ok()
+        });
+        backend.install_health_snapshot_validator(validator);
+        let models = ModelStore::load(config.models_path.as_deref(), &config.models)?;
+        let config_path = absolute_legacy_config_path(&initial_cwd, &data_dir);
+        editable_file_generation::recover_unfinished(&data_dir)
+            .map_err(|_| AppInitError::EditableTaskSnapshot)?;
+        let account_type_catalog = AccountTypeCatalog::new(
+            account_store.clone(),
+            client.clone(),
+            config.upstream_base_url.clone(),
+            true,
             config.upstream_protocol,
             codex_client_version(),
         );
@@ -888,14 +1643,29 @@ impl AppState {
             config: Arc::new(config),
             config_path: Arc::new(config_path),
             data_dir: Arc::new(data_dir),
-            auth_store: Arc::new(auth_store),
-            account_store: Arc::new(account_store),
+            storage_backend: Some(backend),
+            auth_store,
+            account_store,
             account_progress: Arc::new(Mutex::new(HashMap::new())),
             oauth_sessions: Arc::new(Mutex::new(HashMap::new())),
             models: Arc::new(models),
             account_type_catalog: Arc::new(account_type_catalog),
+            editable_workers: Arc::new(editable_file_generation::EditableWorkers::new()),
+            http_admission_open: Arc::new(AtomicBool::new(true)),
+            health_snapshot_gate,
+            health_snapshot_cache,
+            health_storage_semaphore: Arc::new(Semaphore::new(1)),
+            health_accounts_semaphore: Arc::new(Semaphore::new(1)),
             client,
+            #[cfg(test)]
+            health_snapshot_publish_test_hook,
+            #[cfg(test)]
+            health_refresh_coordinator_test_hook,
         })
+    }
+
+    fn begin_http_shutdown(&self) {
+        self.http_admission_open.store(false, Ordering::Release);
     }
 
     pub fn router(&self) -> Router {
@@ -985,8 +1755,14 @@ impl AppState {
             .route("/api/backups/delete", post(management::delete_backup))
             .route("/api/backups/detail", get(management::backup_detail))
             .route("/api/backups/download", get(management::download_backup))
-            .route("/v1/images/generations", post(image_generation))
-            .route("/v1/images/edits", post(image_edit))
+            .route(
+                "/v1/images/generations",
+                post(image_generation).layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES)),
+            )
+            .route(
+                "/v1/images/edits",
+                post(image_edit).layer(DefaultBodyLimit::max(MAX_NATIVE_IMAGE_REQUEST_BYTES)),
+            )
             .route("/v1/search", post(search))
             .route("/v1/ppt/generations", post(ppt_generation))
             .route("/v1/psd/generations", post(psd_generation))
@@ -1066,8 +1842,40 @@ impl AppState {
             .route("/", get(web_root))
             .route("/{*web_path}", get(web_asset))
             .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+            .layer(middleware::from_fn_with_state(
+                self.clone(),
+                enforce_http_admission,
+            ))
+            .layer(middleware::from_fn_with_state(
+                self.clone(),
+                enforce_storage_snapshot_consistency,
+            ))
             .with_state(self.clone())
     }
+}
+
+async fn enforce_http_admission(
+    State(state): State<AppState>,
+    request: AxumRequest,
+    next: Next,
+) -> Response {
+    if !state.http_admission_open.load(Ordering::Acquire) {
+        return ApiError::shutting_down().into_response();
+    }
+    next.run(request).await
+}
+
+async fn enforce_storage_snapshot_consistency(
+    State(state): State<AppState>,
+    request: AxumRequest,
+    next: Next,
+) -> Response {
+    let backend_health = request.uri().path() == "/health" && state.storage_backend.is_some();
+    if backend_health {
+        return next.run(request).await;
+    }
+    let _snapshot_read = state.health_snapshot_gate.read().await;
+    next.run(request).await
 }
 
 async fn version(State(state): State<AppState>) -> impl IntoResponse {
@@ -2227,6 +3035,82 @@ fn checked_parent_identity(path: &Path) -> Result<Option<CheckedDirectory>, ApiE
     }
 }
 
+#[cfg(test)]
+fn maybe_replace_before_file_rebind(path: &Path) -> Result<(), ()> {
+    let hook = VALIDATED_FILE_REBIND_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .filter(|hook| hook.path == path);
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    let replacement = hook
+        .replacement
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    let Some(replacement) = replacement else {
+        return Ok(());
+    };
+    hook.fires.fetch_add(1, Ordering::SeqCst);
+    atomic_replace_checked_with_limit(path, &replacement, replacement.len().max(1) as u64, false)
+        .map_err(|_| ())
+}
+
+fn validated_file_version(path: &Path) -> Result<FileVersion, ()> {
+    let parent = checked_parent_identity(path).map_err(|_| ())?.ok_or(())?;
+    if !checked_directory_still_same(&parent) {
+        return Err(());
+    }
+    let name = path.file_name().ok_or(())?;
+    let file = open_regular_file_for_replace_check_at(&parent._file, name).map_err(|_| ())?;
+    let first = kernel_file_version(&file).map_err(|_| ())?;
+    let second = kernel_file_version(&file).map_err(|_| ())?;
+    if first != second {
+        return Err(());
+    }
+    #[cfg(test)]
+    maybe_replace_before_file_rebind(path)?;
+    let rebound = open_regular_file_for_replace_check_at(&parent._file, name).map_err(|_| ())?;
+    if kernel_file_version(&rebound).map_err(|_| ())? != first
+        || !checked_directory_still_same(&parent)
+    {
+        return Err(());
+    }
+    Ok(first)
+}
+
+fn read_bounded_validated_file(path: &Path, limit: u64) -> Result<(Vec<u8>, FileVersion), ()> {
+    let parent = checked_parent_identity(path).map_err(|_| ())?.ok_or(())?;
+    if !checked_directory_still_same(&parent) {
+        return Err(());
+    }
+    let name = path.file_name().ok_or(())?;
+    let mut file = open_regular_file_for_replace_check_at(&parent._file, name).map_err(|_| ())?;
+    let version = kernel_file_version(&file).map_err(|_| ())?;
+    if version.size > limit {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > limit || kernel_file_version(&file).map_err(|_| ())? != version {
+        return Err(());
+    }
+    #[cfg(test)]
+    maybe_replace_before_file_rebind(path)?;
+    let rebound = open_regular_file_for_replace_check_at(&parent._file, name).map_err(|_| ())?;
+    if kernel_file_version(&rebound).map_err(|_| ())? != version
+        || !checked_directory_still_same(&parent)
+    {
+        return Err(());
+    }
+    Ok((bytes, version))
+}
+
 fn ensure_checked_parent(path: &Path) -> Result<CheckedDirectory, ApiError> {
     if let Some(parent) = checked_parent_identity(path)? {
         return Ok(parent);
@@ -2284,6 +3168,32 @@ fn read_checked_bounded_file_at(
         return Err(ApiError::unavailable());
     }
     Ok(bytes)
+}
+
+fn open_checked_bounded_file_at(
+    parent: &CheckedDirectory,
+    name: &OsStr,
+    limit: u64,
+) -> Result<(fs::File, FileVersion), ApiError> {
+    if !checked_directory_still_same(parent) {
+        return Err(ApiError::unavailable());
+    }
+    let file = open_regular_file_for_replace_check_at(&parent._file, name)
+        .map_err(|_| ApiError::unavailable())?;
+    let version = kernel_file_version(&file).map_err(|_| ApiError::unavailable())?;
+    if version.size > limit || kernel_file_version(&file).ok() != Some(version) {
+        return Err(ApiError::unavailable());
+    }
+    #[cfg(test)]
+    maybe_replace_before_file_rebind(&parent.path.join(name))
+        .map_err(|_| ApiError::unavailable())?;
+    let rebound = open_regular_file_for_replace_check_at(&parent._file, name)
+        .map_err(|_| ApiError::unavailable())?;
+    if kernel_file_version(&rebound).ok() != Some(version) || !checked_directory_still_same(parent)
+    {
+        return Err(ApiError::unavailable());
+    }
+    Ok((file, version))
 }
 
 fn next_atomic_temp_path(path: &Path, use_image_test_hooks: bool) -> PathBuf {
@@ -2689,7 +3599,14 @@ fn maybe_switch_image_tag_cwd_after_final_check() -> Result<(), ApiError> {
     env::set_current_dir(path).map_err(|_| ApiError::unavailable())
 }
 
-pub(crate) fn acquire_path_write_lock_sync(path: &Path) -> Result<fs::File, ApiError> {
+fn lock_is_busy(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock || error.raw_os_error() == Some(33)
+}
+
+fn acquire_path_write_lock_sync_mode(
+    path: &Path,
+    nonblocking: bool,
+) -> Result<Option<fs::File>, ApiError> {
     let parent = ensure_checked_parent(path)?;
     let lock_path = path_write_lock_path(path);
     let lock_name = lock_path.file_name().ok_or_else(ApiError::unavailable)?;
@@ -2718,14 +3635,29 @@ pub(crate) fn acquire_path_write_lock_sync(path: &Path) -> Result<fs::File, ApiE
     {
         return Err(ApiError::unavailable());
     }
-    if let Err(error) = file.lock_exclusive() {
-        let _ = error;
+    let lock_result = if nonblocking {
+        file.try_lock_exclusive()
+    } else {
+        file.lock_exclusive()
+    };
+    if let Err(error) = lock_result {
+        if nonblocking && lock_is_busy(&error) {
+            return Ok(None);
+        }
         return Err(ApiError::unavailable());
     }
     if !checked_directory_still_same(&parent) || kernel_path_identity(&file)? != opened_identity {
         return Err(ApiError::unavailable());
     }
-    Ok(file)
+    Ok(Some(file))
+}
+
+pub(crate) fn acquire_path_write_lock_sync(path: &Path) -> Result<fs::File, ApiError> {
+    acquire_path_write_lock_sync_mode(path, false)?.ok_or_else(ApiError::unavailable)
+}
+
+pub(crate) fn try_acquire_path_write_lock_sync(path: &Path) -> Result<Option<fs::File>, ApiError> {
+    acquire_path_write_lock_sync_mode(path, true)
 }
 
 pub(crate) async fn acquire_path_write_lock(path: &Path) -> Result<fs::File, ApiError> {
@@ -2733,6 +3665,22 @@ pub(crate) async fn acquire_path_write_lock(path: &Path) -> Result<fs::File, Api
     tokio::task::spawn_blocking(move || acquire_path_write_lock_sync(&path))
         .await
         .map_err(|_error| ApiError::unavailable())?
+}
+
+pub(crate) async fn try_acquire_path_write_lock(path: &Path) -> Result<Option<fs::File>, ApiError> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || try_acquire_path_write_lock_sync(&path))
+        .await
+        .map_err(|_error| ApiError::unavailable())?
+}
+
+pub(crate) fn backup_owner_gate(path: &Path) -> Arc<Mutex<()>> {
+    BACKUP_OWNER_GATES
+        .lock()
+        .expect("backup owner gates lock")
+        .entry(path.to_owned())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
 }
 
 fn safe_relative_path(value: &str) -> Option<PathBuf> {
@@ -2859,10 +3807,8 @@ fn all_image_tags(tags: &Map<String, Value>) -> Vec<String> {
 
 fn write_image_tags(state: &AppState, tags: &Map<String, Value>) -> Result<(), ApiError> {
     // Contract: every production writer acquires the canonical sidecar lock
-    // before calling this private helper. FileRenameInfoEx has no portable
-    // target-ID compare-and-swap for an uncooperative writer that swaps the
-    // target after the final pathname check; that threat is outside this
-    // lock-based writer contract.
+    // before calling this private helper. The atomic replacement helper also
+    // rechecks an existing target's kernel identity at the replace boundary.
     validate_image_tags(tags)?;
     let path = image_tags_path(state);
     let mut bytes = serde_json::to_vec_pretty(tags).map_err(|_| ApiError::unavailable())?;
@@ -2979,13 +3925,17 @@ async fn api_image_tag_delete(
 
 async fn image_proxy(
     state: AppState,
-    headers: HeaderMap,
-    body: Body,
+    request: AxumRequest,
     endpoint: &'static str,
 ) -> Result<Response, ApiError> {
+    let headers = request.headers().clone();
     authenticated(&headers, &state).await?;
     if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
-        return native_image_request_proxy(state, body, endpoint).await;
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(ApiError::invalid_request)?;
+        return native_image_request_proxy(state, request, content_type, endpoint).await;
     }
     if state.config.upstream_protocol != UpstreamProtocol::OpenAi {
         return Err(ApiError::unsupported_capability());
@@ -2995,7 +3945,7 @@ async fn image_proxy(
         .upstream_base_url
         .as_deref()
         .ok_or_else(ApiError::unavailable)?;
-    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+    let bytes = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
         .await
         .map_err(|_| ApiError::validation())?;
     let url = format!("{}/v1/{endpoint}", base_url.trim_end_matches('/'));
@@ -3024,6 +3974,334 @@ async fn image_proxy(
         .into_response())
 }
 
+struct NativeImageTempBinding {
+    root: PathBuf,
+    root_identity: Identity,
+    parent: Arc<DirectoryHandle>,
+    root_name: String,
+    entries: StdMutex<HashMap<String, Identity>>,
+}
+
+fn native_rollback_new_temp_root(
+    parent: &DirectoryHandle,
+    root_name: &OsStr,
+    root_identity: Identity,
+    directory: DirectoryHandle,
+    owner: Option<fs::File>,
+) -> io::Result<()> {
+    if let Some(owner) = owner {
+        remove_open_file_at(&directory, OsStr::new(".owner"), &owner)?;
+    } else {
+        match open_regular_file_for_delete_at(&directory, OsStr::new(".owner")) {
+            Ok(owner) => remove_open_file_at(&directory, OsStr::new(".owner"), &owner)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    drop(directory);
+    remove_directory_at(parent, root_name, root_identity)
+}
+
+impl NativeImageTempBinding {
+    fn validate_parent(&self) -> io::Result<()> {
+        if self.root.file_name() != Some(OsStr::new(&self.root_name)) {
+            return Err(io::Error::other("native image upload parent changed"));
+        }
+        let current = open_directory(self.parent.path())?;
+        if current.identity() != self.parent.identity() || !current.same_identity()? {
+            return Err(io::Error::other("native image upload parent changed"));
+        }
+        Ok(())
+    }
+
+    fn open_root(&self) -> io::Result<DirectoryHandle> {
+        let directory = open_directory(&self.root)?;
+        if directory.identity() != self.root_identity || !directory.same_identity()? {
+            return Err(io::Error::other("native image upload root changed"));
+        }
+        Ok(directory)
+    }
+
+    fn register(&self, name: &str, expected_identity: Identity) -> io::Result<()> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if entries.insert(name.to_owned(), expected_identity).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "native image upload entry already registered",
+            ));
+        }
+        Ok(())
+    }
+
+    fn create_file(self: &Arc<Self>, name: &str) -> io::Result<NativeImageTempFile> {
+        let directory = self.open_root()?;
+        let file = create_regular_file_at(&directory, OsStr::new(name))?;
+        if let Err(error) = native_image_temp_failpoint("file-after-create")
+            .and_then(|()| native_require_private_file(&file))
+            .and_then(|()| native_image_temp_failpoint("file-after-private"))
+        {
+            let rollback = remove_open_file_at(&directory, OsStr::new(name), &file);
+            drop(file);
+            return Err(rollback.err().unwrap_or(error));
+        }
+        let identity = match kernel_identity(&file) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let rollback = remove_open_file_at(&directory, OsStr::new(name), &file);
+                drop(file);
+                return Err(rollback.err().unwrap_or(error));
+            }
+        };
+        if let Err(error) = native_image_temp_failpoint("file-after-identity") {
+            let rollback = remove_open_file_at(&directory, OsStr::new(name), &file);
+            drop(file);
+            return Err(rollback.err().unwrap_or(error));
+        }
+        if let Err(error) = native_image_temp_failpoint("file-before-register")
+            .and_then(|()| self.register(name, identity))
+        {
+            let rollback = remove_open_file_at(&directory, OsStr::new(name), &file);
+            drop(file);
+            return Err(rollback.err().unwrap_or(error));
+        }
+        Ok(NativeImageTempFile {
+            binding: self.clone(),
+            name: name.to_owned(),
+            directory: Some(directory),
+            file: Some(file),
+            identity,
+        })
+    }
+
+    fn validate_file(&self, file: &fs::File, name: &str, expected: FileVersion) -> io::Result<()> {
+        let directory = self.open_root()?;
+        let current = open_regular_file_at(&directory, OsStr::new(name))?;
+        native_require_private_file(&current)?;
+        if kernel_file_version(&current)? != expected || kernel_file_version(file)? != expected {
+            return Err(io::Error::other("native image upload file changed"));
+        }
+        Ok(())
+    }
+}
+
+fn native_recover_temp_ownership(
+    binding: &Arc<NativeImageTempBinding>,
+) -> io::Result<DirectoryHandle> {
+    let directory = binding.open_root()?;
+    let expected_owner = binding
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(".owner")
+        .copied();
+    let owner_identity = match open_regular_file_for_delete_at(&directory, OsStr::new(".owner")) {
+        Ok(mut owner) => {
+            native_require_private_file(&owner)?;
+            let mut marker = Vec::new();
+            owner.read_to_end(&mut marker)?;
+            if marker != NATIVE_IMAGE_UPLOAD_MARKER {
+                return Err(io::Error::other("native image upload owner marker changed"));
+            }
+            let identity = kernel_identity(&owner)?;
+            if expected_owner != Some(identity) {
+                return Err(io::Error::other(
+                    "native image upload owner identity changed",
+                ));
+            }
+            identity
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if expected_owner.is_some() {
+                return Err(io::Error::other("native image upload owner disappeared"));
+            }
+            let mut owner = create_regular_file_at(&directory, OsStr::new(".owner"))?;
+            native_require_private_file(&owner)?;
+            owner.write_all(NATIVE_IMAGE_UPLOAD_MARKER)?;
+            owner.sync_all()?;
+            kernel_identity(&owner)?
+        }
+        Err(error) => return Err(error),
+    };
+    let mut entries = binding
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries.insert(".owner".to_owned(), owner_identity);
+    Ok(directory)
+}
+
+struct NativeImageTempFile {
+    binding: Arc<NativeImageTempBinding>,
+    name: String,
+    directory: Option<DirectoryHandle>,
+    file: Option<fs::File>,
+    identity: Identity,
+}
+
+impl NativeImageTempFile {
+    fn take_file(&mut self) -> io::Result<fs::File> {
+        self.file
+            .take()
+            .ok_or_else(|| io::Error::other("native image upload writer already consumed"))
+    }
+
+    fn finalize(mut self, len: usize) -> io::Result<NativeImageFileHandle> {
+        drop(self.file.take());
+        let directory = self
+            .directory
+            .take()
+            .ok_or_else(|| io::Error::other("native image upload directory handle missing"))?;
+        if directory.identity() != self.binding.root_identity
+            || !directory.same_identity()?
+            || open_directory(&self.binding.root)?.identity() != self.binding.root_identity
+        {
+            return Err(io::Error::other("native image upload root changed"));
+        }
+        let file = open_regular_file_at(&directory, OsStr::new(&self.name))?;
+        native_require_private_file(&file)?;
+        if kernel_identity(&file)? != self.identity {
+            return Err(io::Error::other("native image upload file was replaced"));
+        }
+        let retained = Arc::new(file);
+        let version = kernel_file_version(&retained)?;
+        if version.size != len as u64 {
+            return Err(io::Error::other("native image upload file length changed"));
+        }
+        NativeImageFileHandle::new(self.binding, retained, self.name, len)
+    }
+}
+
+#[derive(Clone)]
+struct NativeImageFileHandle {
+    binding: Arc<NativeImageTempBinding>,
+    file: Arc<fs::File>,
+    name: String,
+    version: FileVersion,
+    len: usize,
+    #[cfg(test)]
+    read_observer: Option<Arc<AtomicUsize>>,
+}
+
+impl NativeImageFileHandle {
+    fn new(
+        binding: Arc<NativeImageTempBinding>,
+        file: Arc<fs::File>,
+        name: String,
+        len: usize,
+    ) -> io::Result<Self> {
+        let version = kernel_file_version(&file)?;
+        if version.size != len as u64 {
+            return Err(io::Error::other("native image upload size changed"));
+        }
+        Ok(Self {
+            binding,
+            file,
+            name,
+            version,
+            len,
+            #[cfg(test)]
+            read_observer: None,
+        })
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        self.binding
+            .validate_file(&self.file, &self.name, self.version)
+    }
+
+    fn read(&self) -> io::Result<Vec<u8>> {
+        #[cfg(test)]
+        if let Some(observer) = &self.read_observer {
+            observer.fetch_add(1, Ordering::SeqCst);
+        }
+        self.validate()?;
+        let mut file = self.file.try_clone()?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let mut value = Vec::with_capacity(self.len);
+        file.take(self.len as u64 + 1).read_to_end(&mut value)?;
+        if value.len() != self.len {
+            return Err(io::Error::other("native image upload length changed"));
+        }
+        self.validate()?;
+        Ok(value)
+    }
+
+    fn stream_file(&self) -> io::Result<tokio::fs::File> {
+        self.validate()?;
+        let mut file = self.file.try_clone()?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        Ok(tokio::fs::File::from_std(file))
+    }
+}
+
+#[derive(Clone)]
+enum NativeImageSource {
+    Text(String),
+    File {
+        handle: NativeImageFileHandle,
+        mime_type: String,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl std::fmt::Debug for NativeImageSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(value) => formatter.debug_tuple("Text").field(value).finish(),
+            Self::File {
+                handle,
+                mime_type,
+                width,
+                height,
+            } => formatter
+                .debug_struct("File")
+                .field("name", &handle.name)
+                .field("version", &handle.version)
+                .field("len", &handle.len)
+                .field("mime_type", mime_type)
+                .field("width", width)
+                .field("height", height)
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq for NativeImageSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Text(left), Self::Text(right)) => left == right,
+            (
+                Self::File {
+                    handle: left,
+                    mime_type: left_mime,
+                    width: left_width,
+                    height: left_height,
+                },
+                Self::File {
+                    handle: right,
+                    mime_type: right_mime,
+                    width: right_width,
+                    height: right_height,
+                },
+            ) => {
+                left.name == right.name
+                    && left.version == right.version
+                    && left.len == right.len
+                    && left_mime == right_mime
+                    && left_width == right_width
+                    && left_height == right_height
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for NativeImageSource {}
+
 struct NativeImageRequest {
     model: String,
     codex: bool,
@@ -3037,7 +4315,9 @@ struct NativeImageRequest {
     output_compression: Option<u64>,
     background: String,
     stream: bool,
-    images: Vec<String>,
+    images: Vec<NativeImageSource>,
+    mask: Option<NativeImageSource>,
+    temp_guard: Option<NativeImageTempGuard>,
 }
 
 fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<String>), ApiError> {
@@ -3162,22 +4442,968 @@ fn native_image_reference_values(value: &Value) -> Result<Vec<String>, ApiError>
         _ => return Err(ApiError::invalid_request()),
     };
     if values.is_empty()
-        || values.len() > 16
-        || values
-            .iter()
-            .any(|value| value.trim().is_empty() || value.len() > MAX_UPSTREAM_BODY_BYTES)
+        || values.len() > MAX_NATIVE_IMAGE_MULTIPART_IMAGE_COUNT
+        || values.iter().any(|value| {
+            value.trim().is_empty() || value.len() > MAX_NATIVE_IMAGE_REFERENCE_TEXT_BYTES
+        })
     {
         return Err(ApiError::invalid_request());
     }
     Ok(values)
 }
 
-fn parse_native_image_request(
+struct NativeMultipartPart {
+    name: String,
+    filename: Option<String>,
+    content_type: Option<String>,
+    value: NativeMultipartPartValue,
+}
+
+enum NativeMultipartPartValue {
+    #[cfg(test)]
+    Bytes(Vec<u8>),
+    File {
+        handle: NativeImageFileHandle,
+    },
+}
+
+impl NativeMultipartPartValue {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            #[cfg(test)]
+            Self::Bytes(value) => value.len(),
+            Self::File { handle } => handle.len,
+        }
+    }
+
+    fn read(self) -> Result<Vec<u8>, ApiError> {
+        match self {
+            #[cfg(test)]
+            Self::Bytes(value) => Ok(value),
+            Self::File { handle } => handle.read().map_err(|_| ApiError::unavailable()),
+        }
+    }
+}
+
+const NATIVE_IMAGE_UPLOAD_MARKER: &[u8] = b"chatgpt2api-native-image-upload-v1\n";
+
+struct NativeImageTempGuard {
+    binding: Arc<NativeImageTempBinding>,
+    directory: Option<DirectoryHandle>,
+    root: PathBuf,
+    cleaned: bool,
+}
+
+#[cfg(unix)]
+fn native_require_private_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "native image upload root is not a private directory",
+        ));
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "native image upload directory permissions are not 0700",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn native_require_private_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "native image upload root is not a private directory",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn native_create_private_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn native_create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+#[cfg(unix)]
+fn native_require_private_file(file: &fs::File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if file.metadata()?.permissions().mode() & 0o777 != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "native image upload file permissions are not 0600",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn native_require_private_file(file: &fs::File) -> io::Result<()> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "native image upload file is not regular",
+        ));
+    }
+    Ok(())
+}
+
+impl NativeImageTempGuard {
+    fn create(data_dir: &Path) -> Result<Self, ApiError> {
+        let parent = data_dir.join(".native-image-uploads");
+        let parent_directory =
+            open_or_create_directory(&parent).map_err(|_| ApiError::unavailable())?;
+        native_require_private_directory(&parent).map_err(|_| ApiError::unavailable())?;
+        let parent_directory = Arc::new(parent_directory);
+        for _ in 0..32 {
+            let root_name = format!(
+                "{}-{}",
+                std::process::id(),
+                LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            );
+            let root = parent.join(&root_name);
+            match native_create_private_directory(&root) {
+                Ok(()) => {
+                    let root_identity = match directory_identity_at(
+                        parent_directory.as_ref(),
+                        OsStr::new(&root_name),
+                    ) {
+                        Ok(identity) => identity,
+                        Err(_) => return Err(ApiError::unavailable()),
+                    };
+                    if native_image_temp_failpoint("guard-before-root-open").is_err() {
+                        let _ = remove_directory_at(
+                            parent_directory.as_ref(),
+                            OsStr::new(&root_name),
+                            root_identity,
+                        );
+                        return Err(ApiError::unavailable());
+                    }
+                    let directory = match open_directory(&root) {
+                        Ok(directory)
+                            if directory.identity() == root_identity
+                                && directory.same_identity().unwrap_or(false) =>
+                        {
+                            directory
+                        }
+                        Err(_) => {
+                            let _ = remove_directory_at(
+                                parent_directory.as_ref(),
+                                OsStr::new(&root_name),
+                                root_identity,
+                            );
+                            return Err(ApiError::unavailable());
+                        }
+                        Ok(_) => {
+                            let _ = remove_directory_at(
+                                parent_directory.as_ref(),
+                                OsStr::new(&root_name),
+                                root_identity,
+                            );
+                            return Err(ApiError::unavailable());
+                        }
+                    };
+                    let creation = (|| -> io::Result<Arc<NativeImageTempBinding>> {
+                        native_image_temp_failpoint("guard-after-root-open")?;
+                        native_require_private_directory(&root)?;
+                        let mut file = create_regular_file_at(&directory, OsStr::new(".owner"))?;
+                        native_image_temp_failpoint("guard-after-owner-create")?;
+                        native_require_private_file(&file)?;
+                        native_image_temp_failpoint("guard-after-owner-private")?;
+                        let owner_identity = kernel_identity(&file)?;
+                        native_image_temp_failpoint("guard-after-owner-identity")?;
+                        file.write_all(NATIVE_IMAGE_UPLOAD_MARKER)?;
+                        native_image_temp_failpoint("guard-after-owner-write")?;
+                        file.sync_all()?;
+                        native_image_temp_failpoint("guard-after-owner-sync")?;
+                        let binding = Arc::new(NativeImageTempBinding {
+                            root: root.clone(),
+                            root_identity,
+                            parent: parent_directory.clone(),
+                            root_name: root_name.clone(),
+                            entries: StdMutex::new(HashMap::from([(
+                                ".owner".to_owned(),
+                                owner_identity,
+                            )])),
+                        });
+                        Ok(binding)
+                    })();
+                    match creation {
+                        Ok(binding) => {
+                            return Ok(Self {
+                                binding,
+                                directory: Some(directory),
+                                root,
+                                cleaned: false,
+                            });
+                        }
+                        Err(_error) => {
+                            let rollback = native_rollback_new_temp_root(
+                                parent_directory.as_ref(),
+                                OsStr::new(&root_name),
+                                root_identity,
+                                directory,
+                                None,
+                            );
+                            if rollback.is_err() {
+                                return Err(ApiError::unavailable());
+                            }
+                            return Err(ApiError::unavailable());
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(ApiError::unavailable()),
+            }
+        }
+        Err(ApiError::unavailable())
+    }
+
+    fn create_file(&self, name: &str) -> Result<NativeImageTempFile, ApiError> {
+        self.binding
+            .create_file(name)
+            .map_err(|_| ApiError::unavailable())
+    }
+
+    fn cleanup(&mut self) -> Result<(), ApiError> {
+        if self.cleaned {
+            return Ok(());
+        }
+        if Arc::strong_count(&self.binding) != 1 {
+            return Err(ApiError::unavailable());
+        }
+        self.binding
+            .validate_parent()
+            .map_err(|_| ApiError::unavailable())?;
+        let removal_error = {
+            let directory = self.directory.as_ref().ok_or_else(ApiError::unavailable)?;
+            if directory.identity() != self.binding.root_identity
+                || !directory
+                    .same_identity()
+                    .map_err(|_| ApiError::unavailable())?
+                || open_directory(&self.root)
+                    .map_err(|_| ApiError::unavailable())?
+                    .identity()
+                    != self.binding.root_identity
+            {
+                return Err(ApiError::unavailable());
+            }
+            let mut entries = self
+                .binding
+                .entries
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .map(|(name, identity)| (name.clone(), *identity))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(name, _)| name == ".owner");
+            let mut removal_error = None;
+            for (name, expected_identity) in &entries {
+                let mut current = match open_regular_file_for_delete_at(directory, OsStr::new(name))
+                {
+                    Ok(current) => current,
+                    Err(error) => {
+                        removal_error = Some(error);
+                        break;
+                    }
+                };
+                if let Err(error) = native_require_private_file(&current).and_then(|()| {
+                    if kernel_identity(&current)? != *expected_identity {
+                        return Err(io::Error::other("native image upload entry changed"));
+                    }
+                    if name == ".owner" {
+                        let mut marker_bytes = Vec::new();
+                        current.read_to_end(&mut marker_bytes)?;
+                        if marker_bytes != NATIVE_IMAGE_UPLOAD_MARKER {
+                            return Err(io::Error::other(
+                                "native image upload owner marker changed",
+                            ));
+                        }
+                    }
+                    remove_open_file_at(directory, OsStr::new(name), &current)
+                }) {
+                    removal_error = Some(error);
+                    break;
+                }
+                self.binding
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(name);
+                if native_image_temp_failpoint("guard-after-entry-delete").is_err() {
+                    removal_error =
+                        Some(io::Error::other("native image temp entry delete failpoint"));
+                    break;
+                }
+            }
+            if removal_error.is_none()
+                && native_image_temp_failpoint("guard-before-root-delete").is_err()
+            {
+                removal_error = Some(io::Error::other("native image temp root delete failpoint"));
+            }
+            removal_error
+        };
+        if removal_error.is_some() {
+            self.directory = native_recover_temp_ownership(&self.binding).ok();
+            return Err(ApiError::unavailable());
+        }
+        let root_identity = self.binding.root_identity;
+        let parent = Arc::clone(&self.binding.parent);
+        let root_name = self.binding.root_name.clone();
+        let directory = self.directory.take().ok_or_else(ApiError::unavailable)?;
+        drop(directory);
+        if remove_directory_at(parent.as_ref(), OsStr::new(&root_name), root_identity).is_err() {
+            self.directory = native_recover_temp_ownership(&self.binding).ok();
+            return Err(ApiError::unavailable());
+        }
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for NativeImageTempGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[cfg(test)]
+fn native_find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    (!needle.is_empty())
+        .then(|| {
+            haystack
+                .windows(needle.len())
+                .position(|window| window == needle)
+        })
+        .flatten()
+}
+
+#[cfg(test)]
+fn native_multipart_boundary(content_type: &str) -> Result<Vec<u8>, ApiError> {
+    let mut parts = content_type.split(';');
+    if !parts
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/form-data"))
+    {
+        return Err(ApiError::invalid_request());
+    }
+    let mut boundary = None;
+    for parameter in parts {
+        let Some((name, raw_value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("boundary") || boundary.is_some() {
+            if name.trim().eq_ignore_ascii_case("boundary") {
+                return Err(ApiError::invalid_request());
+            }
+            continue;
+        }
+        let value = raw_value.trim();
+        let value = if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+            &value[1..value.len() - 1]
+        } else if value.contains('"') {
+            return Err(ApiError::invalid_request());
+        } else {
+            value
+        };
+        if value.is_empty()
+            || value.len() > 70
+            || !value.is_ascii()
+            || value
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b' ' || byte == b'\t')
+        {
+            return Err(ApiError::invalid_request());
+        }
+        boundary = Some(value.as_bytes().to_vec());
+    }
+    boundary.ok_or_else(ApiError::invalid_request)
+}
+
+#[cfg(test)]
+fn native_multipart_header_value<'a>(
+    headers: &'a [u8],
+    name: &str,
+) -> Result<Option<&'a [u8]>, ApiError> {
+    let mut found = None;
+    for line in headers.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(separator) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let (key, value) = line.split_at(separator);
+        let Some(value) = value.get(1..) else {
+            return Err(ApiError::invalid_request());
+        };
+        if key.eq_ignore_ascii_case(name.as_bytes()) {
+            if found.is_some() {
+                return Err(ApiError::invalid_request());
+            }
+            found = Some(value.strip_prefix(b" ").unwrap_or(value));
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+fn native_multipart_parameter(value: &[u8], parameter: &str) -> Result<Option<String>, ApiError> {
+    let value = std::str::from_utf8(value).map_err(|_| ApiError::invalid_request())?;
+    let mut items = value.split(';');
+    if !items
+        .next()
+        .is_some_and(|token| token.trim().eq_ignore_ascii_case("form-data"))
+    {
+        return Err(ApiError::invalid_request());
+    }
+    let mut found = None;
+    for item in items {
+        let Some((name, raw_value)) = item.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case(parameter) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(ApiError::invalid_request());
+        }
+        let raw_value = raw_value.trim();
+        let value =
+            if raw_value.starts_with('"') && raw_value.ends_with('"') && raw_value.len() >= 2 {
+                &raw_value[1..raw_value.len() - 1]
+            } else if raw_value.contains('"') {
+                return Err(ApiError::invalid_request());
+            } else {
+                raw_value
+            };
+        if value.is_empty() || !value.is_ascii() || value.chars().any(char::is_control) {
+            return Err(ApiError::invalid_request());
+        }
+        found = Some(value.to_owned());
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+fn native_multipart_part_end(
     bytes: &[u8],
+    start: usize,
+    boundary: &[u8],
+) -> Option<(usize, usize)> {
+    let marker = [b"\r\n--".as_slice(), boundary].concat();
+    let delimiter = [b"--".as_slice(), boundary].concat();
+    let mut search = start;
+    while let Some(relative) = native_find_bytes(&bytes[search..], &marker) {
+        let marker_start = search + relative;
+        let delimiter_start = marker_start + 2;
+        let delimiter_end = delimiter_start + delimiter.len();
+        if bytes
+            .get(delimiter_end..)
+            .is_some_and(|value| value.starts_with(b"\r\n") || value.starts_with(b"--"))
+        {
+            return Some((marker_start, delimiter_end));
+        }
+        search = delimiter_end;
+    }
+    None
+}
+
+#[cfg(test)]
+fn native_parse_multipart_parts(
+    bytes: &[u8],
+    boundary: &[u8],
+) -> Result<Vec<NativeMultipartPart>, ApiError> {
+    let delimiter = [b"--".as_slice(), boundary].concat();
+    let mut cursor = 0usize;
+    let mut parts = Vec::new();
+    if !bytes.starts_with(&delimiter) {
+        return Err(ApiError::invalid_request());
+    }
+    cursor += delimiter.len();
+    loop {
+        if bytes
+            .get(cursor..)
+            .is_some_and(|value| value.starts_with(b"--"))
+        {
+            cursor += 2;
+            if bytes
+                .get(cursor..)
+                .is_some_and(|value| value.starts_with(b"\r\n"))
+            {
+                cursor += 2;
+            }
+            if cursor != bytes.len() {
+                return Err(ApiError::invalid_request());
+            }
+            return Ok(parts);
+        }
+        if !bytes
+            .get(cursor..)
+            .is_some_and(|value| value.starts_with(b"\r\n"))
+        {
+            return Err(ApiError::invalid_request());
+        }
+        cursor += 2;
+        let header_end = native_find_bytes(&bytes[cursor..], b"\r\n\r\n")
+            .filter(|offset| *offset <= MAX_NATIVE_IMAGE_MULTIPART_HEADER_BYTES)
+            .ok_or_else(ApiError::invalid_request)?;
+        let header_bytes = &bytes[cursor..cursor + header_end];
+        let name = native_multipart_parameter(
+            native_multipart_header_value(header_bytes, "Content-Disposition")?
+                .ok_or_else(ApiError::invalid_request)?,
+            "name",
+        )?
+        .ok_or_else(ApiError::invalid_request)?;
+        let filename = native_multipart_parameter(
+            native_multipart_header_value(header_bytes, "Content-Disposition")?
+                .ok_or_else(ApiError::invalid_request)?,
+            "filename",
+        )?;
+        let content_type = native_multipart_header_value(header_bytes, "Content-Type")?
+            .map(|value| {
+                std::str::from_utf8(value)
+                    .map(str::trim)
+                    .map(ToOwned::to_owned)
+                    .map_err(|_| ApiError::invalid_request())
+            })
+            .transpose()?;
+        cursor += header_end + 4;
+        let (part_end, delimiter_end) = native_multipart_part_end(bytes, cursor, boundary)
+            .ok_or_else(ApiError::invalid_request)?;
+        let value = bytes[cursor..part_end].to_vec();
+        if parts.len() >= MAX_NATIVE_IMAGE_MULTIPART_PARTS
+            || (filename.is_none() && value.len() > MAX_NATIVE_IMAGE_MULTIPART_OPTION_BYTES)
+        {
+            return Err(ApiError::invalid_request());
+        }
+        let total_bytes = parts.iter().try_fold(value.len(), |total, part| {
+            total
+                .checked_add(part.value.len())
+                .ok_or_else(ApiError::invalid_request)
+        })?;
+        if total_bytes > MAX_NATIVE_IMAGE_MULTIPART_TOTAL_BYTES {
+            return Err(ApiError::invalid_request());
+        }
+        parts.push(NativeMultipartPart {
+            name,
+            filename,
+            content_type,
+            value: NativeMultipartPartValue::Bytes(value),
+        });
+        cursor = delimiter_end;
+    }
+}
+
+fn native_multipart_option_value(name: &str, value: &[u8]) -> Result<Value, ApiError> {
+    let value = std::str::from_utf8(value)
+        .map(str::trim)
+        .map_err(|_| ApiError::invalid_request())?;
+    if value.is_empty() && name == "prompt" {
+        return Err(ApiError::invalid_request());
+    }
+    match name {
+        "n" | "output_compression" | "partial_images" => value
+            .parse::<u64>()
+            .map(|value| Value::Number(value.into()))
+            .map_err(|_| ApiError::invalid_request()),
+        "stream" => match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "y" | "on" => Ok(Value::Bool(true)),
+            "false" | "0" | "no" | "n" | "off" => Ok(Value::Bool(false)),
+            _ => Err(ApiError::invalid_request()),
+        },
+        _ => Ok(Value::String(value.to_owned())),
+    }
+}
+
+#[cfg(test)]
+fn native_multipart_image_data_url(
+    value: &[u8],
+    declared_content_type: Option<&str>,
+) -> Result<String, ApiError> {
+    let (mime_type, _width, _height) =
+        native_validate_multipart_image(value, declared_content_type)?;
+    Ok(format!(
+        "data:{mime_type};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(value)
+    ))
+}
+
+fn native_image_mime_type(format: image::ImageFormat) -> Option<&'static str> {
+    match format {
+        image::ImageFormat::Jpeg => Some("image/jpeg"),
+        image::ImageFormat::Png => Some("image/png"),
+        image::ImageFormat::WebP => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn native_validate_declared_image_mime(
+    mime_type: &str,
+    declared_content_type: Option<&str>,
+) -> Result<(), ApiError> {
+    if declared_content_type
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && !value.eq_ignore_ascii_case("application/octet-stream")
+        })
+        .is_some_and(|declared| !declared.eq_ignore_ascii_case(mime_type))
+    {
+        return Err(ApiError::invalid_request());
+    }
+    Ok(())
+}
+
+fn native_decode_image(value: &[u8]) -> Result<image::DynamicImage, ApiError> {
+    if value.is_empty() || value.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::invalid_request());
+    }
+    let mut reader = ImageReader::new(Cursor::new(value))
+        .with_guessed_format()
+        .map_err(|_| ApiError::invalid_request())?;
+    let format = reader.format().ok_or_else(ApiError::invalid_request)?;
+    if native_image_mime_type(format).is_none() {
+        return Err(ApiError::invalid_request());
+    }
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_NATIVE_IMAGE_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+    let image = reader.decode().map_err(|_| ApiError::invalid_request())?;
+    if image.width() == 0
+        || image.height() == 0
+        || u64::from(image.width()).saturating_mul(u64::from(image.height()))
+            > MAX_NATIVE_IMAGE_PIXELS
+    {
+        return Err(ApiError::invalid_request());
+    }
+    Ok(image)
+}
+
+#[cfg(test)]
+fn native_validate_multipart_image(
+    value: &[u8],
+    declared_content_type: Option<&str>,
+) -> Result<(String, u32, u32), ApiError> {
+    if value.is_empty() || value.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::invalid_request());
+    }
+    let format = image::guess_format(value).map_err(|_| ApiError::invalid_request())?;
+    let mime_type = native_image_mime_type(format).ok_or_else(ApiError::invalid_request)?;
+    native_validate_declared_image_mime(mime_type, declared_content_type)?;
+    let image = native_decode_image(value)?;
+    Ok((mime_type.to_owned(), image.width(), image.height()))
+}
+
+fn native_multipart_file_dimensions(
+    handle: &NativeImageFileHandle,
+    declared_content_type: Option<&str>,
+) -> Result<(String, u32, u32), ApiError> {
+    if handle.len == 0 || handle.len > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::invalid_request());
+    }
+    handle.validate().map_err(|_| ApiError::unavailable())?;
+    let mut file = handle
+        .file
+        .try_clone()
+        .map_err(|_| ApiError::unavailable())?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| ApiError::unavailable())?;
+    let mut reader = ImageReader::new(io::BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|_| ApiError::invalid_request())?;
+    let format = reader.format().ok_or_else(ApiError::invalid_request)?;
+    let mime_type = native_image_mime_type(format).ok_or_else(ApiError::invalid_request)?;
+    native_validate_declared_image_mime(mime_type, declared_content_type)?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_NATIVE_IMAGE_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|_| ApiError::invalid_request())?;
+    if width == 0
+        || height == 0
+        || u64::from(width).saturating_mul(u64::from(height)) > MAX_NATIVE_IMAGE_PIXELS
+    {
+        return Err(ApiError::invalid_request());
+    }
+    handle.validate().map_err(|_| ApiError::unavailable())?;
+    Ok((mime_type.to_owned(), width, height))
+}
+
+fn native_multipart_source(
+    value: NativeMultipartPartValue,
+    _filename: Option<&str>,
+    declared_content_type: Option<&str>,
+) -> Result<NativeImageSource, ApiError> {
+    match value {
+        NativeMultipartPartValue::File { handle } => {
+            let (mime_type, width, height) =
+                native_multipart_file_dimensions(&handle, declared_content_type)
+                    .map_err(|_| ApiError::invalid_request())?;
+            Ok(NativeImageSource::File {
+                handle,
+                mime_type,
+                width,
+                height,
+            })
+        }
+        #[cfg(test)]
+        NativeMultipartPartValue::Bytes(raw) => Ok(NativeImageSource::Text(
+            native_multipart_image_data_url(&raw, declared_content_type)?,
+        )),
+    }
+}
+
+fn native_build_multipart_request(
+    parts: Vec<NativeMultipartPart>,
+    endpoint: &str,
+    temp_guard: Option<NativeImageTempGuard>,
+) -> Result<NativeImageRequest, ApiError> {
+    let allowed_options = if endpoint == "images/edits" {
+        [
+            "background",
+            "input_fidelity",
+            "model",
+            "moderation",
+            "n",
+            "output_compression",
+            "output_format",
+            "partial_images",
+            "prompt",
+            "quality",
+            "response_format",
+            "size",
+            "stream",
+        ]
+        .as_slice()
+    } else {
+        [
+            "background",
+            "moderation",
+            "model",
+            "n",
+            "output_compression",
+            "output_format",
+            "partial_images",
+            "prompt",
+            "quality",
+            "response_format",
+            "size",
+            "stream",
+        ]
+        .as_slice()
+    };
+    let image_fields = [
+        "image",
+        "image[]",
+        "images",
+        "images[]",
+        "image_url",
+        "image_url[]",
+    ];
+    let mask_fields = ["mask", "mask[]"];
+    let mut object = Map::new();
+    let mut images = Vec::new();
+    let mut masks = Vec::new();
+    for part in parts {
+        let NativeMultipartPart {
+            name,
+            filename,
+            content_type,
+            value,
+        } = part;
+        if image_fields.contains(&name.as_str()) {
+            let value = if filename.is_some() {
+                native_multipart_source(value, filename.as_deref(), content_type.as_deref())?
+            } else {
+                let raw = value.read()?;
+                let value = std::str::from_utf8(&raw)
+                    .map(str::trim)
+                    .map_err(|_| ApiError::invalid_request())?;
+                if value.is_empty() {
+                    return Err(ApiError::invalid_request());
+                }
+                NativeImageSource::Text(value.to_owned())
+            };
+            images.push(value);
+            if images.len() > MAX_NATIVE_IMAGE_MULTIPART_IMAGE_COUNT {
+                return Err(ApiError::invalid_request());
+            }
+        } else if mask_fields.contains(&name.as_str()) {
+            let value = if filename.is_some() {
+                native_multipart_source(value, filename.as_deref(), content_type.as_deref())?
+            } else {
+                let raw = value.read()?;
+                let value = std::str::from_utf8(&raw)
+                    .map(str::trim)
+                    .map_err(|_| ApiError::invalid_request())?;
+                if value.is_empty() {
+                    return Err(ApiError::invalid_request());
+                }
+                NativeImageSource::Text(value.to_owned())
+            };
+            masks.push(value);
+            if masks.len() > MAX_NATIVE_IMAGE_MULTIPART_MASK_COUNT {
+                return Err(ApiError::invalid_request());
+            }
+        } else {
+            if !allowed_options.contains(&name.as_str()) || filename.is_some() {
+                return Err(ApiError::invalid_request());
+            }
+            if object.contains_key(&name) {
+                return Err(ApiError::invalid_request());
+            }
+            let raw = value.read()?;
+            let option = native_multipart_option_value(&name, &raw)?;
+            object.insert(name, option);
+        }
+    }
+    let mask = masks.pop();
+    native_image_request_from_parts(&object, endpoint, images, mask, temp_guard)
+}
+
+#[cfg(test)]
+fn native_parse_multipart_request(
+    bytes: &[u8],
+    content_type: &str,
     endpoint: &str,
 ) -> Result<NativeImageRequest, ApiError> {
-    let value: Value = serde_json::from_slice(bytes).map_err(|_| ApiError::invalid_request())?;
-    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let boundary = native_multipart_boundary(content_type)?;
+    let parts = native_parse_multipart_parts(bytes, &boundary)?;
+    native_build_multipart_request(parts, endpoint, None)
+}
+
+async fn native_parse_multipart_stream(
+    mut multipart: Multipart,
+    endpoint: &str,
+    data_dir: &Path,
+) -> Result<NativeImageRequest, ApiError> {
+    let temp = NativeImageTempGuard::create(data_dir)?;
+    async move {
+        let mut parts = Vec::new();
+        let mut total_bytes = 0usize;
+        let mut image_count = 0usize;
+        let mut mask_count = 0usize;
+        while let Some(mut field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| ApiError::invalid_request())?
+        {
+            if parts.len() >= MAX_NATIVE_IMAGE_MULTIPART_PARTS {
+                return Err(ApiError::invalid_request());
+            }
+            let field_name = field
+                .name()
+                .ok_or_else(ApiError::invalid_request)?
+                .to_owned();
+            let filename = field.file_name().map(ToOwned::to_owned);
+            let content_type = field.content_type().map(ToOwned::to_owned);
+            if matches!(
+                field_name.as_str(),
+                "image" | "image[]" | "images" | "images[]" | "image_url" | "image_url[]"
+            ) {
+                image_count = image_count
+                    .checked_add(1)
+                    .ok_or_else(ApiError::invalid_request)?;
+                if image_count > MAX_NATIVE_IMAGE_MULTIPART_IMAGE_COUNT {
+                    return Err(ApiError::invalid_request());
+                }
+            }
+            if matches!(field_name.as_str(), "mask" | "mask[]") {
+                mask_count = mask_count
+                    .checked_add(1)
+                    .ok_or_else(ApiError::invalid_request)?;
+                if mask_count > MAX_NATIVE_IMAGE_MULTIPART_MASK_COUNT {
+                    return Err(ApiError::invalid_request());
+                }
+            }
+            let field_limit = if filename.is_some() {
+                MAX_NATIVE_IMAGE_BYTES
+            } else {
+                MAX_NATIVE_IMAGE_MULTIPART_OPTION_BYTES
+            };
+            let temp_entry_name = format!("part-{}.bin", parts.len());
+            let mut writer = temp.create_file(&temp_entry_name)?;
+            let std_file = writer.take_file().map_err(|_| ApiError::unavailable())?;
+            let mut file = tokio::fs::File::from_std(std_file);
+            let mut field_bytes = 0usize;
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|_| ApiError::invalid_request())?
+            {
+                field_bytes = field_bytes
+                    .checked_add(chunk.len())
+                    .ok_or_else(ApiError::invalid_request)?;
+                if field_bytes > field_limit {
+                    return Err(ApiError::invalid_request());
+                }
+                total_bytes = total_bytes
+                    .checked_add(chunk.len())
+                    .ok_or_else(ApiError::invalid_request)?;
+                if total_bytes > MAX_NATIVE_IMAGE_MULTIPART_TOTAL_BYTES {
+                    return Err(ApiError::invalid_request());
+                }
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|_| ApiError::unavailable())?;
+            }
+            file.flush().await.map_err(|_| ApiError::unavailable())?;
+            file.sync_all().await.map_err(|_| ApiError::unavailable())?;
+            drop(file);
+            let handle = writer
+                .finalize(field_bytes)
+                .map_err(|_| ApiError::unavailable())?;
+            parts.push(NativeMultipartPart {
+                name: field_name,
+                filename,
+                content_type,
+                value: NativeMultipartPartValue::File { handle },
+            });
+        }
+        native_build_multipart_request(parts, endpoint, Some(temp))
+    }
+    .await
+}
+
+#[cfg(test)]
+fn parse_native_image_request_with_content_type(
+    bytes: &[u8],
+    content_type: &str,
+    endpoint: &str,
+) -> Result<NativeImageRequest, ApiError> {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    if media_type.eq_ignore_ascii_case("application/json") {
+        return parse_native_image_request(bytes, endpoint);
+    }
+    if media_type.eq_ignore_ascii_case("multipart/form-data") {
+        return native_parse_multipart_request(bytes, content_type, endpoint);
+    }
+    Err(ApiError::invalid_request())
+}
+
+fn native_image_request_from_parts(
+    object: &Map<String, Value>,
+    endpoint: &str,
+    images: Vec<NativeImageSource>,
+    mask: Option<NativeImageSource>,
+    temp_guard: Option<NativeImageTempGuard>,
+) -> Result<NativeImageRequest, ApiError> {
     let allowed = if endpoint == "images/edits" {
         [
             "background",
@@ -3301,19 +5527,13 @@ fn parse_native_image_request(
     {
         return Err(ApiError::unsupported_capability());
     }
-    let images = if endpoint == "images/edits" {
-        let source = object
-            .get("images")
-            .or_else(|| object.get("image"))
-            .ok_or_else(ApiError::invalid_request)?;
-        let images = native_image_reference_values(source)?;
-        if object.get("mask").is_some_and(|value| !value.is_null()) {
-            return Err(ApiError::unsupported_capability());
+    if endpoint == "images/edits" {
+        if images.is_empty() || images.len() > MAX_NATIVE_IMAGE_MULTIPART_IMAGE_COUNT {
+            return Err(ApiError::invalid_request());
         }
-        images
-    } else {
-        Vec::new()
-    };
+    } else if !images.is_empty() || mask.is_some() {
+        return Err(ApiError::invalid_request());
+    }
     Ok(NativeImageRequest {
         model,
         codex,
@@ -3328,7 +5548,96 @@ fn parse_native_image_request(
         background,
         stream,
         images,
+        mask,
+        temp_guard,
     })
+}
+
+fn native_image_reference_sources(value: &Value) -> Result<Vec<NativeImageSource>, ApiError> {
+    native_image_reference_values(value)
+        .map(|values| values.into_iter().map(NativeImageSource::Text).collect())
+}
+
+fn parse_native_image_request(
+    bytes: &[u8],
+    endpoint: &str,
+) -> Result<NativeImageRequest, ApiError> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| ApiError::invalid_request())?;
+    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let images = if endpoint == "images/edits" {
+        let mut images = Vec::new();
+        for key in ["images", "image", "image_url"] {
+            if let Some(source) = object.get(key) {
+                images.extend(native_image_reference_sources(source)?);
+            }
+        }
+        images
+    } else {
+        Vec::new()
+    };
+    let mask = if endpoint == "images/edits" {
+        object
+            .get("mask")
+            .filter(|value| !value.is_null())
+            .map(native_image_reference_sources)
+            .transpose()?
+            .map(|mut masks| {
+                if masks.len() > MAX_NATIVE_IMAGE_MULTIPART_MASK_COUNT {
+                    return Err(ApiError::invalid_request());
+                }
+                Ok(masks.pop())
+            })
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    native_image_request_from_parts(object, endpoint, images, mask, None)
+}
+
+fn native_apply_image_edit_mask(
+    mut request: NativeImageRequest,
+) -> Result<NativeImageRequest, ApiError> {
+    let Some(mask) = request.mask.take() else {
+        return Ok(request);
+    };
+    if request.images.is_empty() {
+        return Err(ApiError::invalid_image_mask());
+    }
+    let (source_image, source_format, source_width, source_height) =
+        native_decode_image_source_for_edit(&request.images[0])
+            .map_err(|_| ApiError::invalid_image_mask())?;
+    let (mask_image, mask_format, mask_width, mask_height) =
+        native_decode_image_source_for_edit(&mask).map_err(|_| ApiError::invalid_image_mask())?;
+    if source_format != mask_format
+        || source_width != mask_width
+        || source_height != mask_height
+        || !mask_image.has_alpha()
+    {
+        return Err(ApiError::invalid_image_mask());
+    }
+    let mut output = source_image.to_rgba8();
+    let alpha = mask_image.to_rgba8();
+    for (destination, mask_pixel) in output.pixels_mut().zip(alpha.pixels()) {
+        destination[3] = mask_pixel[3];
+    }
+    let mut encoded = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(output)
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .map_err(|_| ApiError::invalid_image_mask())?;
+    if encoded.get_ref().len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::invalid_image_mask());
+    }
+    let composite = native_image_source_from_bytes(
+        &mut request,
+        encoded.get_ref(),
+        "image/png",
+        source_width,
+        source_height,
+    )
+    .map_err(|_| ApiError::invalid_image_mask())?;
+    request.images[0] = composite;
+    Ok(request)
 }
 
 fn native_image_tool_results(value: &Value) -> Vec<String> {
@@ -3362,13 +5671,40 @@ fn native_image_usage() -> Value {
 
 async fn native_image_request_proxy(
     state: AppState,
-    body: Body,
+    request: AxumRequest,
+    content_type: &str,
     endpoint: &'static str,
 ) -> Result<Response, ApiError> {
-    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
-        .await
-        .map_err(|_| ApiError::invalid_request())?;
-    let request = parse_native_image_request(&bytes, endpoint)?;
+    let request = if content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+    {
+        let bytes = to_bytes(request.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .map_err(|_| ApiError::invalid_request())?;
+        parse_native_image_request(&bytes, endpoint)?
+    } else if content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/form-data"))
+    {
+        let body_limit = if endpoint == "images/edits" {
+            MAX_NATIVE_IMAGE_REQUEST_BYTES
+        } else {
+            MAX_REQUEST_BODY_BYTES
+        };
+        let mut request = request;
+        DefaultBodyLimit::max(body_limit).apply(&mut request);
+        let multipart = Multipart::from_request(request, &state)
+            .await
+            .map_err(|_| ApiError::invalid_request())?;
+        native_parse_multipart_stream(multipart, endpoint, &state.data_dir).await?
+    } else {
+        return Err(ApiError::invalid_request());
+    };
+    let request = native_apply_image_edit_mask(request)?;
+    native_validate_image_sources(&request)?;
     if request.codex {
         native_codex_image_request_proxy(state, request, endpoint).await
     } else {
@@ -3386,6 +5722,14 @@ struct NativeUploadedImage {
 }
 
 fn native_image_input(value: &str) -> Result<(Vec<u8>, String, u32, u32), ApiError> {
+    let (bytes, mime_type) = native_image_input_bytes(value)?;
+    let image = native_decode_image(&bytes)?;
+    let width = image.width();
+    let height = image.height();
+    Ok((bytes, mime_type, width, height))
+}
+
+fn native_image_input_bytes(value: &str) -> Result<(Vec<u8>, String), ApiError> {
     let value = value.trim();
     if value.is_empty() {
         return Err(ApiError::invalid_request());
@@ -3414,19 +5758,132 @@ fn native_image_input(value: &str) -> Result<(Vec<u8>, String, u32, u32), ApiErr
     if bytes.is_empty() || bytes.len() > MAX_NATIVE_IMAGE_BYTES {
         return Err(ApiError::invalid_request());
     }
-    let reader = ImageReader::new(Cursor::new(bytes.clone()))
+    Ok((bytes, mime_type))
+}
+
+fn native_decode_image_file(
+    handle: &NativeImageFileHandle,
+    declared_mime_type: &str,
+) -> Result<(image::DynamicImage, image::ImageFormat), ApiError> {
+    if handle.len == 0 || handle.len > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::invalid_request());
+    }
+    handle.validate().map_err(|_| ApiError::invalid_request())?;
+    let mut file = handle
+        .file
+        .try_clone()
+        .map_err(|_| ApiError::invalid_request())?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|_| ApiError::invalid_request())?;
+    let mut reader = ImageReader::new(io::BufReader::new(file))
         .with_guessed_format()
         .map_err(|_| ApiError::invalid_request())?;
+    let format = reader.format().ok_or_else(ApiError::invalid_request)?;
+    let mime_type = native_image_mime_type(format).ok_or_else(ApiError::invalid_request)?;
+    native_validate_declared_image_mime(mime_type, Some(declared_mime_type))?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_NATIVE_IMAGE_DECODE_ALLOC_BYTES);
+    reader.limits(limits);
     let image = reader.decode().map_err(|_| ApiError::invalid_request())?;
-    let width = image.width();
-    let height = image.height();
-    if width == 0
-        || height == 0
-        || u64::from(width).saturating_mul(u64::from(height)) > MAX_NATIVE_IMAGE_PIXELS
+    if image.width() == 0
+        || image.height() == 0
+        || u64::from(image.width()).saturating_mul(u64::from(image.height()))
+            > MAX_NATIVE_IMAGE_PIXELS
     {
         return Err(ApiError::invalid_request());
     }
-    Ok((bytes, mime_type, width, height))
+    handle.validate().map_err(|_| ApiError::invalid_request())?;
+    Ok((image, format))
+}
+
+fn native_decode_image_source_for_edit(
+    source: &NativeImageSource,
+) -> Result<(image::DynamicImage, image::ImageFormat, u32, u32), ApiError> {
+    match source {
+        NativeImageSource::Text(value) => {
+            let (bytes, _mime_type) = native_image_input_bytes(value)?;
+            let format = image::guess_format(&bytes).map_err(|_| ApiError::invalid_request())?;
+            let image = native_decode_image(&bytes)?;
+            let width = image.width();
+            let height = image.height();
+            Ok((image, format, width, height))
+        }
+        NativeImageSource::File {
+            handle, mime_type, ..
+        } => {
+            let (image, format) = native_decode_image_file(handle, mime_type)?;
+            let width = image.width();
+            let height = image.height();
+            Ok((image, format, width, height))
+        }
+    }
+}
+
+#[cfg(test)]
+fn native_image_source_input(
+    source: &NativeImageSource,
+) -> Result<(Vec<u8>, String, u32, u32), ApiError> {
+    match source {
+        NativeImageSource::Text(value) => native_image_input(value),
+        NativeImageSource::File {
+            handle,
+            mime_type,
+            width,
+            height,
+        } => {
+            let bytes = handle.read().map_err(|_| ApiError::invalid_request())?;
+            if bytes.is_empty() || bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+                return Err(ApiError::invalid_request());
+            }
+            Ok((bytes, mime_type.clone(), *width, *height))
+        }
+    }
+}
+
+fn native_validate_image_sources(request: &NativeImageRequest) -> Result<(), ApiError> {
+    for source in request.images.iter().chain(request.mask.iter()) {
+        if let NativeImageSource::File { handle, .. } = source {
+            handle.validate().map_err(|_| ApiError::invalid_request())?;
+        }
+    }
+    Ok(())
+}
+
+fn native_image_source_from_bytes(
+    request: &mut NativeImageRequest,
+    bytes: &[u8],
+    mime_type: &str,
+    width: u32,
+    height: u32,
+) -> Result<NativeImageSource, ApiError> {
+    if bytes.is_empty() || bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::invalid_image_mask());
+    }
+    if let Some(guard) = request.temp_guard.as_ref() {
+        let name = format!(
+            "mask-composite-{}.bin",
+            LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut writer = guard.create_file(&name)?;
+        let mut file = writer.take_file().map_err(|_| ApiError::unavailable())?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| ApiError::unavailable())?;
+        drop(file);
+        let handle = writer
+            .finalize(bytes.len())
+            .map_err(|_| ApiError::unavailable())?;
+        return Ok(NativeImageSource::File {
+            handle,
+            mime_type: mime_type.to_owned(),
+            width,
+            height,
+        });
+    }
+    Ok(NativeImageSource::Text(format!(
+        "data:{mime_type};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )))
 }
 
 fn native_image_output(
@@ -3527,11 +5984,43 @@ async fn native_upload_image(
     state: &AppState,
     lease: &AccountLease,
     context: &NativeRequestContext,
-    value: &str,
+    source: &NativeImageSource,
     index: usize,
 ) -> Result<NativeUploadedImage, ApiError> {
-    let (bytes, mime_type, width, height) = native_image_input(value)?;
-    let file_name = format!("image-{index}.png");
+    enum UploadBody {
+        Bytes(Vec<u8>),
+        File(NativeImageFileHandle),
+    }
+    let (file_size, mime_type, width, height, upload_body) = match source {
+        NativeImageSource::Text(value) => {
+            let (bytes, mime_type, width, height) = native_image_input(value)?;
+            (
+                bytes.len(),
+                mime_type,
+                width,
+                height,
+                UploadBody::Bytes(bytes),
+            )
+        }
+        NativeImageSource::File {
+            handle,
+            mime_type,
+            width,
+            height,
+        } => (
+            handle.len,
+            mime_type.clone(),
+            *width,
+            *height,
+            UploadBody::File(handle.clone()),
+        ),
+    };
+    let extension = match mime_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    let file_name = format!("image-{index}.{extension}");
     let path = "/backend-api/files";
     let mut request = native_browser_headers(
         state.client.post(format!(
@@ -3550,7 +6039,7 @@ async fn native_upload_image(
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .json(&json!({
         "file_name": file_name,
-        "file_size": bytes.len(),
+        "file_size": file_size,
         "use_case": "multimodal",
         "width": width,
         "height": height,
@@ -3581,20 +6070,63 @@ async fn native_upload_image(
         .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
         .ok_or_else(ApiError::upstream)?
         .to_owned();
-    let upload = tokio::time::timeout(
-        NATIVE_UPSTREAM_TIMEOUT,
-        state
-            .client
-            .put(upload_url)
-            .header(header::CONTENT_TYPE, &mime_type)
-            .header("x-ms-blob-type", "BlockBlob")
-            .header("x-ms-version", "2020-04-08")
-            .body(bytes.clone())
-            .send(),
-    )
-    .await
-    .map_err(|_| ApiError::upstream())?
-    .map_err(|_| ApiError::upstream())?;
+    let mut upload_request = state
+        .client
+        .put(upload_url)
+        .header(header::CONTENT_TYPE, &mime_type)
+        .header(header::CONTENT_LENGTH, file_size)
+        .header("x-ms-blob-type", "BlockBlob")
+        .header("x-ms-version", "2020-04-08");
+    upload_request = match upload_body {
+        UploadBody::Bytes(bytes) => upload_request.body(bytes),
+        UploadBody::File(source) => {
+            let file = source.stream_file().map_err(|_| ApiError::upstream())?;
+            let source_len = source.len;
+            let body = stream::unfold(
+                (file, source, vec![0u8; 64 * 1024], source_len, false),
+                |(mut file, source, mut buffer, remaining, done)| async move {
+                    if done {
+                        return None;
+                    }
+                    if remaining == 0 {
+                        let mut probe = [0u8; 1];
+                        return match file.read(&mut probe).await {
+                            Ok(0) => match source.validate() {
+                                Ok(()) => None,
+                                Err(error) => Some((Err(error), (file, source, buffer, 0, true))),
+                            },
+                            Ok(_) => Some((
+                                Err(io::Error::other(
+                                    "native image upload file grew beyond validated length",
+                                )),
+                                (file, source, buffer, 0, true),
+                            )),
+                            Err(error) => Some((Err(error), (file, source, buffer, 0, true))),
+                        };
+                    }
+                    let read_limit = remaining.min(buffer.len());
+                    match file.read(&mut buffer[..read_limit]).await {
+                        Ok(0) => Some((
+                            Err(io::Error::other(
+                                "native image upload file truncated before validated length",
+                            )),
+                            (file, source, buffer, 0, true),
+                        )),
+                        Ok(size) => Some((
+                            Ok::<Bytes, io::Error>(Bytes::copy_from_slice(&buffer[..size])),
+                            (file, source, buffer, remaining - size, false),
+                        )),
+                        Err(error) => Some((Err(error), (file, source, buffer, 0, true))),
+                    }
+                },
+            );
+            upload_request.body(reqwest::Body::wrap_stream(body))
+        }
+    };
+    let upload = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, upload_request.send())
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
     if !upload.status().is_success() {
         return Err(ApiError::upstream());
     }
@@ -3629,7 +6161,7 @@ async fn native_upload_image(
     Ok(NativeUploadedImage {
         file_id,
         file_name,
-        file_size: bytes.len(),
+        file_size,
         mime_type,
         width,
         height,
@@ -4097,6 +6629,289 @@ async fn native_web_image_attempt(
     .into_response())
 }
 
+fn native_codex_image_body_stream(
+    request: &NativeImageRequest,
+    action: &str,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+    let mut prefix = b"{\"model\":\"gpt-5.5\",\"instructions\":\"Use the image_generation tool to create exactly one image for the user's request.\",\"store\":false,\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":".to_vec();
+    prefix.extend(
+        serde_json::to_vec(&request.prompt).expect("validated image prompt must serialize"),
+    );
+    prefix.extend_from_slice(b"}");
+    if !request.images.is_empty() {
+        prefix.push(b',');
+    }
+    let mut tool = json!({
+        "type": "image_generation",
+        "model": "gpt-image-2",
+        "action": action,
+        "quality": request.quality,
+        "output_format": request.output_format,
+        "background": request.background,
+    });
+    if let Some(size) = &request.size {
+        tool["size"] = Value::String(size.clone());
+    }
+    if let Some(compression) = request.output_compression {
+        tool["output_compression"] = json!(compression);
+    }
+    let mut suffix = b"]}],\"tools\":[".to_vec();
+    suffix.extend(serde_json::to_vec(&tool).expect("validated image tool must serialize"));
+    suffix.extend_from_slice(br#"],"tool_choice":{"type":"image_generation"},"stream":false}"#);
+    let state = NativeCodexImageBodyState {
+        pending: VecDeque::from([Bytes::from(prefix)]),
+        suffix: Bytes::from(suffix),
+        sources: request.images.clone(),
+        index: 0,
+        phase: NativeCodexImageBodyPhase::StartImage,
+        file: None,
+        file_source: None,
+        carry: Vec::new(),
+        file_remaining: 0,
+        file_closing_quote: false,
+    };
+    stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(chunk) = state.pending.pop_front() {
+                return Some((Ok(chunk), state));
+            }
+            match state.phase {
+                NativeCodexImageBodyPhase::StartImage => {
+                    let Some(source) = state.sources.get(state.index).cloned() else {
+                        state.pending.push_back(state.suffix.clone());
+                        state.phase = NativeCodexImageBodyPhase::Done;
+                        continue;
+                    };
+                    state.pending.push_back(Bytes::from_static(
+                        b"{\"type\":\"input_image\",\"image_url\":",
+                    ));
+                    match source {
+                        NativeImageSource::Text(value) => {
+                            let value = match serde_json::to_vec(&value) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    return Some((
+                                        Err(io::Error::other(error)),
+                                        NativeCodexImageBodyState::done(),
+                                    ));
+                                }
+                            };
+                            state.pending.push_back(Bytes::from(value));
+                            state.file_closing_quote = false;
+                            state.phase = NativeCodexImageBodyPhase::EndImage;
+                        }
+                        NativeImageSource::File {
+                            handle, mime_type, ..
+                        } => {
+                            state.pending.push_back(Bytes::from(
+                                format!("\"data:{mime_type};base64,").into_bytes(),
+                            ));
+                            match handle.stream_file() {
+                                Ok(file) => {
+                                    state.file = Some(file);
+                                    state.file_source = Some(handle);
+                                    state.carry.clear();
+                                    state.file_remaining =
+                                        state.file_source.as_ref().map_or(0, |source| source.len);
+                                    state.file_closing_quote = true;
+                                    state.phase = NativeCodexImageBodyPhase::File;
+                                }
+                                Err(error) => {
+                                    return Some((Err(error), NativeCodexImageBodyState::done()));
+                                }
+                            }
+                        }
+                    }
+                }
+                NativeCodexImageBodyPhase::File => {
+                    if state.file.is_none() {
+                        state.phase = NativeCodexImageBodyPhase::EndImage;
+                        continue;
+                    }
+                    if state.file_remaining == 0 {
+                        let mut probe = [0u8; 1];
+                        let result = state
+                            .file
+                            .as_mut()
+                            .expect("file exists")
+                            .read(&mut probe)
+                            .await;
+                        match result {
+                            Ok(0) => {
+                                let Some(source) = state.file_source.take() else {
+                                    return Some((
+                                        Err(io::Error::other("missing image source")),
+                                        NativeCodexImageBodyState::done(),
+                                    ));
+                                };
+                                if let Err(error) = source.validate() {
+                                    return Some((Err(error), NativeCodexImageBodyState::done()));
+                                }
+                                state.file = None;
+                                state.phase = NativeCodexImageBodyPhase::EndImage;
+                                if state.carry.is_empty() {
+                                    continue;
+                                }
+                                let encoded = base64::engine::general_purpose::STANDARD
+                                    .encode(std::mem::take(&mut state.carry));
+                                return Some((Ok(Bytes::from(encoded)), state));
+                            }
+                            Ok(_) => {
+                                return Some((
+                                    Err(io::Error::other(
+                                        "native image upload file grew beyond validated length",
+                                    )),
+                                    NativeCodexImageBodyState::done(),
+                                ));
+                            }
+                            Err(error) => {
+                                return Some((Err(error), NativeCodexImageBodyState::done()));
+                            }
+                        }
+                    }
+                    let read_limit = state.file_remaining.min(64 * 1024);
+                    let mut buffer = vec![0u8; read_limit];
+                    let size = match state
+                        .file
+                        .as_mut()
+                        .expect("file exists")
+                        .read(&mut buffer)
+                        .await
+                    {
+                        Ok(size) => size,
+                        Err(error) => {
+                            return Some((Err(error), NativeCodexImageBodyState::done()));
+                        }
+                    };
+                    if size == 0 {
+                        return Some((
+                            Err(io::Error::other(
+                                "native image upload file truncated before validated length",
+                            )),
+                            NativeCodexImageBodyState::done(),
+                        ));
+                    }
+                    state.file_remaining -= size;
+                    let mut joined = Vec::with_capacity(state.carry.len() + size);
+                    joined.extend_from_slice(&state.carry);
+                    joined.extend_from_slice(&buffer[..size]);
+                    let complete = joined.len() - joined.len() % 3;
+                    if state.file_remaining == 0 {
+                        state.carry = joined;
+                        continue;
+                    }
+                    state.carry = joined[complete..].to_vec();
+                    if complete == 0 {
+                        continue;
+                    }
+                    let encoded =
+                        base64::engine::general_purpose::STANDARD.encode(&joined[..complete]);
+                    return Some((Ok(Bytes::from(encoded)), state));
+                }
+                NativeCodexImageBodyPhase::EndImage => {
+                    if state.file_closing_quote {
+                        state.pending.push_back(Bytes::from_static(b"\""));
+                    }
+                    state.pending.push_back(Bytes::from_static(b"}"));
+                    state.index += 1;
+                    if state.index < state.sources.len() {
+                        state.pending.push_back(Bytes::from_static(b","));
+                        state.phase = NativeCodexImageBodyPhase::StartImage;
+                    } else {
+                        state.phase = NativeCodexImageBodyPhase::StartImage;
+                    }
+                }
+                NativeCodexImageBodyPhase::Done => return None,
+            }
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum NativeCodexImageBodyPhase {
+    StartImage,
+    File,
+    EndImage,
+    Done,
+}
+
+struct NativeCodexImageBodyState {
+    pending: VecDeque<Bytes>,
+    suffix: Bytes,
+    sources: Vec<NativeImageSource>,
+    index: usize,
+    phase: NativeCodexImageBodyPhase,
+    file: Option<tokio::fs::File>,
+    file_source: Option<NativeImageFileHandle>,
+    carry: Vec<u8>,
+    file_remaining: usize,
+    file_closing_quote: bool,
+}
+
+impl NativeCodexImageBodyState {
+    fn done() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            suffix: Bytes::new(),
+            sources: Vec::new(),
+            index: 0,
+            phase: NativeCodexImageBodyPhase::Done,
+            file: None,
+            file_source: None,
+            carry: Vec::new(),
+            file_remaining: 0,
+            file_closing_quote: false,
+        }
+    }
+}
+
+async fn native_codex_image_attempt(
+    state: &AppState,
+    lease: &AccountLease,
+    request: &NativeImageRequest,
+    action: &str,
+    timeout: Duration,
+) -> Result<reqwest::Response, (ApiError, bool)> {
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(|| (ApiError::unavailable(), false))?;
+    let url = format!(
+        "{}/backend-api/codex/responses",
+        base_url.trim_end_matches('/')
+    );
+    let body = reqwest::Body::wrap_stream(native_codex_image_body_stream(request, action));
+    let request = codex_request_headers(
+        state.client.post(url),
+        lease.token(),
+        lease.chatgpt_account_id().map(ToOwned::to_owned),
+        state.account_type_catalog.codex_client_version().as_deref(),
+    )
+    .ok_or_else(|| (ApiError::upstream(), false))?
+    .header(header::CONTENT_TYPE, "application/json")
+    .body(body);
+    let response = tokio::time::timeout(timeout, request.send())
+        .await
+        .map_err(|_| (ApiError::upstream(), false))?
+        .map_err(|_| (ApiError::upstream(), false))?;
+    if !response.status().is_success() {
+        let retryable = matches!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::INTERNAL_SERVER_ERROR
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        );
+        return Err((ApiError::upstream(), retryable));
+    }
+    if upstream_declares_oversize(&response) {
+        return Err((ApiError::upstream(), false));
+    }
+    Ok(response)
+}
+
 async fn native_codex_image_request_proxy(
     state: AppState,
     request: NativeImageRequest,
@@ -4107,68 +6922,75 @@ async fn native_codex_image_request_proxy(
     } else {
         "generate"
     };
+    let allowed_groups = request
+        .plan_type
+        .clone()
+        .map(|plan_type| HashSet::from([plan_type]))
+        .or_else(|| {
+            request
+                .codex
+                .then(|| HashSet::from(["plus".to_owned(), "team".to_owned(), "pro".to_owned()]))
+        });
     let mut data = Vec::new();
     for _ in 0..request.n {
-        let mut content = vec![json!({"type":"input_text","text":request.prompt})];
-        for image in &request.images {
-            let image_url = if image.trim_start().starts_with("data:") {
-                image.clone()
-            } else {
-                format!("data:image/png;base64,{}", image.trim())
-            };
-            content.push(json!({"type":"input_image","image_url":image_url}));
-        }
-        let mut tool = json!({
-            "type": "image_generation",
-            "model": "gpt-image-2",
-            "action": action,
-            "quality": request.quality,
-            "output_format": request.output_format,
-            "background": request.background,
-        });
-        if let Some(size) = &request.size {
-            tool["size"] = Value::String(size.clone());
-        }
-        if let Some(compression) = request.output_compression {
-            tool["output_compression"] = json!(compression);
-        }
-        let internal = json!({
-            "model": CODEX_RESPONSES_MODEL,
-            "instructions": "Use the image_generation tool to create exactly one image for the user's request.",
-            "store": false,
-            "input": [{"role":"user","content":content}],
-            "tools": [tool],
-            "tool_choice": {"type":"image_generation"},
-            "stream": false,
-        });
-        let object = internal
-            .as_object()
-            .cloned()
-            .ok_or_else(ApiError::invalid_request)?;
-        let allowed_groups = request
-            .plan_type
-            .clone()
-            .map(|plan_type| HashSet::from([plan_type]))
-            .or_else(|| {
-                request.codex.then(|| {
-                    HashSet::from(["plus".to_owned(), "team".to_owned(), "pro".to_owned()])
-                })
-            });
-        let response = native_responses_with_timeout_and_groups(
-            state.clone(),
-            object,
-            NATIVE_UPSTREAM_TIMEOUT,
-            allowed_groups,
+        let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
+        let mut attempted_tokens = HashSet::new();
+        let mut lease = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            acquire_native_codex_lease_with_groups(
+                &state,
+                CODEX_RESPONSES_MODEL,
+                &attempted_tokens,
+                allowed_groups.as_ref(),
+            ),
         )
-        .await?;
-        let body = to_bytes(response.into_body(), MAX_UPSTREAM_BODY_BYTES)
-            .await
-            .map_err(|_| ApiError::upstream())?;
-        let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+        .await
+        .map_err(|_| ApiError::upstream())?
+        .ok_or_else(ApiError::unavailable)?;
+        let body = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                drop(lease);
+                return Err(ApiError::upstream());
+            }
+            attempted_tokens.insert(lease.token().to_owned());
+            match native_codex_image_attempt(&state, &lease, &request, action, remaining).await {
+                Ok(response) => break bounded_response_body(response).await?,
+                Err((error, true)) => {
+                    drop(lease);
+                    let acquired = tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        acquire_native_codex_lease_with_groups(
+                            &state,
+                            CODEX_RESPONSES_MODEL,
+                            &attempted_tokens,
+                            allowed_groups.as_ref(),
+                        ),
+                    )
+                    .await;
+                    lease = match acquired {
+                        Ok(Some(lease)) => lease,
+                        Ok(None) | Err(_) => return Err(error),
+                    };
+                }
+                Err((error, false)) => {
+                    drop(lease);
+                    return Err(error);
+                }
+            }
+        };
+        let value =
+            native_codex_responses_json(&body, &request.model).map_err(|_| ApiError::upstream())?;
         let results = native_image_tool_results(&value);
         if results.is_empty() {
+            drop(lease);
             return Err(ApiError::upstream());
         }
+        let token = lease.token().to_owned();
+        if !state.account_store.mark_text_used(&token) {
+            AccountStore::note_usage_mark_failure();
+        }
+        drop(lease);
         data.extend(
             results
                 .into_iter()
@@ -4195,18 +7017,16 @@ async fn native_codex_image_request_proxy(
 
 async fn image_generation(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Body,
+    request: AxumRequest,
 ) -> Result<Response, ApiError> {
-    image_proxy(state, headers, body, "images/generations").await
+    image_proxy(state, request, "images/generations").await
 }
 
 async fn image_edit(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Body,
+    request: AxumRequest,
 ) -> Result<Response, ApiError> {
-    image_proxy(state, headers, body, "images/edits").await
+    image_proxy(state, request, "images/edits").await
 }
 
 async fn openai_proxy(
@@ -5111,7 +7931,13 @@ async fn ppt_generation(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    openai_proxy(state, headers, body, "ppt/generations").await
+    if state.config.upstream_protocol == UpstreamProtocol::OpenAi {
+        openai_proxy(state, headers, body, "ppt/generations").await
+    } else if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
+        editable_file_generation::submit(state, headers, body, "ppt").await
+    } else {
+        Err(ApiError::unsupported_capability())
+    }
 }
 
 async fn psd_generation(
@@ -5119,7 +7945,13 @@ async fn psd_generation(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    openai_proxy(state, headers, body, "psd/generations").await
+    if state.config.upstream_protocol == UpstreamProtocol::OpenAi {
+        openai_proxy(state, headers, body, "psd/generations").await
+    } else if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
+        editable_file_generation::submit(state, headers, body, "psd").await
+    } else {
+        Err(ApiError::unsupported_capability())
+    }
 }
 
 fn editable_file_tasks_path(state: &AppState) -> PathBuf {
@@ -5128,11 +7960,15 @@ fn editable_file_tasks_path(state: &AppState) -> PathBuf {
 
 fn read_editable_task_records(state: &AppState) -> Result<Vec<Value>, ApiError> {
     let path = editable_file_tasks_path(state);
-    let Some(parent) = checked_parent_identity(&path)? else {
+    read_editable_task_records_at(&path)
+}
+
+fn read_editable_task_records_at(path: &Path) -> Result<Vec<Value>, ApiError> {
+    let Some(parent) = checked_parent_identity(path)? else {
         return Ok(Vec::new());
     };
     let name = path.file_name().ok_or_else(ApiError::unavailable)?;
-    if checked_regular_file_identity_optional(&parent, &path)?.is_none() {
+    if checked_regular_file_identity_optional(&parent, path)?.is_none() {
         return Ok(Vec::new());
     }
     let bytes = read_checked_bounded_file_at(&parent, name, MAX_EDITABLE_TASK_FILE_BYTES, false)?;
@@ -5146,18 +7982,23 @@ fn read_editable_task_records(state: &AppState) -> Result<Vec<Value>, ApiError> 
         return Err(ApiError::unavailable());
     }
     let mut result = Vec::with_capacity(records.len());
-    for record in records {
+    let mut keys = HashSet::with_capacity(records.len());
+    for raw_record in records {
+        let record = editable_file_generation::normalize_persisted_task(raw_record)?;
         let object = record.as_object().ok_or_else(ApiError::unavailable)?;
         let id = object
             .get("id")
             .and_then(Value::as_str)
             .filter(|value| valid_editable_task_id(value))
             .ok_or_else(ApiError::unavailable)?;
-        let _owner_id = object
+        let owner_id = object
             .get("owner_id")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty() && value.chars().count() <= 256)
             .ok_or_else(ApiError::unavailable)?;
+        if !keys.insert((owner_id.to_owned(), id.to_owned())) {
+            return Err(ApiError::unavailable());
+        }
         let status = object
             .get("status")
             .and_then(Value::as_str)
@@ -5258,7 +8099,7 @@ fn read_editable_task_records(state: &AppState) -> Result<Vec<Value>, ApiError> 
             }
         }
         let mut raw = Map::new();
-        raw.insert("record".to_owned(), record.clone());
+        raw.insert("record".to_owned(), record);
         raw.insert("public".to_owned(), Value::Object(public));
         result.push(Value::Object(raw));
     }
@@ -5417,6 +8258,8 @@ fn editable_content_type(path: &str) -> &'static str {
 
 async fn download_editable_file(
     State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
     AxumPath(file_path): AxumPath<String>,
 ) -> Result<Response, ApiError> {
     let parts = file_path.replace('\\', "/");
@@ -5479,19 +8322,32 @@ async fn download_editable_file(
     let parent = checked_directory_handle(target.parent().ok_or_else(ApiError::not_found)?)
         .map_err(|_| ApiError::not_found())?;
     let name = target.file_name().ok_or_else(ApiError::not_found)?;
-    let bytes = read_checked_bounded_file_at(&parent, name, MAX_EDITABLE_FILE_BYTES, false)
+    let (file, version) = open_checked_bounded_file_at(&parent, name, MAX_EDITABLE_FILE_BYTES)
         .map_err(|_| ApiError::not_found())?;
-    let filename = name.to_string_lossy().replace('"', "");
-    let disposition = format!("attachment; filename=\"{filename}\"");
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, editable_content_type(&relative_path)),
-            (header::CONTENT_DISPOSITION, disposition.as_str()),
-        ],
-        Body::from(bytes),
+    let filename = name.to_string_lossy();
+    let disposition = if filename
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    {
+        format!("attachment; filename=\"{filename}\"")
+    } else {
+        format!(
+            "attachment; filename*=utf-8''{}",
+            percent_encoding::percent_encode(
+                filename.as_bytes(),
+                percent_encoding::NON_ALPHANUMERIC
+            )
+        )
+    };
+    let opened = opened_file_response::OpenedFile::new(file, version, MAX_EDITABLE_FILE_BYTES)
+        .map_err(|_| ApiError::not_found())?;
+    opened_file_response::respond(
+        opened,
+        &method,
+        &headers,
+        editable_content_type(&relative_path),
+        &disposition,
     )
-        .into_response())
 }
 
 async fn read_tasks(state: &AppState) -> Vec<Value> {
@@ -5575,34 +8431,11 @@ async fn api_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated(&headers, &state).await?;
-    let mut config = read_legacy_config(state.config_path.as_ref());
-    if !config.is_object() {
-        config = json!({});
-    }
-    if let Some(object) = config.as_object_mut() {
-        object.insert(
-            "version".to_owned(),
-            Value::String(state.config.version.clone()),
-        );
-        object.insert(
-            "models".to_owned(),
-            Value::Array(
-                state
-                    .config
-                    .models
-                    .iter()
-                    .cloned()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        );
-        object.insert(
-            "data_dir".to_owned(),
-            Value::String(state.data_dir.to_string_lossy().into_owned()),
-        );
-    }
-    Ok(Json(json!({"config": redact_config(config)})))
+    admin_authenticated(&headers, &state).await?;
+    let config = read_legacy_config_strict(state.config_path.as_ref())?;
+    Ok(Json(json!({
+        "config": public_settings_config(config, &state)
+    })))
 }
 
 async fn api_settings_update(
@@ -5610,10 +8443,15 @@ async fn api_settings_update(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated(&headers, &state).await?;
+    admin_authenticated(&headers, &state).await?;
     let value = account_json_body(body).await?;
-    let updates = value.get("config").cloned().unwrap_or(value);
-    let updates = updates.as_object().ok_or_else(ApiError::invalid_request)?;
+    let updates = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    if updates
+        .keys()
+        .any(|key| !is_settings_update_field(key.as_str()))
+    {
+        return Err(ApiError::settings_invalid_field());
+    }
     if updates.keys().any(|key| {
         let key = key.to_ascii_lowercase();
         key.contains("password")
@@ -5624,13 +8462,45 @@ async fn api_settings_update(
     }) {
         return Err(ApiError::invalid_request());
     }
-    let mut config = read_legacy_config(state.config_path.as_ref());
-    let target = config.as_object_mut().ok_or_else(ApiError::unavailable)?;
-    for (key, update) in updates {
-        target.insert(key.clone(), update.clone());
-    }
-    write_legacy_config(state.config_path.as_ref(), &config)?;
-    Ok(Json(json!({"config": redact_config(config)})))
+    let updates = Value::Object(updates.clone());
+    let config = update_legacy_config(state.config_path.as_ref(), updates)?;
+    Ok(Json(json!({
+        "config": public_settings_config(config, &state)
+    })))
+}
+
+fn is_settings_update_field(key: &str) -> bool {
+    matches!(
+        key,
+        "proxy"
+            | "base_url"
+            | "global_system_prompt"
+            | "default_upstream_model_name"
+            | "default_thinking_effort"
+            | "sensitive_words"
+            | "ai_review"
+            | "refresh_account_interval_minute"
+            | "image_retention_days"
+            | "image_poll_timeout_secs"
+            | "image_poll_interval_secs"
+            | "image_poll_initial_wait_secs"
+            | "image_account_concurrency"
+            | "image_parallel_generation"
+            | "image_settle_enabled"
+            | "image_check_before_hit_enabled"
+            | "image_remove_conversation_after_result"
+            | "image_remove_conversation_always"
+            | "image_settle_secs"
+            | "image_timeout_retry_secs"
+            | "auto_remove_invalid_accounts"
+            | "auto_remove_rate_limited_accounts"
+            | "auto_relogin_after_refresh"
+            | "log_levels"
+            | "image_storage"
+            | "proxy_runtime"
+            | "third_party_apps"
+            | "backup"
+    )
 }
 
 async fn api_third_party_apps(
@@ -5638,24 +8508,105 @@ async fn api_third_party_apps(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     authenticated(&headers, &state).await?;
-    let config = read_legacy_config(state.config_path.as_ref());
+    let config = read_legacy_config_strict(state.config_path.as_ref())?;
     Ok(Json(json!({
-        "third_party_apps": config.get("third_party_apps").cloned().unwrap_or_else(|| json!({}))
+        "third_party_apps": normalize_third_party_apps(config.get("third_party_apps"))
     })))
+}
+
+const STORAGE_INFO_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn unhealthy_storage_probe() -> Value {
+    json!({"status": "unhealthy"})
+}
+
+async fn bounded_storage_health_for_info(
+    state: &AppState,
+    backend: Option<Arc<storage::StorageBackend>>,
+) -> Value {
+    if let Some(backend) = backend.as_ref()
+        && matches!(
+            backend.as_ref(),
+            storage::StorageBackend::Json(_) | storage::StorageBackend::Git(_)
+        )
+    {
+        let local_snapshot_available = state
+            .health_snapshot_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .local_snapshot_available;
+        if let Some(health) = backend.cached_health(local_snapshot_available) {
+            return health;
+        }
+    }
+    let permit = tokio::time::timeout(
+        STORAGE_INFO_PROBE_TIMEOUT,
+        state.health_storage_semaphore.clone().acquire_owned(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok);
+    let Some(permit) = permit else {
+        return unhealthy_storage_probe();
+    };
+
+    if let Some(backend) = backend {
+        let mut worker = tokio::spawn(async move { backend.load_health_snapshots().await });
+        return match tokio::time::timeout(STORAGE_INFO_PROBE_TIMEOUT, &mut worker).await {
+            Ok(Ok(Ok((_, _, health)))) => {
+                drop(permit);
+                health
+            }
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                drop(permit);
+                unhealthy_storage_probe()
+            }
+            Err(_) => {
+                tokio::spawn(async move {
+                    let _ = worker.await;
+                    drop(permit);
+                });
+                unhealthy_storage_probe()
+            }
+        };
+    }
+
+    let state = state.clone();
+    let mut worker = tokio::task::spawn_blocking(move || health_storage(&state));
+    match tokio::time::timeout(STORAGE_INFO_PROBE_TIMEOUT, &mut worker).await {
+        Ok(Ok((storage, _))) => {
+            drop(permit);
+            storage
+                .get("health")
+                .cloned()
+                .unwrap_or_else(unhealthy_storage_probe)
+        }
+        Ok(Err(_)) => {
+            drop(permit);
+            unhealthy_storage_probe()
+        }
+        Err(_) => {
+            tokio::spawn(async move {
+                let _ = worker.await;
+                drop(permit);
+            });
+            unhealthy_storage_probe()
+        }
+    }
 }
 
 async fn api_storage_info(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated(&headers, &state).await?;
-    let path = state.data_dir.as_ref();
-    Ok(Json(json!({
-        "backend": "local",
-        "path": path.to_string_lossy(),
-        "exists": path.is_dir(),
-        "health": {"status": if path.is_dir() { "healthy" } else { "unavailable" }},
-    })))
+    admin_authenticated(&headers, &state).await?;
+    let backend = state.storage_backend.clone();
+    let info = backend
+        .as_ref()
+        .map(|backend| backend.info())
+        .unwrap_or_else(|| json!({"type": "json"}));
+    let health = bounded_storage_health_for_info(&state, backend).await;
+    Ok(Json(public_storage_info(&info, &health)))
 }
 
 fn absolute_legacy_config_path(initial_cwd: &Path, data_dir: &Path) -> PathBuf {
@@ -5673,18 +8624,41 @@ fn absolute_legacy_config_path(initial_cwd: &Path, data_dir: &Path) -> PathBuf {
     }
 }
 
-fn read_legacy_config(path: &Path) -> Value {
-    fs::read(path)
+fn read_legacy_config_strict(path: &Path) -> Result<Value, ApiError> {
+    let bytes = fs::read(path).map_err(|_| ApiError::unavailable())?;
+    serde_json::from_slice(&bytes)
         .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .filter(Value::is_object)
-        .unwrap_or_else(|| json!({}))
+        .ok_or_else(ApiError::unavailable)
 }
 
-fn write_legacy_config(path: &Path, value: &Value) -> Result<(), ApiError> {
-    let bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::unavailable())?;
+fn write_legacy_config_locked(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
+    atomic_replace_checked_with_limit(path, bytes, MAX_REQUEST_BODY_BYTES as u64, false)
+}
+
+fn update_legacy_config(path: &Path, updates: Value) -> Result<Value, ApiError> {
     let _lock = acquire_path_write_lock_sync(path)?;
-    atomic_replace_checked_with_limit(path, &bytes, MAX_REQUEST_BODY_BYTES as u64, false)
+    let current = read_legacy_config_strict(path)?;
+    let mut next = current
+        .as_object()
+        .cloned()
+        .ok_or_else(ApiError::unavailable)?;
+    let updates = updates.as_object().ok_or_else(ApiError::invalid_request)?;
+    for (key, value) in updates {
+        next.insert(key.clone(), value.clone());
+    }
+    let current_object = current.as_object().cloned().unwrap_or_default();
+    restore_redacted_settings_urls(&mut next, &current_object);
+    restore_masked_settings_fields(&mut next, &current_object);
+    normalize_persisted_settings(&mut next);
+    let bytes = serde_json::to_vec_pretty(&Value::Object(next.clone()))
+        .map_err(|_| ApiError::unavailable())?;
+    write_legacy_config_locked(path, &bytes)?;
+    let committed = read_legacy_config_strict(path)?;
+    if committed != Value::Object(next) {
+        return Err(ApiError::unavailable());
+    }
+    Ok(committed)
 }
 
 fn redact_config(value: Value) -> Value {
@@ -5702,7 +8676,7 @@ fn redact_config(value: Value) -> Value {
                     (
                         key,
                         if redacted {
-                            Value::String("[redacted]".to_owned())
+                            Value::String("********".to_owned())
                         } else {
                             redact_config(value)
                         },
@@ -5713,6 +8687,808 @@ fn redact_config(value: Value) -> Value {
         Value::Array(items) => Value::Array(items.into_iter().map(redact_config).collect()),
         value => value,
     }
+}
+
+fn settings_object(value: Option<&Value>) -> Map<String, Value> {
+    value
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn settings_text(value: Option<&Value>, default: &str) -> String {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or(default)
+        .to_owned()
+}
+
+fn settings_bool(value: Option<&Value>, default: bool) -> bool {
+    match value {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        _ => default,
+    }
+}
+
+fn settings_u64(value: Option<&Value>, default: u64, minimum: u64) -> u64 {
+    let parsed = match value {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok())),
+        Some(Value::String(value)) => value.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+    .unwrap_or(default);
+    parsed.max(minimum)
+}
+
+fn settings_f64(value: Option<&Value>, default: f64, minimum: f64) -> f64 {
+    let parsed = match value {
+        Some(Value::Number(value)) => value.as_f64(),
+        Some(Value::String(value)) => value.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+    .unwrap_or(default);
+    parsed.max(minimum)
+}
+
+fn settings_secret(value: Option<&Value>) -> Value {
+    if value
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        Value::String("********".to_owned())
+    } else {
+        Value::String(String::new())
+    }
+}
+
+fn settings_public_url(value: Option<&Value>) -> String {
+    let Some(value) = value.and_then(Value::as_str).map(str::trim) else {
+        return String::new();
+    };
+    let Ok(mut parsed) = url::Url::parse(value) else {
+        return String::new();
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return String::new();
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let normalized = parsed.to_string();
+    if !value.ends_with('/') && parsed.path() == "/" {
+        normalized.trim_end_matches('/').to_owned()
+    } else {
+        normalized
+    }
+}
+
+fn settings_public_config_url(value: Option<&Value>) -> String {
+    settings_redacted_config_url(value)
+}
+
+fn settings_url_has_explicit_root_path(raw: &str, parsed: &url::Url) -> bool {
+    if parsed.path() != "/" {
+        return false;
+    }
+    let suffix = &parsed[url::Position::AfterPath..];
+    raw.strip_suffix(suffix)
+        .is_some_and(|path_part| path_part.ends_with('/'))
+}
+
+fn settings_raw_authority_prefix<'a>(raw: &'a str, parsed: &url::Url) -> Option<&'a str> {
+    let suffix = &parsed[url::Position::AfterPath..];
+    let path_part = raw.strip_suffix(suffix)?;
+    if let Some(authority) = path_part.strip_suffix(parsed.path()) {
+        Some(authority)
+    } else if parsed.path() == "/" {
+        Some(path_part)
+    } else {
+        None
+    }
+}
+
+fn settings_url_has_explicit_empty_port(raw: &str, parsed: &url::Url) -> bool {
+    settings_raw_authority_prefix(raw, parsed).is_some_and(|authority| authority.ends_with(':'))
+}
+
+fn settings_url_has_raw_userinfo(raw: &str, parsed: &url::Url) -> bool {
+    settings_raw_authority_prefix(raw, parsed).is_some_and(|authority| authority.contains('@'))
+}
+
+fn settings_redacted_config_url(value: Option<&Value>) -> String {
+    let raw = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if raw.is_empty()
+        || raw
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return String::new();
+    }
+    let Ok(mut parsed) = url::Url::parse(raw) else {
+        return String::new();
+    };
+    if parsed.scheme().is_empty() || parsed.host_str().is_none() {
+        return String::new();
+    }
+    let has_explicit_empty_port = settings_url_has_explicit_empty_port(raw, &parsed);
+    if parsed.authority().is_empty() || has_explicit_empty_port {
+        return String::new();
+    }
+    let has_userinfo = settings_url_has_raw_userinfo(raw, &parsed)
+        || parsed.authority().contains('@')
+        || !parsed.username().is_empty()
+        || parsed.password().is_some();
+    if has_userinfo && parsed.path().contains('@') {
+        return String::new();
+    }
+    let has_explicit_root_path = settings_url_has_explicit_root_path(raw, &parsed);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    if has_userinfo
+        && (parsed.set_username("[REDACTED]").is_err() || parsed.set_password(None).is_err())
+    {
+        return String::new();
+    }
+    let mut normalized = parsed.to_string();
+    if has_userinfo {
+        normalized = normalized.replacen("%5BREDACTED%5D@", "[REDACTED]@", 1);
+    }
+    if parsed.path() == "/" && !has_explicit_root_path {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn normalize_ai_review(value: Option<&Value>, public: bool) -> Value {
+    let source = settings_object(value);
+    json!({
+        "enabled": settings_bool(source.get("enabled"), false),
+        "base_url": if public {
+            Value::String(settings_public_config_url(source.get("base_url")))
+        } else {
+            Value::String(settings_text(source.get("base_url"), ""))
+        },
+        "api_key": if public {
+            settings_secret(source.get("api_key"))
+        } else {
+            Value::String(settings_text(source.get("api_key"), ""))
+        },
+        "model": settings_text(source.get("model"), ""),
+        "prompt": settings_text(source.get("prompt"), ""),
+    })
+}
+
+fn normalize_backup(value: Option<&Value>, public: bool) -> Value {
+    let source = settings_object(value);
+    let include = settings_object(source.get("include"));
+    let secret_access_key = if public {
+        settings_secret(source.get("secret_access_key"))
+    } else {
+        Value::String(settings_text(source.get("secret_access_key"), ""))
+    };
+    let passphrase = if public {
+        settings_secret(source.get("passphrase"))
+    } else {
+        Value::String(settings_text(source.get("passphrase"), ""))
+    };
+    let prefix = settings_text(source.get("prefix"), "backups");
+    let prefix = {
+        let prefix = prefix.trim_matches('/');
+        if prefix.is_empty() {
+            "backups".to_owned()
+        } else {
+            prefix.to_owned()
+        }
+    };
+    json!({
+        "enabled": settings_bool(source.get("enabled"), false),
+        "provider": "cloudflare_r2",
+        "account_id": settings_text(source.get("account_id"), ""),
+        "access_key_id": settings_text(source.get("access_key_id"), ""),
+        "secret_access_key": secret_access_key,
+        "bucket": settings_text(source.get("bucket"), ""),
+        "prefix": prefix,
+        "interval_minutes": settings_u64(source.get("interval_minutes"), 360, 1),
+        "rotation_keep": settings_u64(source.get("rotation_keep"), 10, 0),
+        "encrypt": settings_bool(source.get("encrypt"), false),
+        "passphrase": passphrase,
+        "include": {
+            "config": settings_bool(include.get("config"), true),
+            "cpa": settings_bool(include.get("cpa"), true),
+            "sub2api": settings_bool(include.get("sub2api"), true),
+            "ccload": settings_bool(include.get("ccload"), true),
+            "logs": settings_bool(include.get("logs"), true),
+            "image_tasks": settings_bool(include.get("image_tasks"), true),
+            "accounts_snapshot": settings_bool(include.get("accounts_snapshot"), true),
+            "auth_keys_snapshot": settings_bool(include.get("auth_keys_snapshot"), true),
+            "images": settings_bool(include.get("images"), false),
+        }
+    })
+}
+
+fn normalize_image_storage(value: Option<&Value>, public: bool) -> Value {
+    let source = settings_object(value);
+    let enabled = settings_bool(source.get("enabled"), false);
+    let mode = match settings_text(source.get("mode"), "local")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "webdav" => "webdav",
+        "both" => "both",
+        _ => "local",
+    };
+    let mode = if enabled { mode } else { "local" };
+    let webdav_root_path = {
+        let root = settings_text(source.get("webdav_root_path"), "chatgpt2api/images");
+        let root = root.trim_matches('/');
+        if root.is_empty() {
+            "chatgpt2api/images".to_owned()
+        } else {
+            root.to_owned()
+        }
+    };
+    json!({
+        "enabled": enabled,
+        "mode": mode,
+        "webdav_url": if public {
+            Value::String(settings_public_config_url(source.get("webdav_url")))
+        } else {
+            Value::String(settings_text(source.get("webdav_url"), ""))
+        },
+        "webdav_username": settings_text(source.get("webdav_username"), ""),
+        "webdav_password": if public {
+            settings_secret(source.get("webdav_password"))
+        } else {
+            Value::String(settings_text(source.get("webdav_password"), ""))
+        },
+        "webdav_root_path": webdav_root_path,
+        "public_base_url": if public {
+            Value::String(settings_public_url(source.get("public_base_url")))
+        } else {
+            Value::String(settings_text(source.get("public_base_url"), ""))
+        },
+    })
+}
+
+fn normalize_third_party_apps(value: Option<&Value>) -> Value {
+    let source = settings_object(value);
+    let canvas = settings_object(source.get("infinite_canvas"));
+    let url = match canvas.get("url") {
+        None => "https://canvas.best".to_owned(),
+        Some(value) => settings_public_url(Some(value)),
+    };
+    let enabled = settings_bool(canvas.get("enabled"), false) && !url.is_empty();
+    json!({
+        "infinite_canvas": {
+            "enabled": enabled,
+            "url": url,
+        }
+    })
+}
+
+fn normalize_log_levels(value: Option<&Value>) -> Value {
+    let allowed = ["debug", "info", "warning", "error"];
+    Value::Array(
+        value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str())
+            .filter_map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                allowed
+                    .contains(&value.as_str())
+                    .then_some(Value::String(value))
+            })
+            .collect(),
+    )
+}
+
+fn normalize_sensitive_words(value: Option<&Value>) -> Value {
+    Value::Array(
+        value
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| Value::String(value.to_owned()))
+            })
+            .collect(),
+    )
+}
+
+fn normalize_chat_completion_cache(value: Option<&Value>) -> Value {
+    let source = settings_object(value);
+    json!({
+        "enabled": settings_bool(source.get("enabled"), true),
+        "ttl_seconds": settings_u64(source.get("ttl_seconds"), 60, 0),
+        "max_entries": settings_u64(source.get("max_entries"), 256, 1),
+        "dedupe_inflight": settings_bool(source.get("dedupe_inflight"), true),
+        "stream_cache": settings_bool(source.get("stream_cache"), true),
+        "normalize_messages": settings_bool(source.get("normalize_messages"), true),
+        "drop_adjacent_duplicates": settings_bool(source.get("drop_adjacent_duplicates"), true),
+        "drop_assistant_history": settings_bool(source.get("drop_assistant_history"), false),
+    })
+}
+
+fn normalize_status_codes(value: Option<&Value>) -> Value {
+    let mut values = Vec::new();
+    if let Some(items) = value.and_then(Value::as_array) {
+        for item in items {
+            let status = match item {
+                Value::Number(value) => value
+                    .as_u64()
+                    .and_then(|value| i64::try_from(value).ok())
+                    .or_else(|| value.as_i64()),
+                Value::String(value) => value.trim().parse::<i64>().ok(),
+                _ => None,
+            };
+            let Some(status) = status.filter(|status| (100..=599).contains(status)) else {
+                continue;
+            };
+            if !values.contains(&status) {
+                values.push(status);
+            }
+        }
+    }
+    if values.is_empty() {
+        values.push(403);
+    }
+    Value::Array(values.into_iter().map(|value| json!(value)).collect())
+}
+
+fn normalize_proxy_runtime(value: Option<&Value>, public: bool) -> Value {
+    let source = settings_object(value);
+    let clearance = settings_object(source.get("clearance"));
+    let egress_mode = match settings_text(source.get("egress_mode"), "direct")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "single_proxy" => "single_proxy",
+        _ => "direct",
+    };
+    let clearance_mode = match settings_text(clearance.get("mode"), "none")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "manual" => "manual",
+        "flaresolverr" => "flaresolverr",
+        _ => "none",
+    };
+    let proxy_url = if public {
+        settings_public_config_url(source.get("proxy_url"))
+    } else {
+        settings_text(source.get("proxy_url"), "")
+    };
+    let resource_proxy_url = if public {
+        settings_public_config_url(source.get("resource_proxy_url"))
+    } else {
+        settings_text(source.get("resource_proxy_url"), "")
+    };
+    let flaresolverr_url = if public {
+        settings_public_config_url(clearance.get("flaresolverr_url"))
+    } else {
+        settings_text(clearance.get("flaresolverr_url"), "")
+    };
+    let cf_cookies = settings_text(clearance.get("cf_cookies"), "");
+    let cf_clearance = settings_text(clearance.get("cf_clearance"), "");
+    let mut public_clearance = Map::new();
+    public_clearance.insert(
+        "enabled".to_owned(),
+        json!(settings_bool(clearance.get("enabled"), false)),
+    );
+    public_clearance.insert("mode".to_owned(), json!(clearance_mode));
+    if public {
+        public_clearance.insert("cf_cookies".to_owned(), json!(""));
+        public_clearance.insert("cf_clearance".to_owned(), json!(""));
+        public_clearance.insert("has_cf_cookies".to_owned(), json!(!cf_cookies.is_empty()));
+        public_clearance.insert(
+            "has_cf_clearance".to_owned(),
+            json!(!cf_clearance.is_empty()),
+        );
+    } else {
+        public_clearance.insert("cf_cookies".to_owned(), json!(cf_cookies));
+        public_clearance.insert("cf_clearance".to_owned(), json!(cf_clearance));
+    }
+    public_clearance.insert(
+        "user_agent".to_owned(),
+        json!(settings_text(
+            clearance.get("user_agent"),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+        )),
+    );
+    public_clearance.insert(
+        "browser".to_owned(),
+        json!(settings_text(clearance.get("browser"), "chrome")),
+    );
+    public_clearance.insert("flaresolverr_url".to_owned(), json!(flaresolverr_url));
+    public_clearance.insert(
+        "timeout_sec".to_owned(),
+        json!(settings_u64(clearance.get("timeout_sec"), 60, 1)),
+    );
+    public_clearance.insert(
+        "refresh_interval".to_owned(),
+        json!(settings_u64(clearance.get("refresh_interval"), 3600, 60)),
+    );
+    public_clearance.insert(
+        "warm_up_on_start".to_owned(),
+        json!(settings_bool(clearance.get("warm_up_on_start"), false)),
+    );
+    json!({
+        "enabled": settings_bool(source.get("enabled"), false),
+        "egress_mode": egress_mode,
+        "proxy_url": proxy_url,
+        "resource_proxy_url": resource_proxy_url,
+        "skip_ssl_verify": settings_bool(source.get("skip_ssl_verify"), false),
+        "reset_session_status_codes": normalize_status_codes(source.get("reset_session_status_codes")),
+        "clearance": Value::Object(public_clearance),
+    })
+}
+
+fn normalize_thinking_effort(value: Option<&Value>) -> Value {
+    let value = settings_text(value, "auto").to_ascii_lowercase();
+    Value::String(
+        if ["auto", "standard", "extended", "max"].contains(&value.as_str()) {
+            value
+        } else {
+            "auto".to_owned()
+        },
+    )
+}
+
+fn normalize_persisted_settings(object: &mut Map<String, Value>) {
+    if object.contains_key("refresh_account_interval_minute") {
+        object.insert(
+            "refresh_account_interval_minute".to_owned(),
+            json!(settings_u64(
+                object.get("refresh_account_interval_minute"),
+                5,
+                0
+            )),
+        );
+    }
+    for (key, default, minimum) in [
+        ("image_retention_days", 30, 1),
+        ("image_poll_timeout_secs", 120, 1),
+        ("image_account_concurrency", 3, 1),
+        ("image_timeout_retry_secs", 30, 1),
+    ] {
+        if object.contains_key(key) {
+            object.insert(
+                key.to_owned(),
+                json!(settings_u64(object.get(key), default, minimum)),
+            );
+        }
+    }
+    for (key, default, minimum) in [
+        ("image_poll_interval_secs", 10.0, 0.5),
+        ("image_poll_initial_wait_secs", 10.0, 0.0),
+        ("image_settle_secs", 2.0, 0.5),
+    ] {
+        if object.contains_key(key) {
+            object.insert(
+                key.to_owned(),
+                json!(settings_f64(object.get(key), default, minimum)),
+            );
+        }
+    }
+    for (key, default) in [
+        ("image_parallel_generation", true),
+        ("image_settle_enabled", true),
+        ("image_check_before_hit_enabled", true),
+        ("image_remove_conversation_after_result", false),
+        ("image_remove_conversation_always", false),
+        ("auto_remove_invalid_accounts", false),
+        ("auto_remove_rate_limited_accounts", false),
+        ("auto_relogin_after_refresh", false),
+    ] {
+        if object.contains_key(key) {
+            object.insert(
+                key.to_owned(),
+                json!(settings_bool(object.get(key), default)),
+            );
+        }
+    }
+    if object.contains_key("sensitive_words") {
+        object.insert(
+            "sensitive_words".to_owned(),
+            normalize_sensitive_words(object.get("sensitive_words")),
+        );
+    }
+    if object.contains_key("global_system_prompt") {
+        object.insert(
+            "global_system_prompt".to_owned(),
+            json!(settings_text(object.get("global_system_prompt"), "")),
+        );
+    }
+    if object.contains_key("default_upstream_model_name") {
+        let value = settings_text(object.get("default_upstream_model_name"), "gpt-5-5");
+        object.insert(
+            "default_upstream_model_name".to_owned(),
+            json!(if value.is_empty() { "gpt-5-5" } else { &value }),
+        );
+    }
+    if object.contains_key("ai_review") {
+        object.insert(
+            "ai_review".to_owned(),
+            normalize_ai_review(object.get("ai_review"), false),
+        );
+    }
+    if object.contains_key("backup") {
+        object.insert(
+            "backup".to_owned(),
+            normalize_backup(object.get("backup"), false),
+        );
+    }
+    if object.contains_key("image_storage") {
+        object.insert(
+            "image_storage".to_owned(),
+            normalize_image_storage(object.get("image_storage"), false),
+        );
+    }
+    if object.contains_key("third_party_apps") {
+        object.insert(
+            "third_party_apps".to_owned(),
+            normalize_third_party_apps(object.get("third_party_apps")),
+        );
+    }
+    if object.contains_key("log_levels") {
+        object.insert(
+            "log_levels".to_owned(),
+            normalize_log_levels(object.get("log_levels")),
+        );
+    }
+    if object.contains_key("default_thinking_effort") {
+        object.insert(
+            "default_thinking_effort".to_owned(),
+            normalize_thinking_effort(object.get("default_thinking_effort")),
+        );
+    }
+    if object.contains_key("chat_completion_cache") {
+        object.insert(
+            "chat_completion_cache".to_owned(),
+            normalize_chat_completion_cache(object.get("chat_completion_cache")),
+        );
+    }
+    if object.contains_key("proxy_runtime") {
+        object.insert(
+            "proxy_runtime".to_owned(),
+            normalize_proxy_runtime(object.get("proxy_runtime"), false),
+        );
+    }
+}
+
+fn restore_masked_settings_fields(next: &mut Map<String, Value>, current: &Map<String, Value>) {
+    for (section, fields) in [
+        ("ai_review", ["api_key"].as_slice()),
+        ("backup", ["secret_access_key", "passphrase"].as_slice()),
+        ("image_storage", ["webdav_password"].as_slice()),
+    ] {
+        let Some(incoming) = next.get_mut(section).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let previous = current
+            .get(section)
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for field in fields {
+            if incoming
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim() == "********")
+                && previous
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+                && let Some(value) = previous.get(*field)
+            {
+                incoming.insert((*field).to_owned(), value.clone());
+            }
+        }
+    }
+}
+
+fn restore_public_url_value(value: Option<&Value>, previous: Option<&Value>) -> Value {
+    let candidate = settings_text(value, "");
+    let previous_text = settings_text(previous, "");
+    if !previous_text.is_empty()
+        && !candidate.is_empty()
+        && (candidate == settings_public_config_url(previous)
+            || candidate == settings_redacted_config_url(previous))
+    {
+        return Value::String(previous_text);
+    }
+    value.cloned().unwrap_or(Value::Null)
+}
+
+fn restore_public_url_field(
+    next: &mut Map<String, Value>,
+    current: &Map<String, Value>,
+    section: &str,
+    field: &str,
+) {
+    let Some(incoming) = next.get_mut(section).and_then(Value::as_object_mut) else {
+        return;
+    };
+    let previous = current
+        .get(section)
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(field));
+    let restored = restore_public_url_value(incoming.get(field), previous);
+    incoming.insert(field.to_owned(), restored);
+}
+
+fn restore_redacted_settings_urls(next: &mut Map<String, Value>, current: &Map<String, Value>) {
+    if next.contains_key("proxy") {
+        let restored = restore_public_url_value(next.get("proxy"), current.get("proxy"));
+        next.insert("proxy".to_owned(), restored);
+    }
+    for (section, field) in [
+        ("ai_review", "base_url"),
+        ("image_storage", "webdav_url"),
+        ("proxy_runtime", "proxy_url"),
+        ("proxy_runtime", "resource_proxy_url"),
+    ] {
+        restore_public_url_field(next, current, section, field);
+    }
+    let Some(incoming_runtime) = next.get_mut("proxy_runtime").and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(incoming_clearance) = incoming_runtime
+        .get_mut("clearance")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let previous = current
+        .get("proxy_runtime")
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("clearance"))
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("flaresolverr_url"));
+    let restored = restore_public_url_value(incoming_clearance.get("flaresolverr_url"), previous);
+    incoming_clearance.insert("flaresolverr_url".to_owned(), restored);
+}
+
+fn public_settings_config(value: Value, _state: &AppState) -> Value {
+    let source = value.as_object().cloned().unwrap_or_default();
+    let mut object = Map::new();
+    if source.contains_key("proxy") {
+        object.insert(
+            "proxy".to_owned(),
+            json!(settings_public_config_url(source.get("proxy"))),
+        );
+    }
+    if source.contains_key("base_url") {
+        object.insert(
+            "base_url".to_owned(),
+            json!(settings_public_url(source.get("base_url"))),
+        );
+    }
+    object.insert(
+        "refresh_account_interval_minute".to_owned(),
+        json!(settings_u64(
+            source.get("refresh_account_interval_minute"),
+            5,
+            0
+        )),
+    );
+    object.insert(
+        "image_retention_days".to_owned(),
+        json!(settings_u64(source.get("image_retention_days"), 30, 1)),
+    );
+    object.insert(
+        "image_poll_timeout_secs".to_owned(),
+        json!(settings_u64(source.get("image_poll_timeout_secs"), 120, 1)),
+    );
+    object.insert(
+        "image_poll_interval_secs".to_owned(),
+        json!(settings_f64(
+            source.get("image_poll_interval_secs"),
+            10.0,
+            0.5
+        )),
+    );
+    object.insert(
+        "image_poll_initial_wait_secs".to_owned(),
+        json!(settings_f64(
+            source.get("image_poll_initial_wait_secs"),
+            10.0,
+            0.0
+        )),
+    );
+    object.insert(
+        "image_account_concurrency".to_owned(),
+        json!(settings_u64(source.get("image_account_concurrency"), 3, 1)),
+    );
+    object.insert(
+        "image_timeout_retry_secs".to_owned(),
+        json!(settings_u64(source.get("image_timeout_retry_secs"), 30, 1)),
+    );
+    for (key, default) in [
+        ("image_parallel_generation", true),
+        ("image_settle_enabled", true),
+        ("image_check_before_hit_enabled", true),
+        ("image_remove_conversation_after_result", false),
+        ("image_remove_conversation_always", false),
+        ("auto_remove_invalid_accounts", false),
+        ("auto_remove_rate_limited_accounts", false),
+        ("auto_relogin_after_refresh", false),
+    ] {
+        object.insert(
+            key.to_owned(),
+            json!(settings_bool(source.get(key), default)),
+        );
+    }
+    object.insert(
+        "image_settle_secs".to_owned(),
+        json!(settings_f64(source.get("image_settle_secs"), 2.0, 0.5)),
+    );
+    object.insert(
+        "log_levels".to_owned(),
+        normalize_log_levels(source.get("log_levels")),
+    );
+    object.insert(
+        "sensitive_words".to_owned(),
+        normalize_sensitive_words(source.get("sensitive_words")),
+    );
+    object.insert(
+        "ai_review".to_owned(),
+        normalize_ai_review(source.get("ai_review"), true),
+    );
+    object.insert(
+        "global_system_prompt".to_owned(),
+        json!(settings_text(source.get("global_system_prompt"), "")),
+    );
+    let model = settings_text(source.get("default_upstream_model_name"), "gpt-5-5");
+    object.insert(
+        "default_upstream_model_name".to_owned(),
+        json!(if model.is_empty() { "gpt-5-5" } else { &model }),
+    );
+    object.insert(
+        "default_thinking_effort".to_owned(),
+        normalize_thinking_effort(source.get("default_thinking_effort")),
+    );
+    object.insert(
+        "backup".to_owned(),
+        normalize_backup(source.get("backup"), true),
+    );
+    object.insert(
+        "image_storage".to_owned(),
+        normalize_image_storage(source.get("image_storage"), true),
+    );
+    object.insert(
+        "chat_completion_cache".to_owned(),
+        normalize_chat_completion_cache(source.get("chat_completion_cache")),
+    );
+    object.insert(
+        "proxy_runtime".to_owned(),
+        normalize_proxy_runtime(source.get("proxy_runtime"), true),
+    );
+    object.insert(
+        "third_party_apps".to_owned(),
+        normalize_third_party_apps(source.get("third_party_apps")),
+    );
+    redact_config(Value::Object(object))
 }
 
 fn server_registry_path(state: &AppState, kind: &str) -> PathBuf {
@@ -5801,59 +9577,38 @@ where
     Ok(result)
 }
 
-fn health_counter(value: Option<&Value>) -> u64 {
-    value
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            value
-                .and_then(Value::as_i64)
-                .filter(|value| *value >= 0)
-                .map(|value| value as u64)
-        })
-        .unwrap_or_default()
-}
-
 fn read_health_bounded_file(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
-    let file = fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > max_bytes {
-        return None;
-    }
-    Some(bytes)
+    read_bounded_validated_file(path, max_bytes)
+        .ok()
+        .map(|(bytes, _version)| bytes)
 }
 
-fn health_cumulative_total(state: &AppState, total: u64) -> u64 {
+fn health_cumulative_total(state: &AppState, snapshot_total: u64) -> u64 {
     let Some(path) = state.account_store.path.as_deref() else {
-        return total;
+        return snapshot_total;
     };
     let sidecar = path.parent().map(|parent| parent.join(".cumulative_total"));
     let sidecar_total = sidecar
         .as_deref()
-        .and_then(|path| read_health_bounded_file(path, MAX_ACCOUNT_SNAPSHOT_BYTES))
+        .and_then(|path| read_health_bounded_file(path, MAX_CUMULATIVE_TOTAL_BYTES))
         .and_then(|bytes| {
             std::str::from_utf8(&bytes)
                 .ok()
                 .and_then(|value| value.trim().parse::<u64>().ok())
         })
         .unwrap_or_default();
-    let snapshot_total = read_health_bounded_file(path, MAX_ACCOUNT_SNAPSHOT_BYTES)
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.get("cumulative_total").cloned())
-        .map(|value| health_counter(Some(&value)))
-        .unwrap_or_default();
-    total.max(sidecar_total).max(snapshot_total)
+    snapshot_total.max(sidecar_total)
 }
 
 fn health_accounts(state: &AppState) -> Value {
     #[cfg(test)]
-    if let Some(hook) = HEALTH_ACCOUNTS_TEST_HOOK
+    let health_accounts_test_hook = HEALTH_ACCOUNTS_TEST_HOOK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-        .filter(|hook| hook.version == state.config.version)
+        .clone();
+    #[cfg(test)]
+    if let Some(hook) =
+        health_accounts_test_hook.filter(|hook| hook.version == state.config.version)
     {
         hook.starts.fetch_add(1, Ordering::SeqCst);
         hook.started.notify_waiters();
@@ -5861,73 +9616,29 @@ fn health_accounts(state: &AppState) -> Value {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    let records = state.account_store.raw_records();
-    let total = records.len() as u64;
-    let mut active = 0u64;
-    let mut limited = 0u64;
-    let mut abnormal = 0u64;
-    let mut disabled = 0u64;
-    let mut total_quota = 0u64;
-    let mut total_success = 0u64;
-    let mut total_fail = 0u64;
-    let mut by_type = Map::new();
-    for record in &records {
-        let object = record.as_object();
-        match object
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str)
-        {
-            Some("正常") => {
-                active += 1;
-                total_quota = total_quota
-                    .saturating_add(health_counter(object.and_then(|value| value.get("quota"))));
-            }
-            Some("限流") => limited += 1,
-            Some("异常") => abnormal += 1,
-            Some("禁用") => disabled += 1,
-            _ => {}
-        }
-        total_success = total_success.saturating_add(health_counter(
-            object.and_then(|value| value.get("success")),
-        ));
-        total_fail =
-            total_fail.saturating_add(health_counter(object.and_then(|value| value.get("fail"))));
-        let raw_account_type = object
-            .and_then(|value| value.get("type"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("free");
-        let account_type = match raw_account_type {
-            "free" | "Plus" | "Pro" | "ProLite" | "Team" | "Enterprise" => raw_account_type,
-            _ => "other",
-        };
-        let bucket = by_type
-            .entry(account_type.to_owned())
-            .or_insert_with(|| Value::from(0u64));
-        *bucket = Value::from(health_counter(Some(bucket)).saturating_add(1));
-    }
+    let health = state.account_store.health_stats();
     json!({
-        "total": total,
-        "cumulative_total": health_cumulative_total(state, total),
-        "active": active,
-        "limited": limited,
-        "abnormal": abnormal,
-        "disabled": disabled,
-        "total_quota": total_quota,
-        "total_success": total_success,
-        "total_fail": total_fail,
-        "by_type": by_type,
+        "total": health.total,
+        "cumulative_total": health_cumulative_total(state, health.cumulative_total),
+        "active": health.active,
+        "limited": health.limited,
+        "abnormal": health.abnormal,
+        "disabled": health.disabled,
+        "total_quota": health.total_quota,
+        "total_success": health.total_success,
+        "total_fail": health.total_fail,
+        "by_type": health.by_type,
     })
 }
 
 fn health_storage(state: &AppState) -> (Value, bool) {
     #[cfg(test)]
-    if let Some(hook) = HEALTH_STORAGE_TEST_HOOK
+    let health_storage_test_hook = HEALTH_STORAGE_TEST_HOOK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-        .filter(|hook| hook.version == state.config.version)
+        .clone();
+    #[cfg(test)]
+    if let Some(hook) = health_storage_test_hook.filter(|hook| hook.version == state.config.version)
     {
         hook.starts.fetch_add(1, Ordering::SeqCst);
         hook.started.notify_waiters();
@@ -5936,15 +9647,8 @@ fn health_storage(state: &AppState) -> (Value, bool) {
         }
     }
     let mut healthy = state.data_dir.is_dir() && fs::read_dir(state.data_dir.as_ref()).is_ok();
-    if healthy && let Some(path) = state.account_store.path.as_deref() {
-        healthy = read_account_snapshot(path).is_ok();
-    }
-    if healthy && let Some(path) = state.auth_store.path.as_deref() {
-        healthy = read_auth_snapshot(path).is_ok();
-    }
-    if healthy && let Some(path) = state.models.configured_path() {
-        healthy = ModelCatalog::load_with_fingerprint(Some(&path), &[]).is_ok();
-    }
+    healthy =
+        healthy && state.account_store.health_validated() && state.auth_store.health_validated();
     let status = if healthy { "healthy" } else { "unhealthy" };
     let health = if healthy {
         json!({"status": status})
@@ -5962,6 +9666,57 @@ fn unhealthy_health_storage() -> (Value, bool) {
         }),
         false,
     )
+}
+
+fn public_storage_backend_type(storage_info: &Value) -> &str {
+    let backend_type = match storage_info.get("type") {
+        Some(Value::String(value)) if !value.is_empty() => value.as_str(),
+        Some(_) => "unknown",
+        None => storage_info
+            .get("backend")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown"),
+    };
+    if matches!(backend_type, "json" | "database" | "git") {
+        backend_type
+    } else {
+        "unknown"
+    }
+}
+
+fn public_storage_snapshot(storage_info: &Value, storage_health: &Value) -> (Value, bool) {
+    let backend_type = public_storage_backend_type(storage_info);
+    let healthy = backend_type != "unknown"
+        && storage_health.get("status").and_then(Value::as_str) == Some("healthy");
+    let mut health = json!({
+        "status": if healthy { "healthy" } else { "unhealthy" },
+    });
+    if !healthy {
+        health["error"] = Value::String("存储后端健康检查失败".to_owned());
+    }
+    (json!({"backend": backend_type, "health": health}), healthy)
+}
+
+fn public_storage_info(storage_info: &Value, storage_health: &Value) -> Value {
+    let backend_type = public_storage_backend_type(storage_info);
+    let mut backend = json!({"type": backend_type});
+    if backend_type == "database"
+        && let Some(db_type) = storage_info
+            .get("db_type")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "sqlite" | "postgresql" | "mysql" | "unknown"))
+    {
+        backend["db_type"] = Value::String(db_type.to_owned());
+    }
+    let (_, healthy) = public_storage_snapshot(storage_info, storage_health);
+    let mut health = json!({
+        "status": if healthy { "healthy" } else { "unhealthy" },
+    });
+    if !healthy {
+        health["error"] = Value::String("存储后端健康检查失败".to_owned());
+    }
+    json!({"backend": backend, "health": health})
 }
 
 fn empty_health_accounts() -> Value {
@@ -6120,33 +9875,215 @@ struct HealthQuery {
     format: Option<String>,
 }
 
+fn health_response(
+    state: &AppState,
+    query: &HealthQuery,
+    accounts: Value,
+    storage: (Value, bool),
+) -> Response {
+    let accounts = if storage.1 {
+        accounts
+    } else {
+        empty_health_accounts()
+    };
+    let payload = health_payload_with_storage(state, accounts, storage);
+    if query.format.as_deref() == Some("json") {
+        Json(payload).into_response()
+    } else {
+        Html(health_html(&payload)).into_response()
+    }
+}
+
 async fn health(State(state): State<AppState>, Query(query): Query<HealthQuery>) -> Response {
     const OVERALL: Duration = Duration::from_millis(500);
     const SUBCHECK: Duration = Duration::from_millis(250);
+    if let Some(backend) = state.storage_backend.clone() {
+        let cache = state
+            .health_snapshot_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let local_snapshot_available = cache.local_snapshot_available;
+        if let Some(backend_health) = backend.cached_health(local_snapshot_available) {
+            let info = backend.info();
+            let (mut storage, storage_healthy) = public_storage_snapshot(&info, &backend_health);
+            if !storage_healthy {
+                storage["health"]["status"] = Value::String("unhealthy".to_owned());
+                storage["health"]["error"] = Value::String("存储后端健康检查失败".to_owned());
+            }
+            let accounts = if local_snapshot_available {
+                cache.accounts
+            } else {
+                empty_health_accounts()
+            };
+            return health_response(&state, &query, accounts, (storage, storage_healthy));
+        }
+        let account_permit = tokio::time::timeout(
+            SUBCHECK,
+            state.health_accounts_semaphore.clone().acquire_owned(),
+        );
+        let storage_permit = tokio::time::timeout(
+            SUBCHECK,
+            state.health_storage_semaphore.clone().acquire_owned(),
+        );
+        let (account_permit, storage_permit) = tokio::join!(account_permit, storage_permit);
+        let permits = account_permit
+            .ok()
+            .and_then(Result::ok)
+            .zip(storage_permit.ok().and_then(Result::ok));
+        let Some((account_permit, storage_permit)) = permits else {
+            let info = backend.info();
+            let (storage, _) = public_storage_snapshot(&info, &json!({"status": "unhealthy"}));
+            return health_response(&state, &query, empty_health_accounts(), (storage, false));
+        };
+        let account_store = state.account_store.clone();
+        let auth_store = state.auth_store.clone();
+        let generation_gate = state.health_snapshot_gate.clone();
+        let health_snapshot_cache = state.health_snapshot_cache.clone();
+        let health_backend = backend.clone();
+        #[cfg(test)]
+        let publish_test_hook = state.health_snapshot_publish_test_hook.clone();
+        let remote = tokio::time::timeout(OVERALL, async move {
+            let generation_guard = generation_gate.write_owned().await;
+            let Some(account_gate) =
+                tokio::time::timeout(SUBCHECK, account_store.lock_reload_gate())
+                    .await
+                    .ok()
+            else {
+                drop((account_permit, storage_permit));
+                return (false, false, None);
+            };
+            let Some(auth_gate) = tokio::time::timeout(SUBCHECK, auth_store.lock_reload_gate())
+                .await
+                .ok()
+            else {
+                drop((
+                    account_gate,
+                    account_permit,
+                    storage_permit,
+                    generation_guard,
+                ));
+                return (false, false, None);
+            };
+            let loaded = tokio::time::timeout(SUBCHECK, health_backend.load_health_snapshots())
+                .await
+                .ok()
+                .and_then(Result::ok);
+            let (account_ok, backend_ok, backend_health) = match loaded {
+                Some((accounts, auth_keys, backend_health)) => {
+                    let parsed_accounts = parse_backend_snapshot(accounts);
+                    let parsed_auth = parse_auth_backend_snapshot(auth_keys);
+                    match (parsed_accounts, parsed_auth) {
+                        (
+                            Ok((account_records, account_fingerprint, cumulative_total)),
+                            Ok((auth_records, auth_fingerprint)),
+                        ) => {
+                            account_store.publish_validated_backend_snapshot_silent(
+                                account_records,
+                                account_fingerprint,
+                                cumulative_total,
+                            );
+                            #[cfg(test)]
+                            {
+                                let hook = publish_test_hook
+                                    .read()
+                                    .expect("database health publish hook")
+                                    .clone();
+                                if let Some(hook) = hook
+                                    && hook.pause_between.swap(false, Ordering::SeqCst)
+                                {
+                                    hook.after_accounts.notify_one();
+                                    hook.release_before_auth.notified().await;
+                                }
+                            }
+                            auth_store.publish_validated_backend_snapshot_silent(
+                                auth_records,
+                                auth_fingerprint,
+                            );
+                            sync_health_snapshot_cache(
+                                &health_snapshot_cache,
+                                &account_store,
+                                &auth_store,
+                            );
+                            (true, true, Some(backend_health))
+                        }
+                        _ => {
+                            invalidate_health_snapshot_pair(
+                                &health_snapshot_cache,
+                                &account_store,
+                                &auth_store,
+                            )
+                            .await;
+                            (false, false, None)
+                        }
+                    }
+                }
+                None => {
+                    invalidate_health_snapshot_pair(
+                        &health_snapshot_cache,
+                        &account_store,
+                        &auth_store,
+                    )
+                    .await;
+                    (false, false, None)
+                }
+            };
+            drop((account_gate, auth_gate, generation_guard));
+            drop((account_permit, storage_permit));
+            (account_ok, backend_ok, backend_health)
+        })
+        .await;
+        let (account_ok, backend_ok, backend_health) = remote.unwrap_or((false, false, None));
+        let cache = state
+            .health_snapshot_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let accounts = if account_ok && cache.local_snapshot_available {
+            cache.accounts.clone()
+        } else {
+            empty_health_accounts()
+        };
+        let info = state
+            .storage_backend
+            .as_deref()
+            .map(storage::StorageBackend::info)
+            .unwrap_or_else(|| json!({"type": "database"}));
+        let raw_health = backend_health.unwrap_or_else(|| json!({"status": "unhealthy"}));
+        let (mut storage, backend_healthy) = public_storage_snapshot(&info, &raw_health);
+        let storage_healthy = backend_healthy && backend_ok;
+        if !storage_healthy {
+            storage["health"]["status"] = Value::String("unhealthy".to_owned());
+            storage["health"]["error"] = Value::String("存储后端健康检查失败".to_owned());
+        }
+        return health_response(&state, &query, accounts, (storage, storage_healthy));
+    }
     let account_store = state.account_store.clone();
     let account_state = state.clone();
     let storage_state = state.clone();
     let probes = async move {
         let account_probe = async move {
-            let reloaded = tokio::time::timeout(SUBCHECK, account_store.reload())
-                .await
-                .ok()
-                .unwrap_or(false);
-            if !reloaded {
-                return empty_health_accounts();
-            }
-            let permit =
-                tokio::time::timeout(SUBCHECK, HEALTH_ACCOUNTS_SEMAPHORE.clone().acquire_owned())
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+            let permit = tokio::time::timeout(
+                SUBCHECK,
+                account_state
+                    .health_accounts_semaphore
+                    .clone()
+                    .acquire_owned(),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
             let Some(permit) = permit else {
                 return empty_health_accounts();
             };
             tokio::time::timeout(
                 SUBCHECK,
                 tokio::task::spawn_blocking(move || {
-                    let accounts = health_accounts(&account_state);
+                    let accounts = if account_store.health_validated() {
+                        health_accounts(&account_state)
+                    } else {
+                        empty_health_accounts()
+                    };
                     drop(permit);
                     accounts
                 }),
@@ -6157,11 +10094,16 @@ async fn health(State(state): State<AppState>, Query(query): Query<HealthQuery>)
             .unwrap_or_else(empty_health_accounts)
         };
         let storage_probe = async {
-            let permit =
-                tokio::time::timeout(SUBCHECK, HEALTH_STORAGE_SEMAPHORE.clone().acquire_owned())
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+            let permit = tokio::time::timeout(
+                SUBCHECK,
+                storage_state
+                    .health_storage_semaphore
+                    .clone()
+                    .acquire_owned(),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
             let Some(permit) = permit else {
                 return (
                     json!({
@@ -6189,11 +10131,7 @@ async fn health(State(state): State<AppState>, Query(query): Query<HealthQuery>)
     let (accounts, storage) = tokio::time::timeout(OVERALL, probes)
         .await
         .unwrap_or_else(|_| (empty_health_accounts(), unhealthy_health_storage()));
-    let payload = health_payload_with_storage(&state, accounts, storage);
-    if query.format.as_deref() == Some("json") {
-        return Json(payload).into_response();
-    }
-    Html(health_html(&payload)).into_response()
+    health_response(&state, &query, accounts, storage)
 }
 
 const ACCOUNT_TYPE_MODEL_TTL: Duration = Duration::from_secs(300);
@@ -6334,6 +10272,7 @@ struct AccountTypeCatalog {
     refresh_gate: Arc<Mutex<()>>,
     refresh_running: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
+    refresh_shutdown: tokio::sync::watch::Sender<bool>,
     refresh_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     #[cfg(test)]
     shutdown_taken: Arc<Notify>,
@@ -6345,6 +10284,16 @@ struct AccountTypeCatalog {
     live_membership_barrier_enabled: Arc<AtomicBool>,
 }
 
+struct CatalogRefreshRunningGuard {
+    refresh_running: Arc<AtomicBool>,
+}
+
+impl Drop for CatalogRefreshRunningGuard {
+    fn drop(&mut self) {
+        self.refresh_running.store(false, Ordering::Release);
+    }
+}
+
 impl AccountTypeCatalog {
     fn new(
         account_store: Arc<AccountStore>,
@@ -6354,6 +10303,7 @@ impl AccountTypeCatalog {
         protocol: UpstreamProtocol,
         codex_client_version: Option<String>,
     ) -> Self {
+        let (refresh_shutdown, _) = tokio::sync::watch::channel(false);
         Self {
             enabled,
             protocol,
@@ -6365,6 +10315,7 @@ impl AccountTypeCatalog {
             refresh_gate: Arc::new(Mutex::new(())),
             refresh_running: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            refresh_shutdown,
             refresh_task: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             shutdown_taken: Arc::new(Notify::new()),
@@ -6482,9 +10433,18 @@ impl AccountTypeCatalog {
                 .is_ok()
             {
                 let worker = self.clone();
+                let refresh_running = self.refresh_running.clone();
+                let mut refresh_shutdown = self.refresh_shutdown.subscribe();
                 let task = tokio::spawn(async move {
-                    worker.refresh_inner().await;
-                    worker.refresh_running.store(false, Ordering::Release);
+                    let _running = CatalogRefreshRunningGuard { refresh_running };
+                    if *refresh_shutdown.borrow() {
+                        return;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = refresh_shutdown.changed() => {}
+                        () = worker.refresh_inner() => {}
+                    }
                 });
                 *refresh_task = Some(task);
             }
@@ -6493,8 +10453,12 @@ impl AccountTypeCatalog {
         self.refresh_inner().await;
     }
 
-    async fn shutdown(&self) {
+    fn begin_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
+        self.refresh_shutdown.send_replace(true);
+    }
+
+    async fn finish_shutdown(&self) {
         let task = self.refresh_task.lock().await.take();
         #[cfg(test)]
         self.shutdown_taken.notify_one();
@@ -6503,6 +10467,12 @@ impl AccountTypeCatalog {
             let _ = task.await;
         }
         self.refresh_running.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn shutdown(&self) {
+        self.begin_shutdown();
+        self.finish_shutdown().await;
     }
 
     async fn refresh_inner(&self) {
@@ -6957,30 +10927,25 @@ impl AccountTypeCatalog {
             let Some(_items) = value.get("data").and_then(Value::as_array) else {
                 continue;
             };
-            return project_remote_model_list(
-                &value,
-                "data",
-                false,
-                Some(account_group),
-                false,
-                false,
-            )
-            .map(|models| {
-                let model_sources = models
-                    .iter()
-                    .map(|model| {
-                        (
-                            model.id.clone(),
-                            HashSet::from([candidate.source_type.clone()]),
-                        )
-                    })
-                    .collect();
-                (
-                    models,
-                    CatalogOwners::with_model_sources(vec![candidate.clone()], model_sources),
-                    true,
-                )
-            });
+            let Some(models) =
+                project_remote_model_list(&value, "data", false, Some(account_group), false, false)
+            else {
+                continue;
+            };
+            let model_sources = models
+                .iter()
+                .map(|model| {
+                    (
+                        model.id.clone(),
+                        HashSet::from([candidate.source_type.clone()]),
+                    )
+                })
+                .collect();
+            return Some((
+                models,
+                CatalogOwners::with_model_sources(vec![candidate.clone()], model_sources),
+                true,
+            ));
         }
         None
     }
@@ -7482,17 +11447,17 @@ async fn admin_authenticated(headers: &HeaderMap, state: &AppState) -> Result<()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
     else {
-        return Err(ApiError::unauthorized());
+        return Err(ApiError::management_unauthorized());
     };
     let Some((scheme, raw_token)) = value.split_once(' ') else {
-        return Err(ApiError::unauthorized());
+        return Err(ApiError::management_unauthorized());
     };
     if !scheme.eq_ignore_ascii_case("bearer") {
-        return Err(ApiError::unauthorized());
+        return Err(ApiError::management_unauthorized());
     }
     let token = raw_token.trim();
     if token.is_empty() {
-        return Err(ApiError::unauthorized());
+        return Err(ApiError::management_unauthorized());
     }
     if state
         .config
@@ -7503,12 +11468,14 @@ async fn admin_authenticated(headers: &HeaderMap, state: &AppState) -> Result<()
         return Ok(());
     }
     if !state.auth_store.reload().await {
-        return Err(ApiError::unauthorized());
+        return Err(ApiError::management_unauthorized());
     }
     if state.auth_store.accepts_role(token, "admin") {
         Ok(())
+    } else if state.auth_store.accepts(token) {
+        Err(ApiError::management_forbidden())
     } else {
-        Err(ApiError::unauthorized())
+        Err(ApiError::management_unauthorized())
     }
 }
 
@@ -7576,9 +11543,13 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut bytes = Vec::with_capacity(value.len() / 2);
-    for pair in value.as_bytes().chunks_exact(2) {
-        let high = (pair[0] as char).to_digit(16)? as u8;
-        let low = (pair[1] as char).to_digit(16)? as u8;
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for &[high, low] in pairs {
+        let high = (high as char).to_digit(16)? as u8;
+        let low = (low as char).to_digit(16)? as u8;
         bytes.push((high << 4) | low);
     }
     Some(bytes)
@@ -10437,6 +14408,35 @@ where
 }
 
 #[cfg(test)]
+fn absolute_test_temp_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .expect("test temp current directory")
+            .join(path)
+    }
+}
+
+#[cfg(test)]
+fn project_local_test_tmp_dir() -> PathBuf {
+    let path = env::var_os("CHATGPT2API_TEST_TMPDIR")
+        .map(PathBuf::from)
+        .map(absolute_test_temp_path)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("project root above Rust manifest")
+                .join(".local")
+                .join("codex")
+                .join("tmp")
+                .join("rust")
+        });
+    fs::create_dir_all(&path).expect("project-local test temp directory");
+    path
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -10483,6 +14483,70 @@ mod tests {
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("client")
+    }
+
+    #[test]
+    fn settings_redacted_url_projection_matches_python_and_fails_closed() {
+        let cases = [
+            (
+                "http://user:p@ss:%2F@proxy.example:8080",
+                "http://[REDACTED]@proxy.example:8080",
+            ),
+            (
+                "http://user:pass@proxy.example:8080/path?token=secret#fragment",
+                "http://[REDACTED]@proxy.example:8080/path",
+            ),
+            (
+                "http://proxy.example:8080/path?token=secret#fragment",
+                "http://proxy.example:8080/path",
+            ),
+            (
+                "http://user:pass@host/?token=x#f",
+                "http://[REDACTED]@host/",
+            ),
+            ("http://host/?token=x#f", "http://host/"),
+            ("http://user:pass@host?token=x#f", "http://[REDACTED]@host"),
+            ("http://host?token=x#f", "http://host"),
+            (
+                "http://user:pass@[::1]:8080/path?token=secret#fragment",
+                "http://[REDACTED]@[::1]:8080/path",
+            ),
+            ("http://user:p@ss:/%2F@proxy.example:8080", ""),
+            ("http://user:p@ss:/%2F@[::1", ""),
+            ("http://user:pass@proxy.example:bad/path", ""),
+            ("http://user:pass@proxy.example:/path", ""),
+            ("http://host:/path", ""),
+            ("http://user:pass@/path", ""),
+            ("http://user:pass@[::1/path", ""),
+            ("http://@host/path@", ""),
+        ];
+        for (input, expected) in cases {
+            let value = Value::String(input.to_owned());
+            assert_eq!(
+                settings_redacted_config_url(Some(&value)),
+                expected,
+                "unexpected redacted projection for {input}"
+            );
+        }
+
+        let public_cases = [
+            (
+                "http://user:pass@host/?token=x#f",
+                "http://[REDACTED]@host/",
+            ),
+            ("http://host/?token=x#f", "http://host/"),
+            ("http://user:pass@host?token=x#f", "http://[REDACTED]@host"),
+            ("http://host?token=x#f", "http://host"),
+            ("http://@host/path@", ""),
+        ];
+        for (input, expected) in public_cases {
+            let value = Value::String(input.to_owned());
+            assert_eq!(
+                settings_public_config_url(Some(&value)),
+                expected,
+                "unexpected public projection for {input}"
+            );
+        }
     }
 
     fn auth_state(path: &Path) -> AppState {
@@ -10567,6 +14631,14 @@ mod tests {
         }
     }
 
+    struct HealthBlockGuard(Arc<AtomicBool>);
+
+    impl Drop for HealthBlockGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn reset_image_tag_test_state() {
         *IMAGE_TAG_READ_REBIND_HOOK
             .lock()
@@ -10618,19 +14690,33 @@ mod tests {
         }
     }
 
+    fn run_cwd_contract_in_subprocess(test_name: &str) -> bool {
+        const CASE_ENV: &str = "CHATGPT2API_CWD_CONTRACT_SUBPROCESS";
+        if env::var(CASE_ENV).ok().as_deref() == Some(test_name) {
+            return false;
+        }
+
+        let output =
+            std::process::Command::new(env::current_exe().expect("current Rust test executable"))
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .env(CASE_ENV, test_name)
+                .output()
+                .expect("spawn isolated CWD contract");
+        assert!(
+            output.status.success(),
+            "isolated CWD contract failed: {test_name}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     fn test_tmp_dir() -> TestTempRoot {
-        let path = env::var_os("CHATGPT2API_TEST_TMPDIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("..")
-                    .join(".local")
-                    .join("codex")
-                    .join("tmp")
-                    .join("rust")
-            });
-        fs::create_dir_all(&path).expect("project-local test temp directory");
-        TestTempRoot { path }
+        TestTempRoot {
+            path: project_local_test_tmp_dir(),
+        }
     }
 
     fn account_snapshot_path(label: &str) -> PathBuf {
@@ -10644,6 +14730,41 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn account_snapshot_paths_isolate_parent_directory_rebinds() {
+        let test_root = test_tmp_dir();
+        let first = account_snapshot_path("parent-isolation-first");
+        let second = account_snapshot_path("parent-isolation-second");
+        let first_parent = first.parent().expect("first snapshot parent").to_owned();
+        let second_parent = second.parent().expect("second snapshot parent").to_owned();
+
+        assert!(first_parent.starts_with(&test_root.path));
+        assert!(second_parent.starts_with(&test_root.path));
+        assert_ne!(
+            first_parent, second_parent,
+            "tests that rebind a snapshot parent must not move another test's files"
+        );
+
+        fs::write(&first, b"[]").expect("first isolated snapshot");
+        fs::write(&second, b"[]").expect("second isolated snapshot");
+        let moved_first_parent = first_parent.with_extension("rebound");
+        fs::rename(&first_parent, &moved_first_parent).expect("rebind first snapshot parent");
+        assert_eq!(
+            fs::read(&second).expect("second snapshot survives unrelated rebind"),
+            b"[]"
+        );
+
+        fs::remove_dir_all(&moved_first_parent).expect("first isolation cleanup");
+        fs::remove_dir_all(&second_parent).expect("second isolation cleanup");
+    }
+
+    fn test_cleanup_error_is_retryable(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
+        ) || (cfg!(windows) && matches!(error.raw_os_error(), Some(5 | 32 | 33)))
+    }
+
     async fn remove_test_file_after_release(path: &Path) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -10651,15 +14772,29 @@ mod tests {
                 Ok(()) => return,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return,
                 Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::PermissionDenied | io::ErrorKind::WouldBlock
-                    ) && Instant::now() < deadline =>
+                    if test_cleanup_error_is_retryable(&error) && Instant::now() < deadline =>
                 {
                     tokio::task::yield_now().await;
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 Err(error) => panic!("cleanup: {error}"),
+            }
+        }
+    }
+
+    async fn remove_test_directory_after_release(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+                Err(error)
+                    if test_cleanup_error_is_retryable(&error) && Instant::now() < deadline =>
+                {
+                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("directory cleanup for {path:?}: {error}"),
             }
         }
     }
@@ -10698,6 +14833,7 @@ mod tests {
 
     #[tokio::test]
     async fn editable_file_tasks_are_owner_scoped_and_download_capability_bound() {
+        let _rebind_test_serial = HEALTH_TEST_SERIAL.lock().await;
         let root = account_snapshot_path("editable-file-contract");
         let data_dir = root.parent().expect("data parent").to_owned();
         let auth_path = data_dir.join("editable-auth.json");
@@ -10778,6 +14914,17 @@ mod tests {
         })
         .expect("state");
         let app = state.router();
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/editable-file-tasks")
+                    .body(Body::empty())
+                    .expect("unauthenticated editable list request"),
+            )
+            .await
+            .expect("unauthenticated editable list response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
         let list = app
             .clone()
             .oneshot(
@@ -10796,13 +14943,12 @@ mod tests {
         assert!(list_value["items"][0].get("owner_id").is_none());
         assert_eq!(list_value["missing_ids"], json!(["task-secret", "missing"]));
 
+        let download_path = format!("/files/{capability}/{owner_scope}/ppt/task-a/primary.pptx");
         let file = app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
-                    .uri(format!(
-                        "/files/{capability}/{owner_scope}/ppt/task-a/primary.pptx"
-                    ))
+                    .uri(&download_path)
                     .body(Body::empty())
                     .expect("editable download request"),
             )
@@ -10823,7 +14969,86 @@ mod tests {
             .to_bytes();
         assert_eq!(&file_body[..], b"owner-a-ppt");
 
+        let head = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("HEAD")
+                    .uri(&download_path)
+                    .body(Body::empty())
+                    .expect("editable HEAD request"),
+            )
+            .await
+            .expect("editable HEAD response");
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers().get(header::ACCEPT_RANGES),
+            Some(&HeaderValue::from_static("bytes"))
+        );
+        assert_eq!(
+            head.headers().get(header::CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("11"))
+        );
+        assert!(
+            head.into_body()
+                .collect()
+                .await
+                .expect("editable HEAD body")
+                .to_bytes()
+                .is_empty()
+        );
+
+        let range = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(&download_path)
+                    .header(header::RANGE, "bytes=0-5")
+                    .body(Body::empty())
+                    .expect("editable range request"),
+            )
+            .await
+            .expect("editable range response");
+        assert_eq!(range.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            range.headers().get(header::ACCEPT_RANGES),
+            Some(&HeaderValue::from_static("bytes"))
+        );
+        assert_eq!(
+            range.headers().get(header::CONTENT_RANGE),
+            Some(&HeaderValue::from_static("bytes 0-5/11"))
+        );
+        assert_eq!(
+            range.headers().get(header::CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("6"))
+        );
+        let range_body = range
+            .into_body()
+            .collect()
+            .await
+            .expect("editable range body")
+            .to_bytes();
+        assert_eq!(&range_body[..], b"owner-");
+
+        let unsatisfiable = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(&download_path)
+                    .header(header::RANGE, "bytes=99-100")
+                    .body(Body::empty())
+                    .expect("editable unsatisfiable range request"),
+            )
+            .await
+            .expect("editable unsatisfiable range response");
+        assert_eq!(unsatisfiable.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            unsatisfiable.headers().get(header::CONTENT_RANGE),
+            Some(&HeaderValue::from_static("bytes */11"))
+        );
+
         let wrong_capability = app
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .uri(format!(
@@ -10835,6 +15060,48 @@ mod tests {
             .await
             .expect("wrong capability response");
         assert_eq!(wrong_capability.status(), StatusCode::NOT_FOUND);
+
+        let target = output_dir.join("primary.pptx");
+        let (rebind_guard, fires) =
+            install_validated_file_rebind_test_hook(target, b"rebound-ppt".to_vec());
+        let rebound = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(&download_path)
+                    .body(Body::empty())
+                    .expect("rebound editable download request"),
+            )
+            .await
+            .expect("rebound editable download response");
+        assert_eq!(rebound.status(), StatusCode::NOT_FOUND);
+        assert_eq!(fires.load(Ordering::SeqCst), 1);
+        drop(rebind_guard);
+
+        let corrupt_canary = "opaque-editable-corrupt-canary";
+        fs::write(
+            data_dir.join("editable_file_tasks.json"),
+            format!("{{\"tasks\":[\"{corrupt_canary}\"]}}"),
+        )
+        .expect("corrupt editable task snapshot");
+        let corrupt = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/editable-file-tasks")
+                    .header(header::AUTHORIZATION, format!("Bearer {user_key}"))
+                    .body(Body::empty())
+                    .expect("corrupt editable list request"),
+            )
+            .await
+            .expect("corrupt editable list response");
+        assert_eq!(corrupt.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let corrupt_public = json_response(corrupt).await;
+        assert_eq!(corrupt_public["error"]["code"], "upstream_unavailable");
+        assert!(
+            !serde_json::to_string(&corrupt_public)
+                .expect("serialize public corrupt response")
+                .contains(corrupt_canary)
+        );
         for path in [
             auth_path,
             account_path,
@@ -10843,6 +15110,1588 @@ mod tests {
             let _ = fs::remove_file(path);
         }
         let _ = fs::remove_dir_all(data_dir.join("files"));
+    }
+
+    #[tokio::test]
+    async fn native_editable_submission_is_bounded_idempotent_and_fails_closed() {
+        let root = account_snapshot_path("native-editable-submission").with_extension("dir");
+        fs::create_dir_all(&root).expect("editable submission test root");
+        let account_path = root.join("accounts.json");
+        fs::write(&account_path, "[]\n").expect("empty account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin-key".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: Some("http://127.0.0.1:9".to_owned()),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("editable submission state");
+
+        async fn submit(state: &AppState, endpoint: &str, payload: Value) -> Response {
+            state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(endpoint)
+                        .header(header::AUTHORIZATION, "Bearer admin-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .expect("editable submission request"),
+                )
+                .await
+                .expect("editable submission response")
+        }
+
+        let prompt_canary = "private editable prompt must not be persisted";
+        let response = submit(
+            &state,
+            "/v1/ppt/generations",
+            json!({
+                "client_task_id": "ppt-no-account",
+                "prompt": prompt_canary,
+                "base64_images": [],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let queued = json_response(response).await;
+        assert_eq!(queued["id"], "ppt-no-account");
+        assert_eq!(queued["taskId"], "ppt-no-account");
+        assert_eq!(queued["kind"], "ppt");
+        assert_eq!(queued["status"], "queued");
+
+        let mut terminal = Value::Null;
+        for _ in 0..100 {
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/editable-file-tasks?ids=ppt-no-account")
+                        .header(header::AUTHORIZATION, "Bearer admin-key")
+                        .body(Body::empty())
+                        .expect("editable status request"),
+                )
+                .await
+                .expect("editable status response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let payload = json_response(response).await;
+            terminal = payload["items"][0].clone();
+            if terminal["status"] == "error" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(terminal["status"], "error");
+        assert_eq!(terminal["error"], "editable file task failed");
+
+        let duplicate = submit(
+            &state,
+            "/v1/ppt/generations",
+            json!({"client_task_id":"ppt-no-account","prompt":"different secret"}),
+        )
+        .await;
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate = json_response(duplicate).await;
+        assert_eq!(duplicate["status"], "error");
+        assert_eq!(duplicate["error"], "editable file task failed");
+
+        let empty_psd = submit(
+            &state,
+            "/v1/psd/generations",
+            json!({"client_task_id":"psd-empty","prompt":"split this","base64_images":[]}),
+        )
+        .await;
+        assert_eq!(empty_psd.status(), StatusCode::OK);
+        assert_eq!(json_response(empty_psd).await["status"], "queued");
+
+        for payload in [
+            json!({"client_task_id":"task,comma"}),
+            json!({"client_task_id":"x".repeat(257)}),
+            json!({"client_task_id":"too-many-images","base64_images":vec!["AA=="; 17]}),
+        ] {
+            let invalid = submit(&state, "/v1/ppt/generations", payload).await;
+            assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        let unsafe_id = submit(
+            &state,
+            "/v1/ppt/generations",
+            json!({"client_task_id":"../outside"}),
+        )
+        .await;
+        assert_eq!(unsafe_id.status(), StatusCode::BAD_REQUEST);
+
+        let snapshot = fs::read_to_string(root.join("editable_file_tasks.json"))
+            .expect("editable task snapshot");
+        assert!(!snapshot.contains(prompt_canary));
+        assert!(!snapshot.contains("different secret"));
+        let snapshot_value: Value = serde_json::from_str(&snapshot).expect("task snapshot json");
+        assert_eq!(snapshot_value["tasks"].as_array().map(Vec::len), Some(2));
+        assert_eq!(state.account_store.inflight(), 0);
+
+        state.account_type_catalog.shutdown().await;
+        fs::remove_dir_all(root).expect("editable submission cleanup");
+    }
+
+    #[tokio::test]
+    async fn editable_restart_recovers_only_unfinished_tasks_without_losing_sidecar_writes() {
+        let root = account_snapshot_path("editable-restart-recovery").with_extension("dir");
+        fs::create_dir_all(&root).expect("editable recovery test root");
+        let account_path = root.join("accounts.json");
+        let auth_path = root.join("auth.json");
+        let task_path = root.join("editable_file_tasks.json");
+        fs::write(&account_path, "[]\n").expect("empty recovery account snapshot");
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&json!({
+                "items": [
+                    {
+                        "id": "owner-a",
+                        "name": "Owner A",
+                        "role": "user",
+                        "enabled": true,
+                        "key_hash": auth_key_hash("owner-a-key")
+                    },
+                    {
+                        "id": "owner-b",
+                        "name": "Owner B",
+                        "role": "user",
+                        "enabled": true,
+                        "key_hash": auth_key_hash("owner-b-key")
+                    }
+                ]
+            }))
+            .expect("recovery auth json"),
+        )
+        .expect("recovery auth snapshot");
+        let config = || AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin-key".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: Some("http://127.0.0.1:9".to_owned()),
+            upstream_auth: None,
+            auth_keys_path: Some(auth_path.clone()),
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        };
+
+        // This state represents an already-running Python/Rust sidecar.  The
+        // crash snapshot is installed only after it starts, so only the fresh
+        // state below is allowed to perform restart recovery.
+        let sidecar_result = AppState::new(config());
+        let sidecar = sidecar_result.expect("sidecar state");
+        let (worker_exit_reached, release_worker_exit) =
+            sidecar.editable_workers.hold_next_completion_for_test();
+        let queued_secret = "queued prompt must be removed";
+        let running_secret = "running images must be removed";
+        let terminal_secret = "terminal prompt must also be removed";
+        fs::write(
+            &task_path,
+            serde_json::to_vec_pretty(&json!({
+                "tasks": [
+                    {
+                        "id": "queued-a",
+                        "owner_id": "owner-a",
+                        "status": "queued",
+                        "kind": "ppt",
+                        "model": "gpt-5-5-thinking",
+                        "created_at": "2026-08-22 12:00:00",
+                        "updated_at": "2026-08-22 12:00:00",
+                        "created_ts": 10.0,
+                        "updated_ts": 10.0,
+                        "prompt": queued_secret
+                    },
+                    {
+                        "id": "running-b",
+                        "owner_id": "owner-b",
+                        "status": "running",
+                        "kind": "psd",
+                        "model": "gpt-5-5-thinking",
+                        "created_at": "2026-08-22 12:00:00",
+                        "updated_at": "2026-08-22 12:00:01",
+                        "created_ts": 20.0,
+                        "updated_ts": 21.0,
+                        "started_ts": 21.0,
+                        "base64_images": [running_secret]
+                    },
+                    {
+                        "id": "success-a",
+                        "owner_id": "owner-a",
+                        "status": "success",
+                        "kind": "ppt",
+                        "model": "gpt-5-5-thinking",
+                        "created_at": "2026-08-22 12:00:00",
+                        "updated_at": "2026-08-22 12:00:02",
+                        "created_ts": 30.0,
+                        "updated_ts": 32.0,
+                        "started_ts": 31.0,
+                        "ended_ts": 32.0,
+                        "result": {"conversation_id": "conversation-success"},
+                        "prompt": terminal_secret
+                    },
+                    {
+                        "id": "error-b",
+                        "owner_id": "owner-b",
+                        "status": "error",
+                        "kind": "psd",
+                        "model": "gpt-5-5-thinking",
+                        "created_at": "2026-08-22 12:00:00",
+                        "updated_at": "2026-08-22 12:00:03",
+                        "created_ts": 40.0,
+                        "updated_ts": 43.0,
+                        "started_ts": 41.0,
+                        "ended_ts": 43.0,
+                        "error": "PSD 任务需要至少一张图片"
+                    }
+                ]
+            }))
+            .expect("recovery task json"),
+        )
+        .expect("recovery task snapshot");
+
+        let fresh_config = config();
+        let fresh_task = tokio::task::spawn_blocking(move || AppState::new(fresh_config));
+        let sidecar_response = sidecar
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/ppt/generations")
+                    .header(header::AUTHORIZATION, "Bearer admin-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "client_task_id": "sidecar-task",
+                            "prompt": "sidecar prompt must not be persisted"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("sidecar editable request"),
+            )
+            .await
+            .expect("sidecar editable response");
+        assert_eq!(sidecar_response.status(), StatusCode::OK);
+        let fresh_result = fresh_task.await.expect("fresh state join");
+        let fresh = fresh_result.expect("fresh state recovery");
+
+        let mut sidecar_terminal = false;
+        for _ in 0..100 {
+            let records = read_editable_task_records(&fresh).expect("recovered task records");
+            sidecar_terminal = records.iter().any(|value| {
+                value["record"]["id"] == "sidecar-task" && value["record"]["status"] == "error"
+            });
+            if sidecar_terminal {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(sidecar_terminal, "sidecar task reaches a terminal state");
+        tokio::time::timeout(Duration::from_secs(2), worker_exit_reached.notified())
+            .await
+            .expect("terminal worker reaches its explicit completion barrier");
+        assert_eq!(
+            sidecar.editable_workers.active_for_test(),
+            1,
+            "persisted terminal state must not be confused with worker completion"
+        );
+
+        let persisted_text = fs::read_to_string(&task_path).expect("recovered snapshot text");
+        for secret in [
+            queued_secret,
+            running_secret,
+            terminal_secret,
+            "sidecar prompt",
+        ] {
+            assert!(!persisted_text.contains(secret));
+        }
+        let persisted: Value = serde_json::from_str(&persisted_text).expect("recovered snapshot");
+        let tasks = persisted["tasks"].as_array().expect("recovered task array");
+        assert_eq!(tasks.len(), 5, "sidecar revision must not be lost");
+        let task = |id: &str| {
+            tasks
+                .iter()
+                .find(|task| task["id"] == id)
+                .unwrap_or_else(|| panic!("missing recovered task {id}"))
+        };
+        for id in ["queued-a", "running-b"] {
+            let recovered = task(id);
+            assert_eq!(recovered["status"], "error");
+            assert_eq!(recovered["error"], "服务已重启，未完成的任务已中断");
+            assert!(
+                recovered["ended_ts"]
+                    .as_f64()
+                    .is_some_and(|value| value > 43.0)
+            );
+            assert!(
+                recovered["updated_ts"]
+                    .as_f64()
+                    .is_some_and(|value| value > 43.0)
+            );
+            assert_ne!(recovered["updated_at"], "2026-08-22 12:00:00");
+        }
+        assert_eq!(task("success-a")["status"], "success");
+        assert_eq!(
+            task("success-a")["result"]["conversation_id"],
+            "conversation-success"
+        );
+        assert_eq!(task("success-a")["ended_ts"], 32.0);
+        assert_eq!(task("error-b")["status"], "error");
+        assert_eq!(task("error-b")["error"], "PSD 任务需要至少一张图片");
+        assert_eq!(task("error-b")["ended_ts"], 43.0);
+
+        async fn owner_items(state: &AppState, key: &str) -> Vec<Value> {
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/editable-file-tasks")
+                        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .expect("owner recovery list request"),
+                )
+                .await
+                .expect("owner recovery list response");
+            assert_eq!(response.status(), StatusCode::OK);
+            json_response(response).await["items"]
+                .as_array()
+                .expect("owner recovery items")
+                .clone()
+        }
+        let owner_a = owner_items(&fresh, "owner-a-key").await;
+        let owner_b = owner_items(&fresh, "owner-b-key").await;
+        assert_eq!(
+            owner_a
+                .iter()
+                .filter_map(|task| task["id"].as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["queued-a", "success-a"])
+        );
+        assert_eq!(
+            owner_b
+                .iter()
+                .filter_map(|task| task["id"].as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["running-b", "error-b"])
+        );
+        assert_eq!(fresh.account_store.inflight(), 0);
+        assert_eq!(sidecar.account_store.inflight(), 0);
+
+        fresh.account_type_catalog.shutdown().await;
+        sidecar.account_type_catalog.shutdown().await;
+        let worker_tracker = sidecar.editable_workers.clone();
+        drop(fresh);
+        drop(sidecar);
+        let first_cleanup = fs::remove_dir_all(&root);
+        if let Err(error) = &first_cleanup {
+            assert!(
+                test_cleanup_error_is_retryable(error),
+                "unexpected pre-completion cleanup error: {error}"
+            );
+        }
+        release_worker_exit.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), worker_tracker.wait_for_idle())
+            .await
+            .expect("editable worker completion");
+        assert_eq!(worker_tracker.active_for_test(), 0);
+        worker_tracker.shutdown().await;
+        remove_test_directory_after_release(&root).await;
+    }
+
+    #[tokio::test]
+    async fn editable_restart_recovery_write_failure_aborts_startup_without_partial_state() {
+        let root = account_snapshot_path("editable-recovery-write-failure").with_extension("dir");
+        fs::create_dir_all(&root).expect("editable recovery failure root");
+        let account_path = root.join("accounts.json");
+        let task_path = root.join("editable_file_tasks.json");
+        fs::write(&account_path, "[]\n").expect("empty recovery failure accounts");
+        let original = serde_json::to_vec_pretty(&json!({
+            "tasks": [{
+                "id": "interrupted",
+                "owner_id": "owner-a",
+                "status": "running",
+                "kind": "ppt",
+                "model": "gpt-5-5-thinking",
+                "created_at": "2026-08-22 12:00:00",
+                "updated_at": "2026-08-22 12:00:01",
+                "created_ts": 1.0,
+                "updated_ts": 2.0,
+                "started_ts": 2.0
+            }]
+        }))
+        .expect("recovery failure task json");
+        fs::write(&task_path, &original).expect("recovery failure task snapshot");
+
+        let _failure_hook = editable_file_generation::fail_next_recovery_write_for_test(
+            &task_path,
+            "editable-recovery-write-failure",
+        );
+        let result = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin-key".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        });
+        assert!(matches!(result, Err(AppInitError::EditableTaskSnapshot)));
+        assert_eq!(
+            fs::read(&task_path).expect("unchanged recovery failure snapshot"),
+            original
+        );
+        assert!(
+            !fs::read_to_string(&task_path)
+                .expect("unchanged recovery failure text")
+                .contains("服务已重启，未完成的任务已中断")
+        );
+
+        fs::remove_dir_all(root).expect("editable recovery failure cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn editable_recovery_failure_injection_is_scoped_to_exact_task_path() {
+        let root_a = account_snapshot_path("editable-recovery-scoped-a").with_extension("dir");
+        let root_b = account_snapshot_path("editable-recovery-scoped-b").with_extension("dir");
+        fs::create_dir_all(&root_a).expect("scoped recovery root a");
+        fs::create_dir_all(&root_b).expect("scoped recovery root b");
+        let task_a = root_a.join("editable_file_tasks.json");
+        let task_b = root_b.join("editable_file_tasks.json");
+        let task_bytes = |id: &str| {
+            serde_json::to_vec(&json!({
+                "tasks": [{
+                    "id": id,
+                    "owner_id": "owner-a",
+                    "status": "running",
+                    "kind": "ppt",
+                    "model": "gpt-5-5-thinking",
+                    "created_at": "2026-08-22 12:00:00",
+                    "updated_at": "2026-08-22 12:00:01",
+                    "created_ts": 1.0,
+                    "updated_ts": 2.0,
+                    "started_ts": 2.0
+                }]
+            }))
+            .expect("scoped recovery task json")
+        };
+        let original_a = task_bytes("scoped-a");
+        let original_b = task_bytes("scoped-b");
+        fs::write(&task_a, &original_a).expect("scoped recovery task a");
+        fs::write(&task_b, &original_b).expect("scoped recovery task b");
+        let _hook_a =
+            editable_file_generation::fail_next_recovery_write_for_test(&task_a, "scoped-a");
+        let _hook_b =
+            editable_file_generation::fail_next_recovery_write_for_test(&task_b, "scoped-b");
+        let (result_a, result_b) = tokio::join!(
+            tokio::task::spawn_blocking({
+                let root_a = root_a.clone();
+                move || editable_file_generation::recover_unfinished(&root_a)
+            }),
+            tokio::task::spawn_blocking({
+                let root_b = root_b.clone();
+                move || editable_file_generation::recover_unfinished(&root_b)
+            }),
+        );
+        assert!(result_a.expect("scoped recovery a join").is_err());
+        assert!(result_b.expect("scoped recovery b join").is_err());
+        assert_eq!(
+            fs::read(&task_a).expect("scoped recovery task a bytes"),
+            original_a
+        );
+        assert_eq!(
+            fs::read(&task_b).expect("scoped recovery task b bytes"),
+            original_b
+        );
+        fs::remove_dir_all(root_a).expect("scoped recovery root a cleanup");
+        fs::remove_dir_all(root_b).expect("scoped recovery root b cleanup");
+    }
+
+    #[tokio::test]
+    async fn cwd_switch_cross_pressure_native_ppt_task_holds_real_web_lease_until_artifacts_are_persisted()
+     {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("editable upstream listener");
+        let address = listener.local_addr().expect("editable upstream address");
+        let run_started = Arc::new(Notify::new());
+        let release_run = Arc::new(Notify::new());
+        let artifacts_served = Arc::new(Notify::new());
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let prepare_payload = Arc::new(Mutex::new(Value::Null));
+        let run_payload = Arc::new(Mutex::new(Value::Null));
+        let upstream = {
+            let calls = calls.clone();
+            let prepare_payload = prepare_payload.clone();
+            let run_payload = run_payload.clone();
+            let run_started = run_started.clone();
+            let release_run = release_run.clone();
+            let artifacts_served = artifacts_served.clone();
+            tokio::spawn(async move {
+                let root_calls = calls.clone();
+                let root = get(move |headers: HeaderMap| {
+                    let calls = root_calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("OAI-Client-Version")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("prod-bede35f9dcd856d080e012478f0c1031faa2588e")
+                        );
+                        calls.lock().await.push("bootstrap".to_owned());
+                        Html("<html></html>")
+                    }
+                });
+                let requirements_prepare_calls = calls.clone();
+                let requirements_prepare = post(move |headers: HeaderMap| {
+                    let calls = requirements_prepare_calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("OAI-Client-Version")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("prod-bede35f9dcd856d080e012478f0c1031faa2588e")
+                        );
+                        calls.lock().await.push("requirements_prepare".to_owned());
+                        Json(json!({"prepare_token":"prepare-token"}))
+                    }
+                });
+                let requirements_finalize_calls = calls.clone();
+                let requirements_finalize = post(move |headers: HeaderMap| {
+                    let calls = requirements_finalize_calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("OAI-Client-Build-Number")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("6631702")
+                        );
+                        calls.lock().await.push("requirements_finalize".to_owned());
+                        Json(json!({"token":"requirements-token"}))
+                    }
+                });
+                let prepare_calls = calls.clone();
+                let prepare_capture = prepare_payload.clone();
+                let prepare = post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let calls = prepare_calls.clone();
+                    let capture = prepare_capture.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Bearer editable-pro-web")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("OAI-Client-Version")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("prod-bede35f9dcd856d080e012478f0c1031faa2588e")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("ChatGPT-Account-ID")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("acct-editable-pro")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("X-Conduit-Token")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("no-token")
+                        );
+                        for name in ["X-OpenAI-Target-Path", "X-OpenAI-Target-Route"] {
+                            assert_eq!(
+                                headers.get(name).and_then(|value| value.to_str().ok()),
+                                Some("/backend-api/f/conversation/prepare")
+                            );
+                        }
+                        calls.lock().await.push("prepare".to_owned());
+                        *capture.lock().await = payload;
+                        Json(json!({"conduit_token":"editable-conduit"}))
+                    }
+                });
+                let run_calls = calls.clone();
+                let run_capture = run_payload.clone();
+                let run_started_handler = run_started.clone();
+                let release_run_handler = release_run.clone();
+                let run = post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let calls = run_calls.clone();
+                    let capture = run_capture.clone();
+                    let started = run_started_handler.clone();
+                    let release = release_run_handler.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Bearer editable-pro-web")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("X-Conduit-Token")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("editable-conduit")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("ChatGPT-Account-ID")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("acct-editable-pro")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("OpenAI-Sentinel-Chat-Requirements-Token")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("requirements-token")
+                        );
+                        for name in ["X-OpenAI-Target-Path", "X-OpenAI-Target-Route"] {
+                            assert_eq!(
+                                headers.get(name).and_then(|value| value.to_str().ok()),
+                                Some("/backend-api/f/conversation")
+                            );
+                        }
+                        calls.lock().await.push("run".to_owned());
+                        *capture.lock().await = payload;
+                        started.notify_one();
+                        release.notified().await;
+                        (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from(
+                                "data: {\"conversation_id\":\"editable-conversation\"}\n\n\
+                                 data: [DONE]\n\n",
+                            ),
+                        )
+                            .into_response()
+                    }
+                });
+                let poll_calls = calls.clone();
+                let poll = get(
+                    move |headers: HeaderMap, AxumPath(conversation_id): AxumPath<String>| {
+                        let calls = poll_calls.clone();
+                        async move {
+                            assert_eq!(conversation_id, "editable-conversation");
+                            assert_eq!(
+                                headers
+                                    .get(header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("Bearer editable-pro-web")
+                            );
+                            assert_eq!(
+                                headers
+                                    .get("ChatGPT-Account-ID")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("acct-editable-pro")
+                            );
+                            assert_eq!(
+                                headers
+                                    .get("X-OpenAI-Target-Route")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("/backend-api/conversation/{conversation_id}")
+                            );
+                            calls.lock().await.push("poll".to_owned());
+                            Json(json!({
+                                "mapping": {
+                                    "assistant": {
+                                        "message": {
+                                            "id": "editable-message",
+                                            "author": {"role":"assistant"},
+                                            "create_time": 100.0,
+                                            "content": {
+                                                "content_type":"text",
+                                                "parts":["sandbox:/mnt/data/deck.pptx"]
+                                            },
+                                            "metadata": {"attachments": [
+                                                {
+                                                    "id":"file-assets",
+                                                    "file_id":"file-assets",
+                                                    "name":"assets.zip",
+                                                    "mime_type":"application/zip"
+                                                }
+                                            ]}
+                                        }
+                                    }
+                                }
+                            }))
+                        }
+                    },
+                );
+                let interpreter_calls = calls.clone();
+                let interpreter = get(
+                    move |headers: HeaderMap,
+                          AxumPath(conversation_id): AxumPath<String>,
+                          Query(query): Query<HashMap<String, String>>| {
+                        let calls = interpreter_calls.clone();
+                        async move {
+                            assert_eq!(conversation_id, "editable-conversation");
+                            assert_eq!(
+                                query.get("message_id").map(String::as_str),
+                                Some("editable-message")
+                            );
+                            assert_eq!(
+                                query.get("sandbox_path").map(String::as_str),
+                                Some("/mnt/data/deck.pptx")
+                            );
+                            assert_eq!(
+                                headers
+                                    .get(header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("Bearer editable-pro-web")
+                            );
+                            assert_eq!(
+                                headers
+                                    .get("ChatGPT-Account-ID")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("acct-editable-pro")
+                            );
+                            assert_eq!(
+                                headers
+                                    .get("X-OpenAI-Target-Route")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some(
+                                    "/backend-api/conversation/{conversation_id}/interpreter/download"
+                                )
+                            );
+                            calls.lock().await.push("interpreter:deck.pptx".to_owned());
+                            Json(json!({
+                                "download_url":format!("http://{address}/artifact/file-deck")
+                            }))
+                        }
+                    },
+                );
+                let metadata_calls = calls.clone();
+                let metadata =
+                    get(
+                        move |headers: HeaderMap,
+                              AxumPath((conversation_id, artifact_id)): AxumPath<(
+                            String,
+                            String,
+                        )>| {
+                            let calls = metadata_calls.clone();
+                            async move {
+                                assert_eq!(conversation_id, "editable-conversation");
+                                assert_eq!(artifact_id, "file-assets");
+                                assert_eq!(
+                                    headers
+                                        .get(header::AUTHORIZATION)
+                                        .and_then(|value| value.to_str().ok()),
+                                    Some("Bearer editable-pro-web")
+                                );
+                                assert_eq!(
+                                    headers
+                                        .get("ChatGPT-Account-ID")
+                                        .and_then(|value| value.to_str().ok()),
+                                    Some("acct-editable-pro")
+                                );
+                                assert_eq!(
+                                    headers
+                                        .get("X-OpenAI-Target-Route")
+                                        .and_then(|value| value.to_str().ok()),
+                                    Some(
+                                        "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
+                                    )
+                                );
+                                calls.lock().await.push(format!("metadata:{artifact_id}"));
+                                Json(json!({
+                                    "download_url": format!("http://{address}/artifact/{artifact_id}")
+                                }))
+                            }
+                        },
+                    );
+                let artifact_calls = calls.clone();
+                let artifact_complete = artifacts_served.clone();
+                let artifact = get(
+                    move |headers: HeaderMap, AxumPath(artifact_id): AxumPath<String>| {
+                        let calls = artifact_calls.clone();
+                        let complete = artifact_complete.clone();
+                        async move {
+                            assert!(headers.get(header::AUTHORIZATION).is_none());
+                            calls.lock().await.push(format!("download:{artifact_id}"));
+                            if artifact_id == "file-assets" {
+                                complete.notify_one();
+                            }
+                            match artifact_id.as_str() {
+                            "file-deck" => (
+                                [(header::CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.presentationml.presentation")],
+                                b"editable-pptx".as_slice(),
+                            )
+                                .into_response(),
+                            "file-assets" => (
+                                [(header::CONTENT_TYPE, "application/zip")],
+                                b"editable-zip".as_slice(),
+                            )
+                                .into_response(),
+                            _ => StatusCode::NOT_FOUND.into_response(),
+                        }
+                        }
+                    },
+                );
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/", root)
+                        .route(
+                            "/backend-api/sentinel/chat-requirements/prepare",
+                            requirements_prepare,
+                        )
+                        .route(
+                            "/backend-api/sentinel/chat-requirements/finalize",
+                            requirements_finalize,
+                        )
+                        .route("/backend-api/f/conversation/prepare", prepare)
+                        .route("/backend-api/f/conversation", run)
+                        .route("/backend-api/conversation/{conversation_id}", poll)
+                        .route(
+                            "/backend-api/conversation/{conversation_id}/interpreter/download",
+                            interpreter,
+                        )
+                        .route(
+                            "/backend-api/conversation/{conversation_id}/attachment/{artifact_id}/download",
+                            metadata,
+                        )
+                        .route("/artifact/{artifact_id}", artifact),
+                )
+                .await
+                .expect("editable upstream server");
+            })
+        };
+
+        let root = account_snapshot_path("native-ppt-upstream").with_extension("dir");
+        fs::create_dir_all(&root).expect("native ppt test root");
+        let account_path = root.join("accounts.json");
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"wrong-free-web","status":"正常","source_type":"web","type":"free"},
+                {"access_token":"wrong-plus-codex","status":"正常","source_type":"codex","type":"plus"},
+                {"access_token":"editable-pro-web","chatgpt_account_id":"acct-editable-pro","status":"正常","source_type":"web","type":"pro"}
+            ]"#,
+        )
+        .expect("native ppt accounts");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-5-5-thinking".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("native ppt state");
+        let user_prompt = "private user deck requirement";
+        let submitted = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/ppt/generations")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "client_task_id":"real-ppt",
+                            "prompt":user_prompt,
+                            "base64_images":[]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("native ppt request"),
+            )
+            .await
+            .expect("native ppt response");
+        assert_eq!(submitted.status(), StatusCode::OK);
+        assert_eq!(json_response(submitted).await["status"], "queued");
+
+        tokio::time::timeout(Duration::from_secs(2), run_started.notified())
+            .await
+            .expect("editable run reached upstream");
+        assert_eq!(state.account_store.inflight(), 1);
+        let running = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/editable-file-tasks?ids=real-ppt")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .body(Body::empty())
+                    .expect("native ppt running query"),
+            )
+            .await
+            .expect("native ppt running response");
+        assert_eq!(
+            json_response(running).await["items"][0]["status"],
+            "running"
+        );
+        assert!(
+            !fs::read_to_string(root.join("editable_file_tasks.json"))
+                .expect("native ppt running snapshot")
+                .contains(user_prompt)
+        );
+        let task_path = root.join("editable_file_tasks.json");
+        let terminal_write_lock = acquire_path_write_lock(&task_path)
+            .await
+            .expect("block editable terminal snapshot publication");
+        release_run.notify_one();
+        if tokio::time::timeout(Duration::from_secs(2), artifacts_served.notified())
+            .await
+            .is_err()
+        {
+            let observed_calls = calls.lock().await.clone();
+            let observed_cwd = env::current_dir().expect("editable failure cwd");
+            panic!(
+                "editable artifacts were not both served; calls={observed_calls:?}; cwd={observed_cwd:?}; root={root:?}; task_path={task_path:?}"
+            );
+        }
+
+        let owner_scope = Sha256::digest(b"admin")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let output_dir = root
+            .join("files")
+            .join(owner_scope)
+            .join("ppt")
+            .join("real-ppt");
+        let primary_path = output_dir.join("deck.pptx");
+        let zip_path = output_dir.join("assets.zip");
+        let artifacts_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if fs::read(&primary_path).ok().as_deref() == Some(b"editable-pptx")
+                && fs::read(&zip_path).ok().as_deref() == Some(b"editable-zip")
+            {
+                break;
+            }
+            if Instant::now() >= artifacts_deadline {
+                let observed_calls = calls.lock().await.clone();
+                let snapshot = fs::read_to_string(&task_path).unwrap_or_default();
+                panic!(
+                    "both editable artifacts must be atomically downloaded before terminal publication; calls={observed_calls:?}; snapshot={snapshot}"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state.account_store.inflight(), 1);
+        let blocked = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/editable-file-tasks?ids=real-ppt")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .body(Body::empty())
+                    .expect("blocked terminal query"),
+            )
+            .await
+            .expect("blocked terminal response");
+        let blocked = json_response(blocked).await["items"][0].clone();
+        assert_eq!(blocked["status"], "running");
+        assert!(blocked.get("result").is_none());
+        let blocked_snapshot = fs::read_to_string(&task_path).expect("blocked terminal snapshot");
+        assert!(!blocked_snapshot.contains("result"));
+        assert!(!blocked_snapshot.contains("download_capability_hashes"));
+        assert!(!blocked_snapshot.contains(user_prompt));
+        assert!(!blocked_snapshot.contains("base64_images"));
+        assert_eq!(
+            calls.lock().await.as_slice(),
+            [
+                "prepare",
+                "bootstrap",
+                "requirements_prepare",
+                "requirements_finalize",
+                "run",
+                "poll",
+                "interpreter:deck.pptx",
+                "download:file-deck",
+                "metadata:file-assets",
+                "download:file-assets",
+            ]
+        );
+        drop(terminal_write_lock);
+
+        let mut terminal = Value::Null;
+        for _ in 0..200 {
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/editable-file-tasks?ids=real-ppt")
+                        .header(header::AUTHORIZATION, "Bearer client")
+                        .body(Body::empty())
+                        .expect("native ppt terminal query"),
+                )
+                .await
+                .expect("native ppt terminal response");
+            terminal = json_response(response).await["items"][0].clone();
+            if matches!(terminal["status"].as_str(), Some("success" | "error")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(terminal["status"], "success", "terminal={terminal}");
+        assert_eq!(
+            terminal["result"]["conversation_id"],
+            "editable-conversation"
+        );
+        let primary_url = terminal["result"]["primary_url"]
+            .as_str()
+            .expect("native ppt primary url");
+        let zip_url = terminal["result"]["zip_url"]
+            .as_str()
+            .expect("native ppt zip url");
+        for (url, expected) in [
+            (primary_url, b"editable-pptx".as_slice()),
+            (zip_url, b"editable-zip".as_slice()),
+        ] {
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(url)
+                        .body(Body::empty())
+                        .expect("native ppt artifact request"),
+                )
+                .await
+                .expect("native ppt artifact response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("native ppt artifact body")
+                    .to_bytes(),
+                expected
+            );
+        }
+        assert_eq!(state.account_store.inflight(), 0);
+        assert!(
+            state
+                .account_store
+                .last_used_at("editable-pro-web")
+                .is_some()
+        );
+        assert!(state.account_store.last_used_at("wrong-free-web").is_none());
+        assert!(
+            state
+                .account_store
+                .last_used_at("wrong-plus-codex")
+                .is_none()
+        );
+        let prepare_payload = prepare_payload.lock().await.clone();
+        assert_eq!(prepare_payload["model"], "gpt-5-5-thinking");
+        assert_eq!(prepare_payload["thinking_effort"], "extended");
+        assert!(
+            prepare_payload["partial_query"]["content"]["parts"][0]
+                .as_str()
+                .is_some_and(
+                    |prompt| prompt.contains(user_prompt) && prompt.contains("可以编辑的PPT")
+                )
+        );
+        let run_payload = run_payload.lock().await.clone();
+        assert_eq!(run_payload["model"], "gpt-5-5-thinking");
+        assert_eq!(run_payload["thinking_effort"], "extended");
+        assert_eq!(
+            calls.lock().await.as_slice(),
+            [
+                "prepare",
+                "bootstrap",
+                "requirements_prepare",
+                "requirements_finalize",
+                "run",
+                "poll",
+                "interpreter:deck.pptx",
+                "download:file-deck",
+                "metadata:file-assets",
+                "download:file-assets",
+            ]
+        );
+
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        fs::remove_dir_all(root).expect("native ppt cleanup");
+    }
+
+    #[tokio::test]
+    async fn cwd_switch_cross_pressure_native_psd_task_uploads_library_image_and_persists_both_artifacts()
+     {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("editable psd upstream listener");
+        let address = listener
+            .local_addr()
+            .expect("editable psd upstream address");
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("editable psd PNG");
+        let upstream = {
+            let calls = calls.clone();
+            let expected_image = image_bytes.clone();
+            tokio::spawn(async move {
+                let bootstrap_calls = calls.clone();
+                let bootstrap = get(move |headers: HeaderMap| {
+                    let calls = bootstrap_calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("OAI-Client-Version")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("prod-bede35f9dcd856d080e012478f0c1031faa2588e")
+                        );
+                        calls.lock().await.push("bootstrap".to_owned());
+                        Html("<html></html>")
+                    }
+                });
+                let prepare_requirement_calls = calls.clone();
+                let prepare_requirement = post(move |headers: HeaderMap| {
+                    let calls = prepare_requirement_calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("OAI-Client-Build-Number")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("6631702")
+                        );
+                        calls.lock().await.push("requirements_prepare".to_owned());
+                        Json(json!({"prepare_token":"prepare-token"}))
+                    }
+                });
+                let finalize_requirement_calls = calls.clone();
+                let finalize_requirement = post(move || {
+                    let calls = finalize_requirement_calls.clone();
+                    async move {
+                        calls.lock().await.push("requirements_finalize".to_owned());
+                        Json(json!({"token":"requirements-token"}))
+                    }
+                });
+                let upload_calls = calls.clone();
+                let upload = post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let calls = upload_calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("Bearer editable-team-web")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("ChatGPT-Account-ID")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("acct-editable-team")
+                        );
+                        for name in ["X-OpenAI-Target-Path", "X-OpenAI-Target-Route"] {
+                            assert_eq!(
+                                headers.get(name).and_then(|value| value.to_str().ok()),
+                                Some("/backend-api/files")
+                            );
+                        }
+                        assert_eq!(payload["file_name"], "image_1.png");
+                        assert_eq!(payload["file_size"], 68);
+                        assert_eq!(payload["use_case"], "multimodal");
+                        assert_eq!(payload["store_in_library"], true);
+                        assert_eq!(payload["library_persistence_mode"], "opportunistic");
+                        calls.lock().await.push("upload_init".to_owned());
+                        Json(json!({
+                            "upload_url":format!("http://{address}/blob/input-image"),
+                            "file_id":"input-image",
+                            "library_file_id":"library-input-image"
+                        }))
+                    }
+                });
+                let blob_calls = calls.clone();
+                let blob_image = expected_image.clone();
+                let blob = axum::routing::put(move |headers: HeaderMap, body: Body| {
+                    let calls = blob_calls.clone();
+                    let image = blob_image.clone();
+                    async move {
+                        assert!(headers.get(header::AUTHORIZATION).is_none());
+                        assert_eq!(
+                            headers
+                                .get(header::CONTENT_TYPE)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("image/png")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("x-ms-blob-type")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("BlockBlob")
+                        );
+                        let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+                            .await
+                            .expect("editable psd blob body");
+                        assert_eq!(bytes.as_ref(), image.as_slice());
+                        calls.lock().await.push("upload_blob".to_owned());
+                        StatusCode::OK
+                    }
+                });
+                let uploaded_calls = calls.clone();
+                let uploaded = post(
+                    move |headers: HeaderMap,
+                          AxumPath(file_id): AxumPath<String>,
+                          Json(payload): Json<Value>| {
+                        let calls = uploaded_calls.clone();
+                        async move {
+                            assert_eq!(file_id, "input-image");
+                            assert_eq!(payload, json!({}));
+                            assert_eq!(
+                                headers
+                                    .get(header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("Bearer editable-team-web")
+                            );
+                            assert_eq!(
+                                headers
+                                    .get("X-OpenAI-Target-Route")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("/backend-api/files/{file_id}/uploaded")
+                            );
+                            calls.lock().await.push("upload_finalize".to_owned());
+                            Json(json!({}))
+                        }
+                    },
+                );
+                let conversation_prepare_calls = calls.clone();
+                let conversation_prepare =
+                    post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                        let calls = conversation_prepare_calls.clone();
+                        async move {
+                            assert_eq!(
+                                headers
+                                    .get("X-Conduit-Token")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("no-token")
+                            );
+                            assert_eq!(payload["model"], "gpt-5-5-thinking");
+                            assert_eq!(payload["thinking_effort"], "extended");
+                            assert_eq!(payload["attachment_mime_types"], json!(["image/png"]));
+                            assert!(
+                                payload["partial_query"]["content"]["parts"][0]
+                                    .as_str()
+                                    .is_some_and(|value| value.contains("需要至少保留三个图层")
+                                        && value.contains("psd文件"))
+                            );
+                            calls.lock().await.push("prepare".to_owned());
+                            Json(json!({"conduit_token":"editable-psd-conduit"}))
+                        }
+                    });
+                let run_calls = calls.clone();
+                let run = post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+                    let calls = run_calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("X-Conduit-Token")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("editable-psd-conduit")
+                        );
+                        assert_eq!(
+                            headers
+                                .get("OpenAI-Sentinel-Chat-Requirements-Token")
+                                .and_then(|value| value.to_str().ok()),
+                            Some("requirements-token")
+                        );
+                        assert_eq!(
+                            payload["messages"][0]["content"]["content_type"],
+                            "multimodal_text"
+                        );
+                        assert_eq!(
+                            payload["messages"][0]["content"]["parts"][0]["asset_pointer"],
+                            "sediment://input-image"
+                        );
+                        assert_eq!(
+                            payload["messages"][0]["content"]["parts"][0]["size_bytes"],
+                            68
+                        );
+                        assert_eq!(payload["messages"][0]["content"]["parts"][0]["width"], 1);
+                        assert_eq!(payload["messages"][0]["content"]["parts"][0]["height"], 1);
+                        let attachment = &payload["messages"][0]["metadata"]["attachments"][0];
+                        assert_eq!(attachment["id"], "input-image");
+                        assert_eq!(attachment["mime_type"], "image/png");
+                        assert_eq!(attachment["source"], "library");
+                        assert_eq!(attachment["library_file_id"], "library-input-image");
+                        calls.lock().await.push("run".to_owned());
+                        (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from(
+                                "data: {\"conversation_id\":\"editable-psd-conversation\"}\n\n\
+                                 data: [DONE]\n\n",
+                            ),
+                        )
+                            .into_response()
+                    }
+                });
+                let poll_calls = calls.clone();
+                let poll = get(
+                    move |headers: HeaderMap, AxumPath(conversation_id): AxumPath<String>| {
+                        let calls = poll_calls.clone();
+                        async move {
+                            assert_eq!(conversation_id, "editable-psd-conversation");
+                            assert_eq!(
+                                headers
+                                    .get("X-OpenAI-Target-Route")
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("/backend-api/conversation/{conversation_id}")
+                            );
+                            calls.lock().await.push("poll".to_owned());
+                            Json(json!({
+                                "mapping": {
+                                    "assistant": {
+                                        "message": {
+                                            "id":"editable-psd-message",
+                                            "author":{"role":"assistant"},
+                                            "create_time":200.0,
+                                            "metadata":{"attachments":[
+                                                {
+                                                    "id":"file-psd",
+                                                    "file_id":"file-psd",
+                                                    "name":"poster.psd",
+                                                    "mime_type":"image/vnd.adobe.photoshop"
+                                                },
+                                                {
+                                                    "id":"file-layers",
+                                                    "file_id":"file-layers",
+                                                    "name":"layers.zip",
+                                                    "mime_type":"application/zip"
+                                                }
+                                            ]}
+                                        }
+                                    }
+                                }
+                            }))
+                        }
+                    },
+                );
+                let metadata_calls = calls.clone();
+                let metadata =
+                    get(
+                        move |headers: HeaderMap,
+                              AxumPath((conversation_id, artifact_id)): AxumPath<(
+                            String,
+                            String,
+                        )>| {
+                            let calls = metadata_calls.clone();
+                            async move {
+                                assert_eq!(conversation_id, "editable-psd-conversation");
+                                assert!(matches!(artifact_id.as_str(), "file-psd" | "file-layers"));
+                                assert_eq!(
+                                    headers
+                                        .get("ChatGPT-Account-ID")
+                                        .and_then(|value| value.to_str().ok()),
+                                    Some("acct-editable-team")
+                                );
+                                calls.lock().await.push(format!("metadata:{artifact_id}"));
+                                Json(json!({
+                                    "download_url":format!("http://{address}/artifact/{artifact_id}")
+                                }))
+                            }
+                        },
+                    );
+                let artifact_calls = calls.clone();
+                let artifact = get(
+                    move |headers: HeaderMap, AxumPath(artifact_id): AxumPath<String>| {
+                        let calls = artifact_calls.clone();
+                        async move {
+                            assert!(headers.get(header::AUTHORIZATION).is_none());
+                            calls.lock().await.push(format!("download:{artifact_id}"));
+                            match artifact_id.as_str() {
+                                "file-psd" => b"editable-psd".as_slice().into_response(),
+                                "file-layers" => b"editable-layers".as_slice().into_response(),
+                                _ => StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                    },
+                );
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/", bootstrap)
+                        .route(
+                            "/backend-api/sentinel/chat-requirements/prepare",
+                            prepare_requirement,
+                        )
+                        .route(
+                            "/backend-api/sentinel/chat-requirements/finalize",
+                            finalize_requirement,
+                        )
+                        .route("/backend-api/files", upload)
+                        .route("/blob/input-image", blob)
+                        .route("/backend-api/files/{file_id}/uploaded", uploaded)
+                        .route(
+                            "/backend-api/f/conversation/prepare",
+                            conversation_prepare,
+                        )
+                        .route("/backend-api/f/conversation", run)
+                        .route("/backend-api/conversation/{conversation_id}", poll)
+                        .route(
+                            "/backend-api/conversation/{conversation_id}/attachment/{artifact_id}/download",
+                            metadata,
+                        )
+                        .route("/artifact/{artifact_id}", artifact),
+                )
+                .await
+                .expect("editable psd upstream server");
+            })
+        };
+
+        let root = account_snapshot_path("native-psd-upstream").with_extension("dir");
+        fs::create_dir_all(&root).expect("native psd test root");
+        let account_path = root.join("accounts.json");
+        fs::write(
+            &account_path,
+            r#"[
+                {"access_token":"wrong-free-web","status":"正常","source_type":"web","type":"free"},
+                {"access_token":"wrong-team-codex","status":"正常","source_type":"codex","type":"team"},
+                {"access_token":"editable-team-web","chatgpt_account_id":"acct-editable-team","status":"正常","source_type":"web","type":"team"}
+            ]"#,
+        )
+        .expect("native psd accounts");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-5-5-thinking".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("native psd state");
+        let private_prompt = "需要至少保留三个图层";
+        let image = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&image_bytes)
+        );
+        let submitted = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/psd/generations")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "client_task_id":"real-psd",
+                            "prompt":private_prompt,
+                            "base64_images":[image]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("native psd request"),
+            )
+            .await
+            .expect("native psd response");
+        assert_eq!(submitted.status(), StatusCode::OK);
+        assert_eq!(json_response(submitted).await["status"], "queued");
+
+        let mut terminal = Value::Null;
+        for _ in 0..300 {
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/editable-file-tasks?ids=real-psd")
+                        .header(header::AUTHORIZATION, "Bearer client")
+                        .body(Body::empty())
+                        .expect("native psd task query"),
+                )
+                .await
+                .expect("native psd task response");
+            terminal = json_response(response).await["items"][0].clone();
+            if matches!(terminal["status"].as_str(), Some("success" | "error")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            terminal["status"],
+            "success",
+            "terminal={terminal}; calls={:?}; cwd={:?}; root={root:?}",
+            calls.lock().await.as_slice(),
+            env::current_dir().expect("editable PSD failure cwd")
+        );
+        assert_eq!(
+            terminal["result"]["conversation_id"],
+            "editable-psd-conversation"
+        );
+        for (field, expected) in [
+            ("primary_url", b"editable-psd".as_slice()),
+            ("zip_url", b"editable-layers".as_slice()),
+        ] {
+            let url = terminal["result"][field]
+                .as_str()
+                .expect("native psd result URL");
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(url)
+                        .body(Body::empty())
+                        .expect("native psd artifact request"),
+                )
+                .await
+                .expect("native psd artifact response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("native psd artifact body")
+                    .to_bytes(),
+                expected
+            );
+        }
+        assert_eq!(
+            calls.lock().await.as_slice(),
+            [
+                "upload_init",
+                "upload_blob",
+                "upload_finalize",
+                "prepare",
+                "bootstrap",
+                "requirements_prepare",
+                "requirements_finalize",
+                "run",
+                "poll",
+                "metadata:file-psd",
+                "download:file-psd",
+                "metadata:file-layers",
+                "download:file-layers",
+            ]
+        );
+        assert_eq!(state.account_store.inflight(), 0);
+        assert!(
+            state
+                .account_store
+                .last_used_at("editable-team-web")
+                .is_some()
+        );
+        assert!(state.account_store.last_used_at("wrong-free-web").is_none());
+        assert!(
+            state
+                .account_store
+                .last_used_at("wrong-team-codex")
+                .is_none()
+        );
+        let persisted = fs::read_to_string(root.join("editable_file_tasks.json"))
+            .expect("native psd terminal snapshot");
+        assert!(!persisted.contains(private_prompt));
+        assert!(!persisted.contains("base64_images"));
+
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
+        fs::remove_dir_all(root).expect("native psd cleanup");
     }
 
     async fn health_json(state: &AppState) -> Value {
@@ -10885,6 +16734,91 @@ mod tests {
             .expect("management response")
     }
 
+    fn create_backup_owner_data(label: &str) -> PathBuf {
+        let data_dir = account_snapshot_path(label).with_extension("backup-owner");
+        fs::create_dir_all(&data_dir).expect("backup owner data directory");
+        fs::write(data_dir.join("accounts.json"), b"[]").expect("backup owner accounts");
+        fs::write(
+            data_dir.join("config.json"),
+            br#"{"backup":{"provider":"local","prefix":"backups","encrypt":false,"include":{"config":false,"cpa":false,"sub2api":false,"ccload":false,"logs":false,"image_tasks":false,"accounts_snapshot":true,"auth_keys_snapshot":false,"images":false}}}"#,
+        )
+        .expect("backup owner config");
+        fs::create_dir_all(data_dir.join("backups")).expect("backup owner backups directory");
+        data_dir
+    }
+
+    fn backup_owner_state(data_dir: &Path) -> AppState {
+        AppState::new(AppConfig {
+            version: "backup-owner-test".to_owned(),
+            auth_key: Some("admin-key".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(data_dir.join("accounts.json")),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("backup owner state")
+    }
+
+    fn read_backup_owner_state(data_dir: &Path) -> Value {
+        serde_json::from_slice(
+            &fs::read(data_dir.join("backup_state.json")).expect("backup owner state file"),
+        )
+        .expect("backup owner state JSON")
+    }
+
+    fn write_backup_owner_state(data_dir: &Path, value: Value) {
+        fs::write(
+            data_dir.join("backup_state.json"),
+            serde_json::to_vec_pretty(&value).expect("backup owner state JSON"),
+        )
+        .expect("backup owner state write");
+    }
+
+    type BackupTestHookHandles = (
+        management::BackupTestHook,
+        Arc<Notify>,
+        Arc<Notify>,
+        Arc<Notify>,
+        Arc<Notify>,
+        Arc<AtomicBool>,
+        Arc<StdMutex<Option<String>>>,
+    );
+
+    fn backup_test_hook(
+        state_path: &Path,
+        pause_after_running: bool,
+        pause_after_archive_commit: bool,
+    ) -> BackupTestHookHandles {
+        let after_running = Arc::new(Notify::new());
+        let release_after_running = Arc::new(Notify::new());
+        let after_archive_commit = Arc::new(Notify::new());
+        let release_after_archive_commit = Arc::new(Notify::new());
+        let fail_next_state_publish = Arc::new(AtomicBool::new(false));
+        let running_key = Arc::new(StdMutex::new(None));
+        (
+            management::BackupTestHook {
+                path: state_path.to_owned(),
+                running_key: running_key.clone(),
+                after_running: after_running.clone(),
+                release_after_running: release_after_running.clone(),
+                pause_after_running: Arc::new(AtomicBool::new(pause_after_running)),
+                after_archive_commit: after_archive_commit.clone(),
+                release_after_archive_commit: release_after_archive_commit.clone(),
+                pause_after_archive_commit: Arc::new(AtomicBool::new(pause_after_archive_commit)),
+                fail_next_state_publish: fail_next_state_publish.clone(),
+            },
+            after_running,
+            release_after_running,
+            after_archive_commit,
+            release_after_archive_commit,
+            fail_next_state_publish,
+            running_key,
+        )
+    }
+
     struct PythonLockChild {
         child: std::process::Child,
         release: PathBuf,
@@ -10913,6 +16847,7 @@ mod tests {
             .to_owned();
         let test_tmp = env::var_os("CHATGPT2API_TEST_TMPDIR")
             .map(PathBuf::from)
+            .map(absolute_test_temp_path)
             .unwrap_or_else(|| project_root.join(".local").join("codex").join("tmp"));
         let pycache = project_root.join(".local").join("codex").join("pycache");
         fs::create_dir_all(&test_tmp).expect("project-local python temp directory");
@@ -11170,6 +17105,487 @@ else:
                 .expect("management stub server");
         });
         (address, shutdown_tx, task, hits)
+    }
+
+    #[tokio::test]
+    async fn cloudflare_r2_backup_routes_use_bounded_remote_owner() {
+        let root = account_snapshot_path("cloudflare-r2-backup-owner");
+        let data_dir = root.parent().expect("data parent").to_owned();
+        fs::create_dir_all(&data_dir).expect("R2 data directory");
+        fs::write(
+            &root,
+            r#"{"items":[{"access_token":"r2-owner-token","status":"正常","type":"free"}]}"#
+                .as_bytes(),
+        )
+        .expect("R2 accounts snapshot");
+        fs::write(
+            data_dir.join("config.json"),
+            serde_json::to_vec(&json!({
+                "backup": {
+                    "enabled": true,
+                    "provider": "cloudflare_r2",
+                    "account_id": "test-account",
+                    "access_key_id": "test-access",
+                    "secret_access_key": "test-secret",
+                    "bucket": "test-bucket",
+                    "prefix": "backups",
+                    "encrypt": false,
+                    "rotation_keep": 10,
+                    "include": {
+                        "config": false,
+                        "accounts_snapshot": true,
+                        "auth_keys_snapshot": false,
+                        "cpa": false,
+                        "sub2api": false,
+                        "ccload": false,
+                        "logs": false,
+                        "image_tasks": false,
+                        "images": false
+                    }
+                }
+            }))
+            .expect("R2 config JSON"),
+        )
+        .expect("R2 config");
+
+        let objects: Arc<Mutex<HashMap<String, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let object_state = objects.clone();
+        let call_state = calls.clone();
+        type FakeR2State = (
+            Arc<Mutex<HashMap<String, Vec<u8>>>>,
+            Arc<Mutex<Vec<String>>>,
+        );
+        let app = Router::new()
+            .fallback(any(move |State((objects, calls)): State<FakeR2State>, request: AxumRequest| async move {
+                let method = request.method().clone();
+                let authorization = request
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                assert!(authorization.starts_with("AWS4-HMAC-SHA256"));
+                let path = request.uri().path().to_owned();
+                let metadata_created = request
+                    .headers()
+                    .get("x-amz-meta-created-at")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let metadata_encrypted = request
+                    .headers()
+                    .get("x-amz-meta-encrypted")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let metadata_trigger = request
+                    .headers()
+                    .get("x-amz-meta-trigger")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                calls.lock().await.push(format!("{method} {path}"));
+                let body = request.into_body();
+                let bytes = to_bytes(body, 4 * 1024 * 1024)
+                    .await
+                    .expect("fake R2 request body");
+                let key = path
+                    .strip_prefix("/test-bucket/")
+                    .unwrap_or_default()
+                    .to_owned();
+                match method {
+                    Method::GET if key.is_empty() => {
+                        let objects = objects.lock().await;
+                        let mut xml = String::from("<ListBucketResult>");
+                        for (key, value) in objects.iter() {
+                            xml.push_str(&format!(
+                                "<Contents><Key>{key}</Key><Size>{}</Size><LastModified>2026-08-24T00:00:00Z</LastModified></Contents>",
+                                value.len()
+                            ));
+                        }
+                        xml.push_str("<IsTruncated>false</IsTruncated></ListBucketResult>");
+                        (StatusCode::OK, xml).into_response()
+                    }
+                    Method::PUT => {
+                        assert!(metadata_created.is_some());
+                        assert_eq!(metadata_encrypted.as_deref(), Some("false"));
+                        assert_eq!(metadata_trigger.as_deref(), Some("manual"));
+                        objects.lock().await.insert(key, bytes.to_vec());
+                        StatusCode::OK.into_response()
+                    }
+                    Method::DELETE => {
+                        objects.lock().await.remove(&key);
+                        StatusCode::NO_CONTENT.into_response()
+                    }
+                    Method::GET => {
+                        let objects = objects.lock().await;
+                        match objects.get(&key) {
+                            Some(value) => (StatusCode::OK, value.clone()).into_response(),
+                            None => StatusCode::NOT_FOUND.into_response(),
+                        }
+                    }
+                    _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                }
+            }))
+            .with_state((object_state, call_state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake R2 listener");
+        let address = listener.local_addr().expect("fake R2 address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("fake R2 server");
+        });
+        let _endpoint = management::install_backup_r2_endpoint(format!("http://{address}"));
+        let state = AppState::new(AppConfig {
+            version: "r2-owner-test".to_owned(),
+            auth_key: Some("admin-key".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(root.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("R2 owner state");
+
+        let tested =
+            management_request(&state, "POST", "/api/backup/test", None, Some("admin-key")).await;
+        assert_eq!(tested.status(), StatusCode::OK, "R2 test response");
+        assert_eq!(json_response(tested).await["result"]["ok"], true);
+
+        let run =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(run.status(), StatusCode::OK, "R2 run response");
+        let run_body = json_response(run).await;
+        let key = run_body["result"]["key"]
+            .as_str()
+            .expect("R2 object key")
+            .to_owned();
+        assert!(key.starts_with("backups/backup-"));
+        assert!(objects.lock().await.contains_key(key.as_str()));
+
+        let listed =
+            management_request(&state, "GET", "/api/backups", None, Some("admin-key")).await;
+        assert_eq!(listed.status(), StatusCode::OK, "R2 list response");
+        assert_eq!(json_response(listed).await["items"][0]["key"], key);
+
+        let encoded_key = key.replace('/', "%2F");
+        let detail = management_request(
+            &state,
+            "GET",
+            &format!("/api/backups/detail?key={encoded_key}"),
+            None,
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(detail.status(), StatusCode::OK, "R2 detail response");
+        assert!(json_response(detail).await["item"]["snapshots"].is_array());
+
+        let downloaded = management_request(
+            &state,
+            "GET",
+            &format!("/api/backups/download?key={encoded_key}"),
+            None,
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(downloaded.status(), StatusCode::OK, "R2 download response");
+        let downloaded_bytes = downloaded
+            .into_body()
+            .collect()
+            .await
+            .expect("R2 download body")
+            .to_bytes();
+        assert_eq!(downloaded_bytes.len(), objects.lock().await[&key].len());
+
+        let deleted = management_request(
+            &state,
+            "POST",
+            "/api/backups/delete",
+            Some(json!({"key": key})),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::OK, "R2 delete response");
+        assert!(!objects.lock().await.contains_key(&key));
+        let calls = calls.lock().await.clone();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("GET /test-bucket"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("PUT /test-bucket"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("DELETE /test-bucket"))
+        );
+
+        state.account_type_catalog.shutdown().await;
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("fake R2 server shutdown timeout")
+            .expect("fake R2 server task");
+        fs::remove_dir_all(data_dir).expect("R2 test cleanup");
+    }
+
+    #[tokio::test]
+    async fn rust_backup_crypto_interoperates_with_pinned_openssl() {
+        let _serial = BACKUP_CRYPT_TEST_SERIAL.lock().await;
+        const OPENSSL_PATH: &str = r"D:\Git\usr\bin\openssl.exe";
+        const PASSWORD_ENV: &str = "CHATGPT2API_TEST_BACKUP_PASSWORD";
+        const PASSWORD: &str = "passphrase";
+        const FIXED_SALT: &str = "0011223344556677";
+        const EXPECTED_FIXED_CIPHERTEXT: [u8; 32] = [
+            0x74, 0x6f, 0x7b, 0xe9, 0x88, 0x1e, 0x4d, 0x23, 0x5d, 0x84, 0x76, 0xd8, 0xf0, 0x98,
+            0xd2, 0x3a, 0xf9, 0xfd, 0x60, 0xce, 0x03, 0xf3, 0xf4, 0x54, 0x4a, 0x85, 0xe1, 0x4f,
+            0x8d, 0xe8, 0x39, 0xb1,
+        ];
+
+        let openssl_path = Path::new(OPENSSL_PATH);
+        assert!(
+            openssl_path.is_file(),
+            "pinned OpenSSL runtime is missing: {OPENSSL_PATH}"
+        );
+        let version = std::process::Command::new(openssl_path)
+            .arg("version")
+            .output()
+            .expect("run pinned OpenSSL version");
+        assert!(version.status.success(), "pinned OpenSSL version failed");
+        assert_eq!(
+            String::from_utf8_lossy(&version.stdout).trim(),
+            "OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.5.5 27 Jan 2026)"
+        );
+
+        let run_openssl =
+            |decrypt: bool, input: &[u8], passphrase: &str, fixed_salt: Option<&str>| {
+                let mut command = std::process::Command::new(openssl_path);
+                command
+                    .arg("enc")
+                    .args(decrypt.then_some(["-d"]).into_iter().flatten())
+                    .args([
+                        "-aes-256-cbc",
+                        "-pbkdf2",
+                        "-iter",
+                        "10000",
+                        "-salt",
+                        "-md",
+                        "sha256",
+                        "-pass",
+                        "env:CHATGPT2API_TEST_BACKUP_PASSWORD",
+                    ])
+                    .env(PASSWORD_ENV, passphrase)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                if let Some(salt) = fixed_salt {
+                    command.arg("-S").arg(salt);
+                }
+                let mut child = command.spawn().expect("spawn pinned OpenSSL");
+                child
+                    .stdin
+                    .take()
+                    .expect("OpenSSL stdin")
+                    .write_all(input)
+                    .expect("write bounded OpenSSL input");
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(status) = child.try_wait().expect("poll OpenSSL") {
+                        let output = child.wait_with_output().expect("collect OpenSSL output");
+                        assert_eq!(output.status, status);
+                        return output;
+                    }
+                    assert!(Instant::now() < deadline, "pinned OpenSSL timed out");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+
+        let plaintext = b"portable backup payload";
+        let cli_encrypted = run_openssl(false, plaintext, PASSWORD, None);
+        assert!(cli_encrypted.status.success(), "OpenSSL encryption failed");
+        assert!(cli_encrypted.stdout.starts_with(b"Salted__"));
+        let rust_decrypted = management::backup_crypt_for_test(
+            cli_encrypted.stdout.clone(),
+            PASSWORD.to_owned(),
+            true,
+        )
+        .await
+        .expect("Rust decrypts real OpenSSL output");
+        assert_eq!(rust_decrypted, plaintext);
+
+        let rust_encrypted =
+            management::backup_crypt_for_test(plaintext.to_vec(), PASSWORD.to_owned(), false)
+                .await
+                .expect("Rust encryption");
+        assert!(rust_encrypted.starts_with(b"Salted__"));
+        let cli_decrypted = run_openssl(true, &rust_encrypted, PASSWORD, None);
+        assert!(cli_decrypted.status.success(), "OpenSSL decryption failed");
+        assert_eq!(cli_decrypted.stdout, plaintext);
+
+        let fixed_ciphertext = run_openssl(false, plaintext, PASSWORD, Some(FIXED_SALT));
+        assert!(fixed_ciphertext.status.success());
+        assert_eq!(fixed_ciphertext.stdout, EXPECTED_FIXED_CIPHERTEXT);
+        let mut fixed_vector = b"Salted__".to_vec();
+        fixed_vector.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+        fixed_vector.extend_from_slice(&fixed_ciphertext.stdout);
+        let fixed_decrypted =
+            management::backup_crypt_for_test(fixed_vector.clone(), PASSWORD.to_owned(), true)
+                .await
+                .expect("Rust decrypts fixed OpenSSL vector");
+        assert_eq!(fixed_decrypted, plaintext);
+
+        // OpenSSL enc AES-CBC has no authentication tag.  A random-salt
+        // ciphertext can therefore make an incorrect password look valid
+        // when its decrypted tail happens to satisfy PKCS#7 padding.  Use
+        // the real fixed-salt OpenSSL vector above so this negative check is
+        // deterministic without changing the interoperable format.
+        assert!(
+            management::backup_crypt_for_test(
+                fixed_vector.clone(),
+                "wrong-password".to_owned(),
+                true,
+            )
+            .await
+            .is_err()
+        );
+        let wrong_cli = run_openssl(true, &fixed_vector, "wrong-password", None);
+        assert!(!wrong_cli.status.success());
+
+        let mut bad_header = fixed_vector.clone();
+        bad_header[0] = b'X';
+        assert!(
+            management::backup_crypt_for_test(bad_header, PASSWORD.to_owned(), true)
+                .await
+                .is_err()
+        );
+        let mut truncated = fixed_vector.clone();
+        truncated.pop();
+        assert!(
+            management::backup_crypt_for_test(truncated, PASSWORD.to_owned(), true)
+                .await
+                .is_err()
+        );
+        let mut bad_padding = fixed_vector;
+        let last = bad_padding.len() - 1;
+        bad_padding[last] ^= 0x01;
+        assert!(
+            management::backup_crypt_for_test(bad_padding, PASSWORD.to_owned(), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            management::backup_crypt_for_test_with_limit(
+                vec![b'x'; 65],
+                PASSWORD.to_owned(),
+                false,
+                64,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            management::backup_crypt_for_test_with_limit(
+                vec![b'x'; 65],
+                PASSWORD.to_owned(),
+                true,
+                64,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rust_backup_crypto_has_bounded_blocking_admission() {
+        let _serial = BACKUP_CRYPT_TEST_SERIAL.lock().await;
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let _hook = management::install_backup_crypt_test_hook(management::BackupCryptTestHook {
+            active: active.clone(),
+            max_active: max_active.clone(),
+            entered,
+            release: release.clone(),
+        });
+        assert!(
+            management::backup_crypt_for_test_with_limit(
+                vec![b'x'; 65],
+                "bounded-admission-test".to_owned(),
+                false,
+                64,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(max_active.load(Ordering::SeqCst), 0);
+        let mut admitted_tasks = Vec::new();
+        for _ in 0..2 {
+            admitted_tasks.push(tokio::spawn(management::backup_crypt_for_test(
+                b"x".to_vec(),
+                "bounded-admission-test".to_owned(),
+                false,
+            )));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if active.load(Ordering::SeqCst) == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("two bounded backup workers did not start");
+        let mut waiting_tasks = Vec::new();
+        for _ in 0..2 {
+            waiting_tasks.push(tokio::spawn(management::backup_crypt_for_test(
+                b"x".to_vec(),
+                "bounded-admission-test".to_owned(),
+                false,
+            )));
+        }
+        let waiting_outcomes = tokio::time::timeout(
+            Duration::from_millis(1500),
+            futures_util::future::join_all(waiting_tasks),
+        )
+        .await
+        .expect("bounded admission did not reject waiting backup workers");
+        assert!(
+            waiting_outcomes
+                .iter()
+                .all(|result| { result.as_ref().is_ok_and(|value| value.is_err()) })
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        assert!(max_active.load(Ordering::SeqCst) <= 2);
+        {
+            let (release_lock, release_signal) = &*release;
+            *release_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            release_signal.notify_all();
+        }
+        let outcomes = futures_util::future::join_all(admitted_tasks).await;
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result.as_ref().is_ok_and(|value| value.is_ok()))
+                .count(),
+            2
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(max_active.load(Ordering::SeqCst) <= 2);
     }
 
     #[tokio::test]
@@ -11532,7 +17948,14 @@ else:
         assert_eq!(add.status(), StatusCode::OK);
         let stored: Value = serde_json::from_slice(&fs::read(&path).expect("stored snapshot"))
             .expect("stored json");
-        assert_eq!(stored.as_array().expect("array").len(), 2);
+        assert_eq!(stored["cumulative_total"], 2);
+        assert_eq!(
+            stored["items"]
+                .as_array()
+                .expect("canonical account items")
+                .len(),
+            2
+        );
 
         let update = state
             .router()
@@ -11553,8 +17976,9 @@ else:
         assert_eq!(update.status(), StatusCode::OK);
         let stored: Value = serde_json::from_slice(&fs::read(&path).expect("updated snapshot"))
             .expect("updated json");
-        assert_eq!(stored[0]["status"], "限流");
-        assert_eq!(stored[0]["refresh_token"], "refresh-one");
+        assert_eq!(stored["cumulative_total"], 2);
+        assert_eq!(stored["items"][0]["status"], "限流");
+        assert_eq!(stored["items"][0]["refresh_token"], "refresh-one");
 
         let delete = state
             .router()
@@ -11572,7 +17996,14 @@ else:
         assert_eq!(delete.status(), StatusCode::OK);
         let stored: Value = serde_json::from_slice(&fs::read(&path).expect("deleted snapshot"))
             .expect("deleted json");
-        assert_eq!(stored.as_array().expect("array").len(), 1);
+        assert_eq!(stored["cumulative_total"], 2);
+        assert_eq!(
+            stored["items"]
+                .as_array()
+                .expect("canonical account items")
+                .len(),
+            1
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -11649,7 +18080,8 @@ else:
         assert_eq!(errors[2]["token"], public_token_ref("alias-token"));
         let stored: Value = serde_json::from_slice(&fs::read(&path).expect("stored snapshot"))
             .expect("stored JSON");
-        let records = stored.as_array().expect("account array");
+        assert_eq!(stored["cumulative_total"], 3);
+        let records = stored["items"].as_array().expect("canonical account items");
         assert_eq!(records.len(), 3);
         assert_eq!(records[0]["access_token"], "account-token");
         assert_eq!(records[0]["private_canary"], "keep");
@@ -12097,7 +18529,7 @@ else:
             )
             .await
             .expect("forbidden response");
-        assert_eq!(forbidden.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 
         let update = state
             .router()
@@ -13552,8 +19984,7 @@ else:
     }
 
     #[tokio::test]
-    #[ignore = "external target swap is outside the canonical sidecar-lock contract"]
-    async fn image_tag_write_rejects_target_swap_after_last_name_check() {
+    async fn image_tag_write_rejects_target_swap_at_replace_boundary() {
         let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
         let _test_cleanup = ImageTagTestCleanup::new();
         let account_path = account_snapshot_path("image-tag-target-swap-after-name-check");
@@ -13587,8 +20018,6 @@ else:
             .expect("after-name target swap hook") =
             Some((tags_path.clone(), attacker_path.clone()));
 
-        // Deliberately retained as an audit canary. Run with --ignored to
-        // demonstrate the unsupported uncooperative-writer CAS guarantee.
         let result = write_image_tags(&state, &updated);
         let _ = fs::remove_file(&tags_path);
         let _ = fs::remove_file(&backup_path);
@@ -13652,7 +20081,13 @@ else:
     }
 
     #[tokio::test]
-    async fn image_tag_write_uses_stable_absolute_path_across_cwd_change() {
+    async fn cwd_switch_cross_pressure_image_tag_write_uses_stable_absolute_path_across_cwd_change()
+    {
+        if run_cwd_contract_in_subprocess(
+            "tests::cwd_switch_cross_pressure_image_tag_write_uses_stable_absolute_path_across_cwd_change",
+        ) {
+            return;
+        }
         let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
         let _test_cleanup = ImageTagTestCleanup::new();
         let root = account_snapshot_path("image-tag-cwd-root").with_extension("dir");
@@ -13695,7 +20130,12 @@ else:
     }
 
     #[tokio::test]
-    async fn relative_data_dir_write_uses_initial_cwd_after_state_init() {
+    async fn cwd_switch_cross_pressure_relative_data_dir_write_uses_initial_cwd_after_state_init() {
+        if run_cwd_contract_in_subprocess(
+            "tests::cwd_switch_cross_pressure_relative_data_dir_write_uses_initial_cwd_after_state_init",
+        ) {
+            return;
+        }
         let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
         let _test_cleanup = ImageTagTestCleanup::new();
         let root = account_snapshot_path("relative-data-dir-root").with_extension("dir");
@@ -13739,7 +20179,13 @@ else:
     }
 
     #[tokio::test]
-    async fn settings_use_initial_absolute_config_path_after_cwd_change() {
+    async fn cwd_switch_cross_pressure_settings_use_initial_absolute_config_path_after_cwd_change()
+    {
+        if run_cwd_contract_in_subprocess(
+            "tests::cwd_switch_cross_pressure_settings_use_initial_absolute_config_path_after_cwd_change",
+        ) {
+            return;
+        }
         let _test_gate = IMAGE_TAG_SECURITY_TEST_GATE.lock().await;
         let _test_cleanup = ImageTagTestCleanup::new();
         let root = account_snapshot_path("stable-config-cwd-root").with_extension("dir");
@@ -13750,7 +20196,12 @@ else:
         env::set_current_dir(&root).expect("enter config root");
         fs::write("data/accounts.json", "[]").expect("relative account snapshot");
         let original_config = json!({
-            "third_party_apps": {"source": "initial"},
+            "third_party_apps": {
+                "infinite_canvas": {
+                    "enabled": true,
+                    "url": "https://canvas.best"
+                }
+            },
             "proxy": "http://proxy.example.test:8080"
         });
         fs::write(
@@ -13793,8 +20244,8 @@ else:
             .to_bytes();
         let settings_value: Value = serde_json::from_slice(&settings_body).expect("settings json");
         assert_eq!(
-            settings_value["config"]["third_party_apps"]["source"],
-            "initial"
+            settings_value["config"]["third_party_apps"]["infinite_canvas"]["enabled"],
+            true
         );
 
         let update = state
@@ -13807,7 +20258,12 @@ else:
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "config": {"third_party_apps": {"source": "updated"}}
+                            "third_party_apps": {
+                                "infinite_canvas": {
+                                    "enabled": false,
+                                    "url": "https://canvas.best"
+                                }
+                            }
                         }))
                         .expect("settings update json"),
                     ))
@@ -13820,8 +20276,8 @@ else:
             serde_json::from_slice::<Value>(
                 &fs::read(root.join("data/config.json")).expect("root config"),
             )
-            .expect("root config json")["third_party_apps"]["source"],
-            "updated"
+            .expect("root config json")["third_party_apps"]["infinite_canvas"]["enabled"],
+            false
         );
         assert!(!alternate.join("config.json").exists());
 
@@ -13845,7 +20301,10 @@ else:
             .expect("third-party apps body")
             .to_bytes();
         let apps_value: Value = serde_json::from_slice(&apps_body).expect("third-party apps json");
-        assert_eq!(apps_value["third_party_apps"]["source"], "updated");
+        assert_eq!(
+            apps_value["third_party_apps"]["infinite_canvas"]["enabled"],
+            false
+        );
 
         env::set_current_dir(&original_cwd).expect("restore cwd");
         let _ = fs::remove_dir_all(&root);
@@ -13981,7 +20440,12 @@ else:
             .await
             .expect("body")
             .to_bytes();
-        assert_eq!(response_status, StatusCode::OK);
+        assert_eq!(
+            response_status,
+            StatusCode::OK,
+            "anthropic response body={}",
+            String::from_utf8_lossy(&body),
+        );
         let value: Value = serde_json::from_slice(&body).expect("message response");
         assert_eq!(value["type"], "message");
         assert_eq!(value["role"], "assistant");
@@ -14706,6 +21170,277 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn state_shutdown_aborts_and_joins_editable_worker_owner() {
+        let app_state = state(Some("client"));
+        let workers = app_state.editable_workers.clone();
+        let started = Arc::new(Notify::new());
+        let worker_started = started.clone();
+        assert!(
+            workers
+                .spawn(async move {
+                    worker_started.notify_one();
+                    std::future::pending::<()>().await;
+                })
+                .await
+        );
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("editable worker starts");
+        assert_eq!(workers.active_for_test(), 1);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_state_with_bounded_shutdown(
+            listener,
+            app_state,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+        shutdown_tx.send(()).expect("shutdown");
+        let result = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("state shutdown")
+            .expect("state server task");
+        assert!(result.is_ok());
+        assert_eq!(workers.active_for_test(), 0);
+        assert!(!workers.spawn(async {}).await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_includes_blocked_owner_cleanup_without_detaching_it() {
+        struct PendingCatalogOwnerGuard {
+            running: Arc<AtomicBool>,
+            canceled: Arc<Notify>,
+        }
+
+        impl Drop for PendingCatalogOwnerGuard {
+            fn drop(&mut self) {
+                self.running.store(false, Ordering::Release);
+                self.canceled.notify_one();
+            }
+        }
+
+        let app_state = state(Some("client"));
+        let catalog = app_state.account_type_catalog.clone();
+        let owner_started = Arc::new(Notify::new());
+        let owner_canceled = Arc::new(Notify::new());
+        catalog.refresh_running.store(true, Ordering::Release);
+        let mut refresh_shutdown = catalog.refresh_shutdown.subscribe();
+        let running = catalog.refresh_running.clone();
+        let started = owner_started.clone();
+        let canceled = owner_canceled.clone();
+        let owner = tokio::spawn(async move {
+            let _guard = PendingCatalogOwnerGuard { running, canceled };
+            started.notify_one();
+            tokio::select! {
+                _ = refresh_shutdown.changed() => {}
+                () = std::future::pending::<()>() => {}
+            }
+        });
+        *catalog.refresh_task.lock().await = Some(owner);
+        owner_started.notified().await;
+        let cleanup_lock = catalog.refresh_task.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(serve_state_with_bounded_shutdown(
+            listener,
+            app_state,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(20),
+        ));
+
+        let started = Instant::now();
+        shutdown_tx.send(()).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !catalog.shutdown_requested.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner shutdown starts");
+        let bounded_result = tokio::time::timeout(Duration::from_millis(200), &mut server).await;
+        let returned_within_budget = match bounded_result {
+            Ok(result) => {
+                result.expect("server task").expect("server result");
+                true
+            }
+            Err(_) => false,
+        };
+        let elapsed = started.elapsed();
+        drop(cleanup_lock);
+        if !returned_within_budget {
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .expect("cleanup after red deadline")
+                .expect("server task")
+                .expect("server result");
+        }
+
+        assert!(
+            returned_within_budget,
+            "blocked owner cleanup escaped the 20ms drain deadline: {elapsed:?}"
+        );
+        tokio::time::timeout(Duration::from_millis(50), owner_canceled.notified())
+            .await
+            .expect("catalog owner canceled before bounded shutdown returns");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), catalog.shutdown_taken.notified())
+                .await
+                .is_err(),
+            "owner cleanup continued detached after bounded shutdown returned"
+        );
+        assert!(!catalog.refresh_running.load(Ordering::Acquire));
+        let completed_owner = catalog
+            .refresh_task
+            .lock()
+            .await
+            .take()
+            .expect("completed catalog owner remains joinable");
+        assert!(completed_owner.is_finished());
+        let _ = completed_owner.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_closes_http_admission_before_blocked_owner_cleanup() {
+        async fn request_status(
+            connection: &mut tokio::net::TcpStream,
+            close: bool,
+            timeout: Duration,
+        ) -> Result<Option<u16>, &'static str> {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let connection_header = if close { "close" } else { "keep-alive" };
+            let request = format!(
+                "GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: {connection_header}\r\n\r\n"
+            );
+            match tokio::time::timeout_at(deadline, connection.write_all(request.as_bytes())).await
+            {
+                Err(_) => return Err("write timed out"),
+                Ok(Err(_)) => return Ok(None),
+                Ok(Ok(())) => {}
+            }
+            let mut response = Vec::new();
+            loop {
+                if let Some(header_end) = response.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                {
+                    let headers = std::str::from_utf8(&response[..header_end])
+                        .map_err(|_| "non-UTF-8 HTTP headers")?;
+                    let status = headers
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_ascii_whitespace().nth(1))
+                        .and_then(|status| status.parse::<u16>().ok())
+                        .ok_or("malformed HTTP status")?;
+                    let body_length = headers
+                        .lines()
+                        .skip(1)
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .ok_or("missing content-length")?;
+                    if response.len() >= header_end + 4 + body_length {
+                        return Ok(Some(status));
+                    }
+                }
+                if response.len() >= 64 * 1024 {
+                    return Err("HTTP response exceeded test bound");
+                }
+                let mut chunk = [0_u8; 1024];
+                match tokio::time::timeout_at(deadline, connection.read(&mut chunk)).await {
+                    Err(_) => return Err("response timed out"),
+                    Ok(Err(_)) => return Ok(None),
+                    Ok(Ok(0)) if response.is_empty() => return Ok(None),
+                    Ok(Ok(0)) => return Err("truncated HTTP response"),
+                    Ok(Ok(read)) => response.extend_from_slice(&chunk[..read]),
+                }
+            }
+        }
+
+        let app_state = state(Some("client"));
+        let admission_state = app_state.clone();
+        let catalog = app_state.account_type_catalog.clone();
+        let cleanup_lock = catalog.refresh_task.lock().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(serve_state_with_bounded_shutdown(
+            listener,
+            app_state,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_secs(5),
+        ));
+        let mut connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .expect("startup connect deadline")
+        .expect("startup connection");
+        assert_eq!(
+            request_status(&mut connection, false, Duration::from_secs(5)).await,
+            Ok(Some(200)),
+            "startup admission handshake"
+        );
+
+        shutdown_tx.send(()).expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admission_state.http_admission_open.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("HTTP admission fence closes");
+        let response_after_signal =
+            request_status(&mut connection, true, Duration::from_secs(1)).await;
+        drop(cleanup_lock);
+        tokio::time::timeout(Duration::from_secs(1), &mut server)
+            .await
+            .expect("server shutdown")
+            .expect("server task")
+            .expect("server result");
+
+        assert!(
+            matches!(response_after_signal, Ok(None | Some(503))),
+            "HTTP admission result while owner cleanup was blocked: {response_after_signal:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_admission_fence_rejects_new_requests() {
+        let app_state = state(Some("client"));
+        app_state.begin_http_shutdown();
+        let response = app_state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/version")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        let body = to_bytes(response.into_body(), 4096).await.expect("body");
+        let payload: Value = serde_json::from_slice(&body).expect("JSON error");
+        assert_eq!(payload["error"]["code"], "server_shutting_down");
+    }
+
+    #[tokio::test]
     async fn shutdown_admission_fence_blocks_a_refresh_started_after_shutdown() {
         let account_path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-catalog-shutdown-fence-{}-{}.json",
@@ -15112,6 +21847,274 @@ data: [DONE]
         }
     }
 
+    #[test]
+    fn public_storage_snapshot_fails_closed_for_malformed_type_and_has_stable_keys() {
+        let info = json!({
+            "type": {"canary": "secret"},
+            "backend": "git",
+            "repo_url": "https://secret.example/repo.git",
+            "file_path": "accounts.json",
+        });
+        let healthy = json!({
+            "status": "healthy",
+            "sync_status": "fresh",
+            "last_commit": "deadbeef",
+        });
+        let (public, is_healthy) = public_storage_snapshot(&info, &healthy);
+        assert!(!is_healthy);
+        assert_eq!(
+            public,
+            json!({
+                "backend": "unknown",
+                "health": {
+                    "status": "unhealthy",
+                    "error": "存储后端健康检查失败",
+                },
+            })
+        );
+        let object = public.as_object().expect("public storage object");
+        assert_eq!(object.len(), 2);
+        assert!(object.contains_key("backend"));
+        assert!(object.contains_key("health"));
+        assert!(!public.to_string().contains("secret"));
+        assert!(!public.to_string().contains("deadbeef"));
+        assert_eq!(
+            public_storage_info(&info, &healthy),
+            json!({
+                "backend": {"type": "unknown"},
+                "health": {
+                    "status": "unhealthy",
+                    "error": "存储后端健康检查失败",
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_info_requires_admin_and_projects_only_public_fields() {
+        let data_dir = test_tmp_dir().join(format!(
+            "chatgpt2api-storage-info-{}-{}",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_dir).expect("storage info data directory");
+        let accounts_path = data_dir.join("accounts.json");
+        let auth_keys_path = data_dir.join("auth_keys.json");
+        fs::write(&accounts_path, br#"{"items":[]}"#).expect("storage info accounts snapshot");
+        let auth_snapshot = format!(
+            r#"{{"items":[{{"id":"normal","role":"user","key_hash":"{}","enabled":true}}]}}"#,
+            auth_key_hash("normal-key")
+        );
+        fs::write(&auth_keys_path, &auth_snapshot).expect("storage info auth snapshot");
+        let state = AppState::new(AppConfig {
+            version: "storage-info-contract".to_owned(),
+            auth_key: Some("admin-key".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: Some(auth_keys_path.clone()),
+            models_path: None,
+            accounts_path: Some(accounts_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("storage info state");
+
+        async fn request(state: &AppState, authorization: Option<&str>) -> (StatusCode, Value) {
+            let mut builder = axum::http::Request::builder().uri("/api/storage/info");
+            if let Some(authorization) = authorization {
+                builder = builder.header(header::AUTHORIZATION, authorization);
+            }
+            let response = state
+                .router()
+                .oneshot(builder.body(Body::empty()).expect("storage info request"))
+                .await
+                .expect("storage info response");
+            let status = response.status();
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("storage info body")
+                .to_bytes();
+            (
+                status,
+                serde_json::from_slice(&body).expect("storage info JSON"),
+            )
+        }
+
+        let (status, missing) = request(&state, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            missing,
+            json!({"detail": {"error": "密钥无效或已失效，请重新登录"}})
+        );
+        let (status, invalid) = request(&state, Some("Bearer invalid-key")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(invalid, missing);
+        let (status, normal) = request(&state, Some("Bearer normal-key")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            normal,
+            json!({"detail": {"error": "需要管理员权限才能执行这个操作"}})
+        );
+        let (status, admin) = request(&state, Some("Bearer admin-key")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            admin,
+            json!({
+                "backend": {"type": "json"},
+                "health": {"status": "healthy"},
+            })
+        );
+        assert!(!admin.to_string().contains("accounts_path"));
+        assert!(!admin.to_string().contains("storage-info-auth"));
+
+        atomic_replace_checked_with_limit(
+            &accounts_path,
+            b"{broken",
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
+        )
+        .expect("corrupt storage info accounts snapshot");
+        let (status, corrupt_accounts) = request(&state, Some("Bearer admin-key")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            corrupt_accounts,
+            json!({
+                "backend": {"type": "json"},
+                "health": {
+                    "status": "unhealthy",
+                    "error": "存储后端健康检查失败"
+                }
+            })
+        );
+        atomic_replace_checked_with_limit(
+            &accounts_path,
+            br#"{"items":[]}"#,
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
+        )
+        .expect("restore storage info accounts snapshot");
+        assert!(state.account_store.reload().await);
+
+        atomic_replace_checked_with_limit(&auth_keys_path, b"{broken", MAX_AUTH_KEYS_BYTES, false)
+            .expect("corrupt storage info auth snapshot");
+        let (status, corrupt_auth) = request(&state, Some("Bearer admin-key")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            corrupt_auth,
+            json!({
+                "backend": {"type": "json"},
+                "health": {
+                    "status": "unhealthy",
+                    "error": "存储后端健康检查失败"
+                }
+            })
+        );
+        atomic_replace_checked_with_limit(
+            &auth_keys_path,
+            auth_snapshot.as_bytes(),
+            MAX_AUTH_KEYS_BYTES,
+            false,
+        )
+        .expect("restore storage info auth snapshot");
+        assert!(state.auth_store.reload().await);
+        drop(state);
+        fs::remove_dir_all(data_dir).expect("storage info cleanup");
+    }
+
+    #[tokio::test]
+    async fn third_party_apps_route_projects_python_public_contract() {
+        assert_eq!(
+            normalize_third_party_apps(Some(&json!({}))),
+            json!({
+                "infinite_canvas": {
+                    "enabled": false,
+                    "url": "https://canvas.best"
+                }
+            })
+        );
+        for invalid_url in [json!(""), json!(123), json!("javascript:alert(1)")] {
+            assert_eq!(
+                normalize_third_party_apps(Some(&json!({
+                    "infinite_canvas": {"enabled": true, "url": invalid_url}
+                }))),
+                json!({
+                    "infinite_canvas": {
+                        "enabled": false,
+                        "url": ""
+                    }
+                })
+            );
+        }
+        let root = account_snapshot_path("third-party-apps-public-contract");
+        let data_dir = root.parent().expect("third-party data parent").to_owned();
+        fs::create_dir_all(&data_dir).expect("third-party data directory");
+        fs::write(data_dir.join("accounts.json"), b"[]").expect("third-party accounts");
+        fs::write(
+            data_dir.join("config.json"),
+            br#"{
+                "third_party_apps": {
+                    "source": "private-canary",
+                    "infinite_canvas": {
+                        "enabled": true,
+                        "url": "javascript:alert('third-party-xss')",
+                        "private": "secret-canary"
+                    }
+                }
+            }"#,
+        )
+        .expect("third-party config");
+        let state = AppState::new(AppConfig {
+            version: "third-party-apps-public-contract".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(data_dir.join("accounts.json")),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("third-party app state");
+
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/third-party-apps")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .body(Body::empty())
+                    .expect("third-party request"),
+            )
+            .await
+            .expect("third-party response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("third-party body")
+            .to_bytes();
+        let public: Value = serde_json::from_slice(&body).expect("third-party JSON");
+        assert_eq!(
+            public,
+            json!({
+                "third_party_apps": {
+                    "infinite_canvas": {
+                        "enabled": false,
+                        "url": ""
+                    }
+                }
+            })
+        );
+        assert!(!public.to_string().contains("private-canary"));
+        assert!(!public.to_string().contains("secret-canary"));
+        assert!(!public.to_string().contains("javascript:"));
+        drop(state);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
     #[tokio::test]
     async fn health_reports_loaded_account_status_counts() {
         let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
@@ -15265,9 +22268,16 @@ data: [DONE]
         })
         .expect("state");
 
-        let healthy = health_json(&state).await;
+        assert_eq!(account_document_parse_count(&accounts_path), 1);
+        assert_eq!(auth_document_parse_count(&auth_path), 1);
+        assert_eq!(model_document_parse_count(&models_path), 1);
+        let (healthy, concurrent_healthy) = tokio::join!(health_json(&state), health_json(&state));
         assert_eq!(healthy["status"], "ok");
         assert_eq!(healthy["healthy"], true);
+        assert_eq!(concurrent_healthy["healthy"], true);
+        assert_eq!(account_document_parse_count(&accounts_path), 1);
+        assert_eq!(auth_document_parse_count(&auth_path), 1);
+        assert_eq!(model_document_parse_count(&models_path), 1);
         assert_eq!(
             healthy["proxy_runtime"],
             json!({
@@ -15277,33 +22287,76 @@ data: [DONE]
         );
         assert!(!healthy.to_string().contains("health-private-canary"));
 
-        fs::write(&accounts_path, b"{broken").expect("corrupt accounts snapshot");
+        atomic_replace_checked_with_limit(
+            &accounts_path,
+            b"{broken",
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
+        )
+        .expect("corrupt accounts snapshot");
         let corrupt_accounts = health_json(&state).await;
         assert_eq!(corrupt_accounts["status"], "degraded");
         assert_eq!(corrupt_accounts["healthy"], false);
         assert_eq!(corrupt_accounts["accounts"]["total"], 0);
         assert_eq!(corrupt_accounts["storage"]["health"]["status"], "unhealthy");
+        assert_eq!(account_document_parse_count(&accounts_path), 1);
 
-        fs::write(&accounts_path, accounts).expect("restore accounts snapshot");
-        fs::write(&auth_path, b"{broken").expect("corrupt auth snapshot");
+        atomic_replace_checked_with_limit(
+            &accounts_path,
+            accounts.as_bytes(),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
+        )
+        .expect("restore accounts snapshot");
+        assert!(state.account_store.reload().await);
+        assert_eq!(account_document_parse_count(&accounts_path), 2);
+        assert_eq!(health_json(&state).await["healthy"], true);
+
+        atomic_replace_checked_with_limit(&auth_path, b"{broken", MAX_AUTH_KEYS_BYTES, false)
+            .expect("corrupt auth snapshot");
         let corrupt_auth = health_json(&state).await;
         assert_eq!(corrupt_auth["status"], "degraded");
         assert_eq!(corrupt_auth["storage"]["health"]["status"], "unhealthy");
+        assert_eq!(auth_document_parse_count(&auth_path), 1);
+        assert!(!state.auth_store.reload().await);
+        assert_eq!(auth_document_parse_count(&auth_path), 2);
 
-        fs::write(&auth_path, &auth).expect("restore auth snapshot");
-        fs::write(
+        atomic_replace_checked_with_limit(&auth_path, &auth, MAX_AUTH_KEYS_BYTES, false)
+            .expect("restore auth snapshot");
+        assert!(state.auth_store.reload().await);
+        assert_eq!(auth_document_parse_count(&auth_path), 3);
+        assert_eq!(health_json(&state).await["healthy"], true);
+
+        let oversized_models_payload =
+            vec![b'x'; (MAX_MODEL_SNAPSHOT_BYTES as usize).saturating_add(1)];
+        atomic_replace_checked_with_limit(
             &models_path,
-            vec![b'x'; (MAX_MODEL_SNAPSHOT_BYTES as usize).saturating_add(1)],
+            &oversized_models_payload,
+            u64::try_from(oversized_models_payload.len()).expect("model payload length"),
+            false,
         )
         .expect("oversized model snapshot");
         let oversized_models = health_json(&state).await;
-        assert_eq!(oversized_models["status"], "degraded");
-        assert_eq!(oversized_models["storage"]["health"]["status"], "unhealthy");
+        assert_eq!(oversized_models["status"], "ok");
+        assert_eq!(oversized_models["healthy"], true);
+        assert_eq!(oversized_models["storage"]["health"]["status"], "healthy");
+        assert_eq!(model_document_parse_count(&models_path), 1);
+        assert!(!state.models.reload().await);
+        assert_eq!(model_document_parse_count(&models_path), 1);
 
-        fs::write(&models_path, models).expect("restore models snapshot");
-        fs::write(
+        atomic_replace_checked_with_limit(&models_path, models, MAX_MODEL_SNAPSHOT_BYTES, false)
+            .expect("restore models snapshot");
+        assert!(state.models.reload().await);
+        assert_eq!(model_document_parse_count(&models_path), 2);
+        assert_eq!(health_json(&state).await["healthy"], true);
+
+        let oversized_accounts_payload =
+            vec![b'x'; (MAX_ACCOUNT_SNAPSHOT_BYTES as usize).saturating_add(1)];
+        atomic_replace_checked_with_limit(
             &accounts_path,
-            vec![b'x'; (MAX_ACCOUNT_SNAPSHOT_BYTES as usize).saturating_add(1)],
+            &oversized_accounts_payload,
+            u64::try_from(oversized_accounts_payload.len()).expect("account payload length"),
+            false,
         )
         .expect("oversized account snapshot");
         let oversized_accounts = health_json(&state).await;
@@ -15314,6 +22367,7 @@ data: [DONE]
             oversized_accounts["storage"]["health"]["status"],
             "unhealthy"
         );
+        assert_eq!(account_document_parse_count(&accounts_path), 2);
         assert!(
             !oversized_accounts
                 .to_string()
@@ -15321,6 +22375,206 @@ data: [DONE]
         );
 
         for path in [accounts_path, auth_path, models_path, config_path] {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_snapshot_pair_invalidation_never_exposes_single_store_failure() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let accounts_path = account_snapshot_path("health-pair-invalidation");
+        let auth_path = account_snapshot_path("health-pair-invalidation-auth");
+        fs::write(
+            &accounts_path,
+            serde_json::to_vec(&json!({
+                "items": [{
+                    "access_token": "pair-old-account",
+                    "status": "正常",
+                }]
+            }))
+            .expect("accounts snapshot"),
+        )
+        .expect("accounts snapshot");
+        fs::write(
+            &auth_path,
+            serde_json::to_vec(&json!({
+                "items": [{
+                    "id": "pair-old-auth",
+                    "role": "admin",
+                    "enabled": true,
+                    "key_hash": auth_key_hash("pair-old-secret"),
+                }]
+            }))
+            .expect("auth snapshot"),
+        )
+        .expect("auth snapshot");
+        let state = AppState::new(AppConfig {
+            version: "health-pair-invalidation".to_owned(),
+            auth_key: None,
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: Some(auth_path.clone()),
+            models_path: None,
+            accounts_path: Some(accounts_path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let old_cache = state
+            .health_snapshot_cache
+            .lock()
+            .expect("health cache")
+            .clone();
+        assert_eq!(old_cache.account_count, 1);
+        assert_eq!(old_cache.auth_key_count, 1);
+        assert!(old_cache.local_snapshot_available);
+
+        let hook = HealthSnapshotInvalidationTestHook {
+            after_accounts: Arc::new(Notify::new()),
+            release_before_auth: Arc::new(Notify::new()),
+            pause_between: Arc::new(AtomicBool::new(true)),
+        };
+        *HEALTH_SNAPSHOT_INVALIDATION_TEST_HOOK
+            .lock()
+            .expect("invalidation hook") = Some(hook.clone());
+        let cache = state.health_snapshot_cache.clone();
+        let account_store = state.account_store.clone();
+        let auth_store = state.auth_store.clone();
+        let invalidation = tokio::spawn(async move {
+            invalidate_health_snapshot_pair(&cache, &account_store, &auth_store).await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), hook.after_accounts.notified())
+            .await
+            .expect("invalidation barrier was not reached");
+
+        let during = state
+            .health_snapshot_cache
+            .lock()
+            .expect("health cache during invalidation")
+            .clone();
+        assert_eq!(during.account_count, old_cache.account_count);
+        assert_eq!(during.auth_key_count, old_cache.auth_key_count);
+        assert_eq!(
+            during.local_snapshot_available,
+            old_cache.local_snapshot_available
+        );
+        assert_eq!(during.accounts, old_cache.accounts);
+        assert!(!state.account_store.health_validated());
+        assert!(state.auth_store.health_validated());
+
+        hook.release_before_auth.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), invalidation)
+            .await
+            .expect("invalidation did not finish")
+            .expect("invalidation task");
+        let after = state
+            .health_snapshot_cache
+            .lock()
+            .expect("health cache after invalidation")
+            .clone();
+        assert_eq!(after.account_count, 0);
+        assert_eq!(after.auth_key_count, 0);
+        assert!(!after.local_snapshot_available);
+        assert_eq!(after.accounts["total"], 0);
+        assert!(!state.auth_store.health_validated());
+        *HEALTH_SNAPSHOT_INVALIDATION_TEST_HOOK
+            .lock()
+            .expect("invalidation hook cleanup") = None;
+        drop(state);
+        fs::remove_file(accounts_path).expect("accounts cleanup");
+        fs::remove_file(auth_path).expect("auth cleanup");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn independent_app_states_do_not_share_health_worker_admission() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let blocked_path = account_snapshot_path("health-state-isolation-blocked");
+        let peer_path = account_snapshot_path("health-state-isolation-peer");
+        for path in [&blocked_path, &peer_path] {
+            fs::write(
+                path,
+                r#"{"items":[{"access_token":"health-state","status":"正常"}]}"#,
+            )
+            .expect("health state snapshot");
+        }
+        let hook = HealthBlockingTestHook {
+            version: "health-state-isolation-blocked".to_owned(),
+            started: Arc::new(Notify::new()),
+            starts: Arc::new(AtomicUsize::new(0)),
+            block: Arc::new(AtomicBool::new(true)),
+        };
+        *HEALTH_STORAGE_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook.clone());
+        let _cleanup = HealthHookCleanup {
+            storage: true,
+            accounts: false,
+        };
+        let _unblock = HealthBlockGuard(hook.block.clone());
+        let make_state = |version: &str, path: PathBuf| {
+            AppState::new(AppConfig {
+                version: version.to_owned(),
+                auth_key: None,
+                models: vec!["auto".to_owned()],
+                upstream_base_url: None,
+                upstream_auth: None,
+                auth_keys_path: None,
+                models_path: None,
+                accounts_path: Some(path),
+                upstream_protocol: UpstreamProtocol::OpenAi,
+            })
+            .expect("health isolation state")
+        };
+        let blocked = make_state(&hook.version, blocked_path.clone());
+        let peer = make_state("health-state-isolation-peer", peer_path.clone());
+        assert!(!Arc::ptr_eq(
+            &blocked.health_storage_semaphore,
+            &peer.health_storage_semaphore
+        ));
+        let (peer_storage, peer_storage_healthy) = health_storage(&peer);
+        assert!(
+            peer_storage_healthy,
+            "peer storage precondition must be healthy: {peer_storage}"
+        );
+
+        let blocked_request = tokio::spawn({
+            let app = blocked.router();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri("/health?format=json")
+                        .body(Body::empty())
+                        .expect("blocked health request"),
+                )
+                .await
+                .expect("blocked health response")
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
+            .await
+            .expect("blocking health hook did not start within two seconds");
+        let peer_payload = tokio::time::timeout(Duration::from_secs(1), health_json(&peer))
+            .await
+            .expect("peer health must not wait for another state");
+        assert_eq!(
+            peer_payload["storage"]["health"]["status"], "healthy",
+            "peer health was starved by another state: {peer_payload}"
+        );
+        assert_eq!(hook.starts.load(Ordering::SeqCst), 1);
+
+        hook.block.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), blocked_request)
+            .await
+            .expect("blocked state health completion")
+            .expect("blocked state health task");
+        let _permit = tokio::time::timeout(
+            Duration::from_secs(2),
+            blocked.health_storage_semaphore.clone().acquire_owned(),
+        )
+        .await
+        .expect("blocked state permit release")
+        .expect("blocked state semaphore closed");
+        for path in [blocked_path, peer_path] {
             let _ = fs::remove_file(path);
         }
     }
@@ -15401,7 +22655,7 @@ data: [DONE]
 
         let acquire_attempt = tokio::time::timeout(
             Duration::from_millis(100),
-            HEALTH_STORAGE_SEMAPHORE.clone().acquire_owned(),
+            state.health_storage_semaphore.clone().acquire_owned(),
         )
         .await;
         let permit_released_early = acquire_attempt.is_ok();
@@ -15467,7 +22721,7 @@ data: [DONE]
             .expect("health task");
         let acquire_attempt = tokio::time::timeout(
             Duration::from_millis(100),
-            HEALTH_ACCOUNTS_SEMAPHORE.clone().acquire_owned(),
+            state.health_accounts_semaphore.clone().acquire_owned(),
         )
         .await;
         let permit_released_early = acquire_attempt.is_ok();
@@ -15479,7 +22733,7 @@ data: [DONE]
         );
         let _permit = tokio::time::timeout(
             Duration::from_secs(2),
-            HEALTH_ACCOUNTS_SEMAPHORE.clone().acquire_owned(),
+            state.health_accounts_semaphore.clone().acquire_owned(),
         )
         .await
         .expect("account permit release timeout")
@@ -16281,6 +23535,35 @@ data: [DONE]
     }
 
     #[test]
+    fn remote_model_projection_rejects_empty_and_all_invalid_catalogs() {
+        let empty = project_remote_model_list(
+            &json!({"models": []}),
+            "models",
+            false,
+            Some("pro"),
+            true,
+            false,
+        );
+        assert!(empty.is_none(), "empty upstream catalog is not success");
+
+        let invalid = project_remote_model_list(
+            &json!({
+                "models": [
+                    {"slug": ""},
+                    {"slug": {"secret": "canary"}},
+                    {"internal": "no-id"}
+                ]
+            }),
+            "models",
+            false,
+            Some("pro"),
+            true,
+            false,
+        );
+        assert!(invalid.is_none(), "all unusable upstream items are failure");
+    }
+
+    #[test]
     fn public_models_recompute_stale_static_account_type_metadata() {
         let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-stale-types-{}-{}.json",
@@ -16799,6 +24082,234 @@ data: [DONE]
             AccountStore::load(Some(&path)),
             Err(AppInitError::AccountSnapshot)
         ));
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    fn python_shaped_account_snapshot_bytes(target_bytes: Option<usize>) -> Vec<u8> {
+        let refresh_token = "r".repeat(2_048);
+        let id_token = "i".repeat(2_048);
+        let password = "p".repeat(512);
+        let items = (0..1_491)
+            .map(|index| {
+                json!({
+                    "access_token": format!("access-token-{index}"),
+                    "account_id": format!("account-{index}"),
+                    "created_at": "2026-08-23 00:00:00",
+                    "id_token": id_token,
+                    "last_used_at": null,
+                    "password": password,
+                    "refresh_token": refresh_token,
+                    "source_type": "codex",
+                    "status": "正常",
+                    "type": "free"
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = serde_json::to_vec(&json!({
+            "cumulative_total": items.len(),
+            "items": items
+        }))
+        .expect("python-shaped account snapshot");
+        assert!(
+            bytes.len() > 4 * 1024 * 1024,
+            "legacy limit must be crossed"
+        );
+        if let Some(target_bytes) = target_bytes {
+            assert!(
+                bytes.len() < target_bytes,
+                "fixture must leave padding room"
+            );
+            bytes.resize(target_bytes, b' ');
+        }
+        bytes
+    }
+
+    fn maximum_legal_structural_account_snapshot_bytes() -> Vec<u8> {
+        let value = vec![b'v'; 63];
+        let mut bytes = Vec::with_capacity(MAX_ACCOUNT_SNAPSHOT_BYTES as usize);
+        bytes.extend_from_slice(br#"{"items":["#);
+        for index in 0..MAX_ACCOUNTS {
+            if index > 0 {
+                bytes.push(b',');
+            }
+            bytes.extend_from_slice(br#"{"access_token":""#);
+            bytes.extend_from_slice(format!("token-{index}").as_bytes());
+            bytes.push(b'"');
+            for field in 0..23 {
+                bytes.extend_from_slice(format!(r#","f{field}":""#).as_bytes());
+                bytes.extend_from_slice(&value);
+                bytes.push(b'"');
+            }
+            bytes.push(b'}');
+        }
+        bytes.extend_from_slice(br#"],"cumulative_total":10000}"#);
+        assert_eq!(bytes.len(), 16_758_926);
+        bytes.resize(MAX_ACCOUNT_SNAPSHOT_BYTES as usize, b' ');
+        bytes
+    }
+
+    #[test]
+    fn account_snapshot_accepts_python_generated_payload_above_legacy_four_mib() {
+        let path = test_tmp_dir().join(format!(
+            "chatgpt2api-rust-accounts-python-size-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, python_shaped_account_snapshot_bytes(None))
+            .expect("large valid account snapshot");
+
+        let store = AccountStore::load(Some(&path)).expect("large Python snapshot must load");
+        assert_eq!(
+            store
+                .snapshot
+                .read()
+                .expect("account snapshot lock")
+                .accounts
+                .len(),
+            1_491
+        );
+        assert_eq!(store.inflight(), 0);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn maximum_legal_structural_account_snapshot_supports_compact_rmw() {
+        let path = account_snapshot_path("maximum-legal-structural");
+        fs::write(&path, maximum_legal_structural_account_snapshot_bytes())
+            .expect("maximum legal account snapshot");
+        let store = AccountStore::load(Some(&path)).expect("maximum legal account store");
+        assert_eq!(store.records().len(), MAX_ACCOUNTS);
+        assert!(store.health_validated());
+
+        store
+            .mutate_raw(|records| {
+                records[0]
+                    .as_object_mut()
+                    .ok_or_else(ApiError::unavailable)?
+                    .insert("f0".to_owned(), Value::String("w".repeat(63)));
+                Ok(())
+            })
+            .await
+            .expect("maximum legal compact RMW");
+        assert!(fs::metadata(&path).expect("written snapshot").len() <= MAX_ACCOUNT_SNAPSHOT_BYTES);
+        assert_eq!(store.records().len(), MAX_ACCOUNTS);
+        assert_eq!(store.records()[0].raw["f0"], "w".repeat(63));
+        assert!(store.health_validated());
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn account_snapshot_enforces_sixteen_mib_byte_boundary() {
+        assert_eq!(MAX_ACCOUNT_SNAPSHOT_BYTES, 16 * 1024 * 1024);
+        let base = br#"{"items":[],"cumulative_total":0}"#;
+        for (size, accepted) in [
+            (MAX_ACCOUNT_SNAPSHOT_BYTES as usize - 1, true),
+            (MAX_ACCOUNT_SNAPSHOT_BYTES as usize, true),
+            (MAX_ACCOUNT_SNAPSHOT_BYTES as usize + 1, false),
+        ] {
+            let mut payload = base.to_vec();
+            payload.resize(size, b' ');
+            assert_eq!(
+                parse_account_document_bytes(&payload).is_ok(),
+                accepted,
+                "snapshot size {size}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn account_file_version_and_reload_reject_directory_entry_rebinds() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let path = account_snapshot_path("account-version-rebind");
+        let original = r#"[{"access_token":"original","status":"正常"}]"#.as_bytes().to_vec();
+        let replacement = r#"[{"access_token":"replaced","status":"正常"}]"#.as_bytes().to_vec();
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&path, &original).expect("initial account snapshot");
+        let store = AccountStore::load(Some(&path)).expect("account store");
+        let original_version = validated_file_version(&path).expect("initial file version");
+
+        let (guard, fires) =
+            install_validated_file_rebind_test_hook(path.clone(), vec![b'x'; original.len()]);
+        assert!(validated_file_version(&path).is_err());
+        assert_eq!(fires.load(Ordering::SeqCst), 1);
+        drop(guard);
+        assert_ne!(
+            validated_file_version(&path).expect("rebound corrupt file version"),
+            original_version
+        );
+        assert!(!store.health_validated());
+
+        atomic_replace_checked_with_limit(&path, &original, MAX_ACCOUNT_SNAPSHOT_BYTES, false)
+            .expect("restore original account snapshot");
+        assert!(store.reload().await);
+        let (guard, fires) =
+            install_validated_file_rebind_test_hook(path.clone(), vec![b'x'; original.len()]);
+        assert!(!store.reload().await);
+        assert_eq!(fires.load(Ordering::SeqCst), 1);
+        drop(guard);
+        assert!(!store.health_validated());
+
+        atomic_replace_checked_with_limit(&path, &replacement, MAX_ACCOUNT_SNAPSHOT_BYTES, false)
+            .expect("publish valid replacement");
+        assert!(!store.health_validated());
+        assert!(store.reload().await);
+        assert!(store.health_validated());
+        assert_eq!(store.records()[0].token, "replaced");
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn production_sized_account_snapshot_health_is_hot_and_fail_closed_on_replacement() {
+        let _health_test_serial = HEALTH_TEST_SERIAL.lock().await;
+        let path = account_snapshot_path("health-production-sized");
+        let original = python_shaped_account_snapshot_bytes(Some(8_027_088));
+        fs::write(&path, &original).expect("production-sized account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "health-production-sized".to_owned(),
+            auth_key: None,
+            models: vec!["auto".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("production-sized state");
+
+        assert_eq!(account_document_parse_count(&path), 1);
+        let (healthy, concurrent_healthy) = tokio::join!(health_json(&state), health_json(&state));
+        assert_eq!(healthy["healthy"], true);
+        assert_eq!(healthy["status"], "ok");
+        assert_eq!(healthy["accounts"]["total"], 1_491);
+        assert_eq!(healthy["storage"]["health"]["status"], "healthy");
+        assert_eq!(concurrent_healthy["healthy"], true);
+        assert_eq!(account_document_parse_count(&path), 1);
+
+        let reload_guard = state.account_store.hold_reload_gate_for_test().await;
+        let unchanged_while_locked = health_json(&state).await;
+        assert_eq!(unchanged_while_locked["healthy"], true);
+        assert_eq!(account_document_parse_count(&path), 1);
+
+        atomic_replace_checked_with_limit(&path, b"{broken", MAX_ACCOUNT_SNAPSHOT_BYTES, false)
+            .expect("replace account snapshot");
+        let corrupt = health_json(&state).await;
+        assert_eq!(corrupt["healthy"], false);
+        assert_eq!(corrupt["storage"]["health"]["status"], "unhealthy");
+        assert_eq!(account_document_parse_count(&path), 1);
+        drop(reload_guard);
+
+        atomic_replace_checked_with_limit(&path, &original, MAX_ACCOUNT_SNAPSHOT_BYTES, false)
+            .expect("restore account snapshot");
+        let unvalidated = health_json(&state).await;
+        assert_eq!(unvalidated["healthy"], false);
+        assert_eq!(account_document_parse_count(&path), 1);
+        assert!(state.account_store.reload().await);
+        assert_eq!(account_document_parse_count(&path), 2);
+        let revalidated = health_json(&state).await;
+        assert_eq!(revalidated["healthy"], true);
+        assert_eq!(revalidated["accounts"]["total"], 1_491);
+        assert_eq!(account_document_parse_count(&path), 2);
         fs::remove_file(path).expect("cleanup");
     }
 
@@ -21473,7 +28984,7 @@ data: [DONE]
                         .and_then(|value| value.to_str().ok())
                         .unwrap_or_default();
                     if token.ends_with("first") {
-                        return StatusCode::BAD_GATEWAY.into_response();
+                        return Json(json!({"models":[]})).into_response();
                     }
                     Json(json!({"models":[{"slug":"fallback-web-model"}]})).into_response()
                 }
@@ -21541,6 +29052,167 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn openai_catalog_falls_back_after_empty_same_type_candidate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_upstream = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/models",
+                    get(move |headers: HeaderMap| {
+                        let calls = calls_for_upstream.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let token = headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default();
+                            if token.ends_with("first") {
+                                Json(json!({"data":[]})).into_response()
+                            } else {
+                                Json(json!({
+                                    "data":[{"id":"openai-fallback-model"}]
+                                }))
+                                .into_response()
+                            }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("state");
+        let candidates = vec![
+            CatalogAccountCandidate {
+                token: "first".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            },
+            CatalogAccountCandidate {
+                token: "second".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            },
+        ];
+        let result = state
+            .account_type_catalog
+            .fetch_account_type_models(
+                &"pro".to_owned(),
+                &candidates,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("second same-type candidate should be tried");
+        assert_eq!(result.1.candidates[0].token, "second");
+        assert_eq!(result.0[0].id, "openai-fallback-model");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        state.account_type_catalog.shutdown().await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+    }
+
+    #[tokio::test]
+    async fn native_catalog_falls_back_after_all_invalid_same_type_candidate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_upstream = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_task = tokio::spawn(async move {
+            let calls = calls_for_upstream.clone();
+            let models = get(move |headers: HeaderMap| {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let token = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default();
+                    if token.ends_with("first") {
+                        Json(json!({
+                            "models": [
+                                {"slug": "", "title": "missing id"},
+                                {"title": "missing slug and id"}
+                            ]
+                        }))
+                        .into_response()
+                    } else {
+                        Json(json!({
+                            "models": [{"slug": "native-invalid-fallback-model"}]
+                        }))
+                        .into_response()
+                    }
+                }
+            });
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", get(|| async { Html("<html></html>") }))
+                    .route("/backend-api/models", models),
+            )
+            .await
+            .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let candidates = vec![
+            CatalogAccountCandidate {
+                token: "first".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            },
+            CatalogAccountCandidate {
+                token: "second".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            },
+        ];
+        let result = state
+            .account_type_catalog
+            .fetch_account_type_models(
+                &"pro".to_owned(),
+                &candidates,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("second same-type candidate should be tried after invalid models");
+        assert_eq!(result.1.candidates[0].token, "second");
+        assert_eq!(result.0[0].id, "native-invalid-fallback-model");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        state.account_type_catalog.shutdown().await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+    }
+
+    #[tokio::test]
     async fn native_catalog_web_failure_returns_no_usable_group_without_codex_probe() {
         let web_calls = Arc::new(AtomicUsize::new(0));
         let codex_calls = Arc::new(AtomicUsize::new(0));
@@ -21556,7 +29228,7 @@ data: [DONE]
                 let calls = web_calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    StatusCode::BAD_GATEWAY
+                    Json(json!({"models":[]})).into_response()
                 }
             });
             let codex_calls = codex_calls_for_upstream.clone();
@@ -21591,11 +29263,18 @@ data: [DONE]
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
-        let candidates = vec![CatalogAccountCandidate {
-            token: "representative".to_owned(),
-            source_type: "web".to_owned(),
-            chatgpt_account_id: None,
-        }];
+        let candidates = vec![
+            CatalogAccountCandidate {
+                token: "representative-first".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            },
+            CatalogAccountCandidate {
+                token: "representative-second".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            },
+        ];
         let result = state
             .account_type_catalog
             .fetch_account_type_models(
@@ -21605,7 +29284,7 @@ data: [DONE]
             )
             .await;
         assert!(result.is_none());
-        assert_eq!(web_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 2);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -22800,8 +30479,7 @@ data: [DONE]
         fs::write(
             &account_path,
             r#"[
-                {"access_token":"free-a","status":"正常","type":"free"},
-                {"access_token":"free-b","status":"正常","type":"free"}
+                {"access_token":"free-a","status":"正常","type":"free"}
             ]"#,
         )
         .expect("account snapshot");
@@ -22822,7 +30500,7 @@ data: [DONE]
                 fail: Arc<AtomicBool>,
                 failed: Arc<Notify>,
             ) -> Response {
-                let call_number = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                calls.fetch_add(1, Ordering::SeqCst);
                 let token = headers
                     .get(header::AUTHORIZATION)
                     .and_then(|value| value.to_str().ok())
@@ -22835,10 +30513,12 @@ data: [DONE]
                     .into_response();
                 }
                 if fail.load(Ordering::SeqCst) {
-                    if call_number == 4 {
-                        failed.notify_one();
-                    }
-                    return StatusCode::BAD_GATEWAY.into_response();
+                    failed.notify_one();
+                    return Json(json!({
+                        "object": "list",
+                        "data": []
+                    }))
+                    .into_response();
                 }
                 Json(json!({
                     "object": "list",
@@ -22901,7 +30581,11 @@ data: [DONE]
                 entry.retry_at = Instant::now() - Duration::from_secs(1);
             }
         }
-        let second = state.router().oneshot(request()).await.expect("response");
+        let second =
+            tokio::time::timeout(Duration::from_secs(2), state.router().oneshot(request()))
+                .await
+                .expect("empty catalog refresh must finish within the bounded request budget")
+                .expect("response");
         assert_eq!(second.status(), StatusCode::OK);
         let body = second.into_body().collect().await.expect("body").to_bytes();
         let value: Value = serde_json::from_slice(&body).expect("models json");
@@ -22910,11 +30594,18 @@ data: [DONE]
                 .as_array()
                 .is_some_and(|items| { items.iter().any(|item| item["id"] == "free-model") })
         );
-        failed.notified().await;
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        tokio::time::timeout(Duration::from_secs(2), failed.notified())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "empty catalog candidate sequence must reach the refresh failure hook; calls={} ",
+                    calls.load(Ordering::SeqCst)
+                )
+            });
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         let third = state.router().oneshot(request()).await.expect("response");
         assert_eq!(third.status(), StatusCode::OK);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         state.account_type_catalog.shutdown().await;
         drop(state);
         upstream_task.abort();
@@ -24662,7 +32353,9 @@ data: [DONE]
             .expect("listener");
         let address = listener.local_addr().expect("address");
         let captured_payload = Arc::new(Mutex::new(None::<Value>));
+        let response_calls = Arc::new(AtomicUsize::new(0));
         let captured_payload_for_upstream = captured_payload.clone();
+        let response_calls_for_upstream = response_calls.clone();
         let upstream = tokio::spawn(async move {
             let bootstrap = get(|| async {
                 Html(
@@ -24674,8 +32367,9 @@ data: [DONE]
                     "models": [{"slug":"gpt-5.5","supported_in_api":true}]
                 }))
             });
-            let responses = post(move |headers: HeaderMap, Json(payload): Json<Value>| {
+            let responses = post(move |headers: HeaderMap, request: AxumRequest| {
                 let captured_payload = captured_payload_for_upstream.clone();
+                let response_calls = response_calls_for_upstream.clone();
                 async move {
                     assert_eq!(
                         headers
@@ -24683,6 +32377,14 @@ data: [DONE]
                             .and_then(|value| value.to_str().ok()),
                         Some("Bearer image-codex-token")
                     );
+                    let body = request
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("Codex request body");
+                    let payload: Value = serde_json::from_slice(&body.to_bytes())
+                        .expect("Codex image request must be valid JSON");
+                    response_calls.fetch_add(1, Ordering::SeqCst);
                     *captured_payload.lock().await = Some(payload);
                     (
                         [(header::CONTENT_TYPE, "text/event-stream")],
@@ -24750,7 +32452,17 @@ data: [DONE]
             .await
             .expect("body")
             .to_bytes();
-        assert_eq!(response_status, StatusCode::OK);
+        let captured_for_diagnostic = captured_payload.lock().await.clone();
+        assert_eq!(
+            response_status,
+            StatusCode::OK,
+            "image response body={} upstream_calls={} captured={}",
+            String::from_utf8_lossy(&body),
+            response_calls.load(Ordering::SeqCst),
+            captured_for_diagnostic
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), Value::to_string)
+        );
         let value: Value = serde_json::from_slice(&body).expect("image response");
         assert_eq!(value["data"][0]["b64_json"], "aW1hZ2U=");
         let payload = captured_payload
@@ -24761,6 +32473,103 @@ data: [DONE]
         assert_eq!(payload["tools"][0]["type"], "image_generation");
         assert_eq!(payload["tools"][0]["action"], "generate");
         assert_eq!(payload["input"][0]["content"][0]["text"], "draw a cat");
+        assert_eq!(state.account_store.inflight(), 0);
+        let generation_response_calls = response_calls.load(Ordering::SeqCst);
+        assert_eq!(generation_response_calls, 1);
+
+        let make_png = |pixel: image::Rgba<u8>| {
+            let image = image::RgbaImage::from_pixel(2, 2, pixel);
+            let mut encoded = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .expect("PNG fixture");
+            encoded.into_inner()
+        };
+        let source = make_png(image::Rgba([255, 0, 0, 255]));
+        let mask = make_png(image::Rgba([0, 0, 0, 64]));
+        let boundary = "----router-image-edit";
+        let mut edit_body = Vec::new();
+        {
+            let mut text_part = |name: &str, value: &str| {
+                edit_body.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                    )
+                    .as_bytes(),
+                );
+            };
+            text_part("model", "codex-gpt-image-2");
+            text_part("prompt", "edit the cat");
+        }
+        {
+            let mut file_part = |name: &str, filename: &str, value: &[u8]| {
+                edit_body.extend_from_slice(
+                    format!(
+                        "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: image/png\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                edit_body.extend_from_slice(value);
+                edit_body.extend_from_slice(b"\r\n");
+            };
+            file_part("image", "source.png", &source);
+            file_part("mask", "mask.png", &mask);
+        }
+        edit_body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/edits")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(edit_body))
+                    .expect("multipart edit request"),
+            )
+            .await
+            .expect("multipart edit response");
+        let edit_status = response.status();
+        let edit_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("multipart body")
+            .to_bytes();
+        assert_eq!(
+            edit_status,
+            StatusCode::OK,
+            "edit response body={} calls={}",
+            String::from_utf8_lossy(&edit_body),
+            response_calls.load(Ordering::SeqCst)
+        );
+        let edit_payload = captured_payload
+            .lock()
+            .await
+            .clone()
+            .expect("captured edit payload");
+        assert_eq!(edit_payload["tools"][0]["action"], "edit");
+        assert_eq!(
+            edit_payload["input"][0]["content"][0]["text"],
+            "edit the cat"
+        );
+        let image_url = edit_payload["input"][0]["content"][1]["image_url"]
+            .as_str()
+            .expect("composited image input");
+        let (composited, _, width, height) =
+            native_image_input(image_url).expect("composited image input decodes");
+        assert_eq!((width, height), (2, 2));
+        let decoded = image::load_from_memory(&composited)
+            .expect("router-composited image")
+            .to_rgba8();
+        assert!(decoded.pixels().all(|pixel| pixel.0 == [255, 0, 0, 64]));
+        assert_eq!(
+            response_calls.load(Ordering::SeqCst),
+            generation_response_calls + 1
+        );
         assert_eq!(state.account_store.inflight(), 0);
 
         state.account_type_catalog.shutdown().await;
@@ -25397,6 +33206,1283 @@ data: [DONE]
         assert_eq!(request.output_format, "jpeg");
         assert_eq!(request.output_compression, Some(80));
         assert!(request.stream);
+    }
+
+    #[test]
+    fn native_image_edit_accepts_standard_multipart_image_and_mask_contract() {
+        let make_png = |pixel: image::Rgba<u8>| {
+            let image = image::RgbaImage::from_pixel(2, 2, pixel);
+            let mut encoded = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .expect("PNG fixture");
+            encoded.into_inner()
+        };
+        let source = make_png(image::Rgba([255, 0, 0, 255]));
+        let source2 = make_png(image::Rgba([0, 255, 0, 77]));
+        let mask = make_png(image::Rgba([0, 0, 0, 64]));
+        let boundary = "----chatgpt2api-image-edit";
+        let mut body = Vec::new();
+        let mut field = |name: &str, value: &[u8]| {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n")
+                    .as_bytes(),
+            );
+            body.extend_from_slice(value);
+            body.extend_from_slice(b"\r\n");
+        };
+        field("prompt", b"edit cat");
+        for (name, filename, payload) in [
+            ("image", "source.png", source.as_slice()),
+            ("image[]", "source-two.png", source2.as_slice()),
+            ("mask", "mask.png", mask.as_slice()),
+        ] {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: image/png\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(payload);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let request =
+            parse_native_image_request_with_content_type(&body, &content_type, "images/edits")
+                .expect("standard multipart edits must be parsed before upstream selection");
+        assert_eq!(request.prompt, "edit cat");
+        assert_eq!(request.n, 1);
+        assert_eq!(request.images.len(), 2);
+        assert!(request.mask.is_some());
+
+        let mask_reference = request.mask.clone().expect("mask reference");
+        let source_reference = request.images[0].clone();
+        let second_reference = request.images[1].clone();
+        let request = native_apply_image_edit_mask(request).expect("mask composition");
+        assert!(request.mask.is_none());
+        assert_eq!(request.images.len(), 2);
+        assert_eq!(request.images[1], second_reference);
+        let (composited, _, width, height) =
+            native_image_source_input(&request.images[0]).expect("composited image");
+        let (source_bytes, _, _, _) =
+            native_image_source_input(&source_reference).expect("source reference");
+        let (mask_bytes, _, _, _) =
+            native_image_source_input(&mask_reference).expect("mask reference");
+        assert_eq!((width, height), (2, 2));
+        let decoded = image::load_from_memory(&composited).expect("composited PNG");
+        let source_decoded = image::load_from_memory(&source).expect("source PNG");
+        let mask_decoded = image::load_from_memory(&mask_bytes).expect("mask PNG");
+        assert!(decoded.has_alpha());
+        for ((source_pixel, mask_pixel), output_pixel) in source_decoded
+            .to_rgba8()
+            .pixels()
+            .zip(mask_decoded.to_rgba8().pixels())
+            .zip(decoded.to_rgba8().pixels())
+        {
+            assert_eq!(
+                [source_pixel[0], source_pixel[1], source_pixel[2]],
+                [output_pixel[0], output_pixel[1], output_pixel[2]]
+            );
+            assert_eq!(mask_pixel[3], output_pixel[3]);
+        }
+        assert_eq!(source_bytes.len(), source.len());
+
+        assert!(
+            parse_native_image_request_with_content_type(
+                &body,
+                "multipart/form-data",
+                "images/edits",
+            )
+            .is_err(),
+            "missing boundary must fail before side effects"
+        );
+        assert!(
+            parse_native_image_request_with_content_type(
+                &body,
+                "multipart/form-data; boundary=wrong",
+                "images/edits",
+            )
+            .is_err(),
+            "mismatched boundary must fail before side effects"
+        );
+        assert!(
+            parse_native_image_request_with_content_type(
+                &body,
+                &format!("multipart/form-data; boundary={boundary}; boundary={boundary}"),
+                "images/edits",
+            )
+            .is_err(),
+            "duplicate boundary must fail closed"
+        );
+        let long_boundary = "x".repeat(71);
+        assert!(
+            parse_native_image_request_with_content_type(
+                &body,
+                &format!("multipart/form-data; boundary={long_boundary}"),
+                "images/edits",
+            )
+            .is_err(),
+            "overlong boundary must fail closed"
+        );
+        for value in ["true", "1", "yes", "y", "on"] {
+            assert_eq!(
+                native_multipart_option_value("stream", value.as_bytes())
+                    .expect("true stream alias"),
+                Value::Bool(true)
+            );
+        }
+        for value in ["false", "0", "no", "n", "off"] {
+            assert_eq!(
+                native_multipart_option_value("stream", value.as_bytes())
+                    .expect("false stream alias"),
+                Value::Bool(false)
+            );
+        }
+
+        let duplicate_header = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n--{boundary}--\r\n"
+        );
+        assert!(
+            parse_native_image_request_with_content_type(
+                duplicate_header.as_bytes(),
+                &content_type,
+                "images/edits",
+            )
+            .is_err(),
+            "duplicate Content-Disposition must fail closed"
+        );
+        let duplicate_option = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nfirst\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nsecond\r\n--{boundary}--\r\n"
+        );
+        assert!(
+            parse_native_image_request_with_content_type(
+                duplicate_option.as_bytes(),
+                &content_type,
+                "images/edits",
+            )
+            .is_err(),
+            "duplicate options must fail closed instead of last-wins"
+        );
+        let wrong_disposition = format!(
+            "--{boundary}\r\nContent-Disposition: attachment; name=\"prompt\"\r\n\r\nx\r\n--{boundary}--\r\n"
+        );
+        assert!(
+            parse_native_image_request_with_content_type(
+                wrong_disposition.as_bytes(),
+                &content_type,
+                "images/edits",
+            )
+            .is_err(),
+            "non-form-data disposition must fail closed"
+        );
+        let false_delimiter = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n--{boundary}X\r\n--{boundary}--\r\n"
+        );
+        let false_parts =
+            native_parse_multipart_parts(false_delimiter.as_bytes(), boundary.as_bytes())
+                .expect("false delimiter candidate is payload");
+        let expected_false_payload = b"x\r\n--"
+            .iter()
+            .chain(boundary.as_bytes())
+            .chain(b"X")
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            &false_parts[0].value,
+            NativeMultipartPartValue::Bytes(value) if value == &expected_false_payload
+        ));
+        assert!(
+            parse_native_image_request_with_content_type(
+                false_delimiter.as_bytes(),
+                &content_type,
+                "images/edits",
+            )
+            .is_err(),
+            "boundary-like bytes with an invalid suffix must not truncate a part"
+        );
+        let mut many_parts = Vec::new();
+        for _ in 0..=MAX_NATIVE_IMAGE_MULTIPART_PARTS {
+            many_parts.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        many_parts.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        assert!(
+            parse_native_image_request_with_content_type(
+                &many_parts,
+                &content_type,
+                "images/edits",
+            )
+            .is_err(),
+            "multipart part count must be bounded"
+        );
+        let long_option = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n{}\r\n--{boundary}--\r\n",
+            "x".repeat(MAX_NATIVE_IMAGE_MULTIPART_OPTION_BYTES + 1)
+        );
+        assert!(
+            parse_native_image_request_with_content_type(
+                long_option.as_bytes(),
+                &content_type,
+                "images/edits",
+            )
+            .is_err(),
+            "multipart option values must be bounded"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_codex_image_body_stream_is_valid_json_for_text_sources() {
+        let request = parse_native_image_request(
+            br#"{"model":"codex-gpt-image-2","prompt":"edit","image":["data:image/png;base64,aGVsbG8="]}"#,
+            "images/edits",
+        )
+        .expect("text image request");
+        let mut stream = Box::pin(native_codex_image_body_stream(&request, "edit"));
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+        let value: Value = serde_json::from_slice(&body).expect("stream must be JSON");
+        assert_eq!(
+            value["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[tokio::test]
+    async fn native_codex_image_body_stream_preserves_file_sources_and_order() {
+        let data_dir = project_local_test_tmp_dir().join(format!(
+            "native-image-codex-stream-{}",
+            LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_dir).expect("test data directory");
+        let mut temp = NativeImageTempGuard::create(&data_dir).expect("temp guard");
+        let make_file = |name: &str, length: usize| {
+            let bytes = (0..length)
+                .map(|value| (value % 251) as u8)
+                .collect::<Vec<_>>();
+            let mut writer = temp.create_file(name).expect("file writer");
+            let mut file = writer.take_file().expect("writer handle");
+            file.write_all(&bytes).expect("write fixture");
+            file.sync_all().expect("sync fixture");
+            drop(file);
+            let handle = writer.finalize(bytes.len()).expect("retained file handle");
+            (bytes, handle)
+        };
+        let make_request = |images: Vec<NativeImageSource>| NativeImageRequest {
+            model: "codex-gpt-image-2".to_owned(),
+            codex: true,
+            plan_type: None,
+            prompt: "stream".to_owned(),
+            n: 1,
+            size: None,
+            quality: "auto".to_owned(),
+            response_format: "b64_json".to_owned(),
+            output_format: "png".to_owned(),
+            output_compression: None,
+            background: "auto".to_owned(),
+            stream: false,
+            images,
+            mask: None,
+            temp_guard: None,
+        };
+
+        let cases = [
+            (3usize, "file-zero"),
+            (4usize, "file-one"),
+            (5usize, "file-two"),
+        ];
+        for (length, name) in cases {
+            let (bytes, handle) = make_file(name, length);
+            let request = make_request(vec![NativeImageSource::File {
+                handle,
+                mime_type: "image/png".to_owned(),
+                width: 1,
+                height: 1,
+            }]);
+            let mut stream = Box::pin(native_codex_image_body_stream(&request, "edit"));
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                body.extend_from_slice(&chunk.expect("file stream chunk"));
+            }
+            let value: Value = serde_json::from_slice(&body).expect("file stream must be JSON");
+            let expected = format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            );
+            assert_eq!(value["input"][0]["content"][1]["image_url"], expected);
+        }
+
+        let (file_bytes, handle) = make_file("file-mixed", 7);
+        let text = "data:image/png;base64,dGV4dC1pbWFnZQ==".to_owned();
+        let request = make_request(vec![
+            NativeImageSource::Text(text.clone()),
+            NativeImageSource::File {
+                handle,
+                mime_type: "image/png".to_owned(),
+                width: 1,
+                height: 1,
+            },
+        ]);
+        let mut stream = Box::pin(native_codex_image_body_stream(&request, "edit"));
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.expect("mixed stream chunk"));
+        }
+        let value: Value = serde_json::from_slice(&body).expect("mixed stream must be JSON");
+        assert_eq!(value["input"][0]["content"][1]["image_url"], text);
+        assert_eq!(
+            value["input"][0]["content"][2]["image_url"],
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(file_bytes)
+            )
+        );
+        assert_eq!(value["input"][0]["content"].as_array().unwrap().len(), 3);
+        drop(stream);
+        drop(request);
+        temp.cleanup().expect("cleanup temp guard");
+        drop(temp);
+        fs::remove_dir_all(&data_dir).expect("cleanup test data directory");
+    }
+
+    #[test]
+    fn native_multipart_file_dimensions_bound_large_bombs_and_preserve_order() {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xffff_ffffu32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let make_png = |width: u32, height: u32| {
+            let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+            let mut encoded = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .expect("PNG fixture");
+            let mut bytes = encoded.into_inner();
+            bytes[16..20].copy_from_slice(&width.to_be_bytes());
+            bytes[20..24].copy_from_slice(&height.to_be_bytes());
+            let header_crc = crc32(&bytes[12..29]);
+            bytes[29..33].copy_from_slice(&header_crc.to_be_bytes());
+            bytes
+        };
+        let data_dir = project_local_test_tmp_dir().join(format!(
+            "native-image-dimensions-bound-{}",
+            LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_dir).expect("test data directory");
+        let mut temp = NativeImageTempGuard::create(&data_dir).expect("temp guard");
+        let write_file = |temp: &NativeImageTempGuard, name: &str, bytes: &[u8]| {
+            let mut writer = temp.create_file(name).expect("file writer");
+            let mut file = writer.take_file().expect("writer handle");
+            file.write_all(bytes).expect("write fixture");
+            file.sync_all().expect("sync fixture");
+            drop(file);
+            writer.finalize(bytes.len()).expect("retained file handle")
+        };
+        let source = make_png(1, 1);
+        let mut large = source.clone();
+        large.resize(MAX_NATIVE_IMAGE_BYTES - 1024, b'x');
+        let large_reads = Arc::new(AtomicUsize::new(0));
+        let mut large_handle = write_file(&temp, "large.png", &large);
+        large_handle.read_observer = Some(large_reads.clone());
+        let large_source = native_multipart_source(
+            NativeMultipartPartValue::File {
+                handle: large_handle,
+            },
+            Some("large.png"),
+            Some("image/png"),
+        )
+        .expect("large valid PNG dimensions");
+        assert!(matches!(
+            large_source,
+            NativeImageSource::File {
+                width: 1,
+                height: 1,
+                ..
+            }
+        ));
+        assert_eq!(large_reads.load(Ordering::SeqCst), 0);
+        drop(large_source);
+        drop(large);
+
+        let bomb_reads = Arc::new(AtomicUsize::new(0));
+        let mut bomb_handle = write_file(&temp, "bomb.png", &make_png(5_001, 5_000));
+        bomb_handle.read_observer = Some(bomb_reads.clone());
+        assert!(
+            native_multipart_source(
+                NativeMultipartPartValue::File {
+                    handle: bomb_handle,
+                },
+                Some("bomb.png"),
+                Some("image/png"),
+            )
+            .is_err()
+        );
+        assert_eq!(bomb_reads.load(Ordering::SeqCst), 0);
+
+        let truncated_reads = Arc::new(AtomicUsize::new(0));
+        let mut truncated_handle = write_file(
+            &temp,
+            "truncated.png",
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR",
+        );
+        truncated_handle.read_observer = Some(truncated_reads.clone());
+        assert!(
+            native_multipart_source(
+                NativeMultipartPartValue::File {
+                    handle: truncated_handle,
+                },
+                Some("truncated.png"),
+                Some("image/png"),
+            )
+            .is_err()
+        );
+        assert_eq!(truncated_reads.load(Ordering::SeqCst), 0);
+
+        let mut parts = vec![NativeMultipartPart {
+            name: "prompt".to_owned(),
+            filename: None,
+            content_type: None,
+            value: NativeMultipartPartValue::Bytes(b"ordered".to_vec()),
+        }];
+        for index in 0..MAX_NATIVE_IMAGE_MULTIPART_IMAGE_COUNT {
+            let handle = write_file(&temp, &format!("ordered-{index}.png"), &source);
+            parts.push(NativeMultipartPart {
+                name: "image[]".to_owned(),
+                filename: Some(format!("ordered-{index}.png")),
+                content_type: Some("image/png".to_owned()),
+                value: NativeMultipartPartValue::File { handle },
+            });
+        }
+        let request = native_build_multipart_request(parts, "images/edits", None)
+            .expect("all ordered image sources");
+        assert_eq!(request.images.len(), MAX_NATIVE_IMAGE_MULTIPART_IMAGE_COUNT);
+        for (index, image) in request.images.iter().enumerate() {
+            assert!(matches!(
+                image,
+                NativeImageSource::File { handle, .. }
+                    if handle.name == format!("ordered-{index}.png")
+            ));
+        }
+        drop(request);
+        temp.cleanup().expect("cleanup temp guard");
+        drop(temp);
+        fs::remove_dir_all(&data_dir).expect("cleanup test data directory");
+    }
+
+    #[test]
+    fn native_image_temp_creation_failures_roll_back_owned_objects() {
+        let root = project_local_test_tmp_dir().join(format!(
+            "native-image-temp-failpoints-{}-{}",
+            std::process::id(),
+            LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("test data directory");
+        for stage in [
+            "guard-before-root-open",
+            "guard-after-root-open",
+            "guard-after-owner-create",
+            "guard-after-owner-private",
+            "guard-after-owner-identity",
+            "guard-after-owner-write",
+            "guard-after-owner-sync",
+        ] {
+            let _failpoint = install_native_image_temp_failpoint(stage);
+            assert!(
+                NativeImageTempGuard::create(&root).is_err(),
+                "stage={stage} must fail"
+            );
+            let upload_root = root.join(".native-image-uploads");
+            let leftovers = fs::read_dir(upload_root)
+                .expect("upload parent")
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            assert!(leftovers.is_empty(), "stage={stage} left owned root");
+        }
+        let mut temp = NativeImageTempGuard::create(&root).expect("temp guard for retry");
+        {
+            let _failpoint = install_native_image_temp_failpoint("guard-before-root-delete");
+            assert!(temp.cleanup().is_err(), "root delete failpoint must fail");
+        }
+        temp.cleanup()
+            .expect("cleanup retries after root delete failure");
+        drop(temp);
+        let mut temp = NativeImageTempGuard::create(&root).expect("temp guard for entry retry");
+        drop(temp.create_file("retry.bin").expect("owned retry entry"));
+        {
+            let _failpoint = install_native_image_temp_failpoint("guard-after-entry-delete");
+            assert!(temp.cleanup().is_err(), "entry delete failpoint must fail");
+        }
+        temp.cleanup()
+            .expect("cleanup retries after partial entry deletion");
+        drop(temp);
+        for stage in [
+            "file-after-create",
+            "file-after-private",
+            "file-after-identity",
+            "file-before-register",
+        ] {
+            let mut temp = NativeImageTempGuard::create(&root).expect("temp guard");
+            {
+                let _failpoint = install_native_image_temp_failpoint(stage);
+                assert!(
+                    temp.create_file("failure.bin").is_err(),
+                    "stage={stage} must fail"
+                );
+            }
+            let directory = temp.binding.open_root().expect("owned root");
+            assert!(open_regular_file_at(&directory, OsStr::new("failure.bin")).is_err());
+            drop(directory);
+            temp.cleanup().expect("cleanup failed create");
+            drop(temp);
+            assert!(
+                !root
+                    .join(".native-image-uploads")
+                    .read_dir()
+                    .expect("upload parent")
+                    .filter_map(Result::ok)
+                    .any(|_| true)
+            );
+        }
+        fs::remove_dir_all(&root).expect("cleanup test data directory");
+    }
+
+    #[test]
+    fn native_image_temp_cleanup_rejects_parent_path_rebind_and_recovers() {
+        let root = project_local_test_tmp_dir().join(format!(
+            "native-image-temp-parent-rebind-{}-{}",
+            std::process::id(),
+            LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("test data directory");
+        let mut temp = NativeImageTempGuard::create(&root).expect("temp guard");
+        let parent = root.join(".native-image-uploads");
+        let rebound = root.join(".native-image-uploads-rebound");
+        let moved = root.join(".native-image-uploads-original");
+        let renamed = fs::rename(&parent, &moved).is_ok();
+        if renamed {
+            fs::create_dir(&parent).expect("rebound parent");
+            fs::write(parent.join("external.txt"), b"external").expect("rebound sentinel");
+            assert!(temp.cleanup().is_err(), "rebound parent must fail closed");
+            assert_eq!(
+                fs::read(parent.join("external.txt")).expect("rebound sentinel survives"),
+                b"external"
+            );
+            fs::remove_dir(&parent).expect("remove empty rebound parent");
+            fs::rename(&moved, &parent).expect("restore original parent");
+        } else {
+            assert!(
+                !rebound.exists(),
+                "failed parent replacement must not create rebound fixture"
+            );
+        }
+        temp.cleanup().expect("cleanup after parent restoration");
+        drop(temp);
+        assert!(!parent.join("unused").exists());
+        fs::remove_dir_all(&root).expect("cleanup test data directory");
+    }
+
+    #[test]
+    fn native_image_reference_text_has_image_specific_boundary() {
+        let above_global_upstream_limit = Value::String("x".repeat(MAX_UPSTREAM_BODY_BYTES + 1));
+        assert!(native_image_reference_values(&above_global_upstream_limit).is_ok());
+
+        let above_image_limit =
+            Value::String("x".repeat(MAX_NATIVE_IMAGE_REFERENCE_TEXT_BYTES + 1));
+        assert!(native_image_reference_values(&above_image_limit).is_err());
+
+        let oversized_raw = vec![0u8; MAX_NATIVE_IMAGE_BYTES + 1];
+        assert!(native_multipart_image_data_url(&oversized_raw, Some("image/png")).is_err());
+    }
+
+    #[test]
+    fn native_image_edit_mask_validation_is_fail_closed() {
+        let encode = |image: image::DynamicImage, format: image::ImageFormat, mime: &str| {
+            let mut encoded = Cursor::new(Vec::new());
+            image.write_to(&mut encoded, format).expect("image fixture");
+            format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(encoded.get_ref())
+            )
+        };
+        let source = encode(
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2,
+                2,
+                image::Rgba([255, 0, 0, 255]),
+            )),
+            image::ImageFormat::Png,
+            "image/png",
+        );
+        let mask_wrong_size = encode(
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([0, 0, 0, 0]),
+            )),
+            image::ImageFormat::Png,
+            "image/png",
+        );
+        let mask_wrong_format = encode(
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                2,
+                2,
+                image::Rgb([0, 0, 0]),
+            )),
+            image::ImageFormat::Jpeg,
+            "image/jpeg",
+        );
+        let mask_without_alpha = encode(
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                2,
+                2,
+                image::Rgb([0, 0, 0]),
+            )),
+            image::ImageFormat::Png,
+            "image/png",
+        );
+        for (name, mask) in [
+            ("wrong-size", mask_wrong_size),
+            ("wrong-format", mask_wrong_format),
+            ("without-alpha", mask_without_alpha),
+        ] {
+            let mut request = parse_native_image_request(
+                json!({
+                    "model": "gpt-image-2",
+                    "prompt": "edit",
+                    "image": source.clone(),
+                })
+                .to_string()
+                .as_bytes(),
+                "images/edits",
+            )
+            .expect("base edit request");
+            request.mask = Some(NativeImageSource::Text(mask));
+            let error = match native_apply_image_edit_mask(request) {
+                Ok(_) => panic!("invalid mask must fail before upstream"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code(), "invalid_image_mask", "case={name}");
+        }
+        let oversized_pixels = image::ImageBuffer::from_pixel(5_001, 5_000, image::Luma([0u8]));
+        let mut oversized = Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(oversized_pixels)
+            .write_to(&mut oversized, image::ImageFormat::Png)
+            .expect("oversized pixel fixture");
+        let mut request = parse_native_image_request(
+            json!({
+                "model": "gpt-image-2",
+                "prompt": "edit",
+                "image": source,
+            })
+            .to_string()
+            .as_bytes(),
+            "images/edits",
+        )
+        .expect("base edit request");
+        request.mask = Some(NativeImageSource::Text(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(oversized.get_ref())
+        )));
+        let error = match native_apply_image_edit_mask(request) {
+            Ok(_) => panic!("oversized mask pixels must fail before upstream"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "invalid_image_mask");
+    }
+
+    #[test]
+    fn native_image_edit_file_mask_uses_retained_readers_and_preserves_pixels() {
+        let data_dir = project_local_test_tmp_dir().join(format!(
+            "native-image-file-mask-reader-{}",
+            LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_dir).expect("test data directory");
+        let temp = NativeImageTempGuard::create(&data_dir).expect("temp guard");
+
+        let write_png = |temp: &NativeImageTempGuard,
+                         name: &str,
+                         image: image::DynamicImage|
+         -> NativeImageFileHandle {
+            let mut encoded = Cursor::new(Vec::new());
+            image
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .expect("PNG fixture");
+            let bytes = encoded.into_inner();
+            let mut writer = temp.create_file(name).expect("file writer");
+            let mut file = writer.take_file().expect("writer handle");
+            file.write_all(&bytes).expect("write fixture");
+            file.sync_all().expect("sync fixture");
+            drop(file);
+            writer.finalize(bytes.len()).expect("retained file handle")
+        };
+
+        let source_reads = Arc::new(AtomicUsize::new(0));
+        let mask_reads = Arc::new(AtomicUsize::new(0));
+        let mut source_handle = write_png(
+            &temp,
+            "source.png",
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2,
+                2,
+                image::Rgba([255, 0, 0, 255]),
+            )),
+        );
+        source_handle.read_observer = Some(source_reads.clone());
+        let mut mask_handle = write_png(
+            &temp,
+            "mask.png",
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                2,
+                2,
+                image::Rgba([0, 0, 0, 64]),
+            )),
+        );
+        mask_handle.read_observer = Some(mask_reads.clone());
+
+        let request = NativeImageRequest {
+            model: "gpt-image-2".to_owned(),
+            codex: false,
+            plan_type: None,
+            prompt: "edit".to_owned(),
+            n: 1,
+            size: None,
+            quality: "auto".to_owned(),
+            response_format: "b64_json".to_owned(),
+            output_format: "png".to_owned(),
+            output_compression: None,
+            background: "auto".to_owned(),
+            stream: false,
+            images: vec![NativeImageSource::File {
+                handle: source_handle,
+                mime_type: "image/png".to_owned(),
+                width: 2,
+                height: 2,
+            }],
+            mask: Some(NativeImageSource::File {
+                handle: mask_handle,
+                mime_type: "image/png".to_owned(),
+                width: 2,
+                height: 2,
+            }),
+            temp_guard: Some(temp),
+        };
+
+        let request = native_apply_image_edit_mask(request).expect("file mask composition");
+        assert_eq!(source_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(mask_reads.load(Ordering::SeqCst), 0);
+        let NativeImageSource::File { handle, .. } = &request.images[0] else {
+            panic!("file-backed composite expected");
+        };
+        let composite =
+            native_decode_image(&handle.read().expect("composite bytes")).expect("composite PNG");
+        for pixel in composite.to_rgba8().pixels() {
+            assert_eq!(pixel.0, [255, 0, 0, 64]);
+        }
+        drop(request);
+        let upload_root = data_dir.join(".native-image-uploads");
+        assert!(
+            fs::read_dir(&upload_root)
+                .expect("upload parent")
+                .next()
+                .is_none()
+        );
+        fs::remove_dir_all(&data_dir).expect("cleanup test data directory");
+    }
+
+    #[test]
+    fn native_multipart_file_source_dimensions_do_not_read_entire_file() {
+        let data_dir = project_local_test_tmp_dir().join(format!(
+            "native-image-dimensions-{}",
+            LOCAL_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_dir).expect("test data directory");
+        let mut temp = NativeImageTempGuard::create(&data_dir).expect("temp guard");
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("PNG fixture");
+        let bytes = encoded.into_inner();
+        let mut writer = temp.create_file("part-0.bin").expect("file writer");
+        let mut file = writer.take_file().expect("writer handle");
+        file.write_all(&bytes).expect("write fixture");
+        file.sync_all().expect("sync fixture");
+        drop(file);
+        let mut handle = writer.finalize(bytes.len()).expect("retained file handle");
+        let reads = Arc::new(AtomicUsize::new(0));
+        handle.read_observer = Some(reads.clone());
+        let source = native_multipart_source(
+            NativeMultipartPartValue::File { handle },
+            Some("source.png"),
+            Some("image/png"),
+        )
+        .expect("file source dimensions");
+        assert!(matches!(
+            source,
+            NativeImageSource::File {
+                width: 1,
+                height: 1,
+                ..
+            }
+        ));
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+        drop(source);
+        temp.cleanup().expect("cleanup temp guard");
+        drop(temp);
+        fs::remove_dir_all(&data_dir).expect("cleanup test data directory");
+    }
+
+    #[tokio::test]
+    async fn native_image_route_reads_beyond_general_body_limit_with_bounded_cap() {
+        let boundary = "----large-image-body";
+        let mut body =
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\n")
+                .into_bytes();
+        body.extend(std::iter::repeat_n(b'x', MAX_REQUEST_BODY_BYTES + 1));
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        assert!(body.len() > MAX_REQUEST_BODY_BYTES);
+        assert!(body.len() <= MAX_NATIVE_IMAGE_REQUEST_BYTES);
+
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-image-2".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/edits")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.account_store.inflight(), 0);
+        state.account_type_catalog.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_image_json_keeps_general_body_limit() {
+        let body = json!({
+            "model": "gpt-image-2",
+            "prompt": "x".repeat(MAX_REQUEST_BODY_BYTES),
+        })
+        .to_string();
+        assert!(body.len() > MAX_REQUEST_BODY_BYTES);
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-image-2".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/edits")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = response.into_body().collect().await.expect("body");
+        assert_eq!(state.account_store.inflight(), 0);
+        state.account_type_catalog.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_image_route_accepts_near_limit_image_and_mask_before_backend_selection() {
+        const fn crc32_table() -> [u32; 256] {
+            let mut table = [0u32; 256];
+            let mut index = 0;
+            while index < table.len() {
+                let mut value = index as u32;
+                let mut bit = 0;
+                while bit < 8 {
+                    value = if value & 1 != 0 {
+                        (value >> 1) ^ 0xedb8_8320
+                    } else {
+                        value >> 1
+                    };
+                    bit += 1;
+                }
+                table[index] = value;
+                index += 1;
+            }
+            table
+        }
+        let make_png = |pixel: image::Rgba<u8>| {
+            let image = image::RgbaImage::from_pixel(1, 1, pixel);
+            let mut encoded = Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image)
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .expect("PNG fixture");
+            encoded.into_inner()
+        };
+        let near_limit = MAX_NATIVE_IMAGE_BYTES - 1024;
+        let table = crc32_table();
+        let add_padding = |png: Vec<u8>| {
+            let data_len = near_limit
+                .checked_sub(png.len() + 12)
+                .expect("padding fixture size");
+            let mut data = b"padding\0".to_vec();
+            data.resize(data_len, b'x');
+            let update_crc = |mut crc: u32, bytes: &[u8]| {
+                for byte in bytes {
+                    crc = (crc >> 8) ^ table[((crc ^ u32::from(*byte)) & 0xff) as usize];
+                }
+                crc
+            };
+            let crc = !update_crc(update_crc(0xffff_ffff, b"tEXt"), &data);
+            let mut padded = Vec::with_capacity(near_limit);
+            let iend = png.len() - 12;
+            padded.extend_from_slice(&png[..iend]);
+            padded.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            padded.extend_from_slice(b"tEXt");
+            padded.extend_from_slice(&data);
+            padded.extend_from_slice(&crc.to_be_bytes());
+            padded.extend_from_slice(&png[iend..]);
+            assert_eq!(padded.len(), near_limit);
+            padded
+        };
+        let source = add_padding(make_png(image::Rgba([255, 0, 0, 255])));
+        let mask = add_padding(make_png(image::Rgba([0, 0, 0, 64])));
+        assert!(image::load_from_memory(&source).is_ok());
+        assert!(image::load_from_memory(&mask).is_ok());
+        assert_eq!(source.len(), mask.len());
+        assert!(source.len() < MAX_NATIVE_IMAGE_BYTES);
+        assert!(source.len() + mask.len() <= MAX_NATIVE_IMAGE_MULTIPART_TOTAL_BYTES);
+
+        let boundary = "----near-limit-image-mask";
+        let prompt = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n"
+        );
+        let first_header = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"source.png\"\r\nContent-Type: image/png\r\n\r\n"
+        );
+        let second_header = format!(
+            "\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"mask\"; filename=\"mask.png\"\r\nContent-Type: image/png\r\n\r\n"
+        );
+        let end = format!("\r\n--{boundary}--\r\n");
+        let body = Body::from_stream(stream::iter([
+            Ok::<Bytes, io::Error>(Bytes::from(prompt)),
+            Ok(Bytes::from(first_header)),
+            Ok(Bytes::from(source)),
+            Ok(Bytes::from(second_header)),
+            Ok(Bytes::from(mask)),
+            Ok(Bytes::from(end)),
+        ]));
+
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-image-2".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/edits")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(body)
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.account_store.inflight(), 0);
+        state.account_type_catalog.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_image_route_accepts_documented_multi_image_budget_before_backend_selection() {
+        let boundary = "----aggregate-image-limit";
+        let per_file = MAX_NATIVE_IMAGE_BYTES - 1024;
+        assert!(per_file <= MAX_NATIVE_IMAGE_BYTES);
+        assert!(per_file * 3 > 128 * 1024 * 1024);
+        let mut jpeg = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .expect("JPEG fixture");
+        let jpeg = Arc::new(jpeg.into_inner());
+        let padding = per_file
+            .checked_sub(jpeg.len())
+            .expect("JPEG fixture fits the per-file budget");
+        let mut padded = Vec::with_capacity(per_file);
+        padded.extend_from_slice(&jpeg);
+        padded.resize(per_file, 0);
+        assert!(image::load_from_memory(&padded).is_ok());
+        let prompt = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nedit\r\n"
+        );
+        let image_header = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"payload.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n"
+        );
+        let final_boundary = format!("\r\n--{boundary}--\r\n");
+        let stream = stream::unfold((usize::MAX, 0usize, 0usize), move |(field, phase, sent)| {
+            let prompt = prompt.clone();
+            let image_header = image_header.clone();
+            let final_boundary = final_boundary.clone();
+            let jpeg = jpeg.clone();
+            async move {
+                if field == usize::MAX {
+                    return Some((Ok::<Bytes, io::Error>(Bytes::from(prompt)), (0, 0, 0)));
+                }
+                if field >= 3 {
+                    return None;
+                }
+                let mut phase = phase;
+                let mut sent = sent;
+                if phase == 1 && sent >= jpeg.len() {
+                    phase = 2;
+                    sent = 0;
+                }
+                if phase == 2 && sent >= padding {
+                    let next = if field + 1 == 3 {
+                        (Ok(Bytes::from(final_boundary)), (3, 0, 0))
+                    } else {
+                        (Ok(Bytes::from_static(b"\r\n")), (field + 1, 0, 0))
+                    };
+                    return Some(next);
+                }
+                if phase == 0 {
+                    return Some((Ok(Bytes::from(image_header.clone())), (field, 1, 0)));
+                }
+                let (source, offset) = if phase == 1 {
+                    (&jpeg[..], sent)
+                } else {
+                    (&[][..], sent)
+                };
+                let remaining = if phase == 1 {
+                    source.len() - offset
+                } else {
+                    padding - offset
+                };
+                let size = remaining.min(1024 * 1024);
+                let bytes = if phase == 1 {
+                    Bytes::copy_from_slice(&source[offset..offset + size])
+                } else {
+                    Bytes::from(vec![0; size])
+                };
+                Some((Ok(bytes), (field, phase, sent + size)))
+            }
+        });
+        let body = Body::from_stream(stream);
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-image-2".to_owned()],
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/edits")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(body)
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.account_store.inflight(), 0);
+        state.account_type_catalog.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn native_image_multipart_stream_rejects_malformed_inputs_before_upstream_and_lease() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let upstream_calls = Arc::new(AtomicUsize::new(0));
+        let upstream_calls_for_server = upstream_calls.clone();
+        let upstream = tokio::spawn(async move {
+            let fallback = any(move || {
+                let calls = upstream_calls_for_server.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            });
+            axum::serve(listener, Router::new().fallback(fallback))
+                .await
+                .expect("upstream server");
+        });
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["gpt-image-2".to_owned()],
+            upstream_base_url: Some(format!("http://{address}")),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: None,
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let boundary = "----malformed-image-stream";
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let duplicate_option = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\ny\r\n--{boundary}--\r\n"
+        );
+        let truncated =
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n");
+        let mismatched = "--wrong-boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n--wrong-boundary--\r\n".to_owned();
+        let mut too_many_parts = Vec::new();
+        for _ in 0..=MAX_NATIVE_IMAGE_MULTIPART_PARTS {
+            too_many_parts.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nx\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        too_many_parts.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        for (name, bytes, request_content_type) in [
+            (
+                "duplicate-option",
+                duplicate_option.into_bytes(),
+                content_type.clone(),
+            ),
+            ("truncated", truncated.into_bytes(), content_type.clone()),
+            (
+                "mismatched-boundary",
+                mismatched.into_bytes(),
+                content_type.clone(),
+            ),
+            ("too-many-parts", too_many_parts, content_type.clone()),
+        ] {
+            let response = state
+                .router()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/images/edits")
+                        .header(header::AUTHORIZATION, "Bearer client")
+                        .header(header::CONTENT_TYPE, request_content_type)
+                        .body(Body::from(bytes))
+                        .expect("malformed request"),
+                )
+                .await
+                .expect("malformed response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "case={name}");
+            let _ = response.into_body().collect().await.expect("error body");
+            assert_eq!(state.account_store.inflight(), 0, "case={name}");
+        }
+
+        let oversized = MAX_NATIVE_IMAGE_BYTES + 1;
+        let file_header = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"oversized.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        );
+        let file_end = format!("\r\n--{boundary}--\r\n");
+        let file_stream = stream::unfold((0usize, 0usize), move |(phase, sent)| {
+            let file_header = file_header.clone();
+            let file_end = file_end.clone();
+            async move {
+                match phase {
+                    0 => Some((Ok::<Bytes, io::Error>(Bytes::from(file_header)), (1, 0))),
+                    1 if sent < oversized => {
+                        let size = (oversized - sent).min(1024 * 1024);
+                        Some((Ok(Bytes::from(vec![b'x'; size])), (1, sent + size)))
+                    }
+                    1 => Some((Ok(Bytes::from(file_end)), (2, 0))),
+                    _ => None,
+                }
+            }
+        });
+        let response = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/edits")
+                    .header(header::AUTHORIZATION, "Bearer client")
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(Body::from_stream(file_stream))
+                    .expect("oversized request"),
+            )
+            .await
+            .expect("oversized response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let _ = response
+            .into_body()
+            .collect()
+            .await
+            .expect("oversized body");
+        assert_eq!(state.account_store.inflight(), 0);
+        assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+        state.account_type_catalog.shutdown().await;
+        upstream.abort();
+        let _ = upstream.await;
     }
 
     #[test]
@@ -27843,5 +36929,1420 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"
     fn constant_time_comparison_does_not_accept_prefixes() {
         assert!(constant_time_equal(b"secret", b"secret"));
         assert!(!constant_time_equal(b"secret", b"secret2"));
+    }
+
+    #[tokio::test]
+    async fn json_backup_concurrent_runs_have_one_owner_and_preserve_sidecar() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-concurrent");
+        let state_a = backup_owner_state(&data_dir);
+        let state_b = backup_owner_state(&data_dir);
+        let state_path = data_dir.join("backup_state.json");
+        let (hook, after_running, release_after_running, _, _, _, _) =
+            backup_test_hook(&state_path, true, false);
+        let _hook_guard = management::install_backup_test_hook(hook);
+
+        let task_a_state = state_a.clone();
+        let task_a = tokio::spawn(async move {
+            management_request(
+                &task_a_state,
+                "POST",
+                "/api/backups/run",
+                None,
+                Some("admin-key"),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), after_running.notified())
+            .await
+            .expect("first backup must reach running state");
+
+        let response_b = tokio::time::timeout(
+            Duration::from_secs(2),
+            management_request(
+                &state_b,
+                "POST",
+                "/api/backups/run",
+                None,
+                Some("admin-key"),
+            ),
+        )
+        .await
+        .expect("second backup must fail closed instead of waiting forever");
+        assert_eq!(response_b.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response_b).await,
+            json!({"detail":{"error":"当前已有备份任务正在执行"}})
+        );
+
+        release_after_running.notify_one();
+        let response_a = task_a.await.expect("first backup task");
+        assert_eq!(response_a.status(), StatusCode::OK);
+        let key_a = json_response(response_a).await["result"]["key"]
+            .as_str()
+            .expect("first backup key")
+            .to_owned();
+        let state = read_backup_owner_state(&data_dir);
+        assert_eq!(state["last_status"], "success");
+        assert_eq!(state["last_object_key"], key_a);
+        assert_eq!(state["pending_object_key"], Value::Null);
+        assert!(state["last_finished_at"].is_string());
+
+        state_a.account_type_catalog.shutdown().await;
+        state_b.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_archive_commit_failure_finishes_error_and_preserves_owner_fields() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-archive-failure");
+        write_backup_owner_state(
+            &data_dir,
+            json!({
+                "last_started_at": "2026-08-24T00:00:00Z",
+                "last_finished_at": "2026-08-24T00:01:00Z",
+                "last_status": "success",
+                "last_object_key": "backups/backup-old.tar.gz"
+            }),
+        );
+        let state = backup_owner_state(&data_dir);
+        let state_path = data_dir.join("backup_state.json");
+        let (hook, after_running, release_after_running, _, _, _, _) =
+            backup_test_hook(&state_path, true, false);
+        let _hook_guard = management::install_backup_test_hook(hook);
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            management_request(
+                &task_state,
+                "POST",
+                "/api/backups/run",
+                None,
+                Some("admin-key"),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), after_running.notified())
+            .await
+            .expect("backup must reach running state before archive failure");
+
+        let moved_backup_dir = data_dir.join("backups-moved");
+        fs::rename(data_dir.join("backups"), &moved_backup_dir)
+            .expect("move backup directory away for commit failure");
+        fs::write(data_dir.join("backups"), b"not a directory")
+            .expect("install invalid backup parent");
+        release_after_running.notify_one();
+        let response = task.await.expect("archive failure task");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let state_after = read_backup_owner_state(&data_dir);
+        assert_eq!(state_after["last_status"], "error");
+        assert_eq!(state_after["last_object_key"], "backups/backup-old.tar.gz");
+        assert!(state_after["last_started_at"].is_string());
+        assert!(state_after["last_finished_at"].is_string());
+        assert!(state_after["pending_object_key"].is_string());
+        assert!(state_after["pending_target_fingerprint"].is_string());
+        assert_eq!(state_after["last_error_code"], "backup_failed");
+
+        fs::remove_file(data_dir.join("backups")).expect("remove invalid backup parent");
+        fs::rename(moved_backup_dir, data_dir.join("backups")).expect("restore backup directory");
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_run_rejects_malformed_state_without_overwrite() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-malformed-state");
+        let original = b"{broken";
+        fs::write(data_dir.join("backup_state.json"), original).expect("malformed state");
+        fs::write(data_dir.join("backups").join("backup-old.tar.gz"), b"old").expect("old backup");
+        let state = backup_owner_state(&data_dir);
+        let response =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert_eq!(
+            fs::read(data_dir.join("backup_state.json")).expect("state bytes"),
+            original
+        );
+        assert_eq!(
+            fs::read_dir(data_dir.join("backups"))
+                .expect("backup directory")
+                .filter_map(Result::ok)
+                .count(),
+            1
+        );
+        assert!(
+            !fs::read(data_dir.join("backup_state.json"))
+                .expect("state bytes")
+                .windows(b"running".len())
+                .any(|window| window == b"running")
+        );
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_run_rejects_array_state_without_overwrite() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-array-state");
+        let original = br#"[{"last_status":"success"}]"#;
+        fs::write(data_dir.join("backup_state.json"), original).expect("array state");
+        let state = backup_owner_state(&data_dir);
+        let response =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert_eq!(
+            fs::read(data_dir.join("backup_state.json")).expect("state bytes"),
+            original
+        );
+        assert_eq!(
+            fs::read_dir(data_dir.join("backups"))
+                .expect("backup directory")
+                .filter_map(Result::ok)
+                .count(),
+            0
+        );
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_delete_rejects_corrupt_state_without_removing_archive() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-delete-corrupt-state");
+        let original = b"not-json\n";
+        fs::write(data_dir.join("backup_state.json"), original).expect("corrupt state");
+        let key = "backups/backup-delete-corrupt.tar.gz";
+        let archive_path = data_dir
+            .join("backups")
+            .join("backup-delete-corrupt.tar.gz");
+        fs::write(&archive_path, b"archive").expect("archive");
+        let state = backup_owner_state(&data_dir);
+        let response = management_request(
+            &state,
+            "POST",
+            "/api/backups/delete",
+            Some(json!({"key": key})),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert_eq!(
+            fs::read(data_dir.join("backup_state.json")).expect("state bytes"),
+            original
+        );
+        assert_eq!(fs::read(&archive_path).expect("archive bytes"), b"archive");
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_status_rejects_malformed_state_without_projecting_idle() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-status-malformed-state");
+        let original = b"{broken";
+        let state_path = data_dir.join("backup_state.json");
+        fs::write(&state_path, original).expect("malformed state");
+        let state = backup_owner_state(&data_dir);
+
+        let response =
+            management_request(&state, "GET", "/api/backups", None, Some("admin-key")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert_eq!(fs::read(&state_path).expect("state bytes"), original);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_status_rejects_non_object_state_without_projecting_idle() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-status-array-state");
+        let original = br#"[{"last_status":"success"}]"#;
+        let state_path = data_dir.join("backup_state.json");
+        fs::write(&state_path, original).expect("array state");
+        let state = backup_owner_state(&data_dir);
+
+        let response =
+            management_request(&state, "GET", "/api/backups", None, Some("admin-key")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert_eq!(fs::read(&state_path).expect("state bytes"), original);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_status_rejects_unreadable_state_without_projecting_idle() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-status-unreadable-state");
+        let state_path = data_dir.join("backup_state.json");
+        fs::create_dir(&state_path).expect("unreadable state directory");
+        let state = backup_owner_state(&data_dir);
+
+        let response =
+            management_request(&state, "GET", "/api/backups", None, Some("admin-key")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert!(
+            state_path.is_dir(),
+            "status query replaced unreadable state"
+        );
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_success_state_publish_failure_cannot_leave_running_or_fake_success() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-state-failure");
+        let state = backup_owner_state(&data_dir);
+        let state_path = data_dir.join("backup_state.json");
+        let (hook, _, _, after_archive_commit, release_after_archive_commit, fail_state, _) =
+            backup_test_hook(&state_path, false, true);
+        let _hook_guard = management::install_backup_test_hook(hook);
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            management_request(
+                &task_state,
+                "POST",
+                "/api/backups/run",
+                None,
+                Some("admin-key"),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), after_archive_commit.notified())
+            .await
+            .expect("backup must commit archive before state publish");
+        fail_state.store(true, Ordering::SeqCst);
+        release_after_archive_commit.notify_one();
+        let response = task.await.expect("state publish failure task");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let state_after = read_backup_owner_state(&data_dir);
+        assert_ne!(state_after["last_status"], "success");
+        assert_eq!(state_after["last_status"], "error");
+        assert_ne!(state_after["running"], true);
+        assert!(state_after["last_finished_at"].is_string());
+        assert!(state_after["pending_object_key"].is_string());
+        assert_ne!(
+            state_after["last_object_key"],
+            state_after["pending_object_key"]
+        );
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_delete_of_pending_key_is_busy_until_owner_finishes() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-delete");
+        let state = backup_owner_state(&data_dir);
+        let state_path = data_dir.join("backup_state.json");
+        let (hook, after_running, release_after_running, _, _, _, running_key) =
+            backup_test_hook(&state_path, true, false);
+        let _hook_guard = management::install_backup_test_hook(hook);
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            management_request(
+                &task_state,
+                "POST",
+                "/api/backups/run",
+                None,
+                Some("admin-key"),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), after_running.notified())
+            .await
+            .expect("backup must reach pending state");
+        let key = running_key
+            .lock()
+            .expect("running key lock")
+            .clone()
+            .expect("running key");
+        let response = management_request(
+            &state,
+            "POST",
+            "/api/backups/delete",
+            Some(json!({"key": key})),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail":{"error":"当前备份正在写入该对象，请稍后再删除"}})
+        );
+        release_after_running.notify_one();
+        let response = task.await.expect("backup task");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_stale_pending_reuses_only_matching_target_and_encryption() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-stale-pending");
+        let state = backup_owner_state(&data_dir);
+        let pending_key = "backups/backup-stale-owner.tar.gz";
+        let fingerprint = management::backup_target_fingerprint_for_test(&state);
+        write_backup_owner_state(
+            &data_dir,
+            json!({
+                "last_started_at": "2026-08-24T00:00:00Z",
+                "last_finished_at": "2026-08-24T00:01:00Z",
+                "last_status": "error",
+                "last_object_key": "backups/backup-old.tar.gz",
+                "pending_object_key": pending_key,
+                "pending_target_fingerprint": fingerprint
+            }),
+        );
+        let response =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = json_response(response).await;
+        assert_eq!(result["result"]["key"], pending_key);
+
+        write_backup_owner_state(
+            &data_dir,
+            json!({
+                "last_status": "error",
+                "last_object_key": pending_key,
+                "pending_object_key": "backups/backup-mismatch.tar.gz",
+                "pending_target_fingerprint": "wrong-target"
+            }),
+        );
+        let mismatch_state = fs::read(data_dir.join("backup_state.json")).expect("mismatch state");
+        let mismatch =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(mismatch).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert_eq!(
+            fs::read(data_dir.join("backup_state.json")).expect("mismatch state after run"),
+            mismatch_state
+        );
+
+        write_backup_owner_state(
+            &data_dir,
+            json!({
+                "last_status": "error",
+                "pending_object_key": "backups/backup-encrypted.tar.gz.enc",
+                "pending_target_fingerprint": fingerprint
+            }),
+        );
+        let encryption_mismatch_state =
+            fs::read(data_dir.join("backup_state.json")).expect("encryption mismatch state");
+        let encryption_mismatch =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(encryption_mismatch.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(encryption_mismatch).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert_eq!(
+            fs::read(data_dir.join("backup_state.json"))
+                .expect("encryption mismatch state after run"),
+            encryption_mismatch_state
+        );
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_stale_running_pending_reuses_matching_key_after_lock_is_free() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-stale-running");
+        let state = backup_owner_state(&data_dir);
+        let pending_key = "backups/backup-stale-running.tar.gz";
+        let fingerprint = management::backup_target_fingerprint_for_test(&state);
+        write_backup_owner_state(
+            &data_dir,
+            json!({
+                "running": true,
+                "last_started_at": "2026-08-24T00:00:00Z",
+                "last_finished_at": "2026-08-24T00:01:00Z",
+                "last_status": "running",
+                "last_object_key": "backups/backup-old.tar.gz",
+                "pending_object_key": pending_key,
+                "pending_target_fingerprint": fingerprint
+            }),
+        );
+        let response =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = json_response(response).await;
+        assert_eq!(result["result"]["key"], pending_key);
+        let final_state = read_backup_owner_state(&data_dir);
+        assert_eq!(final_state["last_status"], "success");
+        assert_eq!(final_state["last_object_key"], pending_key);
+        assert_eq!(final_state["pending_object_key"], Value::Null);
+
+        write_backup_owner_state(
+            &data_dir,
+            json!({
+                "running": true,
+                "last_status": "running",
+                "pending_object_key": "backups/backup-stale-running-mismatch.tar.gz",
+                "pending_target_fingerprint": "wrong-target"
+            }),
+        );
+        let mismatch_state = fs::read(data_dir.join("backup_state.json")).expect("mismatch state");
+        let mismatch =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(mismatch).await,
+            json!({"detail":{"error":"上一次备份状态无效，已停止重试"}})
+        );
+        assert_eq!(
+            fs::read(data_dir.join("backup_state.json")).expect("mismatch state after run"),
+            mismatch_state
+        );
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_cross_process_state_lock_blocks_second_owner() {
+        let _serial = BACKUP_TEST_SERIAL.lock().await;
+        let data_dir = create_backup_owner_data("backup-owner-cross-process");
+        let state = backup_owner_state(&data_dir);
+        let state_path = data_dir.join("backup_state.json");
+        write_backup_owner_state(&data_dir, json!({"last_status":"idle"}));
+        let ready = data_dir.join("python-lock-ready");
+        let release = data_dir.join("python-lock-release");
+        let error = data_dir.join("python-lock-error");
+        let mut child = PythonLockChild {
+            child: spawn_python_lock_child(
+                PYTHON_HOLD_LOCK,
+                &[&state_path, &ready, &release, &error],
+            ),
+            release: release.clone(),
+        };
+        wait_for_test_marker(&ready);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")),
+        )
+        .await
+        .expect("cross-process lock rejection must be bounded");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(response).await,
+            json!({"detail":{"error":"当前已有备份任务正在执行"}})
+        );
+
+        fs::write(&release, b"release").expect("release cross-process lock");
+        let status = child.wait();
+        assert!(status.success());
+        assert!(!error.exists());
+        let lock_path = path_write_lock_path(&state_path);
+        assert!(lock_path.exists());
+        fs::remove_file(&lock_path).expect("remove released test lock sidecar");
+        assert!(!lock_path.exists());
+
+        state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_owner_settings_and_backup_route_persistence_slice() {
+        let root = account_snapshot_path("json-owner-settings-backup");
+        let data_dir = root.parent().expect("data parent").to_owned();
+        fs::create_dir_all(&data_dir).expect("data directory");
+        fs::write(
+            data_dir.join("accounts.json"),
+            r#"{"items":[{"access_token":"owner-token","status":"正常","type":"free"}]}"#
+                .as_bytes(),
+        )
+        .expect("accounts snapshot");
+        fs::write(
+            data_dir.join("auth_keys.json"),
+            serde_json::to_vec(&json!({
+                "items": [
+                    {"id":"admin-user","name":"Admin","role":"admin","enabled":true,"key_hash":auth_key_hash("admin-key")},
+                    {"id":"normal-user","name":"Normal","role":"user","enabled":true,"key_hash":auth_key_hash("user-key")}
+                ]
+            }))
+            .expect("auth snapshot"),
+        )
+        .expect("auth snapshot write");
+        fs::write(
+            data_dir.join("config.json"),
+            serde_json::to_vec(&json!({
+                "third_party_apps": {
+                    "infinite_canvas": {
+                        "enabled": true,
+                        "url": "https://canvas.example.test/editor"
+                    }
+                },
+                "proxy": "http://proxy-user:proxy-secret@proxy.example.test:8080?token=proxy-canary#fragment",
+                "unknown_settings_canary": "must-not-project",
+                "ai_review": {
+                    "enabled": true,
+                    "base_url": "https://review-user:review-url-secret@review.example.test/api/?token=review-canary#fragment",
+                    "api_key": "old-ai-secret",
+                    "model": "review-model",
+                    "prompt": "review prompt"
+                },
+                "backup": {
+                    "enabled": true,
+                    "provider": "cloudflare_r2",
+                    "secret_access_key": "old-backup-secret",
+                    "passphrase": "old-backup-passphrase",
+                    "include": {"config": true}
+                },
+                "image_storage": {
+                    "enabled": true,
+                    "mode": "webdav",
+                    "webdav_url": "https://webdav-user:webdav-url-secret@dav.example.test/root?token=webdav-canary#fragment",
+                    "webdav_password": "old-webdav-secret"
+                },
+                "chat_completion_cache": {
+                    "enabled": "yes",
+                    "ttl_seconds": "0",
+                    "max_entries": false,
+                    "dedupe_inflight": "off",
+                    "unknown_cache_canary": "must-not-project"
+                },
+                "proxy_runtime": {
+                    "enabled": true,
+                    "egress_mode": "tor",
+                    "proxy_url": "http://runtime-user:runtime-secret@runtime.example:8081?token=runtime-canary#fragment",
+                    "resource_proxy_url": "socks5://resource-user:resource-secret@resource.example:1082?token=resource-canary",
+                    "skip_ssl_verify": "on",
+                    "reset_session_status_codes": ["403", 429, 99, 600],
+                    "unknown_proxy_canary": "must-not-project",
+                    "clearance": {
+                        "enabled": "yes",
+                        "mode": "bad",
+                        "cf_cookies": "cookie-secret",
+                        "cf_clearance": "clearance-secret",
+                        "user_agent": " ua ",
+                        "browser": " firefox ",
+                        "flaresolverr_url": "http://flare-user:flare-secret@flare.example:8191?token=flare-canary",
+                        "timeout_sec": 0,
+                        "refresh_interval": 59,
+                        "warm_up_on_start": "true"
+                    }
+                }
+            }))
+            .expect("config snapshot JSON"),
+        )
+        .expect("config snapshot");
+
+        let backend = storage::StorageBackend::connect_configured("json", None, &data_dir)
+            .await
+            .expect("json owner connection")
+            .expect("json must be a first-class storage owner");
+        let state = AppState::new_with_storage_backend(
+            AppConfig {
+                version: "json-owner-contract".to_owned(),
+                auth_key: None,
+                models: vec!["contract-model".to_owned()],
+                upstream_base_url: None,
+                upstream_auth: None,
+                auth_keys_path: None,
+                models_path: None,
+                accounts_path: None,
+                upstream_protocol: UpstreamProtocol::OpenAi,
+            },
+            backend.clone(),
+            data_dir.clone(),
+        )
+        .await
+        .expect("json owner state");
+
+        let missing_settings = management_request(&state, "GET", "/api/settings", None, None).await;
+        assert_eq!(missing_settings.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_response(missing_settings).await,
+            json!({"detail":{"error":"密钥无效或已失效，请重新登录"}})
+        );
+
+        let invalid_settings =
+            management_request(&state, "GET", "/api/settings", None, Some("invalid-key")).await;
+        assert_eq!(invalid_settings.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_response(invalid_settings).await,
+            json!({"detail":{"error":"密钥无效或已失效，请重新登录"}})
+        );
+
+        let user_settings =
+            management_request(&state, "GET", "/api/settings", None, Some("user-key")).await;
+        assert_eq!(user_settings.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_response(user_settings).await,
+            json!({"detail":{"error":"需要管理员权限才能执行这个操作"}})
+        );
+
+        let settings =
+            management_request(&state, "GET", "/api/settings", None, Some("admin-key")).await;
+        assert_eq!(settings.status(), StatusCode::OK);
+        let settings_value = json_response(settings).await;
+        assert_eq!(
+            settings_value["config"]["third_party_apps"],
+            json!({
+                "infinite_canvas": {
+                    "enabled": true,
+                    "url": "https://canvas.example.test/editor"
+                }
+            })
+        );
+        assert_eq!(settings_value["config"]["ai_review"]["api_key"], "********");
+        assert_eq!(
+            settings_value["config"]["proxy"],
+            "http://[REDACTED]@proxy.example.test:8080"
+        );
+        assert_eq!(
+            settings_value["config"]["ai_review"]["base_url"],
+            "https://[REDACTED]@review.example.test/api/"
+        );
+        assert_eq!(
+            settings_value["config"]["image_storage"]["webdav_url"],
+            "https://[REDACTED]@dav.example.test/root"
+        );
+        assert_eq!(
+            settings_value["config"]["backup"]["secret_access_key"],
+            "********"
+        );
+        assert_eq!(settings_value["config"]["backup"]["passphrase"], "********");
+        assert_eq!(
+            settings_value["config"]["image_storage"]["webdav_password"],
+            "********"
+        );
+        assert_eq!(
+            settings_value["config"]["chat_completion_cache"],
+            json!({
+                "enabled": true,
+                "ttl_seconds": 0,
+                "max_entries": 256,
+                "dedupe_inflight": false,
+                "stream_cache": true,
+                "normalize_messages": true,
+                "drop_adjacent_duplicates": true,
+                "drop_assistant_history": false
+            })
+        );
+        assert_eq!(
+            settings_value["config"]["proxy_runtime"],
+            json!({
+                "enabled": true,
+                "egress_mode": "direct",
+                "proxy_url": "http://[REDACTED]@runtime.example:8081",
+                "resource_proxy_url": "socks5://[REDACTED]@resource.example:1082",
+                "skip_ssl_verify": true,
+                "reset_session_status_codes": [403, 429],
+                "clearance": {
+                    "enabled": true,
+                    "mode": "none",
+                    "cf_cookies": "",
+                    "cf_clearance": "",
+                    "has_cf_cookies": true,
+                    "has_cf_clearance": true,
+                    "user_agent": "ua",
+                    "browser": "firefox",
+                    "flaresolverr_url": "http://[REDACTED]@flare.example:8191",
+                    "timeout_sec": 1,
+                    "refresh_interval": 60,
+                    "warm_up_on_start": true
+                }
+            })
+        );
+        let settings_json = serde_json::to_string(&settings_value).expect("settings JSON");
+        assert!(!settings_json.contains("unknown_settings_canary"));
+        assert!(!settings_json.contains("unknown_cache_canary"));
+        assert!(!settings_json.contains("unknown_proxy_canary"));
+        for secret in [
+            "runtime-secret",
+            "resource-secret",
+            "cookie-secret",
+            "clearance-secret",
+            "flare-secret",
+            "runtime-canary",
+            "resource-canary",
+            "flare-canary",
+            "proxy-secret",
+            "proxy-canary",
+            "review-url-secret",
+            "review-canary",
+            "webdav-url-secret",
+            "webdav-canary",
+        ] {
+            assert!(
+                !settings_json.contains(secret),
+                "runtime secret leaked: {secret}"
+            );
+        }
+        assert!(
+            !settings_value["config"]
+                .as_object()
+                .unwrap()
+                .contains_key("data_dir")
+        );
+        assert!(
+            !settings_value["config"]
+                .as_object()
+                .unwrap()
+                .contains_key("version")
+        );
+        assert!(
+            !settings_value["config"]
+                .as_object()
+                .unwrap()
+                .contains_key("models")
+        );
+        for secret in [
+            "old-ai-secret",
+            "old-backup-secret",
+            "old-backup-passphrase",
+            "old-webdav-secret",
+        ] {
+            assert!(!settings_json.contains(secret), "secret leaked: {secret}");
+        }
+
+        let masked_update = management_request(
+            &state,
+            "POST",
+            "/api/settings",
+            Some(json!({
+                "proxy": settings_value["config"]["proxy"].clone(),
+                "ai_review": {
+                    "api_key": "********",
+                    "base_url": settings_value["config"]["ai_review"]["base_url"].clone()
+                },
+                "backup": {"secret_access_key": "********", "passphrase": "********"},
+                "image_storage": {
+                    "webdav_password": "********",
+                    "webdav_url": settings_value["config"]["image_storage"]["webdav_url"].clone()
+                },
+                "proxy_runtime": {
+                    "proxy_url": settings_value["config"]["proxy_runtime"]["proxy_url"].clone(),
+                    "resource_proxy_url": settings_value["config"]["proxy_runtime"]["resource_proxy_url"].clone(),
+                    "clearance": {
+                        "flaresolverr_url": settings_value["config"]["proxy_runtime"]["clearance"]["flaresolverr_url"].clone()
+                    }
+                }
+            })),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(masked_update.status(), StatusCode::OK);
+        let preserved_config: Value = serde_json::from_slice(
+            &fs::read(data_dir.join("config.json")).expect("preserved config"),
+        )
+        .expect("preserved config JSON");
+        assert_eq!(preserved_config["ai_review"]["api_key"], "old-ai-secret");
+        assert_eq!(
+            preserved_config["backup"]["secret_access_key"],
+            "old-backup-secret"
+        );
+        assert_eq!(
+            preserved_config["backup"]["passphrase"],
+            "old-backup-passphrase"
+        );
+        assert_eq!(
+            preserved_config["image_storage"]["webdav_password"],
+            "old-webdav-secret"
+        );
+        assert_eq!(
+            preserved_config["proxy"],
+            "http://proxy-user:proxy-secret@proxy.example.test:8080?token=proxy-canary#fragment"
+        );
+        assert_eq!(
+            preserved_config["ai_review"]["base_url"],
+            "https://review-user:review-url-secret@review.example.test/api/?token=review-canary#fragment"
+        );
+        assert_eq!(
+            preserved_config["image_storage"]["webdav_url"],
+            "https://webdav-user:webdav-url-secret@dav.example.test/root?token=webdav-canary#fragment"
+        );
+        assert_eq!(
+            preserved_config["proxy_runtime"]["proxy_url"],
+            "http://runtime-user:runtime-secret@runtime.example:8081?token=runtime-canary#fragment"
+        );
+        assert_eq!(
+            preserved_config["proxy_runtime"]["resource_proxy_url"],
+            "socks5://resource-user:resource-secret@resource.example:1082?token=resource-canary"
+        );
+        assert_eq!(
+            preserved_config["proxy_runtime"]["clearance"]["flaresolverr_url"],
+            "http://flare-user:flare-secret@flare.example:8191?token=flare-canary"
+        );
+
+        let redacted_update = management_request(
+            &state,
+            "POST",
+            "/api/settings",
+            Some(json!({
+                "proxy": "http://[REDACTED]@proxy.example.test:8080",
+                "ai_review": {
+                    "base_url": "https://[REDACTED]@review.example.test/api/"
+                },
+                "image_storage": {
+                    "webdav_url": "https://[REDACTED]@dav.example.test/root"
+                },
+                "proxy_runtime": {
+                    "proxy_url": "http://[REDACTED]@runtime.example:8081",
+                    "resource_proxy_url": "socks5://[REDACTED]@resource.example:1082",
+                    "clearance": {
+                        "flaresolverr_url": "http://[REDACTED]@flare.example:8191"
+                    }
+                }
+            })),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(redacted_update.status(), StatusCode::OK);
+        let redacted_config: Value = serde_json::from_slice(
+            &fs::read(data_dir.join("config.json")).expect("redacted URL config"),
+        )
+        .expect("redacted URL config JSON");
+        assert_eq!(redacted_config["proxy"], preserved_config["proxy"]);
+        assert_eq!(
+            redacted_config["ai_review"]["base_url"],
+            preserved_config["ai_review"]["base_url"]
+        );
+        assert_eq!(
+            redacted_config["image_storage"]["webdav_url"],
+            preserved_config["image_storage"]["webdav_url"]
+        );
+        assert_eq!(
+            redacted_config["proxy_runtime"]["proxy_url"],
+            preserved_config["proxy_runtime"]["proxy_url"]
+        );
+        assert_eq!(
+            redacted_config["proxy_runtime"]["resource_proxy_url"],
+            preserved_config["proxy_runtime"]["resource_proxy_url"]
+        );
+        assert_eq!(
+            redacted_config["proxy_runtime"]["clearance"]["flaresolverr_url"],
+            preserved_config["proxy_runtime"]["clearance"]["flaresolverr_url"]
+        );
+
+        let new_url_update = management_request(
+            &state,
+            "POST",
+            "/api/settings",
+            Some(json!({"proxy": "https://new-proxy.example.test/path"})),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(new_url_update.status(), StatusCode::OK);
+        let new_url_config: Value = serde_json::from_slice(
+            &fs::read(data_dir.join("config.json")).expect("new URL config"),
+        )
+        .expect("new URL config JSON");
+        assert_eq!(
+            new_url_config["proxy"],
+            "https://new-proxy.example.test/path"
+        );
+
+        let empty_url_update = management_request(
+            &state,
+            "POST",
+            "/api/settings",
+            Some(json!({"proxy": ""})),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(empty_url_update.status(), StatusCode::OK);
+        let empty_url_config: Value = serde_json::from_slice(
+            &fs::read(data_dir.join("config.json")).expect("empty URL config"),
+        )
+        .expect("empty URL config JSON");
+        assert_eq!(empty_url_config["proxy"], "");
+
+        let new_secret_update = management_request(
+            &state,
+            "POST",
+            "/api/settings",
+            Some(json!({
+                "ai_review": {"api_key": "new-ai-secret"},
+                "backup": {"secret_access_key": "new-backup-secret", "passphrase": "new-passphrase"},
+                "image_storage": {"webdav_password": "new-webdav-secret"}
+            })),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(new_secret_update.status(), StatusCode::OK);
+        let new_config: Value =
+            serde_json::from_slice(&fs::read(data_dir.join("config.json")).expect("new config"))
+                .expect("new config JSON");
+        assert_eq!(new_config["ai_review"]["api_key"], "new-ai-secret");
+        assert_eq!(
+            new_config["backup"]["secret_access_key"],
+            "new-backup-secret"
+        );
+        assert_eq!(new_config["backup"]["passphrase"], "new-passphrase");
+        assert_eq!(
+            new_config["image_storage"]["webdav_password"],
+            "new-webdav-secret"
+        );
+
+        let clear_secret_update = management_request(
+            &state,
+            "POST",
+            "/api/settings",
+            Some(json!({
+                "ai_review": {"api_key": ""},
+                "backup": {"secret_access_key": "", "passphrase": ""},
+                "image_storage": {"webdav_password": ""}
+            })),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(clear_secret_update.status(), StatusCode::OK);
+        let cleared_config: Value = serde_json::from_slice(
+            &fs::read(data_dir.join("config.json")).expect("cleared config"),
+        )
+        .expect("cleared config JSON");
+        assert_eq!(cleared_config["ai_review"]["api_key"], "");
+        assert_eq!(cleared_config["backup"]["secret_access_key"], "");
+        assert_eq!(cleared_config["backup"]["passphrase"], "");
+        assert_eq!(cleared_config["image_storage"]["webdav_password"], "");
+
+        // The local archive route is a separate slice.  Python's normalized
+        // backup settings select the remote provider, so use the local
+        // default fixture for this route contract after the settings checks.
+        fs::write(
+            data_dir.join("config.json"),
+            br#"{"third_party_apps":{"infinite_canvas":{"enabled":false,"url":"https://canvas.example.test/old"}}}"#,
+        )
+        .expect("local backup config");
+
+        let update = management_request(
+            &state,
+            "POST",
+            "/api/settings",
+            Some(json!({"config":{"third_party_apps":{"source":"invalid-wrapper"}}})),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(update.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_response(update).await,
+            json!({"detail":{"error":"配置更新包含不支持的字段"}})
+        );
+
+        let update = management_request(
+            &state,
+            "POST",
+            "/api/settings",
+            Some(json!({
+                "third_party_apps": {
+                    "infinite_canvas": {
+                        "enabled": true,
+                        "url": "https://canvas.example.test/new",
+                        "private": "third-party-private-canary"
+                    }
+                }
+            })),
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(update.status(), StatusCode::OK);
+        let saved_config: Value =
+            serde_json::from_slice(&fs::read(data_dir.join("config.json")).expect("saved config"))
+                .expect("saved config JSON");
+        assert_eq!(
+            saved_config["third_party_apps"],
+            json!({
+                "infinite_canvas": {
+                    "enabled": true,
+                    "url": "https://canvas.example.test/new"
+                }
+            })
+        );
+        assert!(
+            !serde_json::to_string(&saved_config)
+                .expect("saved config JSON text")
+                .contains("third-party-private-canary")
+        );
+
+        let forged_state_secret = "forged-backup-state-secret owner@example.com";
+        fs::write(
+            data_dir.join("backup_state.json"),
+            serde_json::to_vec(&json!({
+                "last_started_at": {"secret": forged_state_secret},
+                "last_finished_at": [forged_state_secret],
+                "last_status": {"secret": forged_state_secret},
+                "last_object_key": {"secret": forged_state_secret},
+                "last_error": forged_state_secret,
+                "_last_error_public": true,
+                "last_error_code": "unknown-code",
+                "last_error_status": 503
+            }))
+            .expect("forged backup state"),
+        )
+        .expect("forged backup state write");
+        let backups =
+            management_request(&state, "GET", "/api/backups", None, Some("admin-key")).await;
+        assert_eq!(backups.status(), StatusCode::OK);
+        let backups_value = json_response(backups).await;
+        assert_eq!(backups_value["state"]["running"], false);
+        assert_eq!(backups_value["state"]["last_status"], "idle");
+        assert_eq!(backups_value["state"]["last_started_at"], Value::Null);
+        assert_eq!(backups_value["state"]["last_finished_at"], Value::Null);
+        assert_eq!(backups_value["state"]["last_object_key"], Value::Null);
+        assert_eq!(
+            backups_value["state"]["last_error"],
+            "备份执行失败，请稍后重试"
+        );
+        let backups_json = serde_json::to_string(&backups_value).expect("backups JSON");
+        assert!(!backups_json.contains(forged_state_secret));
+        assert!(!backups_json.contains("_last_error_public"));
+
+        let backup =
+            management_request(&state, "POST", "/api/backups/run", None, Some("admin-key")).await;
+        assert_eq!(backup.status(), StatusCode::OK);
+        let key = json_response(backup).await["result"]["key"]
+            .as_str()
+            .expect("backup key")
+            .to_owned();
+        let backup_path = data_dir
+            .join("backups")
+            .join(key.strip_prefix("backups/").expect("local key"));
+        let payload = fs::read(&backup_path).expect("backup payload");
+        let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(payload));
+        let mut archive = tar::Archive::new(decoder);
+        let names = archive
+            .entries()
+            .expect("backup entries")
+            .map(|entry| {
+                entry
+                    .expect("backup entry")
+                    .path()
+                    .expect("backup member path")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "snapshots/accounts.json"));
+        assert!(names.iter().any(|name| name == "snapshots/auth_keys.json"));
+
+        let detail = management_request(
+            &state,
+            "GET",
+            &format!("/api/backups/detail?key={}", key.replace('/', "%2F")),
+            None,
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail_value = json_response(detail).await;
+        let item = &detail_value["item"];
+        assert!(item["created_at"].is_string());
+        assert_eq!(item["trigger"], "manual");
+        assert_eq!(item["app_version"], "json-owner-contract");
+        assert_eq!(item["storage_backend"], json!({"type": "json"}));
+        assert!(
+            item["files"]
+                .as_array()
+                .expect("detail files")
+                .iter()
+                .all(|file| file["name"] != "backup-metadata.json"
+                    && !file["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with("snapshots/"))
+        );
+        assert_eq!(
+            item["snapshots"],
+            json!([
+                {"name": "accounts", "count": 1, "cumulative_total": 1},
+                {"name": "auth_keys", "count": 2}
+            ])
+        );
+
+        let invalid_detail = management_request(
+            &state,
+            "GET",
+            "/api/backups/detail?key=backups%2F..%2Foutside.tar.gz",
+            None,
+            Some("admin-key"),
+        )
+        .await;
+        assert_eq!(invalid_detail.status(), StatusCode::BAD_REQUEST);
+
+        state.account_type_catalog.shutdown().await;
+        backend.close().await;
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn json_backup_detail_matches_python_archive_projection_boundaries() {
+        fn write_archive(
+            path: &Path,
+            entries: Vec<(String, Vec<u8>, tar::EntryType, Option<String>)>,
+        ) {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+            for (name, bytes, entry_type, link_name) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o600);
+                header.set_entry_type(entry_type);
+                if let Some(link_name) = link_name {
+                    header.set_link_name(link_name).expect("archive link name");
+                }
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, name, std::io::Cursor::new(bytes))
+                    .expect("archive member");
+            }
+            let encoder = builder.into_inner().expect("archive encoder");
+            fs::write(path, encoder.finish().expect("gzip archive")).expect("archive bytes");
+        }
+
+        async fn detail_request(state: &AppState, key: &str) -> Response {
+            management_request(
+                state,
+                "GET",
+                &format!("/api/backups/detail?key={}", key.replace('/', "%2F")),
+                None,
+                Some("admin-key"),
+            )
+            .await
+        }
+
+        let root = account_snapshot_path("json-backup-detail-boundaries");
+        let data_dir = root.parent().expect("data parent").to_owned();
+        fs::create_dir_all(&data_dir).expect("data directory");
+        fs::write(data_dir.join("accounts.json"), br#"{"items":[]}"#).expect("accounts snapshot");
+        fs::write(
+            data_dir.join("auth_keys.json"),
+            serde_json::to_vec(&json!({
+                "items": [{
+                    "id": "admin-user",
+                    "name": "Admin",
+                    "role": "admin",
+                    "enabled": true,
+                    "key_hash": auth_key_hash("admin-key")
+                }]
+            }))
+            .expect("auth snapshot"),
+        )
+        .expect("auth snapshot write");
+        fs::write(data_dir.join("config.json"), br#"{"third_party_apps":{}}"#)
+            .expect("config snapshot");
+
+        let backend = storage::StorageBackend::connect_configured("json", None, &data_dir)
+            .await
+            .expect("json owner connection")
+            .expect("json owner");
+        let state = AppState::new_with_storage_backend(
+            AppConfig {
+                version: "backup-detail-boundary".to_owned(),
+                auth_key: None,
+                models: Vec::new(),
+                upstream_base_url: None,
+                upstream_auth: None,
+                auth_keys_path: None,
+                models_path: None,
+                accounts_path: None,
+                upstream_protocol: UpstreamProtocol::OpenAi,
+            },
+            backend.clone(),
+            data_dir.clone(),
+        )
+        .await
+        .expect("json owner state");
+
+        let key = "backups/backup-detail-boundary.tar.gz";
+        let archive_path = data_dir
+            .join("backups")
+            .join("backup-detail-boundary.tar.gz");
+        fs::create_dir_all(archive_path.parent().expect("backup parent"))
+            .expect("backup directory");
+        let metadata = serde_json::to_vec(&json!({
+            "version": 2,
+            "created_at": "2024-99-99T99:99:99Z",
+            "trigger": "manual",
+            "app_version": "backup-boundary+1",
+            "storage_backend": {"type": 123, "backend": "git"}
+        }))
+        .expect("metadata");
+        write_archive(
+            &archive_path,
+            vec![
+                (
+                    "backup-metadata.json".to_owned(),
+                    metadata,
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "config.json".to_owned(),
+                    br#"{"safe":true}"#.to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "data/logs.jsonl".to_owned(),
+                    b"{}\n".to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "snapshots/accounts.json".to_owned(),
+                    br#"[{"access_token":"redacted"}]"#.to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "snapshots/auth_keys.json".to_owned(),
+                    br#"[{"id":"one"},{"id":"two"}]"#.to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "private.txt".to_owned(),
+                    b"must not project".to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "private/secret..txt".to_owned(),
+                    b"must not reject".to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "私密.json".to_owned(),
+                    b"must not project".to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "data/secret?json".to_owned(),
+                    b"must not project".to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "data/dir".to_owned(),
+                    Vec::new(),
+                    tar::EntryType::Directory,
+                    None,
+                ),
+                (
+                    "data/link".to_owned(),
+                    Vec::new(),
+                    tar::EntryType::Symlink,
+                    Some("../private.txt".to_owned()),
+                ),
+                (
+                    "private-large.bin".to_owned(),
+                    vec![0; 64 * 1024 * 1024 + 1],
+                    tar::EntryType::Regular,
+                    None,
+                ),
+            ],
+        );
+        let response = detail_request(&state, key).await;
+        let status = response.status();
+        let body = json_response(response).await;
+        assert_eq!(status, StatusCode::OK, "detail response: {body}");
+        let item = body["item"].clone();
+        assert_eq!(item["created_at"], Value::Null);
+        assert_eq!(item["trigger"], "manual");
+        assert_eq!(item["app_version"], "backup-boundary+1");
+        assert_eq!(item["storage_backend"], json!({"type":"git"}));
+        assert_eq!(
+            item["files"]
+                .as_array()
+                .expect("projected files")
+                .iter()
+                .map(|file| file["name"].as_str().expect("file name"))
+                .collect::<Vec<_>>(),
+            vec!["config.json", "data/logs.jsonl"]
+        );
+        assert_eq!(
+            item["snapshots"],
+            json!([
+                {"name":"accounts","count":1},
+                {"name":"auth_keys","count":2}
+            ])
+        );
+
+        let too_many = (0..5001)
+            .map(|index| {
+                (
+                    format!("private-{index}.txt"),
+                    Vec::new(),
+                    tar::EntryType::Regular,
+                    None,
+                )
+            })
+            .collect();
+        write_archive(&archive_path, too_many);
+        let response = detail_request(&state, key).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        write_archive(
+            &archive_path,
+            vec![
+                (
+                    "backup-metadata.json".to_owned(),
+                    br#"{"snapshot_manifest":{"version":2}}"#.to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+                (
+                    "snapshots/accounts.json".to_owned(),
+                    b"{}".to_vec(),
+                    tar::EntryType::Regular,
+                    None,
+                ),
+            ],
+        );
+        let response = detail_request(&state, key).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = json_response(response).await;
+        assert_eq!(error["error"]["code"], "bad_request");
+
+        state.account_type_catalog.shutdown().await;
+        backend.close().await;
+        let _ = remove_test_directory_after_release(&data_dir).await;
     }
 }

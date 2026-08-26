@@ -109,6 +109,59 @@ def test_health_does_not_report_cached_accounts_as_healthy_after_snapshot_corrup
     assert payload["status"] == "degraded"
 
 
+def test_public_health_large_valid_snapshot_uses_validated_metadata_within_deadline(tmp_path) -> None:
+    accounts_path = tmp_path / "accounts.json"
+    auth_keys_path = tmp_path / "auth_keys.json"
+    records = [
+        {
+            "access_token": f"health-production-token-{index}",
+            "account_id": f"health-production-account-{index}",
+            "refresh_token": "r" * 5_000,
+            "source_type": "web",
+            "status": "正常",
+            "quota": 1,
+            "type": "free",
+        }
+        for index in range(1_491)
+    ]
+    payload = json.dumps(
+        {"items": records, "cumulative_total": len(records)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert 4 * 1024 * 1024 < len(payload) < 8_027_088
+    accounts_path.write_bytes(payload + (b" " * (8_027_088 - len(payload))))
+    auth_keys_path.write_text('{"items":[]}', encoding="utf-8")
+    storage = JSONStorageBackend(accounts_path, auth_keys_path)
+    service = AccountService(storage)
+    assert storage.load_auth_keys() == []
+    app = FastAPI()
+    app.include_router(create_router("test"))
+
+    with (
+        mock.patch.object(system_module.config, "get_storage_backend", return_value=storage),
+        mock.patch.object(account_module, "account_service", service),
+        mock.patch.object(
+            storage,
+            "_load_json_document",
+            side_effect=AssertionError("health must not reparse accounts"),
+        ),
+        mock.patch.object(
+            storage,
+            "load_auth_keys",
+            side_effect=AssertionError("health must not reparse auth keys"),
+        ),
+    ):
+        response = TestClient(app).get("/health?format=json")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["healthy"] is True
+    assert body["status"] == "ok"
+    assert body["storage"]["health"] == {"status": "healthy"}
+    assert body["accounts"]["total"] == 1_491
+
+
 def test_public_health_projects_storage_details_without_paths_or_urls() -> None:
     storage = LeakyStorageBackend()
     service = AccountService(storage)

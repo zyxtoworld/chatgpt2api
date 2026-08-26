@@ -27,25 +27,33 @@ def _cross_process_writer(kind: str, path_text: str, barrier_text: str, worker_i
     barrier = Path(barrier_text)
     if kind == "cpa":
         config = CPAConfig(path)
-        operation = lambda: config.add_pool(
-            f"pool-{worker_id}", "https://example.test", f"secret-{worker_id}"
-        )
+
+        def operation() -> None:
+            config.add_pool(
+                f"pool-{worker_id}",
+                "https://example.test",
+                f"secret-{worker_id}",
+            )
     elif kind == "sub2api":
         config = Sub2APIConfig(path)
-        operation = lambda: config.add_server(
-            name=f"server-{worker_id}",
-            base_url="https://example.test",
-            email=f"{worker_id}@example.test",
-            password=f"password-{worker_id}",
-            api_key=f"key-{worker_id}",
-        )
+
+        def operation() -> None:
+            config.add_server(
+                name=f"server-{worker_id}",
+                base_url="https://example.test",
+                email=f"{worker_id}@example.test",
+                password=f"password-{worker_id}",
+                api_key=f"key-{worker_id}",
+            )
     elif kind == "ccload":
         config = CCLoadConfig(path)
-        operation = lambda: config.add_server(
-            name=f"server-{worker_id}",
-            base_url="https://example.test",
-            password=f"password-{worker_id}",
-        )
+
+        def operation() -> None:
+            config.add_server(
+                name=f"server-{worker_id}",
+                base_url="https://example.test",
+                password=f"password-{worker_id}",
+            )
     else:
         raise AssertionError(kind)
 
@@ -88,11 +96,15 @@ def _json_cas_writer(
     if kind == "accounts":
         expected = backend.load_accounts_snapshot()
         records = [{"id": worker_id, "kind": "account"}]
-        write = lambda: backend.save_accounts_if_revision(expected, records)
+
+        def write() -> None:
+            backend.save_accounts_if_revision(expected, records)
     elif kind == "auth_keys":
         expected = backend.load_auth_keys_snapshot()
         records = [{"id": worker_id, "kind": "auth_key"}]
-        write = lambda: backend.save_auth_keys_if_revision(expected, records)
+
+        def write() -> None:
+            backend.save_auth_keys_if_revision(expected, records)
     else:
         raise AssertionError(kind)
 
@@ -145,31 +157,59 @@ def _json_cas_writer_with_gate(
     barrier_text: str,
     outcomes,
 ) -> None:
-    from services.storage.json_storage import JSONStorageBackend
+    from services.storage.json_storage import (
+        ACCOUNT_SNAPSHOT_MAX_BYTES,
+        JSONStorageBackend,
+        _AUTH_KEYS_MAX_BYTES,
+    )
 
     backend = JSONStorageBackend(Path(accounts_path_text), Path(auth_keys_path_text))
     barrier = Path(barrier_text)
     if kind == "accounts":
         expected = backend.load_accounts_snapshot()
         records = [{"id": "cas", "kind": "account"}]
-        write = lambda: backend.save_accounts_if_revision(expected, records)
+
+        def write() -> None:
+            backend.save_accounts_if_revision(expected, records)
+
+        expected_path = Path(accounts_path_text)
+        expected_max_bytes = ACCOUNT_SNAPSHOT_MAX_BYTES
     elif kind == "auth_keys":
         expected = backend.load_auth_keys_snapshot()
         records = [{"id": "cas", "kind": "auth_key"}]
-        write = lambda: backend.save_auth_keys_if_revision(expected, records)
+
+        def write() -> None:
+            backend.save_auth_keys_if_revision(expected, records)
+
+        expected_path = Path(auth_keys_path_text)
+        expected_max_bytes = _AUTH_KEYS_MAX_BYTES
     else:
         raise AssertionError(kind)
 
     original_save_json_value = backend._save_json_value
 
-    def gated_save(file_path, value) -> None:
+    def gated_save(
+        file_path,
+        value,
+        *,
+        max_bytes: int,
+        cumulative_total: int | None = None,
+    ) -> None:
+        assert Path(file_path) == expected_path
+        assert max_bytes == expected_max_bytes
+        assert cumulative_total is None
         (barrier / "json-cas-entered-save").write_text("entered", encoding="ascii")
         deadline = time.monotonic() + 10
         while not (barrier / "json-release-cas").exists():
             if time.monotonic() >= deadline:
                 raise TimeoutError("JSON CAS save gate timeout")
             time.sleep(0.005)
-        original_save_json_value(file_path, value)
+        original_save_json_value(
+            file_path,
+            value,
+            max_bytes=max_bytes,
+            cumulative_total=cumulative_total,
+        )
 
     backend._save_json_value = gated_save
     (barrier / "json-cas-ready-cas").write_text("ready", encoding="ascii")

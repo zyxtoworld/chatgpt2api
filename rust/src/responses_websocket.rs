@@ -2165,7 +2165,11 @@ mod tests {
         state
             .account_type_catalog
             .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
-        assert!(state.account_store.poison_usage_marker_lock("codex-token"));
+        assert!(
+            state
+                .account_store
+                .force_usage_marker_failure_for_test("codex-token")
+        );
         let downstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("downstream listener");

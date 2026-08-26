@@ -2,7 +2,7 @@
 
 更新时间：2026-08-23
 
-这份矩阵记录 Rust 二进制进入生产 Docker、主分支 `:latest` 和 ai-arm 的硬门。当前 Dockerfile/发布 workflow 已切到 Rust release 入口；本地程序门已经闭合，但同 SHA 的 Actions/GHCR、远程运行态和真实上游验收仍必须独立落盘，不能把本地 fake upstream 当成部署证据。
+这份矩阵记录 Rust 二进制进入生产 Docker、主分支 `:latest` 和 ai-arm 的硬门。当前 Dockerfile 保持 Python 生产入口；Rust 只作为候选二进制接受本地合同与黑盒验证。矩阵中任一阻断项、完整程序门或真实上游验收未闭合时，都不能提前切换生产入口。
 
 ### 当前 Rust native 启动合同（仅黑盒/验收夹具）
 
@@ -25,7 +25,7 @@ Rust Docker/Compose 必须显式提供下列配置，并在绑定监听端口前
 
 | 能力 | Python 生产合同 | Rust 当前状态 | 发布结论 |
 | --- | --- | --- | --- |
-| 启动/上游 | Docker 通过 Compose 挂载 `config.json`/`data` 并启动单一主服务 | Dockerfile 的 app stage 启动 Rust release 二进制；`RUST_PRODUCTION=1`、`RUST_BIND=0.0.0.0:80`、`RUST_DATA_DIR=/app/data`、ChatGPT 上游和 Codex 版本已固定；本地 release/static 证据通过，远程同镜像启动与回滚仍待 Actions/ai-arm | 待远程验收 |
+| 启动/上游 | Docker 通过 Compose 挂载 `config.json`/`data` 并启动单一 Python 主服务 | Rust release 候选支持 `RUST_PRODUCTION=1`、`RUST_BIND=0.0.0.0:80`、`RUST_DATA_DIR=/app/data`、ChatGPT 上游和 Codex 版本配置；在其余公共合同与黑盒门闭合前不得进入生产 Docker | 阻断 |
 | 模型目录 | 每个规范化账号类型按顺序取一个成功代表，请求一次认证 Web `GET /backend-api/models?history_and_training_disabled=false`；代表失败才回退同类型下一账号；匿名目录单独请求一次 `GET /backend-anon/models?iim=false&is_gizmo=false`。Codex endpoint 只属于对话协议，不参与模型发现 | Rust/Python 已按单 Web 目录、同类型 fallback、last-good/失败关闭实现并有 focused/黑盒证据；仍需完整跨实现矩阵与生产启动验收 | 阻断 |
 | `/v1/chat/completions` | ChatGPT 本地业务链、账号租约、工具/多模态/流生命周期 | Rust native Chat/工具/流生命周期与 Python 对照门已通过；仍需真实上游和远程启动副作用验收 | 待远程验收 |
 | `POST /v1/responses` | Responses 请求、流事件、工具、搜索、历史和终态合同 | Rust native 普通/流、工具、网页搜索、图片 tool、历史和终态的本地黑盒/合同门已通过；真实上游与远程启动仍待验收 | 待远程验收 |
@@ -33,8 +33,8 @@ Rust Docker/Compose 必须显式提供下列配置，并在绑定监听端口前
 | `POST /v1/images/generations`、`/v1/images/edits` | Python 本地 ChatGPT 图片业务处理 | Rust native 已按 web/Codex 后端分流，覆盖 options、输入像素门、WebP/JPEG/PNG 输出、流终态和 fail-closed；真实图片上游仍待远程验收 | 待远程验收 |
 | `POST /v1/search` | Python 本地搜索处理、结果和引用 | Rust native 已覆盖搜索会话、轮询、引用清洗、租约 failover；真实搜索上游仍待远程验收 | 待远程验收 |
 | `POST /v1/ppt/generations`、`/v1/psd/generations` | Python 本地 editable-file task 及产物生命周期 | ChatGPT native 下不支持 | 阻断 |
-| `GET /v1/editable-file-tasks` | Python 任务查询 | Rust 认证后仍返回 `unsupported_capability` | 阻断 |
-| `GET/HEAD /files/{file_path}` | Python 通过安全打开器返回 PPT/PSD 等产物文件流 | Rust 已注册 GET `/files/{file_path}`，读取链校验 owner scope、任务状态、能力摘要、相对路径和受检 regular file；Rust exact owner/download 回归与 Python `16 passed, 1 skipped` 通过；HEAD/Range 及完整 streaming 仍未实现 | 阻断 |
+| `GET /v1/editable-file-tasks` | Python 任务查询 | Rust 已实现认证、owner scope、任务投影和损坏快照 fail-closed；当前 exact 路由与默认并行完整 Rust lib 门通过，仍需候选镜像用户黑盒 | 待远程验收 |
+| `GET/HEAD /files/{file_path}` | Python 通过安全打开器返回 PPT/PSD 等产物文件流 | Rust 已实现 GET/HEAD、同一受检 fd 流式发送、最终目录项重绑定校验、单段/多段/开放/suffix Range、If-Range、400/416、动态 size/ETag 刷新、早 EOF 失败和 512 MiB 首块有界；当前 8 项响应矩阵、exact 路由与默认并行完整 Rust lib 门通过，但候选镜像及真实 PPT/PSD 产物验收尚未闭合 | 阻断 |
 | `POST /api/images/download` | Python 接受多路径并返回 ZIP，受数量上限约束 | Rust 已接受有界多路径并生成 ZIP，同时提供单图下载；管理 flow 与 Python 合同组已通过，但全链路文件边界、并发副作用和用户验收未闭合 | 阻断 |
 | 图片、日志、代理、备份、存储维护 | Python 有压缩、清理、日志读删、proxy test/runtime/clearance、backup、WebDAV test/sync 等真实副作用 | Rust 已注册并实现图片列表/删除/下载/压缩/清理、日志、proxy、backup、storage 等管理 handler；route matrix 通过，Rust management flow 与 Python 543 组通过，但安全原子写、后端 owner、跨实现细节和用户验收仍未闭合 | 阻断 |
 | CPA | Python 有 files、import、进度和更新/删除等管理流程 | Rust 已实现 pools CRUD、files、import/progress 路由与远端调用；管理 flow 覆盖持久化/重启，但完整 Python↔Rust 远端状态/错误/副作用矩阵仍未闭合 | 阻断 |
@@ -55,4 +55,4 @@ Rust Docker/Compose 必须显式提供下列配置，并在绑定监听端口前
 4. `/health?format=json` 的 storage、proxy、account 字段来自真实检查；健康和降级两类结果均有部署验收证据。
 5. Rust/Python focused、全量测试、fmt、Clippy `-D warnings`、构建产物和多架构镜像均在同一提交 SHA 上验证；失败任一项都不得推送或替换 `:latest`。
 
-当前结论：Rust Docker 入口、依赖门、本地全量程序门和用户视角 fake/blackbox 门已具备提交条件；同 SHA 的多架构 Actions/GHCR、ai-arm 回滚/健康/真实请求仍是发布前必须完成的门。
+当前结论：Rust 目录模型端点修复是有效的局部修复；但公共路由、副作用、存储 owner、WebSocket release 黑盒和真实上游合同尚未全部闭合。Docker 必须保持 Python 生产入口，不能把局部测试或已构建 Rust 镜像当作生产切换依据。

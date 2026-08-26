@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
@@ -11,7 +11,16 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use tokio::sync::Mutex;
 
-use super::{ApiError, AppInitError, read_account_snapshot};
+use file_identity::FileVersion;
+
+use super::{
+    ApiError, AppInitError, HealthSnapshotSync, read_account_snapshot,
+    storage::{StorageBackend, StorageError, StorageSnapshot},
+    validated_file_version,
+};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 
 static USAGE_MARK_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
@@ -43,14 +52,83 @@ pub(super) struct AccountSlot {
     pub(super) record: AccountRecord,
     pub(super) inflight: AtomicUsize,
     last_used_at: RwLock<Option<String>>,
+    #[cfg(test)]
+    fail_usage_marker: AtomicBool,
 }
 
 #[derive(Clone)]
 pub(super) struct AccountSnapshot {
     pub(super) generation: u64,
     pub(super) fingerprint: [u8; 32],
+    pub(super) file_version: Option<FileVersion>,
     pub(super) valid: bool,
     pub(super) accounts: Arc<Vec<Arc<AccountSlot>>>,
+    pub(super) health: AccountHealthStats,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct AccountHealthStats {
+    pub(super) total: u64,
+    pub(super) cumulative_total: u64,
+    pub(super) active: u64,
+    pub(super) limited: u64,
+    pub(super) abnormal: u64,
+    pub(super) disabled: u64,
+    pub(super) total_quota: u64,
+    pub(super) total_success: u64,
+    pub(super) total_fail: u64,
+    pub(super) by_type: BTreeMap<String, u64>,
+}
+
+impl AccountHealthStats {
+    fn from_records(records: &[AccountRecord], cumulative_total: u64) -> Self {
+        let mut health = Self {
+            total: records.len() as u64,
+            cumulative_total: cumulative_total.max(records.len() as u64),
+            ..Self::default()
+        };
+        for record in records {
+            match record.status.as_str() {
+                "正常" => {
+                    health.active = health.active.saturating_add(1);
+                    health.total_quota = health
+                        .total_quota
+                        .saturating_add(account_counter(record.raw.get("quota")));
+                }
+                "限流" => health.limited = health.limited.saturating_add(1),
+                "异常" => health.abnormal = health.abnormal.saturating_add(1),
+                "禁用" => health.disabled = health.disabled.saturating_add(1),
+                _ => {}
+            }
+            health.total_success = health
+                .total_success
+                .saturating_add(account_counter(record.raw.get("success")));
+            health.total_fail = health
+                .total_fail
+                .saturating_add(account_counter(record.raw.get("fail")));
+            let account_type = match record.account_type.as_str() {
+                "free" | "Plus" | "Pro" | "ProLite" | "Team" | "Enterprise" => {
+                    record.account_type.as_str()
+                }
+                _ => "other",
+            };
+            let count = health.by_type.entry(account_type.to_owned()).or_default();
+            *count = count.saturating_add(1);
+        }
+        health
+    }
+}
+
+fn account_counter(value: Option<&serde_json::Value>) -> u64 {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            value
+                .and_then(serde_json::Value::as_i64)
+                .filter(|value| *value >= 0)
+                .map(|value| value as u64)
+        })
+        .unwrap_or_default()
 }
 
 pub(super) struct AccountLease {
@@ -99,61 +177,247 @@ impl Drop for AccountLease {
 #[derive(Clone)]
 pub(super) struct AccountStore {
     pub(super) path: Option<Arc<PathBuf>>,
+    backend: Option<Arc<StorageBackend>>,
     pub(super) snapshot: Arc<RwLock<AccountSnapshot>>,
     reload_gate: Arc<Mutex<()>>,
     mutation_gate: Arc<Mutex<()>>,
     pub(super) cursor: Arc<AtomicUsize>,
+    health_snapshot_sync: Arc<RwLock<Option<HealthSnapshotSync>>>,
 }
 
 impl AccountStore {
     pub(super) fn load(path: Option<&Path>) -> Result<Self, AppInitError> {
-        let (records, fingerprint) = if let Some(path) = path {
-            read_account_snapshot(path)?
+        let (records, fingerprint, file_version, cumulative_total) = if let Some(path) = path {
+            let (records, fingerprint, file_version, cumulative_total) =
+                read_account_snapshot(path)?;
+            (records, fingerprint, Some(file_version), cumulative_total)
         } else {
-            (Vec::new(), [0; 32])
+            (Vec::new(), [0; 32], None, 0)
         };
+        let health = AccountHealthStats::from_records(&records, cumulative_total);
         let accounts = Arc::new(account_slots(records));
         Ok(Self {
             path: path.map(|path| Arc::new(path.to_owned())),
+            backend: None,
             snapshot: Arc::new(RwLock::new(AccountSnapshot {
                 generation: 0,
                 fingerprint,
+                file_version,
                 valid: true,
                 accounts,
+                health,
             })),
             reload_gate: Arc::new(Mutex::new(())),
             mutation_gate: Arc::new(Mutex::new(())),
             cursor: Arc::new(AtomicUsize::new(0)),
+            health_snapshot_sync: Arc::new(RwLock::new(None)),
         })
     }
 
+    pub(super) async fn load_backend(backend: Arc<StorageBackend>) -> Result<Self, AppInitError> {
+        let loaded = backend
+            .load_accounts()
+            .await
+            .map_err(|_| AppInitError::StorageBackend)?;
+        let (records, fingerprint, cumulative_total) = parse_backend_snapshot(loaded)?;
+        let health = AccountHealthStats::from_records(&records, cumulative_total);
+        Ok(Self {
+            path: None,
+            backend: Some(backend),
+            snapshot: Arc::new(RwLock::new(AccountSnapshot {
+                generation: 0,
+                fingerprint,
+                file_version: None,
+                valid: true,
+                accounts: Arc::new(account_slots(records)),
+                health,
+            })),
+            reload_gate: Arc::new(Mutex::new(())),
+            mutation_gate: Arc::new(Mutex::new(())),
+            cursor: Arc::new(AtomicUsize::new(0)),
+            health_snapshot_sync: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    pub(super) fn install_health_snapshot_sync(&self, sync: HealthSnapshotSync) {
+        *self
+            .health_snapshot_sync
+            .write()
+            .expect("account health snapshot sync lock") = Some(sync);
+    }
+
+    fn notify_health_snapshot_sync(&self) {
+        let sync = self
+            .health_snapshot_sync
+            .read()
+            .expect("account health snapshot sync lock")
+            .clone();
+        if let Some(sync) = sync {
+            sync();
+        }
+    }
+
     pub(super) async fn reload(&self) -> bool {
+        if self.backend.is_some() {
+            return self.snapshot.read().expect("account snapshot lock").valid;
+        }
         let Some(path) = self.path.clone() else {
             return true;
         };
         let _reload_guard = self.reload_gate.lock().await;
-        let result = tokio::task::spawn_blocking(move || read_account_snapshot(&path)).await;
-        let mut snapshot = self.snapshot.write().expect("account snapshot lock");
-        match result {
-            Ok(Ok((accounts, fingerprint))) => {
-                if !snapshot.valid || snapshot.fingerprint != fingerprint {
-                    snapshot.generation = snapshot.generation.saturating_add(1);
-                    snapshot.fingerprint = fingerprint;
-                    snapshot.accounts = Arc::new(account_slots_with_runtime_state(
-                        accounts,
-                        Some(snapshot.accounts.as_ref()),
-                    ));
-                    snapshot.valid = true;
-                }
-                true
+        let version_path = path.clone();
+        let version =
+            tokio::task::spawn_blocking(move || validated_file_version(&version_path)).await;
+        let Ok(Ok(version)) = version else {
+            self.invalidate();
+            return false;
+        };
+        {
+            let snapshot = self.snapshot.read().expect("account snapshot lock");
+            if snapshot.valid && snapshot.file_version == Some(version) {
+                return true;
             }
-            _ => {
-                snapshot.generation = snapshot.generation.saturating_add(1);
-                snapshot.valid = false;
-                snapshot.accounts = Arc::new(Vec::new());
+        }
+        let result = tokio::task::spawn_blocking(move || read_account_snapshot(&path)).await;
+        let valid = {
+            let mut snapshot = self.snapshot.write().expect("account snapshot lock");
+            match result {
+                Ok(Ok((accounts, fingerprint, file_version, cumulative_total))) => {
+                    if !snapshot.valid
+                        || snapshot.fingerprint != fingerprint
+                        || snapshot.file_version != Some(file_version)
+                    {
+                        let health = AccountHealthStats::from_records(&accounts, cumulative_total);
+                        snapshot.generation = snapshot.generation.saturating_add(1);
+                        snapshot.fingerprint = fingerprint;
+                        snapshot.file_version = Some(file_version);
+                        snapshot.accounts = Arc::new(account_slots_with_runtime_state(
+                            accounts,
+                            Some(snapshot.accounts.as_ref()),
+                        ));
+                        snapshot.health = health;
+                        snapshot.valid = true;
+                    }
+                    true
+                }
+                _ => {
+                    snapshot.generation = snapshot.generation.saturating_add(1);
+                    snapshot.valid = false;
+                    snapshot.accounts = Arc::new(Vec::new());
+                    snapshot.health = AccountHealthStats::default();
+                    false
+                }
+            }
+        };
+        self.notify_health_snapshot_sync();
+        valid
+    }
+
+    /// Refresh a backend-backed snapshot after a failed CAS.  The ordinary
+    /// backend `reload` path is deliberately cache-only so health and request
+    /// reads never turn into an implicit remote/database scan.  A mutation
+    /// conflict is the explicit exception: the next CAS attempt must be built
+    /// from the winning persisted revision.
+    async fn reload_backend_fresh(&self) -> bool {
+        let Some(backend) = self.backend.clone() else {
+            return self.reload().await;
+        };
+        match backend.load_accounts().await {
+            Ok(loaded) => self.publish_backend_snapshot(loaded),
+            Err(_) => {
+                self.invalidate();
                 false
             }
         }
+    }
+
+    pub(super) fn invalidate(&self) {
+        self.invalidate_silent();
+        self.notify_health_snapshot_sync();
+    }
+
+    pub(super) fn invalidate_silent(&self) {
+        {
+            let mut snapshot = self.snapshot.write().expect("account snapshot lock");
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.valid = false;
+            snapshot.accounts = Arc::new(Vec::new());
+            snapshot.health = AccountHealthStats::default();
+        }
+    }
+
+    pub(super) fn health_validated(&self) -> bool {
+        if self.backend.is_some() {
+            return self.snapshot.read().expect("account snapshot lock").valid;
+        }
+        let Some(path) = self.path.as_deref() else {
+            return self.snapshot.read().expect("account snapshot lock").valid;
+        };
+        let expected = {
+            let snapshot = self.snapshot.read().expect("account snapshot lock");
+            if !snapshot.valid {
+                return false;
+            }
+            snapshot.file_version
+        };
+        expected.is_some_and(|expected| validated_file_version(path).ok() == Some(expected))
+    }
+
+    pub(super) fn health_stats(&self) -> AccountHealthStats {
+        self.snapshot
+            .read()
+            .expect("account snapshot lock")
+            .health
+            .clone()
+    }
+
+    pub(super) async fn lock_reload_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.reload_gate.clone().lock_owned().await
+    }
+
+    pub(super) fn publish_backend_snapshot(&self, loaded: StorageSnapshot) -> bool {
+        let Ok((accounts, fingerprint, cumulative_total)) = parse_backend_snapshot(loaded) else {
+            self.invalidate();
+            return false;
+        };
+        self.publish_validated_backend_snapshot(accounts, fingerprint, cumulative_total);
+        true
+    }
+
+    pub(super) fn publish_validated_backend_snapshot(
+        &self,
+        accounts: Vec<AccountRecord>,
+        fingerprint: [u8; 32],
+        cumulative_total: u64,
+    ) {
+        self.publish_validated_backend_snapshot_silent(accounts, fingerprint, cumulative_total);
+        self.notify_health_snapshot_sync();
+    }
+
+    pub(super) fn publish_validated_backend_snapshot_silent(
+        &self,
+        accounts: Vec<AccountRecord>,
+        fingerprint: [u8; 32],
+        cumulative_total: u64,
+    ) {
+        let mut snapshot = self.snapshot.write().expect("account snapshot lock");
+        if !snapshot.valid || snapshot.fingerprint != fingerprint {
+            let health = AccountHealthStats::from_records(&accounts, cumulative_total);
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.fingerprint = fingerprint;
+            snapshot.file_version = None;
+            snapshot.accounts = Arc::new(account_slots_with_runtime_state(
+                accounts,
+                Some(snapshot.accounts.as_ref()),
+            ));
+            snapshot.health = health;
+            snapshot.valid = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn hold_reload_gate_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_reload_gate().await
     }
 
     #[cfg(test)]
@@ -357,6 +621,10 @@ impl AccountStore {
         else {
             return false;
         };
+        #[cfg(test)]
+        if slot.fail_usage_marker.load(Ordering::Acquire) {
+            return false;
+        }
         let Ok(mut last_used_at) = slot.last_used_at.write() else {
             return false;
         };
@@ -405,6 +673,27 @@ impl AccountStore {
         F: FnOnce(&mut Vec<serde_json::Value>) -> Result<R, ApiError>,
     {
         let _mutation_guard = self.mutation_gate.lock().await;
+        if self.backend.is_some() {
+            let _reload_guard = self.reload_gate.lock().await;
+            if !self.reload().await {
+                return Err(ApiError::unavailable());
+            }
+            let expected_fingerprint = self
+                .snapshot
+                .read()
+                .expect("account snapshot lock")
+                .fingerprint;
+            let mut records = self.raw_records();
+            let result = mutator(&mut records)?;
+            self.replace_raw_locked(
+                serde_json::Value::Array(records),
+                expected_fingerprint,
+                None,
+            )
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+            return Ok(result);
+        }
         let path = self
             .path
             .as_deref()
@@ -420,9 +709,13 @@ impl AccountStore {
             .fingerprint;
         let mut records = self.raw_records();
         let result = mutator(&mut records)?;
-        self.replace_raw_locked(serde_json::Value::Array(records), expected_fingerprint)
-            .await
-            .map_err(|_| ApiError::unavailable())?;
+        self.replace_raw_locked(
+            serde_json::Value::Array(records),
+            expected_fingerprint,
+            None,
+        )
+        .await
+        .map_err(|_| ApiError::unavailable())?;
         Ok(result)
     }
 
@@ -433,85 +726,56 @@ impl AccountStore {
         &self,
         incoming: Vec<serde_json::Value>,
     ) -> Result<(usize, usize), ApiError> {
-        self.mutate_raw(|records| {
-            let mut index_by_key = HashMap::new();
-            let mut index_by_token = HashMap::new();
-            for (index, record) in records.iter().enumerate() {
-                if let Some(token) = account_payload_token(record) {
-                    index_by_token.insert(token, index);
-                }
-                if let Some(key) = account_identity_key(record) {
-                    let replace = index_by_key.get(&key).copied().is_none_or(|previous| {
-                        token_rank(&account_payload_token(record).unwrap_or_default())
-                            >= token_rank(
-                                &account_payload_token(&records[previous]).unwrap_or_default(),
-                            )
-                    });
-                    if replace {
-                        index_by_key.insert(key, index);
-                    }
-                }
+        let _mutation_guard = self.mutation_gate.lock().await;
+        if self.backend.is_some() {
+            let _reload_guard = self.reload_gate.lock().await;
+            return self.merge_import_records_locked(&incoming, 8).await;
+        }
+        let path = self
+            .path
+            .as_deref()
+            .ok_or_else(ApiError::unsupported_capability)?;
+        let _file_lock = super::acquire_path_write_lock(path).await?;
+        self.merge_import_records_locked(&incoming, 1).await
+    }
+
+    async fn merge_import_records_locked(
+        &self,
+        incoming: &[serde_json::Value],
+        attempts: usize,
+    ) -> Result<(usize, usize), ApiError> {
+        for attempt in 0..attempts {
+            if !self.reload().await {
+                return Err(ApiError::unavailable());
             }
-            let mut added = 0usize;
-            let mut skipped = 0usize;
-            let mut incoming_keys = HashMap::<String, usize>::new();
-            let mut deduped_incoming = Vec::<(String, serde_json::Value)>::new();
-            for value in incoming {
-                let Some(token) = account_payload_token(&value) else {
+            let (expected_fingerprint, cumulative_total) = {
+                let snapshot = self.snapshot.read().expect("account snapshot lock");
+                (snapshot.fingerprint, snapshot.health.cumulative_total)
+            };
+            let mut records = self.raw_records();
+            let result = merge_import_records_in_place(&mut records, incoming)?;
+            let next_cumulative_total = cumulative_total
+                .checked_add(u64::try_from(result.0).map_err(|_| ApiError::invalid_request())?)
+                .ok_or_else(ApiError::invalid_request)?;
+            match self
+                .replace_raw_locked(
+                    serde_json::Value::Array(records),
+                    expected_fingerprint,
+                    Some(next_cumulative_total),
+                )
+                .await
+            {
+                Ok(()) => return Ok(result),
+                Err(StorageError::Conflict) if attempt + 1 < attempts => {
+                    if !self.reload_backend_fresh().await {
+                        return Err(ApiError::unavailable());
+                    }
                     continue;
-                };
-                let key = account_identity_key(&value).unwrap_or_else(|| format!("token:{token}"));
-                if let Some(index) = incoming_keys.get(&key).copied() {
-                    let previous = &deduped_incoming[index].1;
-                    let merged = merge_account_values(previous, &value);
-                    deduped_incoming[index].1 = merged;
-                    skipped += 1;
-                    continue;
                 }
-                incoming_keys.insert(key.clone(), deduped_incoming.len());
-                deduped_incoming.push((key, value));
+                Err(_) => return Err(ApiError::unavailable()),
             }
-            for (key, value) in deduped_incoming {
-                let Some(token) = account_payload_token(&value) else {
-                    continue;
-                };
-                let index = index_by_token
-                    .get(&token)
-                    .copied()
-                    .or_else(|| index_by_key.get(&key).copied());
-                if let Some(index) = index {
-                    let merged = merge_account_values(&records[index], &value);
-                    if let Some(previous) = account_payload_token(&records[index]) {
-                        index_by_token.remove(&previous);
-                    }
-                    if let Some(next) = account_payload_token(&merged) {
-                        index_by_token.insert(next, index);
-                    }
-                    records[index] = merged;
-                    skipped += 1;
-                } else {
-                    let index = records.len();
-                    let mut value = value;
-                    if let Some(object) = value.as_object_mut() {
-                        object.remove("accessToken");
-                        object.remove("token");
-                        object.insert("access_token".to_owned(), serde_json::json!(token));
-                        if !object.contains_key("status") {
-                            object.insert("status".to_owned(), serde_json::json!("正常"));
-                        }
-                    }
-                    records.push(value);
-                    index_by_key.insert(key, index);
-                    index_by_token.insert(token, index);
-                    added += 1;
-                }
-            }
-            if records.len() > super::MAX_ACCOUNTS {
-                return Err(ApiError::invalid_request());
-            }
-            Ok((added, skipped))
-        })
-        .await
+        }
+        Err(ApiError::unavailable())
     }
 
     pub(super) async fn update_refreshed_account(
@@ -579,42 +843,116 @@ impl AccountStore {
         &self,
         value: serde_json::Value,
         expected_fingerprint: [u8; 32],
-    ) -> Result<(), ()> {
+        next_cumulative_total: Option<u64>,
+    ) -> Result<(), StorageError> {
+        if let Some(backend) = self.backend.clone() {
+            let records = value.as_array().cloned().ok_or(StorageError::Invalid)?;
+            let cumulative_total = match next_cumulative_total {
+                Some(value) => value,
+                None => {
+                    self.snapshot
+                        .read()
+                        .map_err(|_| StorageError::Unavailable)?
+                        .health
+                        .cumulative_total
+                }
+            };
+            let saved = match backend
+                .save_accounts(expected_fingerprint, records, cumulative_total)
+                .await
+            {
+                Ok(saved) => saved,
+                Err(StorageError::Conflict) => return Err(StorageError::Conflict),
+                Err(error) => {
+                    self.invalidate();
+                    return Err(error);
+                }
+            };
+            let (accounts, fingerprint, cumulative_total) =
+                parse_backend_snapshot(saved).map_err(|_| {
+                    self.invalidate();
+                    StorageError::Invalid
+                })?;
+            let health = AccountHealthStats::from_records(&accounts, cumulative_total);
+            let mut snapshot = self.snapshot.write().expect("account snapshot lock");
+            snapshot.generation = snapshot.generation.saturating_add(1);
+            snapshot.fingerprint = fingerprint;
+            snapshot.file_version = None;
+            snapshot.accounts = Arc::new(account_slots_with_runtime_state(
+                accounts,
+                Some(snapshot.accounts.as_ref()),
+            ));
+            snapshot.health = health;
+            snapshot.valid = true;
+            drop(snapshot);
+            self.notify_health_snapshot_sync();
+            return Ok(());
+        }
         let Some(path) = self.path.clone() else {
-            return Err(());
+            return Err(StorageError::Unsupported);
         };
         let target = path.as_ref().clone();
         let result = tokio::task::spawn_blocking(move || {
-            let (current, _, fingerprint) =
-                super::read_account_document(&target).map_err(|_| ())?;
+            let (current, _, fingerprint, _version) =
+                super::read_account_document(&target).map_err(|_| StorageError::Unavailable)?;
             if fingerprint != expected_fingerprint {
-                return Err(());
+                return Err(StorageError::Conflict);
             }
             let output = match current {
                 serde_json::Value::Object(mut object) if object.get("items").is_some() => {
                     object.insert("items".to_owned(), value);
+                    if let Some(cumulative_total) = next_cumulative_total {
+                        object.insert(
+                            "cumulative_total".to_owned(),
+                            serde_json::json!(cumulative_total),
+                        );
+                    }
                     serde_json::Value::Object(object)
                 }
+                _ if next_cumulative_total.is_some() => serde_json::json!({
+                    "items": value,
+                    "cumulative_total": next_cumulative_total.expect("checked cumulative total"),
+                }),
                 _ => value,
             };
-            let bytes = serde_json::to_vec(&output).map_err(|_| ())?;
-            if bytes.len() as u64 > super::MAX_ACCOUNT_SNAPSHOT_BYTES {
-                return Err(());
-            }
+            let bytes = serde_json::to_vec(&output).map_err(|_| StorageError::Invalid)?;
+            super::account_snapshot::validate_bytes(&bytes).map_err(|_| StorageError::Invalid)?;
             super::atomic_replace_checked_with_limit(
                 &target,
                 &bytes,
                 super::MAX_ACCOUNT_SNAPSHOT_BYTES,
                 false,
             )
-            .map_err(|_| ())?;
-            let _ = super::read_account_snapshot(&target).map_err(|_| ())?;
-            Ok(())
+            .map_err(|_| StorageError::Unavailable)?;
+            super::read_account_snapshot(&target).map_err(|_| StorageError::Unavailable)
         })
-        .await
-        .map_err(|_| ())?;
-        result?;
-        if self.reload().await { Ok(()) } else { Err(()) }
+        .await;
+        let (accounts, fingerprint, file_version, cumulative_total) = match result {
+            Ok(Ok(committed)) => committed,
+            Ok(Err(StorageError::Conflict)) => return Err(StorageError::Conflict),
+            Ok(Err(error)) => {
+                self.invalidate();
+                return Err(error);
+            }
+            Err(_) => {
+                self.invalidate();
+                return Err(StorageError::Unavailable);
+            }
+        };
+        let health = AccountHealthStats::from_records(&accounts, cumulative_total);
+        let mut snapshot = self.snapshot.write().expect("account snapshot lock");
+        snapshot.generation = snapshot.generation.saturating_add(1);
+        snapshot.fingerprint = fingerprint;
+        snapshot.file_version = Some(file_version);
+        snapshot.accounts = Arc::new(account_slots_with_runtime_state(
+            accounts,
+            Some(snapshot.accounts.as_ref()),
+        ));
+        snapshot.health = health;
+        snapshot.valid = true;
+        drop(snapshot);
+        self.notify_health_snapshot_sync();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -629,7 +967,7 @@ impl AccountStore {
     }
 
     #[cfg(test)]
-    pub(super) fn poison_usage_marker_lock(&self, token: &str) -> bool {
+    pub(super) fn force_usage_marker_failure_for_test(&self, token: &str) -> bool {
         let snapshot = self.snapshot.read().expect("account snapshot lock");
         let Some(slot) = snapshot
             .accounts
@@ -639,15 +977,107 @@ impl AccountStore {
         else {
             return false;
         };
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = slot
-                .last_used_at
-                .write()
-                .expect("usage marker lock should initially be healthy");
-            panic!("test-only usage marker poison");
-        }))
-        .is_err()
+        !slot.fail_usage_marker.swap(true, Ordering::AcqRel)
     }
+}
+
+fn merge_import_records_in_place(
+    records: &mut Vec<serde_json::Value>,
+    incoming: &[serde_json::Value],
+) -> Result<(usize, usize), ApiError> {
+    let mut index_by_key = HashMap::new();
+    let mut index_by_token = HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if let Some(token) = account_payload_token(record) {
+            index_by_token.insert(token, index);
+        }
+        if let Some(key) = account_identity_key(record) {
+            let replace = index_by_key.get(&key).copied().is_none_or(|previous| {
+                token_rank(&account_payload_token(record).unwrap_or_default())
+                    >= token_rank(&account_payload_token(&records[previous]).unwrap_or_default())
+            });
+            if replace {
+                index_by_key.insert(key, index);
+            }
+        }
+    }
+    let mut added = 0usize;
+    let mut skipped = 0usize;
+    let mut incoming_keys = HashMap::<String, usize>::new();
+    let mut deduped_incoming = Vec::<(String, serde_json::Value)>::new();
+    for value in incoming.iter().cloned() {
+        let Some(token) = account_payload_token(&value) else {
+            continue;
+        };
+        let key = account_identity_key(&value).unwrap_or_else(|| format!("token:{token}"));
+        if let Some(index) = incoming_keys.get(&key).copied() {
+            let previous = &deduped_incoming[index].1;
+            let merged = merge_account_values(previous, &value);
+            deduped_incoming[index].1 = merged;
+            skipped += 1;
+            continue;
+        }
+        incoming_keys.insert(key.clone(), deduped_incoming.len());
+        deduped_incoming.push((key, value));
+    }
+    for (key, value) in deduped_incoming {
+        let Some(token) = account_payload_token(&value) else {
+            continue;
+        };
+        let index = index_by_token
+            .get(&token)
+            .copied()
+            .or_else(|| index_by_key.get(&key).copied());
+        if let Some(index) = index {
+            let merged = merge_account_values(&records[index], &value);
+            if let Some(previous) = account_payload_token(&records[index]) {
+                index_by_token.remove(&previous);
+            }
+            if let Some(next) = account_payload_token(&merged) {
+                index_by_token.insert(next, index);
+            }
+            records[index] = merged;
+            skipped += 1;
+        } else {
+            let index = records.len();
+            let mut value = value;
+            if let Some(object) = value.as_object_mut() {
+                object.remove("accessToken");
+                object.remove("token");
+                object.insert("access_token".to_owned(), serde_json::json!(token));
+                if !object.contains_key("status") {
+                    object.insert("status".to_owned(), serde_json::json!("正常"));
+                }
+            }
+            records.push(value);
+            index_by_key.insert(key, index);
+            index_by_token.insert(token, index);
+            added += 1;
+        }
+    }
+    if records.len() > super::MAX_ACCOUNTS {
+        return Err(ApiError::invalid_request());
+    }
+    Ok((added, skipped))
+}
+
+pub(super) fn parse_backend_snapshot(
+    snapshot: StorageSnapshot,
+) -> Result<(Vec<AccountRecord>, [u8; 32], u64), AppInitError> {
+    let cumulative_total = snapshot
+        .cumulative_total
+        .unwrap_or(snapshot.records.len() as u64);
+    let value = if snapshot.cumulative_total.is_some() {
+        serde_json::json!({
+            "items": snapshot.records,
+            "cumulative_total": cumulative_total,
+        })
+    } else {
+        serde_json::Value::Array(snapshot.records)
+    };
+    let bytes = serde_json::to_vec(&value).map_err(|_| AppInitError::AccountSnapshot)?;
+    let (_, records, _) = super::parse_account_document_bytes(&bytes)?;
+    Ok((records, snapshot.revision, cumulative_total))
 }
 
 fn account_payload_token(value: &serde_json::Value) -> Option<String> {
@@ -950,12 +1380,14 @@ fn account_slots_with_runtime_state(
                 record,
                 inflight: AtomicUsize::new(0),
                 last_used_at: RwLock::new(last_used_at),
+                #[cfg(test)]
+                fail_usage_marker: AtomicBool::new(false),
             })
         })
         .collect()
 }
 
-fn current_timestamp() -> String {
+pub(super) fn current_timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

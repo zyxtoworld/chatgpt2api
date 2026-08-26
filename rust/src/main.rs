@@ -2,7 +2,7 @@ use chatgpt2api_rust::{AppConfig, AppState, run};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let state = AppState::new(AppConfig::from_env())?;
+    let state = AppState::from_environment(AppConfig::from_env()).await?;
     let bind = std::env::var("RUST_BIND").unwrap_or_else(|_| {
         if std::env::var_os("RUST_PRODUCTION").is_some() {
             "0.0.0.0:80".to_owned()

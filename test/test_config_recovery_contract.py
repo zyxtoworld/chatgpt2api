@@ -203,12 +203,22 @@ class ConfigRecoveryContractTests(unittest.TestCase):
             before = path.stat()
             events: list[str] = []
             original_write = os.write
+            original_fchmod = os.fchmod
+            original_fchown = os.fchown
             original_fsync = os.fsync
             original_replace = os.replace
 
             def record_write(fd: int, payload: bytes) -> int:
                 events.append("write")
                 return original_write(fd, payload)
+
+            def record_fchmod(fd: int, mode: int) -> None:
+                events.append("fchmod")
+                original_fchmod(fd, mode)
+
+            def record_fchown(fd: int, uid: int, gid: int) -> None:
+                events.append("fchown")
+                original_fchown(fd, uid, gid)
 
             def record_replace(source: str, target: str, *args, **kwargs) -> None:
                 events.append("replace")
@@ -219,8 +229,8 @@ class ConfigRecoveryContractTests(unittest.TestCase):
 
             with (
                 mock.patch.object(config_module.os, "write", side_effect=record_write),
-                mock.patch.object(config_module.os, "fchmod", side_effect=lambda *_args: events.append("fchmod"), create=True),
-                mock.patch.object(config_module.os, "fchown", side_effect=lambda *_args: events.append("fchown"), create=True),
+                mock.patch.object(config_module.os, "fchmod", side_effect=record_fchmod, create=True),
+                mock.patch.object(config_module.os, "fchown", side_effect=record_fchown, create=True),
                 mock.patch.object(config_module.os, "geteuid", return_value=before.st_uid + 1, create=True),
                 mock.patch.object(config_module.os, "getegid", return_value=before.st_gid + 1, create=True),
                 mock.patch.object(config_module.os, "fsync", side_effect=lambda fd: (events.append("fsync"), original_fsync(fd))[1]),

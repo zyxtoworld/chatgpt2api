@@ -14,6 +14,8 @@ use super::{
 pub(crate) struct NativeRequestContext {
     pub(crate) device_id: String,
     pub(crate) session_id: String,
+    client_version: &'static str,
+    client_build_number: &'static str,
 }
 
 impl NativeRequestContext {
@@ -21,6 +23,20 @@ impl NativeRequestContext {
         Self {
             device_id: native_message_id(),
             session_id: native_message_id(),
+            client_version: NATIVE_CLIENT_VERSION,
+            client_build_number: NATIVE_CLIENT_BUILD_NUMBER,
+        }
+    }
+
+    pub(crate) fn for_client(
+        client_version: &'static str,
+        client_build_number: &'static str,
+    ) -> Self {
+        Self {
+            device_id: native_message_id(),
+            session_id: native_message_id(),
+            client_version,
+            client_build_number,
         }
     }
 }
@@ -36,6 +52,22 @@ pub(crate) fn native_browser_headers_with_referer(
     request: RequestBuilder,
     context: &NativeRequestContext,
     referer: &str,
+) -> RequestBuilder {
+    native_browser_headers_for_client(
+        request,
+        context,
+        referer,
+        context.client_version,
+        context.client_build_number,
+    )
+}
+
+fn native_browser_headers_for_client(
+    request: RequestBuilder,
+    context: &NativeRequestContext,
+    referer: &str,
+    client_version: &str,
+    client_build_number: &str,
 ) -> RequestBuilder {
     request
         .header(header::USER_AGENT, NATIVE_USER_AGENT)
@@ -60,8 +92,8 @@ pub(crate) fn native_browser_headers_with_referer(
         .header("OAI-Device-Id", &context.device_id)
         .header("OAI-Session-Id", &context.session_id)
         .header("OAI-Language", "zh-CN")
-        .header("OAI-Client-Version", NATIVE_CLIENT_VERSION)
-        .header("OAI-Client-Build-Number", NATIVE_CLIENT_BUILD_NUMBER)
+        .header("OAI-Client-Version", client_version)
+        .header("OAI-Client-Build-Number", client_build_number)
 }
 
 pub(super) fn codex_client_version() -> Option<String> {

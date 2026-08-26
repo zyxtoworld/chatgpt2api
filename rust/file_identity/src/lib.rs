@@ -13,6 +13,14 @@ pub struct Identity {
     pub second: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileVersion {
+    pub identity: Identity,
+    pub size: u64,
+    pub modified: i128,
+    pub changed: i128,
+}
+
 pub struct DirectoryHandle {
     path: PathBuf,
     file: File,
@@ -51,6 +59,10 @@ impl DirectoryHandle {
         if identity(&self.file)? != self.identity {
             return Ok(false);
         }
+        let current = open_directory_chain(&self.path, false)?;
+        if current.identity != self.identity {
+            return Ok(false);
+        }
         for (file, expected) in &self.ancestors {
             if identity(file)? != *expected {
                 return Ok(false);
@@ -65,6 +77,31 @@ impl DirectoryHandle {
     }
 }
 
+fn verify_replace_target_binding(
+    directory: &DirectoryHandle,
+    target_name: &OsStr,
+    replace_if_exists: bool,
+    target_file: Option<&File>,
+) -> io::Result<()> {
+    match (replace_if_exists, target_file) {
+        (false, None) => Ok(()),
+        (true, Some(expected)) => {
+            let expected_identity = identity(expected)?;
+            let current = open_regular_file_for_replace_check_at(directory, target_name)?;
+            if identity(&current)? != expected_identity {
+                return Err(io::Error::other(
+                    "replacement target changed after it was opened",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "replace flag and target handle must describe the same target state",
+        )),
+    }
+}
+
 #[cfg(unix)]
 pub fn identity(file: &File) -> io::Result<Identity> {
     use std::os::unix::fs::MetadataExt;
@@ -73,6 +110,22 @@ pub fn identity(file: &File) -> io::Result<Identity> {
     Ok(Identity {
         first: metadata.dev(),
         second: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+pub fn version(file: &File) -> io::Result<FileVersion> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(FileVersion {
+        identity: Identity {
+            first: metadata.dev(),
+            second: metadata.ino(),
+        },
+        size: metadata.len(),
+        modified: i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec()),
+        changed: i128::from(metadata.ctime()) * 1_000_000_000 + i128::from(metadata.ctime_nsec()),
     })
 }
 
@@ -109,6 +162,41 @@ pub fn identity(file: &File) -> io::Result<Identity> {
         first: u64::from(information.dwVolumeSerialNumber),
         second: (u64::from(information.nFileIndexHigh) << 32)
             | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub fn version(file: &File) -> io::Result<FileVersion> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx},
+    };
+
+    let identity = identity(file)?;
+    let mut information = MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+    // SAFETY: the handle is borrowed from a live File and the API writes one
+    // FILE_BASIC_INFO value into the correctly sized output buffer.
+    let success = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileBasicInfo,
+            information.as_mut_ptr().cast(),
+            u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>()).expect("FILE_BASIC_INFO size"),
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: GetFileInformationByHandleEx returned nonzero after filling the
+    // output structure.
+    let information = unsafe { information.assume_init() };
+    Ok(FileVersion {
+        identity,
+        size: file.metadata()?.len(),
+        modified: i128::from(information.LastWriteTime),
+        changed: i128::from(information.ChangeTime),
     })
 }
 
@@ -191,6 +279,95 @@ pub fn open_or_create_directory(path: &Path) -> io::Result<DirectoryHandle> {
     open_directory_chain(path, true)
 }
 
+#[cfg(windows)]
+pub fn directory_identity_at(parent: &DirectoryHandle, name: &OsStr) -> io::Result<Identity> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_TRAVERSE, OPEN_EXISTING,
+    };
+
+    validate_entry_name(name)?;
+    if !parent.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    let path = entry_path(parent, name)?;
+    let child = open_with_delete_share(
+        &path,
+        FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+        OPEN_EXISTING,
+        true,
+    )?;
+    let metadata = child.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path is not an approved directory",
+        ));
+    }
+    let identity = identity(&child)?;
+    if !parent.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    Ok(identity)
+}
+
+#[cfg(unix)]
+pub fn directory_identity_at(parent: &DirectoryHandle, name: &OsStr) -> io::Result<Identity> {
+    validate_entry_name(name)?;
+    if !parent.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    let fd = nix::fcntl::openat(
+        parent.file(),
+        name,
+        nix::fcntl::OFlag::O_RDONLY
+            | nix::fcntl::OFlag::O_DIRECTORY
+            | nix::fcntl::OFlag::O_NOFOLLOW
+            | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .map_err(nix_error)?;
+    let child = File::from(fd);
+    if !parent.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    identity(&child)
+}
+
+#[cfg(unix)]
+pub fn remove_directory_at(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+    expected_identity: Identity,
+) -> io::Result<()> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    validate_entry_name(name)?;
+    if !parent.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    let fd = openat(
+        parent.file(),
+        name,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(nix_error)?;
+    let child = File::from(fd);
+    if identity(&child)? != expected_identity {
+        return Err(io::Error::other("directory entry changed"));
+    }
+    if !parent.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    nix::unistd::unlinkat(parent.file(), name, nix::unistd::UnlinkatFlags::RemoveDir)
+        .map_err(nix_error)
+}
+
 #[cfg(unix)]
 pub fn open_regular_file_at(directory: &DirectoryHandle, name: &OsStr) -> io::Result<File> {
     use nix::{
@@ -215,6 +392,14 @@ pub fn open_regular_file_at(directory: &DirectoryHandle, name: &OsStr) -> io::Re
     }
     identity(&file)?;
     Ok(file)
+}
+
+#[cfg(unix)]
+pub fn open_regular_file_for_delete_at(
+    directory: &DirectoryHandle,
+    name: &OsStr,
+) -> io::Result<File> {
+    open_regular_file_at(directory, name)
 }
 
 #[cfg(unix)]
@@ -319,9 +504,22 @@ pub fn remove_file_at(directory: &DirectoryHandle, name: &OsStr) -> io::Result<(
 pub fn remove_open_file_at(
     directory: &DirectoryHandle,
     name: &OsStr,
-    _file: &File,
+    file: &File,
 ) -> io::Result<()> {
-    remove_file_at(directory, name)
+    validate_entry_name(name)?;
+    if !directory.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    identity(file)?;
+    if !directory.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    nix::unistd::unlinkat(
+        directory.file(),
+        name,
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
+    )
+    .map_err(nix_error)
 }
 
 #[cfg(unix)]
@@ -335,6 +533,7 @@ pub fn replace_file_at(
 ) -> io::Result<()> {
     validate_entry_name(temporary_name)?;
     validate_entry_name(target_name)?;
+    verify_replace_target_binding(directory, target_name, _replace_if_exists, _target_file)?;
 
     #[cfg(target_os = "linux")]
     if !_replace_if_exists {
@@ -380,6 +579,29 @@ pub fn replace_file_at(
 }
 
 #[cfg(windows)]
+fn windows_api_path_wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let raw = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let is_device_path = raw.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        || raw.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16]);
+    if !path.is_absolute() || raw.len() < 248 || is_device_path {
+        return raw;
+    }
+    if raw.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        "\\\\?\\UNC\\"
+            .encode_utf16()
+            .chain(raw[2..].iter().copied())
+            .collect()
+    } else {
+        "\\\\?\\"
+            .encode_utf16()
+            .chain(raw.iter().copied())
+            .collect()
+    }
+}
+
+#[cfg(windows)]
 #[allow(unsafe_code)]
 fn open_with_flags(
     path: &Path,
@@ -410,10 +632,7 @@ fn open_with_sharing(
     directory: bool,
     share_delete: bool,
 ) -> io::Result<File> {
-    use std::{
-        os::windows::{ffi::OsStrExt, io::FromRawHandle},
-        ptr,
-    };
+    use std::{os::windows::io::FromRawHandle, ptr};
     use windows_sys::Win32::{
         Foundation::{HANDLE, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
@@ -422,7 +641,7 @@ fn open_with_sharing(
         },
     };
 
-    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut wide = windows_api_path_wide(path);
     wide.push(0);
     let flags = FILE_FLAG_OPEN_REPARSE_POINT
         | if directory {
@@ -533,6 +752,47 @@ pub fn open_or_create_directory(path: &Path) -> io::Result<DirectoryHandle> {
 }
 
 #[cfg(windows)]
+pub fn remove_directory_at(
+    parent: &DirectoryHandle,
+    name: &OsStr,
+    expected_identity: Identity,
+) -> io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_TRAVERSE, OPEN_EXISTING,
+    };
+
+    validate_entry_name(name)?;
+    if !parent.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    let path = entry_path(parent, name)?;
+    let child = open_with_delete_share(
+        &path,
+        DELETE | FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+        OPEN_EXISTING,
+        true,
+    )?;
+    let metadata = child.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "path is not an approved directory",
+        ));
+    }
+    if identity(&child)? != expected_identity {
+        return Err(io::Error::other("directory entry changed"));
+    }
+    if !parent.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    dispose_file_by_handle(&child)
+}
+
+#[cfg(windows)]
 fn entry_path(directory: &DirectoryHandle, name: &OsStr) -> io::Result<PathBuf> {
     validate_entry_name(name)?;
     Ok(directory.path.join(name))
@@ -557,6 +817,25 @@ pub fn open_regular_file_at(directory: &DirectoryHandle, name: &OsStr) -> io::Re
 
     let path = entry_path(directory, name)?;
     let file = open_with_flags(&path, FILE_GENERIC_READ, OPEN_EXISTING, false)?;
+    validate_regular_file(file)
+}
+
+#[cfg(windows)]
+pub fn open_regular_file_for_delete_at(
+    directory: &DirectoryHandle,
+    name: &OsStr,
+) -> io::Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_READ_ATTRIBUTES, FILE_READ_DATA, OPEN_EXISTING,
+    };
+
+    let path = entry_path(directory, name)?;
+    let file = open_with_delete_share(
+        &path,
+        DELETE | FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+        OPEN_EXISTING,
+        false,
+    )?;
     validate_regular_file(file)
 }
 
@@ -712,8 +991,9 @@ mod tests {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| {
                     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("..")
-                        .join("..")
+                        .parent()
+                        .and_then(Path::parent)
+                        .expect("project root above file_identity manifest")
                         .join(".local")
                         .join("codex")
                         .join("tmp")
@@ -1011,6 +1291,63 @@ mod tests {
     }
 
     #[test]
+    fn open_or_create_directory_creates_and_binds_a_nested_chain() {
+        let root = TestDirectory::new("nested-directory-chain");
+        let target = root
+            .path
+            .join("a".repeat(120))
+            .join("b".repeat(100))
+            .join("owner")
+            .join("ppt")
+            .join("task");
+        assert!(target.as_os_str().encode_wide().count() > 260);
+
+        let directory = open_or_create_directory(&target)
+            .unwrap_or_else(|error| panic!("nested directory creation failed: {error:?}"));
+
+        assert_eq!(directory.path(), target);
+        assert!(
+            directory
+                .same_identity()
+                .expect("nested directory identity")
+        );
+        assert_eq!(
+            open_directory(&target)
+                .expect("reopen nested directory")
+                .identity(),
+            directory.identity()
+        );
+
+        let temporary_name = OsStr::new("artifact.tmp");
+        let target_name = OsStr::new("artifact.pptx");
+        let mut temporary = create_regular_file_at(&directory, temporary_name)
+            .expect("create long-path temporary artifact");
+        temporary
+            .write_all(b"long-path-artifact")
+            .expect("write long-path temporary artifact");
+        temporary
+            .sync_all()
+            .expect("flush long-path temporary artifact");
+        replace_file_at(
+            &directory,
+            temporary_name,
+            target_name,
+            &temporary,
+            false,
+            None,
+        )
+        .expect("publish long-path artifact");
+        drop(temporary);
+        let mut published = open_regular_file_at(&directory, target_name)
+            .expect("reopen long-path published artifact");
+        let mut body = Vec::new();
+        published
+            .read_to_end(&mut body)
+            .expect("read long-path published artifact");
+        assert_eq!(body, b"long-path-artifact");
+    }
+
+    #[test]
     fn windows_replace_file_at_binds_absolute_name_and_exact_buffer_size() {
         let root = TestDirectory::new("replace-file-at");
 
@@ -1043,6 +1380,99 @@ mod tests {
             Some(b"aligned old\n"),
         );
     }
+
+    #[test]
+    fn replace_file_at_rejects_a_rebound_existing_target() {
+        let root = TestDirectory::new("replace-rebound-target");
+        let parent = root.child("parent");
+        let directory = open_or_create_directory(&parent).expect("open parent");
+        let target_name = OsStr::new("published.json");
+        let backup_name = OsStr::new("published.old.json");
+        let temporary_name = OsStr::new("temporary.json");
+        let target_path = parent.join(target_name);
+        let backup_path = parent.join(backup_name);
+        let temporary_path = parent.join(temporary_name);
+
+        fs::write(&target_path, b"original").expect("original target");
+        let original = open_regular_file_for_replace_at(&directory, target_name)
+            .expect("open original target for replacement");
+        let mut temporary =
+            create_regular_file_at(&directory, temporary_name).expect("create temporary");
+        temporary
+            .write_all(b"replacement")
+            .expect("write temporary");
+        temporary.sync_all().expect("flush temporary");
+
+        fs::rename(&target_path, &backup_path).expect("move original target");
+        fs::write(&target_path, b"attacker").expect("install rebound target");
+
+        let result = replace_file_at(
+            &directory,
+            temporary_name,
+            target_name,
+            &temporary,
+            true,
+            Some(&original),
+        );
+        assert!(result.is_err(), "rebound target was overwritten");
+        assert_eq!(fs::read(&target_path).expect("rebound target"), b"attacker");
+        assert_eq!(
+            fs::read(&backup_path).expect("original backup"),
+            b"original"
+        );
+        assert_eq!(
+            fs::read(&temporary_path).expect("unpublished temporary"),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn remove_directory_at_deletes_only_the_bound_directory() {
+        let root = TestDirectory::new("remove-directory-at");
+        let parent_path = root.child("parent");
+        let parent = open_directory(&parent_path).expect("open parent");
+        let name = OsStr::new("owned");
+        let target_path = parent_path.join(name);
+        fs::create_dir(&target_path).expect("create target directory");
+        let target = open_directory(&target_path).expect("open target");
+        let target_identity = target.identity();
+        drop(target);
+
+        remove_directory_at(&parent, name, target_identity)
+            .unwrap_or_else(|error| panic!("remove bound directory: {error:?}"));
+        assert!(!target_path.exists(), "bound directory remains");
+    }
+
+    #[test]
+    fn delete_capable_file_open_uses_share_delete_before_disposition() {
+        let root = TestDirectory::new("delete-capable-file");
+        let parent = root.child("parent");
+        let directory = open_directory(&parent).expect("open parent");
+        let name = OsStr::new("owned.bin");
+        let path = parent.join(name);
+        let mut created = create_regular_file_at(&directory, name).expect("create file");
+        created.write_all(b"owned-marker").expect("write file");
+        created.sync_all().expect("sync file");
+        drop(created);
+
+        let read_handle = open_regular_file_at(&directory, name).expect("read handle");
+        assert!(
+            open_regular_file_for_delete_at(&directory, name).is_err(),
+            "a non-share-delete read handle must block delete open"
+        );
+        drop(read_handle);
+
+        let mut delete_handle =
+            open_regular_file_for_delete_at(&directory, name).expect("delete-capable handle");
+        let mut marker = Vec::new();
+        delete_handle
+            .read_to_end(&mut marker)
+            .expect("read marker through delete handle");
+        assert_eq!(marker, b"owned-marker");
+        remove_open_file_at(&directory, name, &delete_handle).expect("dispose file");
+        drop(delete_handle);
+        assert!(!path.exists(), "disposed file remains");
+    }
 }
 
 #[cfg(windows)]
@@ -1057,10 +1487,18 @@ pub fn remove_file_at(directory: &DirectoryHandle, name: &OsStr) -> io::Result<(
 
 #[cfg(windows)]
 pub fn remove_open_file_at(
-    _directory: &DirectoryHandle,
-    _name: &OsStr,
+    directory: &DirectoryHandle,
+    name: &OsStr,
     file: &File,
 ) -> io::Result<()> {
+    validate_entry_name(name)?;
+    if !directory.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
+    identity(file)?;
+    if !directory.same_identity()? {
+        return Err(io::Error::other("directory parent changed"));
+    }
     dispose_file_by_handle(file)
 }
 
@@ -1074,27 +1512,16 @@ pub fn replace_file_at(
     replace_if_exists: bool,
     target_file: Option<&File>,
 ) -> io::Result<()> {
-    use std::{
-        mem::size_of,
-        os::windows::{ffi::OsStrExt, io::AsRawHandle},
-        ptr,
-    };
+    use std::{mem::size_of, os::windows::io::AsRawHandle, ptr};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_RENAME_INFO, FILE_RENAME_INFO_0, FileRenameInfoEx, SetFileInformationByHandle,
     };
 
     validate_entry_name(temporary_name)?;
     validate_entry_name(target_name)?;
-    if let Some(target_file) = target_file {
-        identity(target_file)?;
-    }
-    let target_name = directory
-        .path
-        .join(target_name)
-        .as_os_str()
-        .encode_wide()
-        .collect::<Vec<_>>();
-    if target_name.is_empty() || target_name.iter().any(|unit| *unit == 0) {
+    verify_replace_target_binding(directory, target_name, replace_if_exists, target_file)?;
+    let target_name = windows_api_path_wide(&directory.path.join(target_name));
+    if target_name.is_empty() || target_name.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "file name must not be empty or contain NUL",

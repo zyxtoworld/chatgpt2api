@@ -1303,6 +1303,60 @@ const PUBLIC_CUSTOM_TOOL_CALL_OUTPUT_ITEM_FIELDS: &[&str] =
     &["type", "id", "call_id", "name", "output", "status"];
 const PUBLIC_MCP_CALL_OUTPUT_ITEM_FIELDS: &[&str] = &["type", "call_id", "output"];
 
+const PUBLIC_ITEM_RULES: &[(&str, &[&str])] = &[
+    ("message", PUBLIC_MESSAGE_ITEM_FIELDS),
+    ("file_search_call", PUBLIC_FILE_SEARCH_ITEM_FIELDS),
+    ("function_call", PUBLIC_FUNCTION_CALL_ITEM_FIELDS),
+    (
+        "function_call_output",
+        PUBLIC_FUNCTION_CALL_OUTPUT_ITEM_FIELDS,
+    ),
+    ("web_search_call", PUBLIC_WEB_SEARCH_ITEM_FIELDS),
+    ("computer_call", PUBLIC_COMPUTER_CALL_ITEM_FIELDS),
+    (
+        "computer_call_output",
+        PUBLIC_COMPUTER_CALL_OUTPUT_ITEM_FIELDS,
+    ),
+    ("reasoning", PUBLIC_REASONING_ITEM_FIELDS),
+    ("program", PUBLIC_PROGRAM_ITEM_FIELDS),
+    ("program_output", PUBLIC_PROGRAM_OUTPUT_ITEM_FIELDS),
+    ("tool_search_call", PUBLIC_TOOL_SEARCH_CALL_ITEM_FIELDS),
+    ("tool_search_output", PUBLIC_TOOL_SEARCH_OUTPUT_ITEM_FIELDS),
+    ("additional_tools", PUBLIC_ADDITIONAL_TOOLS_ITEM_FIELDS),
+    ("compaction", PUBLIC_COMPACTION_ITEM_FIELDS),
+    ("image_generation_call", PUBLIC_IMAGE_GENERATION_ITEM_FIELDS),
+    ("code_interpreter_call", PUBLIC_CODE_INTERPRETER_ITEM_FIELDS),
+    ("local_shell_call", PUBLIC_LOCAL_SHELL_ITEM_FIELDS),
+    (
+        "local_shell_call_output",
+        PUBLIC_LOCAL_SHELL_OUTPUT_ITEM_FIELDS,
+    ),
+    ("shell_call", PUBLIC_SHELL_ITEM_FIELDS),
+    ("shell_call_output", PUBLIC_SHELL_OUTPUT_ITEM_FIELDS),
+    ("apply_patch_call", PUBLIC_APPLY_PATCH_ITEM_FIELDS),
+    (
+        "apply_patch_call_output",
+        PUBLIC_APPLY_PATCH_OUTPUT_ITEM_FIELDS,
+    ),
+    ("mcp_call", PUBLIC_MCP_CALL_ITEM_FIELDS),
+    ("mcp_call_output", PUBLIC_MCP_CALL_OUTPUT_ITEM_FIELDS),
+    ("mcp_tool_call_output", PUBLIC_MCP_CALL_OUTPUT_ITEM_FIELDS),
+    ("mcp_list_tools", PUBLIC_MCP_LIST_TOOLS_ITEM_FIELDS),
+    (
+        "mcp_approval_request",
+        PUBLIC_MCP_APPROVAL_REQUEST_ITEM_FIELDS,
+    ),
+    (
+        "mcp_approval_response",
+        PUBLIC_MCP_APPROVAL_RESPONSE_ITEM_FIELDS,
+    ),
+    ("custom_tool_call", PUBLIC_CUSTOM_TOOL_CALL_ITEM_FIELDS),
+    (
+        "custom_tool_call_output",
+        PUBLIC_CUSTOM_TOOL_CALL_OUTPUT_ITEM_FIELDS,
+    ),
+];
+
 const PUBLIC_CONTENT_FIELDS: &[&str] = &[
     "type",
     "text",
@@ -1525,38 +1579,9 @@ fn project_public_item_output(value: &Value) -> Result<Value, ()> {
 }
 
 fn public_item_fields(item_type: &str) -> Option<&'static [&'static str]> {
-    Some(match item_type {
-        "message" => PUBLIC_MESSAGE_ITEM_FIELDS,
-        "file_search_call" => PUBLIC_FILE_SEARCH_ITEM_FIELDS,
-        "function_call" => PUBLIC_FUNCTION_CALL_ITEM_FIELDS,
-        "function_call_output" => PUBLIC_FUNCTION_CALL_OUTPUT_ITEM_FIELDS,
-        "web_search_call" => PUBLIC_WEB_SEARCH_ITEM_FIELDS,
-        "computer_call" => PUBLIC_COMPUTER_CALL_ITEM_FIELDS,
-        "computer_call_output" => PUBLIC_COMPUTER_CALL_OUTPUT_ITEM_FIELDS,
-        "reasoning" => PUBLIC_REASONING_ITEM_FIELDS,
-        "program" => PUBLIC_PROGRAM_ITEM_FIELDS,
-        "program_output" => PUBLIC_PROGRAM_OUTPUT_ITEM_FIELDS,
-        "tool_search_call" => PUBLIC_TOOL_SEARCH_CALL_ITEM_FIELDS,
-        "tool_search_output" => PUBLIC_TOOL_SEARCH_OUTPUT_ITEM_FIELDS,
-        "additional_tools" => PUBLIC_ADDITIONAL_TOOLS_ITEM_FIELDS,
-        "compaction" => PUBLIC_COMPACTION_ITEM_FIELDS,
-        "image_generation_call" => PUBLIC_IMAGE_GENERATION_ITEM_FIELDS,
-        "code_interpreter_call" => PUBLIC_CODE_INTERPRETER_ITEM_FIELDS,
-        "local_shell_call" => PUBLIC_LOCAL_SHELL_ITEM_FIELDS,
-        "local_shell_call_output" => PUBLIC_LOCAL_SHELL_OUTPUT_ITEM_FIELDS,
-        "shell_call" => PUBLIC_SHELL_ITEM_FIELDS,
-        "shell_call_output" => PUBLIC_SHELL_OUTPUT_ITEM_FIELDS,
-        "apply_patch_call" => PUBLIC_APPLY_PATCH_ITEM_FIELDS,
-        "apply_patch_call_output" => PUBLIC_APPLY_PATCH_OUTPUT_ITEM_FIELDS,
-        "mcp_call" => PUBLIC_MCP_CALL_ITEM_FIELDS,
-        "mcp_call_output" | "mcp_tool_call_output" => PUBLIC_MCP_CALL_OUTPUT_ITEM_FIELDS,
-        "mcp_list_tools" => PUBLIC_MCP_LIST_TOOLS_ITEM_FIELDS,
-        "mcp_approval_request" => PUBLIC_MCP_APPROVAL_REQUEST_ITEM_FIELDS,
-        "mcp_approval_response" => PUBLIC_MCP_APPROVAL_RESPONSE_ITEM_FIELDS,
-        "custom_tool_call" => PUBLIC_CUSTOM_TOOL_CALL_ITEM_FIELDS,
-        "custom_tool_call_output" => PUBLIC_CUSTOM_TOOL_CALL_OUTPUT_ITEM_FIELDS,
-        _ => return None,
-    })
+    PUBLIC_ITEM_RULES
+        .iter()
+        .find_map(|(name, fields)| (*name == item_type).then_some(*fields))
 }
 
 fn project_public_logprob(value: &Value) -> Result<Value, ()> {
@@ -2099,4 +2124,162 @@ pub(super) fn native_codex_delta_frame(
     output.extend(serde_json::to_vec(&value).expect("static Codex chat frame"));
     output.extend_from_slice(b"\n\n");
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PUBLIC_ITEM_RULES, project_public_item, public_item_fields};
+    use serde_json::{Map, Value, json};
+
+    const PUBLIC_ITEM_MANIFEST: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../services/protocol/codex_public_item_manifest.json"
+    ));
+
+    fn positive_item(item_type: &str, fields: &[&str]) -> Value {
+        let mut item = Map::new();
+        item.insert("type".to_owned(), Value::String(item_type.to_owned()));
+        item.insert("id".to_owned(), Value::String(format!("{item_type}-id")));
+        for field in fields {
+            if matches!(*field, "type" | "id") {
+                continue;
+            }
+            let value = match *field {
+                "action" | "environment" | "operation" => json!({}),
+                "content" | "outputs" | "pending_safety_checks" | "queries" | "tools" => {
+                    json!([])
+                }
+                "output" if item_type == "computer_call_output" => json!({}),
+                "output" if item_type == "shell_call_output" => json!([]),
+                "approve" => json!(true),
+                "max_output_length" => json!(32),
+                "status" => json!("completed"),
+                _ => json!("value"),
+            };
+            item.insert((*field).to_owned(), value);
+        }
+        Value::Object(item)
+    }
+
+    #[test]
+    fn public_item_rules_match_shared_manifest_exactly() {
+        let manifest: Value = serde_json::from_str(PUBLIC_ITEM_MANIFEST).expect("manifest JSON");
+        let expected = manifest
+            .get("items")
+            .and_then(Value::as_object)
+            .expect("manifest items");
+        assert_eq!(PUBLIC_ITEM_RULES.len(), expected.len());
+        for (item_type, fields) in expected {
+            let fields = fields.as_array().expect("manifest field array");
+            let actual = public_item_fields(item_type).expect("manifest type is implemented");
+            let expected = fields
+                .iter()
+                .map(|field| field.as_str().expect("manifest field string"))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected.as_slice(), "fields for {item_type}");
+        }
+        for (item_type, _) in PUBLIC_ITEM_RULES {
+            assert!(
+                expected.contains_key(*item_type),
+                "unmanifested type {item_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_item_manifest_positive_and_foreign_fields_are_fail_closed() {
+        let manifest: Value = serde_json::from_str(PUBLIC_ITEM_MANIFEST).expect("manifest JSON");
+        let items = manifest
+            .get("items")
+            .and_then(Value::as_object)
+            .expect("manifest items");
+        let canary = "codex-cross-type-item-canary";
+        for (item_type, fields) in items {
+            let fields = fields
+                .as_array()
+                .expect("manifest field array")
+                .iter()
+                .map(|field| field.as_str().expect("manifest field string"))
+                .collect::<Vec<_>>();
+            let projected =
+                project_public_item(&positive_item(item_type, &fields)).expect("positive item");
+            let projected = projected.as_object().expect("projected object");
+            assert_eq!(projected.len(), fields.len(), "fields for {item_type}");
+            for field in &fields {
+                assert!(
+                    projected.contains_key(*field),
+                    "missing {item_type}.{field}"
+                );
+            }
+
+            let foreign = items.iter().find_map(|(other_type, other_fields)| {
+                if other_type == item_type {
+                    return None;
+                }
+                other_fields.as_array()?.iter().find_map(|field| {
+                    let field = field.as_str()?;
+                    (!fields.contains(&field)).then_some(field)
+                })
+            });
+            if let Some(foreign) = foreign {
+                let mut poisoned = positive_item(item_type, &fields);
+                poisoned[foreign] = Value::String(canary.to_owned());
+                let poisoned = project_public_item(&poisoned).expect("foreign field ignored");
+                assert!(
+                    !poisoned.to_string().contains(canary),
+                    "leak in {item_type}.{foreign}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_item_manifest_nested_projectors_drop_recursive_secrets() {
+        let manifest: Value = serde_json::from_str(PUBLIC_ITEM_MANIFEST).expect("manifest JSON");
+        let nested = manifest
+            .get("nested_projectors")
+            .and_then(Value::as_object)
+            .expect("manifest nested projectors");
+        let canary = "codex-nested-projector-secret";
+        for (item_type, projector_fields) in nested {
+            let projector_fields = projector_fields
+                .as_object()
+                .expect("manifest projector object");
+            for (field, projector) in projector_fields {
+                let value = match projector.as_str().expect("projector name") {
+                    "environment" => json!({
+                        "type": "container",
+                        "id": "container-id",
+                        "secret": canary
+                    }),
+                    "item_output" | "output_object" => {
+                        json!({"type": "result", "text": "ok", "secret": canary})
+                    }
+                    "operation" => json!({
+                        "type": "patch",
+                        "path": "README.md",
+                        "secret": canary
+                    }),
+                    "outputs" => json!([{
+                        "type": "output_text",
+                        "text": "ok",
+                        "secret": canary
+                    }]),
+                    "safety_checks" => json!([{
+                        "type": "safety",
+                        "reason": "review",
+                        "secret": canary
+                    }]),
+                    other => panic!("unknown projector {other}"),
+                };
+                let item =
+                    json!({"type": item_type, "id": format!("{item_type}-id"), field: value});
+                let projected = project_public_item(&item).expect("nested projector");
+                assert!(
+                    !projected.to_string().contains(canary),
+                    "leak in {item_type}.{field}"
+                );
+            }
+        }
+    }
 }

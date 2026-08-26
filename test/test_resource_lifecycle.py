@@ -1440,11 +1440,28 @@ class ResourceLifecycleTests(unittest.TestCase):
 
     def test_production_container_disables_per_request_access_logging(self) -> None:
         dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile"
-        command_line = next(
-            line.strip()
-            for line in dockerfile.read_text(encoding="utf-8").splitlines()
-            if line.strip().startswith("CMD ")
+        lines = dockerfile.read_text(encoding="utf-8").splitlines()
+        app_start = next(
+            index
+            for index, line in enumerate(lines)
+            if line.strip().lower().startswith("from ")
+            and line.strip().lower().endswith(" as app")
         )
+        app_end = next(
+            (
+                index
+                for index in range(app_start + 1, len(lines))
+                if lines[index].strip().lower().startswith("from ")
+            ),
+            len(lines),
+        )
+        command_lines = [
+            line.strip()
+            for line in lines[app_start + 1 : app_end]
+            if line.strip().startswith("CMD ")
+        ]
+        self.assertEqual(len(command_lines), 1)
+        command_line = command_lines[0]
         command = json.loads(command_line.removeprefix("CMD "))
 
         self.assertNotIn("--access-log", command)

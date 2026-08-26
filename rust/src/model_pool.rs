@@ -1,11 +1,10 @@
 use std::{
     collections::HashSet,
-    fs,
-    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
+use file_identity::FileVersion;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -13,7 +12,8 @@ use tokio::sync::Mutex;
 
 use super::{
     AppInitError, MAX_MODEL_SNAPSHOT_BYTES, MAX_MODEL_TEXT_LENGTH, MAX_MODELS, bounded_text,
-    normalized_list, normalized_reasoning_efforts, parse_created,
+    normalized_list, normalized_reasoning_efforts, parse_created, read_bounded_validated_file,
+    validated_file_version,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -35,6 +35,7 @@ pub(super) struct PublicModel {
 struct ModelSnapshot {
     generation: u64,
     fingerprint: [u8; 32],
+    file_version: Option<FileVersion>,
     valid: bool,
     models: Arc<Vec<PublicModel>>,
 }
@@ -48,12 +49,14 @@ pub(super) struct ModelStore {
 
 impl ModelStore {
     pub(super) fn load(path: Option<&Path>, configured: &[String]) -> Result<Self, AppInitError> {
-        let (models, fingerprint) = ModelCatalog::load_with_fingerprint(path, configured)?;
+        let (models, fingerprint, file_version) =
+            ModelCatalog::load_with_fingerprint(path, configured)?;
         Ok(Self {
             path: path.map(|path| Arc::new(path.to_owned())),
             snapshot: Arc::new(RwLock::new(ModelSnapshot {
                 generation: 0,
                 fingerprint,
+                file_version,
                 valid: true,
                 models: Arc::new(models),
             })),
@@ -66,16 +69,33 @@ impl ModelStore {
             return true;
         };
         let _reload_guard = self.reload_gate.lock().await;
+        let version_path = path.clone();
+        let version =
+            tokio::task::spawn_blocking(move || validated_file_version(&version_path)).await;
+        let Ok(Ok(version)) = version else {
+            self.invalidate();
+            return false;
+        };
+        {
+            let snapshot = self.snapshot.read().expect("model snapshot lock");
+            if snapshot.valid && snapshot.file_version == Some(version) {
+                return true;
+            }
+        }
         let result = tokio::task::spawn_blocking(move || {
             ModelCatalog::load_with_fingerprint(Some(&path), &[])
         })
         .await;
         let mut snapshot = self.snapshot.write().expect("model snapshot lock");
         match result {
-            Ok(Ok((models, fingerprint))) => {
-                if !snapshot.valid || snapshot.fingerprint != fingerprint {
+            Ok(Ok((models, fingerprint, file_version))) => {
+                if !snapshot.valid
+                    || snapshot.fingerprint != fingerprint
+                    || snapshot.file_version != file_version
+                {
                     snapshot.generation = snapshot.generation.saturating_add(1);
                     snapshot.fingerprint = fingerprint;
+                    snapshot.file_version = file_version;
                     snapshot.models = Arc::new(models);
                     snapshot.valid = true;
                 }
@@ -90,6 +110,13 @@ impl ModelStore {
         }
     }
 
+    fn invalidate(&self) {
+        let mut snapshot = self.snapshot.write().expect("model snapshot lock");
+        snapshot.generation = snapshot.generation.saturating_add(1);
+        snapshot.valid = false;
+        snapshot.models = Arc::new(Vec::new());
+    }
+
     pub(super) fn current(&self) -> Arc<Vec<PublicModel>> {
         self.snapshot
             .read()
@@ -97,28 +124,22 @@ impl ModelStore {
             .models
             .clone()
     }
-
-    pub(super) fn configured_path(&self) -> Option<Arc<PathBuf>> {
-        self.path.clone()
-    }
 }
 
 pub(super) struct ModelCatalog;
+
+type LoadedModelCatalog = (Vec<PublicModel>, [u8; 32], Option<FileVersion>);
 
 impl ModelCatalog {
     pub(super) fn load_with_fingerprint(
         path: Option<&Path>,
         configured: &[String],
-    ) -> Result<(Vec<PublicModel>, [u8; 32]), AppInitError> {
+    ) -> Result<LoadedModelCatalog, AppInitError> {
         let raw_items = if let Some(path) = path {
-            let file = fs::File::open(path).map_err(|_| AppInitError::ModelSnapshot)?;
-            let mut bytes = Vec::new();
-            file.take(MAX_MODEL_SNAPSHOT_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| AppInitError::ModelSnapshot)?;
-            if bytes.len() as u64 > MAX_MODEL_SNAPSHOT_BYTES {
-                return Err(AppInitError::ModelSnapshot);
-            }
+            let (bytes, file_version) = read_bounded_validated_file(path, MAX_MODEL_SNAPSHOT_BYTES)
+                .map_err(|()| AppInitError::ModelSnapshot)?;
+            #[cfg(test)]
+            super::record_model_document_parse(path);
             let fingerprint = Sha256::digest(&bytes).into();
             let value: Value =
                 serde_json::from_slice(&bytes).map_err(|_| AppInitError::ModelSnapshot)?;
@@ -128,14 +149,15 @@ impl ModelCatalog {
                 .and_then(Value::as_array)
                 .cloned()
                 .ok_or(AppInitError::ModelSnapshot)?;
-            (items, fingerprint)
+            (items, fingerprint, Some(file_version))
         } else {
             (
                 configured.iter().map(|id| json!({ "id": id })).collect(),
                 [0; 32],
+                None,
             )
         };
-        let (raw_items, fingerprint) = raw_items;
+        let (raw_items, fingerprint, file_version) = raw_items;
         if raw_items.len() > MAX_MODELS {
             return Err(AppInitError::ModelSnapshot);
         }
@@ -149,7 +171,7 @@ impl ModelCatalog {
                 models.push(model);
             }
         }
-        Ok((models, fingerprint))
+        Ok((models, fingerprint, file_version))
     }
 
     pub(super) fn project(item: &Value) -> Option<PublicModel> {
@@ -222,5 +244,5 @@ pub(super) fn project_remote_model_list(
             .unwrap_or_default();
         models.push(model);
     }
-    Some(models)
+    (!models.is_empty()).then_some(models)
 }

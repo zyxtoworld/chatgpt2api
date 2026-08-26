@@ -4,14 +4,23 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[workspace]
+members = ["file_identity"]
+resolver = "3"
+
+[features]
+live-database-tests = []
+
 [dependencies]
-axum = { version = "0.8", features = ["ws"] }
+aes = "0.8.4"
+axum = { version = "0.8", features = ["multipart", "ws"] }
 base64 = "0.22"
 file_identity = { package = "chatgpt2api-file-identity", path = "file_identity" }
 futures-util = "0.3"
 fs2 = "0.4"
 flate2 = "1"
 getrandom = "0.2"
+httpdate = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 log = "0.4"
 percent-encoding = "2.3"
@@ -22,9 +31,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 sha3 = "0.10"
+sqlx = { version = "0.8.6", default-features = false, features = ["any", "mysql", "postgres", "runtime-tokio", "sqlite", "tls-rustls-ring-native-roots"] }
 tiktoken-rs = "0.12"
 tar = "0.4"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "test-util"] }
+time = { version = "0.3.55", default-features = false, features = ["parsing"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time", "test-util"] }
 tokio-rustls = "0.26"
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 url = "2"

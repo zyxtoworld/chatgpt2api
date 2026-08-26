@@ -29,16 +29,7 @@ impl AppConfig {
     pub fn from_env() -> Self {
         let config_path = config_path();
         let legacy = read_json_object(&config_path);
-        let data_dir = env::var_os("RUST_DATA_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                if Path::new("/app/data").is_dir() {
-                    Some(PathBuf::from("/app/data"))
-                } else {
-                    Some(PathBuf::from("data"))
-                }
-            })
-            .expect("data directory path");
+        let data_dir = runtime_data_dir();
         let auth_key = first_nonempty([
             env::var("RUST_AUTH_KEY").ok(),
             env::var("CHATGPT2API_AUTH_KEY").ok(),
@@ -91,6 +82,18 @@ impl AppConfig {
             },
         }
     }
+}
+
+pub(crate) fn runtime_data_dir() -> PathBuf {
+    env::var_os("RUST_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if Path::new("/app/data").is_dir() {
+                PathBuf::from("/app/data")
+            } else {
+                PathBuf::from("data")
+            }
+        })
 }
 
 fn first_nonempty<const N: usize>(values: [Option<String>; N]) -> Option<String> {
@@ -152,6 +155,8 @@ pub enum AppInitError {
     AuthSnapshot,
     ModelSnapshot,
     AccountSnapshot,
+    EditableTaskSnapshot,
+    StorageBackend,
 }
 
 impl std::fmt::Display for AppInitError {
@@ -161,6 +166,8 @@ impl std::fmt::Display for AppInitError {
             Self::AuthSnapshot => formatter.write_str("authentication snapshot is invalid"),
             Self::ModelSnapshot => formatter.write_str("model snapshot is invalid"),
             Self::AccountSnapshot => formatter.write_str("account snapshot is invalid"),
+            Self::EditableTaskSnapshot => formatter.write_str("editable task snapshot is invalid"),
+            Self::StorageBackend => formatter.write_str("storage backend initialization failed"),
         }
     }
 }

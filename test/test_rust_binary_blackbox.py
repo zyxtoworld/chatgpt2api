@@ -17,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 from uuid import uuid4
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CODEX_LOCAL = ROOT / ".local" / "codex"
@@ -64,7 +66,11 @@ class _ModelUpstreamHandler(BaseHTTPRequestHandler):
         if path == "/backend-api/models?history_and_training_disabled=false":
             token = authorization.removeprefix("Bearer ").strip()
             if token == "free-a":
-                self._send(502, b"temporary", "text/plain")
+                self._send(
+                    200,
+                    json.dumps({"models": []}).encode(),
+                    "application/json",
+                )
             elif token == "free-b":
                 self._send(
                     200,
@@ -242,6 +248,26 @@ def test_clean_rust_binary_native_models_black_box() -> None:
                 "total_fail": 0,
                 "by_type": {"free": 2, "other": 1},
             },
+        }
+        for authorization in (None, "Bearer invalid-storage-info-key"):
+            status, body = _request(
+                rust_address,
+                "/api/storage/info",
+                authorization=authorization,
+            )
+            assert status == 401
+            assert json.loads(body) == {
+                "detail": {"error": "密钥无效或已失效，请重新登录"}
+            }
+        storage_info_status, storage_info_body = _request(
+            rust_address,
+            "/api/storage/info",
+            authorization="Bearer client-key",
+        )
+        assert storage_info_status == 200
+        assert json.loads(storage_info_body) == {
+            "backend": {"type": "json"},
+            "health": {"status": "healthy"},
         }
         assert _request(rust_address, "/v1/models")[0] == 401
         expected_ids = {
@@ -741,6 +767,10 @@ async def _serve_native_websocket_upstream(
                 [
                     ("Content-Type", content_type),
                     ("Content-Length", str(len(body))),
+                    # websockets' HTTP rejection path doesn't serve a second
+                    # request on this connection; advertise that boundary so
+                    # reqwest doesn't reuse a dead keep-alive socket.
+                    ("Connection", "close"),
                 ]
             ),
             body,
@@ -969,7 +999,18 @@ def test_clean_rust_binary_native_websocket_warmup_and_reconnect_black_box() -> 
             if "codex-model" in model_ids:
                 break
             time.sleep(0.05)
-        assert "codex-model" in model_ids
+        if "codex-model" not in model_ids:
+            _connections, _payloads, _authorizations, http_paths = upstream_state.snapshot()
+            rust_log = log_path.read_text(encoding="utf-8", errors="replace")[-8192:]
+            rust_log = rust_log.replace("codex-token", "<redacted>").replace(
+                "client-key",
+                "<redacted>",
+            )
+            pytest.fail(
+                "native model catalog did not publish codex-model: "
+                f"upstream_paths={http_paths!r}, "
+                f"rust_exit={process.poll()}, rust_log_tail={rust_log!r}"
+            )
 
         from websockets.exceptions import InvalidStatus
         from websockets.sync.client import connect

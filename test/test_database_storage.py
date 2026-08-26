@@ -355,35 +355,174 @@ def test_database_storage_concurrent_legacy_startup_is_serialized(tmp_path) -> N
     assert results == ["ok", "ok"]
 
 
-@pytest.mark.parametrize("dialect", ("postgresql", "mysql"))
-def test_database_schema_lock_uses_server_advisory_lock(dialect) -> None:
-    statements = []
+def test_postgres_schema_lock_uses_server_database_identity_and_transaction_scope() -> None:
+    lock_keys = []
 
     class Result:
+        def __init__(self, value):
+            self.value = value
+
         def scalar(self):
-            return 1
+            return self.value
+
+    class Transaction:
+        def __init__(self, events):
+            self.events = events
+
+        def commit(self):
+            self.events.append("COMMIT")
+
+        def rollback(self):
+            self.events.append("ROLLBACK")
+
+    class Connection:
+        def __init__(self):
+            self.events = []
+
+        def begin(self):
+            self.events.append("BEGIN")
+            return Transaction(self.events)
+
+        def execute(self, statement, parameters=None):
+            sql = str(statement)
+            self.events.append(sql)
+            if "current_database()" in sql:
+                return Result("same_server_database")
+            if "pg_try_advisory_xact_lock" in sql:
+                lock_keys.append(parameters["lock_key"])
+                return Result(True)
+            if "SET LOCAL statement_timeout" in sql:
+                return Result(None)
+            raise AssertionError(f"unexpected statement: {sql}")
+
+        def close(self):
+            self.events.append("CLOSE")
+
+    connections = []
+    for database_url in (
+        "postgresql://first-user:first-password@db/test?application_name=one",
+        "postgresql://second-user:second-password@db/test?application_name=two",
+    ):
+        connection = Connection()
+        connections.append(connection)
+        backend = DatabaseStorageBackend.__new__(DatabaseStorageBackend)
+        backend.engine = SimpleNamespace(
+            dialect=SimpleNamespace(name="postgresql"),
+            connect=lambda connection=connection: connection,
+        )
+        backend.database_url = database_url
+
+        with backend._acquire_schema_lock():
+            connection.events.append("BODY")
+
+    assert lock_keys[0] == lock_keys[1]
+    for connection in connections:
+        assert connection.events[0] == "BEGIN"
+        assert connection.events[-2:] == ["COMMIT", "CLOSE"]
+        assert any("pg_try_advisory_xact_lock" in event for event in connection.events)
+        assert not any("pg_advisory_lock(" in event for event in connection.events)
+        assert not any("pg_advisory_unlock" in event for event in connection.events)
+
+
+def test_postgres_schema_lock_times_out_and_rolls_back(monkeypatch) -> None:
+    events = []
+    clock = iter((100.0, 100.0, 110.0))
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar(self):
+            return self.value
+
+    class Transaction:
+        def commit(self):
+            events.append("COMMIT")
+
+        def rollback(self):
+            events.append("ROLLBACK")
+
+    class Connection:
+        def begin(self):
+            events.append("BEGIN")
+            return Transaction()
+
+        def execute(self, statement, parameters=None):
+            sql = str(statement)
+            events.append(sql)
+            if "current_database()" in sql:
+                return Result("locked_database")
+            if "SET LOCAL statement_timeout" in sql:
+                return Result(None)
+            if "pg_try_advisory_xact_lock" in sql:
+                return Result(False)
+            raise AssertionError(f"unexpected statement: {sql}")
+
+        def close(self):
+            events.append("CLOSE")
+
+    monkeypatch.setattr(
+        "services.storage.database_storage.time.monotonic", lambda: next(clock)
+    )
+    monkeypatch.setattr("services.storage.database_storage.time.sleep", lambda _delay: None)
+    backend = DatabaseStorageBackend.__new__(DatabaseStorageBackend)
+    backend.engine = SimpleNamespace(
+        dialect=SimpleNamespace(name="postgresql"),
+        connect=Connection,
+    )
+    backend.database_url = "postgresql://credential-that-must-not-select-lock/db"
+
+    with pytest.raises(StorageDataError):
+        with backend._acquire_schema_lock():
+            raise AssertionError("lock timeout must not enter migration body")
+
+    assert events[-2:] == ["ROLLBACK", "CLOSE"]
+
+
+def test_mysql_schema_lock_release_failure_invalidates_physical_connection() -> None:
+    events = []
+
+    class Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar(self):
+            return self.value
 
     class Connection:
         def execute(self, statement, parameters=None):
-            statements.append(str(statement))
-            return Result()
+            sql = str(statement)
+            events.append(sql)
+            if "DATABASE()" in sql:
+                return Result("same_server_database")
+            if "GET_LOCK" in sql:
+                assert len(parameters["lock_name"].encode("utf-8")) <= 64
+                return Result(1)
+            if "RELEASE_LOCK" in sql:
+                return Result(0)
+            raise AssertionError(f"unexpected statement: {sql}")
+
+        def invalidate(self, _error=None):
+            events.append("INVALIDATE")
+
+        def detach(self):
+            events.append("DETACH")
 
         def close(self):
-            statements.append("CLOSE")
+            events.append("CLOSE")
 
     backend = DatabaseStorageBackend.__new__(DatabaseStorageBackend)
     backend.engine = SimpleNamespace(
-        dialect=SimpleNamespace(name=dialect),
+        dialect=SimpleNamespace(name="mysql"),
         connect=Connection,
     )
-    backend.database_url = f"{dialect}://local/test"
+    backend.database_url = "mysql://credential-that-must-not-select-lock/db"
 
-    with backend._acquire_schema_lock():
-        pass
+    with pytest.raises(StorageDataError):
+        with backend._acquire_schema_lock():
+            events.append("BODY")
 
-    assert any("pg_advisory_lock" in statement or "GET_LOCK" in statement for statement in statements)
-    assert any("pg_advisory_unlock" in statement or "RELEASE_LOCK" in statement for statement in statements)
-    assert statements[-1] == "CLOSE"
+    assert events[-2:] == ["INVALIDATE", "CLOSE"]
 
 
 def test_database_storage_rejects_corrupt_account_hash_without_rewriting_row(tmp_path) -> None:

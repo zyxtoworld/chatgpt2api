@@ -201,16 +201,20 @@ _PUBLIC_CODEX_RESPONSE_FIELDS = frozenset({
 })
 _PUBLIC_CODEX_ITEM_FIELDS_BY_TYPE = {
     "message": SUPPORTED_RESPONSE_MESSAGE_FIELDS,
+    "file_search_call": {"type", "id", "queries", "status"},
     "function_call_output": SUPPORTED_FUNCTION_CALL_OUTPUT_FIELDS,
-    "custom_tool_call_output": SUPPORTED_CUSTOM_TOOL_CALL_OUTPUT_FIELDS,
+    "custom_tool_call_output": SUPPORTED_CUSTOM_TOOL_CALL_OUTPUT_FIELDS | {"status"},
     "function_call": SUPPORTED_FUNCTION_CALL_FIELDS,
     "custom_tool_call": SUPPORTED_CUSTOM_TOOL_CALL_FIELDS,
     "reasoning": SUPPORTED_REASONING_FIELDS,
+    "program": {"type", "id", "call_id", "code", "fingerprint"},
+    "program_output": {"type", "id", "call_id", "result", "status"},
     "compaction": SUPPORTED_COMPACTION_FIELDS,
     "image_generation_call": SUPPORTED_IMAGE_GENERATION_CALL_FIELDS,
     "web_search_call": SUPPORTED_WEB_SEARCH_CALL_FIELDS,
     "tool_search_call": SUPPORTED_TOOL_SEARCH_CALL_FIELDS,
     "tool_search_output": SUPPORTED_TOOL_SEARCH_OUTPUT_FIELDS,
+    "additional_tools": {"type", "id", "role", "tools"},
     "mcp_call_output": SUPPORTED_MCP_TOOL_CALL_OUTPUT_FIELDS,
     "mcp_tool_call_output": SUPPORTED_MCP_TOOL_CALL_OUTPUT_FIELDS,
     "computer_call": {"type", "id", "call_id", "pending_safety_checks", "status"},
@@ -220,6 +224,12 @@ _PUBLIC_CODEX_ITEM_FIELDS_BY_TYPE = {
     "apply_patch_call": {"type", "id", "call_id", "operation", "status"},
     "apply_patch_call_output": {"type", "id", "call_id", "status"},
     "code_interpreter_call": {"type", "id", "code", "container_id", "outputs", "status"},
+    "local_shell_call": {"type", "id", "action", "call_id", "status"},
+    "local_shell_call_output": {"type", "id", "output"},
+    "mcp_call": {"type", "id", "arguments", "name", "server_label"},
+    "mcp_list_tools": {"type", "id", "server_label", "tools"},
+    "mcp_approval_request": {"type", "id", "arguments", "name", "server_label"},
+    "mcp_approval_response": {"type", "id", "approval_request_id", "approve"},
 }
 _PUBLIC_CODEX_CONTENT_FIELDS = frozenset({
     "type",
@@ -2023,6 +2033,7 @@ def _project_public_codex_response_item(item: dict[str, Any]) -> dict[str, Any]:
             "custom_tool_call_output",
             "mcp_call_output",
             "mcp_tool_call_output",
+            "local_shell_call_output",
         }:
             projected[key] = _project_public_codex_item_output(child)
         else:

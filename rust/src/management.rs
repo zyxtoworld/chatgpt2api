@@ -3,9 +3,18 @@ use std::{
     fs::{self, File},
     io::{Cursor, Read},
     path::{Component, Path, PathBuf},
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::sync::{
+    Condvar, Mutex as StdMutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
+use aes::Aes256;
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
 use axum::{
     Json,
     body::Body,
@@ -16,11 +25,12 @@ use axum::{
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use image::ImageReader;
-use reqwest::Client;
+use reqwest::{Client, Method};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
+use tokio::sync::Semaphore;
 
 use super::{
     ApiError, AppState, admin_authenticated, authenticated, data_file, image_content_type,
@@ -34,10 +44,23 @@ const MAX_IMAGE_ARCHIVE_ITEMS: usize = 5_000;
 const MAX_IMAGE_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BACKUP_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BACKUP_DETAIL_MEMBERS: usize = 5_000;
 const CCLOAD_CHANNEL_BROWSE_DEADLINE: Duration = Duration::from_secs(90);
 const CCLOAD_IMPORT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 const CCLOAD_MAX_CHANNELS: usize = 5_000;
 const CCLOAD_MAX_CHANNEL_PAGES: usize = 25;
+const MAX_R2_DOWNLOAD_BYTES: u64 = MAX_BACKUP_BYTES;
+const MAX_R2_LIST_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_R2_LIST_OBJECTS: usize = 5_000;
+const MAX_R2_LIST_PAGES: usize = 25;
+const R2_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const BACKUP_CRYPT_MAX_CONCURRENCY: usize = 2;
+const BACKUP_CRYPT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(1);
+const BACKUP_CRYPT_HEADER_BYTES: usize = 16;
+const BACKUP_CRYPT_BLOCK_BYTES: usize = 16;
+
+static BACKUP_CRYPT_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(BACKUP_CRYPT_MAX_CONCURRENCY)));
 
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct LogQuery {
@@ -56,6 +79,147 @@ pub(super) struct ImageCleanupQuery {
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct BackupKeyQuery {
     pub key: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct BackupTestHook {
+    pub path: PathBuf,
+    pub running_key: Arc<StdMutex<Option<String>>>,
+    pub after_running: Arc<tokio::sync::Notify>,
+    pub release_after_running: Arc<tokio::sync::Notify>,
+    pub pause_after_running: Arc<AtomicBool>,
+    pub after_archive_commit: Arc<tokio::sync::Notify>,
+    pub release_after_archive_commit: Arc<tokio::sync::Notify>,
+    pub pause_after_archive_commit: Arc<AtomicBool>,
+    pub fail_next_state_publish: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+static BACKUP_TEST_HOOK: LazyLock<StdMutex<Option<BackupTestHook>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+static BACKUP_R2_ENDPOINT: LazyLock<StdMutex<Option<String>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct BackupCryptTestHook {
+    pub active: Arc<AtomicUsize>,
+    pub max_active: Arc<AtomicUsize>,
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<(StdMutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+static BACKUP_CRYPT_TEST_HOOK: LazyLock<StdMutex<Option<BackupCryptTestHook>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+pub(super) struct BackupCryptTestHookGuard;
+
+#[cfg(test)]
+impl Drop for BackupCryptTestHookGuard {
+    fn drop(&mut self) {
+        *BACKUP_CRYPT_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_backup_crypt_test_hook(
+    hook: BackupCryptTestHook,
+) -> BackupCryptTestHookGuard {
+    *BACKUP_CRYPT_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    BackupCryptTestHookGuard
+}
+
+#[cfg(test)]
+pub(super) struct BackupR2EndpointGuard;
+
+#[cfg(test)]
+impl Drop for BackupR2EndpointGuard {
+    fn drop(&mut self) {
+        *BACKUP_R2_ENDPOINT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_backup_r2_endpoint(endpoint: String) -> BackupR2EndpointGuard {
+    *BACKUP_R2_ENDPOINT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(endpoint);
+    BackupR2EndpointGuard
+}
+
+#[cfg(test)]
+pub(super) struct BackupTestHookGuard;
+
+#[cfg(test)]
+impl Drop for BackupTestHookGuard {
+    fn drop(&mut self) {
+        *BACKUP_TEST_HOOK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_backup_test_hook(hook: BackupTestHook) -> BackupTestHookGuard {
+    *BACKUP_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    BackupTestHookGuard
+}
+
+#[cfg(test)]
+fn backup_test_hook_for(path: &Path) -> Option<BackupTestHook> {
+    BACKUP_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .filter(|hook| hook.path == path)
+}
+
+#[cfg(test)]
+async fn backup_test_after_running(path: &Path, key: &str) {
+    let Some(hook) = backup_test_hook_for(path) else {
+        return;
+    };
+    *hook
+        .running_key
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(key.to_owned());
+    if hook.pause_after_running.swap(false, Ordering::SeqCst) {
+        hook.after_running.notify_one();
+        hook.release_after_running.notified().await;
+    }
+}
+
+#[cfg(test)]
+async fn backup_test_after_archive_commit(path: &Path) {
+    let Some(hook) = backup_test_hook_for(path) else {
+        return;
+    };
+    if hook
+        .pause_after_archive_commit
+        .swap(false, Ordering::SeqCst)
+    {
+        hook.after_archive_commit.notify_one();
+        hook.release_after_archive_commit.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn backup_test_should_fail_state_publish(path: &Path) -> bool {
+    backup_test_hook_for(path)
+        .is_some_and(|hook| hook.fail_next_state_publish.swap(false, Ordering::SeqCst))
 }
 
 fn now_nanos() -> u128 {
@@ -120,12 +284,32 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ApiError> {
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
     let _lock = super::acquire_path_write_lock_sync(path)?;
+    write_atomic_unlocked(path, bytes)
+}
+
+fn write_atomic_unlocked(path: &Path, bytes: &[u8]) -> Result<(), ApiError> {
     super::atomic_replace_checked_with_limit(path, bytes, MAX_BACKUP_BYTES, false)
 }
 
+fn maybe_fail_backup_state_publish(path: &Path) -> Result<(), ApiError> {
+    #[cfg(test)]
+    if backup_test_should_fail_state_publish(path) {
+        return Err(ApiError::unavailable());
+    }
+    let _ = path;
+    Ok(())
+}
+
 fn write_json(path: &Path, value: &Value) -> Result<(), ApiError> {
+    maybe_fail_backup_state_publish(path)?;
     let bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::unavailable())?;
     write_atomic(path, &bytes)
+}
+
+fn write_json_unlocked(path: &Path, value: &Value) -> Result<(), ApiError> {
+    maybe_fail_backup_state_publish(path)?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::unavailable())?;
+    write_atomic_unlocked(path, &bytes)
 }
 
 fn object_or_empty(value: Value) -> Map<String, Value> {
@@ -1235,7 +1419,7 @@ fn public_registry_item(kind: &str, value: &Value) -> Value {
         .get("base_url")
         .and_then(Value::as_str)
         .map(|value| public_url(Some(&Value::String(value.to_owned()))))
-        .map(Value::String)
+        .map(|value| Value::String(value.to_owned()))
         .unwrap_or_else(|| json!(""));
     let job = public_import_job(object.get("import_job"));
     match kind {
@@ -3251,6 +3435,152 @@ fn backup_settings(state: &AppState) -> Value {
     })
 }
 
+fn backup_raw_settings(state: &AppState) -> Map<String, Value> {
+    object_or_empty(
+        read_config(state)
+            .get("backup")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    )
+}
+
+fn backup_raw_text(settings: &Map<String, Value>, key: &str) -> String {
+    settings
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+fn backup_target_fingerprint(state: &AppState) -> String {
+    let settings = backup_raw_settings(state);
+    let prefix = {
+        let value = backup_raw_text(&settings, "prefix");
+        value.trim_matches('/').to_owned()
+    };
+    let value = json!({
+        "account_id": backup_raw_text(&settings, "account_id"),
+        "access_key_id": backup_raw_text(&settings, "access_key_id"),
+        "bucket": backup_raw_text(&settings, "bucket"),
+        "encrypt": bool_or(settings.get("encrypt"), false),
+        "passphrase": backup_raw_text(&settings, "passphrase"),
+        "prefix": if prefix.is_empty() { "backups".to_owned() } else { prefix },
+        "secret_access_key": backup_raw_text(&settings, "secret_access_key"),
+    });
+    let bytes = serde_json::to_vec(&value).expect("backup fingerprint JSON");
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn backup_encryption_enabled(state: &AppState) -> bool {
+    let settings = backup_raw_settings(state);
+    bool_or(settings.get("encrypt"), false)
+}
+
+#[cfg(test)]
+pub(super) fn backup_target_fingerprint_for_test(state: &AppState) -> String {
+    backup_target_fingerprint(state)
+}
+
+fn backup_state_map(state: &AppState) -> Result<Map<String, Value>, ApiError> {
+    let bytes = match fs::read(backup_state_path(state)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(_) => return Err(ApiError::backup_state_invalid()),
+    };
+    let value =
+        serde_json::from_slice::<Value>(&bytes).map_err(|_| ApiError::backup_state_invalid())?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(ApiError::backup_state_invalid)
+}
+
+fn backup_state_value(current: &Map<String, Value>, key: &str) -> Value {
+    current.get(key).cloned().unwrap_or(Value::Null)
+}
+
+fn backup_running_state(
+    current: &Map<String, Value>,
+    started: &str,
+    object_key: &str,
+    target_fingerprint: &str,
+) -> Value {
+    let mut next = current.clone();
+    next.insert("running".to_owned(), Value::Bool(true));
+    next.insert("last_started_at".to_owned(), json!(started));
+    next.insert(
+        "last_finished_at".to_owned(),
+        backup_state_value(current, "last_finished_at"),
+    );
+    next.insert("last_status".to_owned(), json!("running"));
+    next.insert("last_error".to_owned(), Value::Null);
+    next.remove("last_error_code");
+    next.remove("last_error_status");
+    next.insert(
+        "last_object_key".to_owned(),
+        backup_state_value(current, "last_object_key"),
+    );
+    next.insert("pending_object_key".to_owned(), json!(object_key));
+    next.insert(
+        "pending_target_fingerprint".to_owned(),
+        json!(target_fingerprint),
+    );
+    Value::Object(next)
+}
+
+fn backup_error_state(
+    current: &Map<String, Value>,
+    started: &str,
+    pending_key: &str,
+    target_fingerprint: &str,
+    error_code: &str,
+) -> Value {
+    let mut next = current.clone();
+    next.insert("running".to_owned(), Value::Bool(false));
+    next.insert("last_started_at".to_owned(), json!(started));
+    next.insert(
+        "last_finished_at".to_owned(),
+        json!(iso_timestamp(SystemTime::now())),
+    );
+    next.insert("last_status".to_owned(), json!("error"));
+    next.insert("last_error".to_owned(), Value::Null);
+    next.insert("last_error_code".to_owned(), json!(error_code));
+    next.remove("last_error_status");
+    next.insert(
+        "last_object_key".to_owned(),
+        backup_state_value(current, "last_object_key"),
+    );
+    next.insert("pending_object_key".to_owned(), json!(pending_key));
+    next.insert(
+        "pending_target_fingerprint".to_owned(),
+        json!(target_fingerprint),
+    );
+    Value::Object(next)
+}
+
+fn backup_error_state_from_api(
+    current: &Map<String, Value>,
+    started: &str,
+    pending_key: &str,
+    target_fingerprint: &str,
+    error: &ApiError,
+) -> Value {
+    let code = if error.code().starts_with("r2_") || error.code().starts_with("backup_") {
+        error.code()
+    } else {
+        "backup_failed"
+    };
+    let mut state = backup_error_state(current, started, pending_key, target_fingerprint, code);
+    if let Some(status) = error.detail_status() {
+        state["last_error_status"] = json!(status);
+    }
+    state
+}
+
 fn backup_is_remote(state: &AppState) -> bool {
     backup_settings(state)
         .get("provider")
@@ -3258,37 +3588,939 @@ fn backup_is_remote(state: &AppState) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("cloudflare_r2"))
 }
 
-fn backup_state(state: &AppState) -> Value {
-    fs::read(backup_state_path(state))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| {
-            json!({
-                "running": false,
-                "last_started_at": null,
-                "last_finished_at": null,
-                "last_status": "idle",
-                "last_error": null,
-                "last_object_key": null,
-            })
+#[derive(Clone, Debug)]
+struct R2Object {
+    key: String,
+    size: u64,
+    updated_at: String,
+}
+
+struct R2Client {
+    client: Client,
+    endpoint: String,
+    access_key_id: String,
+    secret_access_key: String,
+    bucket: String,
+    prefix: String,
+}
+
+impl R2Client {
+    fn from_state(state: &AppState) -> Result<Self, ApiError> {
+        Self::from_settings(&backup_raw_settings(state))
+    }
+
+    fn from_settings(settings: &Map<String, Value>) -> Result<Self, ApiError> {
+        let account_id = backup_raw_text(settings, "account_id");
+        let access_key_id = backup_raw_text(settings, "access_key_id");
+        let secret_access_key = backup_raw_text(settings, "secret_access_key");
+        let bucket = backup_raw_text(settings, "bucket");
+        let prefix = backup_raw_text(settings, "prefix")
+            .trim_matches('/')
+            .to_owned();
+        let mut missing = Vec::new();
+        if account_id.is_empty() {
+            missing.push("Account ID");
+        }
+        if access_key_id.is_empty() {
+            missing.push("Access Key ID");
+        }
+        if secret_access_key.is_empty() {
+            missing.push("Secret Access Key");
+        }
+        if bucket.is_empty() {
+            missing.push("Bucket");
+        }
+        if !missing.is_empty() {
+            return Err(ApiError::backup_r2_config_incomplete(missing.join("、")));
+        }
+        if account_id.len() > 128
+            || access_key_id.len() > 256
+            || secret_access_key.len() > 512
+            || bucket.len() > 256
+            || account_id.chars().any(char::is_whitespace)
+            || access_key_id.chars().any(char::is_whitespace)
+            || secret_access_key.chars().any(char::is_whitespace)
+            || bucket.contains('/')
+        {
+            return Err(ApiError::backup_r2_message(
+                "r2_config_incomplete",
+                "R2 配置不完整",
+            ));
+        }
+        let prefix = if prefix.is_empty() {
+            "backups".to_owned()
+        } else {
+            prefix
+        };
+        if prefix.len() > 1024
+            || prefix.starts_with('/')
+            || prefix.ends_with('/')
+            || prefix
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == ".." || !part.is_ascii())
+        {
+            return Err(ApiError::invalid_request());
+        }
+        let endpoint = {
+            #[cfg(test)]
+            if let Some(endpoint) = BACKUP_R2_ENDPOINT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+            {
+                endpoint
+            } else {
+                format!("https://{account_id}.r2.cloudflarestorage.com")
+            }
+            #[cfg(not(test))]
+            {
+                format!("https://{account_id}.r2.cloudflarestorage.com")
+            }
+        };
+        let endpoint = endpoint.trim_end_matches('/').to_owned();
+        let parsed_endpoint = url::Url::parse(&endpoint)
+            .map_err(|_| ApiError::backup_r2_message("r2_config_incomplete", "R2 配置不完整"))?;
+        if !matches!(parsed_endpoint.scheme(), "http" | "https")
+            || parsed_endpoint.host_str().is_none()
+            || parsed_endpoint.username() != ""
+            || parsed_endpoint.password().is_some()
+            || parsed_endpoint.query().is_some()
+            || parsed_endpoint.fragment().is_some()
+        {
+            return Err(ApiError::backup_r2_message(
+                "r2_config_incomplete",
+                "R2 配置不完整",
+            ));
+        }
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(R2_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|_| ApiError::backup_r2_message("r2_connection_failed", "连接 R2 失败"))?;
+        Ok(Self {
+            client,
+            endpoint,
+            access_key_id,
+            secret_access_key,
+            bucket,
+            prefix,
+        })
+    }
+
+    fn object_url(&self, key: &str) -> Result<url::Url, ApiError> {
+        let mut url = url::Url::parse(&self.endpoint).map_err(|_| ApiError::unavailable())?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| ApiError::unavailable())?;
+            segments.push(&self.bucket);
+            for segment in key.split('/') {
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+            }
+        }
+        Ok(url)
+    }
+
+    fn signed_request(
+        &self,
+        method: &str,
+        key: &str,
+        query: &[(String, String)],
+        body: &[u8],
+        extra_headers: &[(String, String)],
+    ) -> Result<reqwest::RequestBuilder, ApiError> {
+        let method = Method::from_bytes(method.as_bytes()).map_err(|_| ApiError::unavailable())?;
+        let mut url = self.object_url(key)?;
+        let canonical_query = query
+            .iter()
+            .map(|(name, value)| (aws_encode(name), aws_encode(value)))
+            .collect::<Vec<_>>();
+        let canonical_query = {
+            let mut pairs = canonical_query;
+            pairs.sort();
+            pairs
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        };
+        if !canonical_query.is_empty() {
+            url.set_query(Some(&canonical_query));
+        }
+        let (amz_date, date_stamp) = r2_timestamp();
+        let payload_hash = hex_sha256(body);
+        let host = url.host_str().ok_or_else(ApiError::unavailable)?.to_owned();
+        let host = match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        };
+        let mut headers = BTreeMap::<String, String>::new();
+        headers.insert("host".to_owned(), host);
+        headers.insert("x-amz-content-sha256".to_owned(), payload_hash.clone());
+        headers.insert("x-amz-date".to_owned(), amz_date.clone());
+        for (name, value) in extra_headers {
+            headers.insert(name.to_ascii_lowercase(), collapse_header_value(value));
+        }
+        let canonical_headers = headers
+            .iter()
+            .map(|(name, value)| format!("{name}:{value}\n"))
+            .collect::<String>();
+        let signed_headers = headers.keys().cloned().collect::<Vec<_>>().join(";");
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method.as_str(),
+            url.path(),
+            canonical_query,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        );
+        let credential_scope = format!("{date_stamp}/auto/s3/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+            hex_sha256(canonical_request.as_bytes())
+        );
+        let date_key = hmac_sha256(
+            format!("AWS4{}", self.secret_access_key).as_bytes(),
+            date_stamp.as_bytes(),
+        );
+        let region_key = hmac_sha256(&date_key, b"auto");
+        let service_key = hmac_sha256(&region_key, b"s3");
+        let signing_key = hmac_sha256(&service_key, b"aws4_request");
+        let signature = hex_bytes(&hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            self.access_key_id
+        );
+        let mut request = self.client.request(method, url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request = request.header("authorization", authorization);
+        for (name, value) in extra_headers {
+            request = request.header(name, value);
+        }
+        Ok(request.body(body.to_owned()))
+    }
+
+    async fn response_body(
+        response: reqwest::Response,
+        limit: u64,
+        code: &'static str,
+        size_invalid_message: &'static str,
+        too_large_message: &'static str,
+        read_message: &'static str,
+    ) -> Result<Vec<u8>, ApiError> {
+        if let Some(raw) = response.headers().get("content-length") {
+            let value = raw
+                .to_str()
+                .map_err(|_| ApiError::backup_r2_message(code, size_invalid_message))?
+                .trim();
+            if value.is_empty()
+                || value.len() > 19
+                || !value.is_ascii()
+                || !value.chars().all(|character| character.is_ascii_digit())
+            {
+                return Err(ApiError::backup_r2_message(code, size_invalid_message));
+            }
+            let length = value
+                .parse::<u64>()
+                .map_err(|_| ApiError::backup_r2_message(code, size_invalid_message))?;
+            if length > limit {
+                return Err(ApiError::backup_r2_message(code, too_large_message));
+            }
+        }
+        let mut total = 0u64;
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| ApiError::backup_r2_message(code, read_message))?;
+            total = total
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| ApiError::backup_r2_message(code, too_large_message))?;
+            if total > limit {
+                return Err(ApiError::backup_r2_message(code, too_large_message));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    async fn test_connection(&self) -> Result<Value, ApiError> {
+        let request = self.signed_request(
+            "GET",
+            "",
+            &[
+                ("list-type".to_owned(), "2".to_owned()),
+                ("max-keys".to_owned(), "1".to_owned()),
+            ],
+            &[],
+            &[],
+        )?;
+        let response = request
+            .send()
+            .await
+            .map_err(|_| ApiError::backup_r2_message("r2_connection_failed", "连接 R2 失败"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::backup_r2_status(
+                "r2_connection_failed",
+                "连接 R2 失败",
+                status.as_u16(),
+            ));
+        }
+        drop(response);
+        Ok(json!({"ok": true, "status": status.as_u16()}))
+    }
+
+    async fn upload_bytes(
+        &self,
+        key: &str,
+        payload: &[u8],
+        metadata: &[(String, String)],
+    ) -> Result<(), ApiError> {
+        let mut extra_headers = vec![(
+            "content-type".to_owned(),
+            "application/octet-stream".to_owned(),
+        )];
+        extra_headers.extend(
+            metadata
+                .iter()
+                .map(|(name, value)| (format!("x-amz-meta-{name}"), value.clone())),
+        );
+        let request = self.signed_request("PUT", key, &[], payload, &extra_headers)?;
+        let response = request
+            .send()
+            .await
+            .map_err(|_| ApiError::backup_r2_message("r2_upload_failed", "上传备份失败"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::backup_r2_status(
+                "r2_upload_failed",
+                "上传备份失败",
+                status.as_u16(),
+            ));
+        }
+        drop(response);
+        Ok(())
+    }
+
+    async fn delete_object(&self, key: &str) -> Result<(), ApiError> {
+        let request = self.signed_request("DELETE", key, &[], &[], &[])?;
+        let response = request
+            .send()
+            .await
+            .map_err(|_| ApiError::backup_r2_message("r2_delete_failed", "删除备份失败"))?;
+        let status = response.status();
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+            return Err(ApiError::backup_r2_status(
+                "r2_delete_failed",
+                "删除备份失败",
+                status.as_u16(),
+            ));
+        }
+        drop(response);
+        Ok(())
+    }
+
+    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>, ApiError> {
+        let request = self.signed_request("GET", key, &[], &[], &[])?;
+        let response = request
+            .send()
+            .await
+            .map_err(|_| ApiError::backup_r2_message("r2_read_failed", "读取备份失败"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::backup_r2_status(
+                "r2_read_failed",
+                "读取备份失败",
+                status.as_u16(),
+            ));
+        }
+        Self::response_body(
+            response,
+            MAX_R2_DOWNLOAD_BYTES,
+            "r2_read_payload_invalid",
+            "备份响应大小无效",
+            "备份响应过大",
+            "读取备份响应失败",
+        )
+        .await
+    }
+
+    async fn list_objects(&self) -> Result<Vec<R2Object>, ApiError> {
+        let mut result = Vec::new();
+        let mut continuation = None::<String>;
+        for _ in 0..MAX_R2_LIST_PAGES {
+            let mut query = vec![
+                ("list-type".to_owned(), "2".to_owned()),
+                ("max-keys".to_owned(), "1000".to_owned()),
+                ("prefix".to_owned(), format!("{}/", self.prefix)),
+            ];
+            if let Some(token) = continuation.as_ref() {
+                query.push(("continuation-token".to_owned(), token.clone()));
+            }
+            let request = self.signed_request("GET", "", &query, &[], &[])?;
+            let response = request
+                .send()
+                .await
+                .map_err(|_| ApiError::backup_r2_message("r2_list_failed", "获取备份列表失败"))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(ApiError::backup_r2_status(
+                    "r2_list_failed",
+                    "获取备份列表失败",
+                    status.as_u16(),
+                ));
+            }
+            let body = Self::response_body(
+                response,
+                MAX_R2_LIST_RESPONSE_BYTES,
+                "r2_list_payload_invalid",
+                "备份响应大小无效",
+                "备份响应过大",
+                "读取备份响应失败",
+            )
+            .await?;
+            let xml = String::from_utf8(body).map_err(|_| {
+                ApiError::backup_r2_message("r2_list_payload_invalid", "备份列表格式无效")
+            })?;
+            let (page, is_truncated, next_token) = parse_r2_list_xml(&xml)?;
+            if result.len().saturating_add(page.len()) > MAX_R2_LIST_OBJECTS {
+                return Err(ApiError::backup_r2_message(
+                    "r2_list_limit_exceeded",
+                    "备份列表过大",
+                ));
+            }
+            result.extend(page);
+            if !is_truncated || next_token.is_none() {
+                break;
+            }
+            continuation = next_token;
+        }
+        if continuation.is_some() {
+            return Err(ApiError::backup_r2_message(
+                "r2_list_limit_exceeded",
+                "备份列表过大",
+            ));
+        }
+        result.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(result)
+    }
+}
+
+fn aws_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn collapse_header_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hex_sha256(value: &[u8]) -> String {
+    hex_bytes(&Sha256::digest(value))
+}
+
+fn hmac_sha256(key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut normalized_key = [0u8; 64];
+    if key.len() > 64 {
+        normalized_key[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized_key[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(64 + value.len());
+    let mut outer = Vec::with_capacity(64 + 32);
+    for byte in normalized_key {
+        inner.push(byte ^ 0x36);
+        outer.push(byte ^ 0x5c);
+    }
+    inner.extend_from_slice(value);
+    let inner_hash = Sha256::digest(inner);
+    outer.extend_from_slice(&inner_hash);
+    Sha256::digest(outer).to_vec()
+}
+
+fn r2_timestamp() -> (String, String) {
+    let now = unix_seconds(SystemTime::now());
+    let date = date_from_unix(now);
+    let day_seconds = now.rem_euclid(86_400);
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    let amz_date = format!("{}T{hour:02}{minute:02}{second:02}Z", date.replace('-', ""));
+    (amz_date, date.replace('-', ""))
+}
+
+fn xml_tag<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = block.find(open.as_str())? + open.len();
+    let end = block[start..].find(close.as_str())? + start;
+    Some(&block[start..end])
+}
+
+fn parse_r2_list_xml(xml: &str) -> Result<(Vec<R2Object>, bool, Option<String>), ApiError> {
+    let mut items = Vec::new();
+    for block in xml.split("<Contents>").skip(1) {
+        let Some(block) = block.split("</Contents>").next() else {
+            return Err(ApiError::backup_r2_message(
+                "r2_list_payload_invalid",
+                "备份列表格式无效",
+            ));
+        };
+        let Some(key) = xml_tag(block, "Key").map(str::trim) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let size = match xml_tag(block, "Size").map(str::trim) {
+            None | Some("") => 0,
+            Some(value)
+                if value.len() <= 19
+                    && value.is_ascii()
+                    && value.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value <= MAX_R2_DOWNLOAD_BYTES)
+                    .ok_or_else(|| {
+                        ApiError::backup_r2_message("r2_list_payload_invalid", "备份列表格式无效")
+                    })?
+            }
+            Some(_) => {
+                return Err(ApiError::backup_r2_message(
+                    "r2_list_payload_invalid",
+                    "备份列表格式无效",
+                ));
+            }
+        };
+        let updated_at = xml_tag(block, "LastModified")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        items.push(R2Object {
+            key: key.to_owned(),
+            size,
+            updated_at,
+        });
+    }
+    let is_truncated = xml_tag(xml, "IsTruncated") == Some("true");
+    let next_token = xml_tag(xml, "NextContinuationToken")
+        .filter(|value| !value.is_empty() && value.len() <= 4096)
+        .map(ToOwned::to_owned);
+    Ok((items, is_truncated, next_token))
+}
+
+async fn openssl_backup_crypt(
+    payload: Vec<u8>,
+    passphrase: String,
+    decrypt: bool,
+) -> Result<Vec<u8>, ApiError> {
+    openssl_backup_crypt_with_limit(payload, passphrase, decrypt, MAX_BACKUP_BYTES).await
+}
+
+async fn openssl_backup_crypt_with_limit(
+    payload: Vec<u8>,
+    passphrase: String,
+    decrypt: bool,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ApiError> {
+    preflight_backup_crypt_budget(payload.len(), decrypt, max_bytes)?;
+    if passphrase.is_empty() {
+        return Err(ApiError::invalid_request());
+    }
+    let permit = tokio::time::timeout(
+        BACKUP_CRYPT_ADMISSION_TIMEOUT,
+        BACKUP_CRYPT_SEMAPHORE.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| ApiError::unavailable())?
+    .map_err(|_| ApiError::unavailable())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        openssl_backup_crypt_sync(payload, passphrase, decrypt, max_bytes)
+    })
+    .await
+    .map_err(|_| ApiError::unavailable())?
+}
+
+fn preflight_backup_crypt_budget(
+    input_len: usize,
+    decrypt: bool,
+    max_bytes: u64,
+) -> Result<(), ApiError> {
+    if input_len as u64 > max_bytes {
+        return Err(ApiError::unavailable());
+    }
+    if decrypt {
+        return Ok(());
+    }
+    let padding = BACKUP_CRYPT_BLOCK_BYTES - (input_len % BACKUP_CRYPT_BLOCK_BYTES);
+    let ciphertext_len = input_len
+        .checked_add(padding)
+        .ok_or_else(ApiError::unavailable)?;
+    let output_len = BACKUP_CRYPT_HEADER_BYTES
+        .checked_add(ciphertext_len)
+        .ok_or_else(ApiError::unavailable)?;
+    if output_len as u64 > max_bytes {
+        return Err(ApiError::unavailable());
+    }
+    Ok(())
+}
+
+fn openssl_backup_crypt_sync(
+    mut payload: Vec<u8>,
+    passphrase: String,
+    decrypt: bool,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ApiError> {
+    const PBKDF2_ITERATIONS: usize = 10_000;
+    #[cfg(test)]
+    let _test_guard = backup_crypt_test_enter(&passphrase);
+    let passphrase = passphrase.into_bytes();
+    if decrypt {
+        if payload.len() < BACKUP_CRYPT_HEADER_BYTES || &payload[..8] != b"Salted__" {
+            return Err(ApiError::unavailable());
+        }
+        let salt = payload[8..BACKUP_CRYPT_HEADER_BYTES].to_owned();
+        let ciphertext_len = payload.len() - BACKUP_CRYPT_HEADER_BYTES;
+        if ciphertext_len == 0 || !ciphertext_len.is_multiple_of(BACKUP_CRYPT_BLOCK_BYTES) {
+            return Err(ApiError::unavailable());
+        }
+        payload.copy_within(BACKUP_CRYPT_HEADER_BYTES.., 0);
+        payload.truncate(ciphertext_len);
+        let (key, iv) = pbkdf2_backup_key(&passphrase, &salt, PBKDF2_ITERATIONS);
+        let cipher = Aes256::new(GenericArray::from_slice(&key));
+        let mut previous = iv;
+        for offset in (0..ciphertext_len).step_by(BACKUP_CRYPT_BLOCK_BYTES) {
+            let ciphertext =
+                GenericArray::clone_from_slice(&payload[offset..offset + BACKUP_CRYPT_BLOCK_BYTES]);
+            let mut block = ciphertext;
+            cipher.decrypt_block(&mut block);
+            for (byte, previous_byte) in block.iter_mut().zip(previous) {
+                *byte ^= previous_byte;
+            }
+            payload[offset..offset + BACKUP_CRYPT_BLOCK_BYTES].copy_from_slice(&block);
+            previous.copy_from_slice(&ciphertext);
+        }
+        let padding = *payload.last().ok_or_else(ApiError::unavailable)? as usize;
+        if !(1..=BACKUP_CRYPT_BLOCK_BYTES).contains(&padding)
+            || payload.len() < padding
+            || !payload[payload.len() - padding..]
+                .iter()
+                .all(|byte| usize::from(*byte) == padding)
+        {
+            return Err(ApiError::unavailable());
+        }
+        payload.truncate(payload.len() - padding);
+        if payload.len() as u64 > max_bytes {
+            return Err(ApiError::unavailable());
+        }
+        return Ok(payload);
+    }
+
+    let input_len = payload.len();
+    let padding = BACKUP_CRYPT_BLOCK_BYTES - (input_len % BACKUP_CRYPT_BLOCK_BYTES);
+    let ciphertext_len = input_len
+        .checked_add(padding)
+        .ok_or_else(ApiError::unavailable)?;
+    let output_len = BACKUP_CRYPT_HEADER_BYTES
+        .checked_add(ciphertext_len)
+        .ok_or_else(ApiError::unavailable)?;
+    if output_len as u64 > max_bytes {
+        return Err(ApiError::unavailable());
+    }
+    let mut salt = [0u8; 8];
+    getrandom::getrandom(&mut salt).map_err(|_| ApiError::unavailable())?;
+    let (key, iv) = pbkdf2_backup_key(&passphrase, &salt, PBKDF2_ITERATIONS);
+    payload.resize(output_len, padding as u8);
+    payload.copy_within(0..ciphertext_len, BACKUP_CRYPT_HEADER_BYTES);
+    payload[..8].copy_from_slice(b"Salted__");
+    payload[8..BACKUP_CRYPT_HEADER_BYTES].copy_from_slice(&salt);
+    let cipher = Aes256::new(GenericArray::from_slice(&key));
+    let mut previous = iv;
+    for offset in (BACKUP_CRYPT_HEADER_BYTES..output_len).step_by(BACKUP_CRYPT_BLOCK_BYTES) {
+        let mut block =
+            GenericArray::clone_from_slice(&payload[offset..offset + BACKUP_CRYPT_BLOCK_BYTES]);
+        for (byte, previous_byte) in block.iter_mut().zip(previous) {
+            *byte ^= previous_byte;
+        }
+        cipher.encrypt_block(&mut block);
+        payload[offset..offset + BACKUP_CRYPT_BLOCK_BYTES].copy_from_slice(&block);
+        previous.copy_from_slice(&block);
+    }
+    Ok(payload)
+}
+
+#[cfg(test)]
+struct BackupCryptTestActiveGuard {
+    active: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Drop for BackupCryptTestActiveGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn backup_crypt_test_enter(passphrase: &str) -> Option<BackupCryptTestActiveGuard> {
+    if passphrase != "bounded-admission-test" {
+        return None;
+    }
+    let hook = BACKUP_CRYPT_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()?;
+    let active = hook.active.fetch_add(1, Ordering::SeqCst) + 1;
+    hook.max_active.fetch_max(active, Ordering::SeqCst);
+    hook.entered.notify_waiters();
+    let (release_lock, release_signal) = &*hook.release;
+    let mut released = release_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while !*released {
+        released = release_signal
+            .wait(released)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    Some(BackupCryptTestActiveGuard {
+        active: hook.active,
+    })
+}
+
+fn pbkdf2_backup_key(passphrase: &[u8], salt: &[u8], iterations: usize) -> ([u8; 32], [u8; 16]) {
+    let mut derived = [0u8; 48];
+    for block_index in 0..2 {
+        let mut salt_block = Vec::with_capacity(salt.len() + 4);
+        salt_block.extend_from_slice(salt);
+        salt_block.extend_from_slice(&((block_index + 1) as u32).to_be_bytes());
+        let mut u = hmac_sha256(passphrase, &salt_block);
+        let mut t = u.clone();
+        for _ in 1..iterations {
+            u = hmac_sha256(passphrase, &u);
+            for (left, right) in t.iter_mut().zip(&u) {
+                *left ^= *right;
+            }
+        }
+        let start = block_index * 32;
+        let end = (start + 32).min(derived.len());
+        derived[start..end].copy_from_slice(&t[..end - start]);
+    }
+    let mut key = [0u8; 32];
+    let mut iv = [0u8; 16];
+    key.copy_from_slice(&derived[..32]);
+    iv.copy_from_slice(&derived[32..]);
+    (key, iv)
+}
+
+async fn decrypt_backup_if_needed(
+    state: &AppState,
+    key: &str,
+    payload: Vec<u8>,
+    missing_code: &'static str,
+    missing_message: &'static str,
+) -> Result<Vec<u8>, ApiError> {
+    if !key.ends_with(".enc") {
+        return Ok(payload);
+    }
+    let passphrase = backup_raw_text(&backup_raw_settings(state), "passphrase");
+    if passphrase.is_empty() {
+        return Err(ApiError::backup_r2_message(missing_code, missing_message));
+    }
+    openssl_backup_crypt(payload, passphrase, true)
+        .await
+        .map_err(|_| {
+            ApiError::backup_r2_message("backup_decrypt_failed", "解密备份失败：openssl 执行失败")
         })
 }
 
+#[cfg(test)]
+pub(super) async fn backup_crypt_for_test(
+    payload: Vec<u8>,
+    passphrase: String,
+    decrypt: bool,
+) -> Result<Vec<u8>, ApiError> {
+    openssl_backup_crypt(payload, passphrase, decrypt).await
+}
+
+#[cfg(test)]
+pub(super) async fn backup_crypt_for_test_with_limit(
+    payload: Vec<u8>,
+    passphrase: String,
+    decrypt: bool,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ApiError> {
+    openssl_backup_crypt_with_limit(payload, passphrase, decrypt, max_bytes).await
+}
+
+fn public_backup_state_text(value: Option<&Value>, max_length: usize) -> Value {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return Value::Null;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        Value::Null
+    } else {
+        Value::String(value.chars().take(max_length).collect())
+    }
+}
+
+fn public_backup_error(raw: &Map<String, Value>) -> Value {
+    const FALLBACK: &str = "备份执行失败，请稍后重试";
+    let raw_error = raw
+        .get("last_error")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let error_code = raw
+        .get("last_error_code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let error_status = match raw.get("last_error_status") {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .filter(|value| (400..=599).contains(value))
+            .map(|value| value as u16),
+        _ => None,
+    };
+    let has_invalid_status = raw.contains_key("last_error_status") && error_status.is_none();
+    if has_invalid_status {
+        return Value::String(FALLBACK.to_owned());
+    }
+    let message = match error_code {
+        "backup_failed" => Some(FALLBACK.to_owned()),
+        "r2_config_incomplete" => Some("R2 配置不完整".to_owned()),
+        "backup_encrypt_unavailable" => Some("当前环境缺少 openssl，无法执行加密备份".to_owned()),
+        "backup_encrypt_failed" => Some("加密备份失败：openssl 执行失败".to_owned()),
+        "backup_decrypt_unavailable" => Some("当前环境缺少 openssl，无法解密备份内容".to_owned()),
+        "backup_decrypt_failed" => Some("解密备份失败：openssl 执行失败".to_owned()),
+        "backup_key_required" => Some("备份对象 key 不能为空".to_owned()),
+        "backup_download_passphrase_missing" => {
+            Some("当前未配置加密口令，无法下载并解密已加密备份".to_owned())
+        }
+        "backup_detail_passphrase_missing" => {
+            Some("当前未配置加密口令，无法查看已加密备份".to_owned())
+        }
+        "backup_busy" => Some("当前已有备份任务正在执行".to_owned()),
+        "backup_encrypt_passphrase_missing" => Some("已启用备份加密，但未设置加密口令".to_owned()),
+        "backup_archive_invalid" => Some("解析备份压缩包失败，备份可能已损坏".to_owned()),
+        "backup_state_invalid" => Some("上一次备份状态无效，已停止重试".to_owned()),
+        "r2_connection_failed" => error_status.map(|status| format!("连接 R2 失败：HTTP {status}")),
+        "r2_upload_failed" => error_status.map(|status| format!("上传备份失败：HTTP {status}")),
+        "r2_delete_failed" => error_status.map(|status| format!("删除备份失败：HTTP {status}")),
+        "r2_read_failed" => error_status.map(|status| format!("读取备份失败：HTTP {status}")),
+        "r2_list_failed" => error_status.map(|status| format!("获取备份列表失败：HTTP {status}")),
+        _ => None,
+    };
+    if message.is_some() {
+        return message.map(Value::String).unwrap_or(Value::Null);
+    }
+    if raw_error
+        || !error_code.is_empty()
+        || raw.contains_key("last_error_status")
+        || raw
+            .get("_last_error_public")
+            .and_then(Value::as_bool)
+            .is_some_and(|value| value)
+    {
+        Value::String(FALLBACK.to_owned())
+    } else {
+        Value::Null
+    }
+}
+
+fn backup_state(state: &AppState) -> Result<Value, ApiError> {
+    let raw = backup_state_map(state)?;
+    let last_status = match raw.get("last_status").and_then(Value::as_str) {
+        Some(value) if matches!(value, "idle" | "running" | "success" | "error") => value,
+        _ => "idle",
+    };
+    Ok(json!({
+        "running": last_status == "running",
+        "last_started_at": public_backup_state_text(raw.get("last_started_at"), 128),
+        "last_finished_at": public_backup_state_text(raw.get("last_finished_at"), 128),
+        "last_status": last_status,
+        "last_error": public_backup_error(&raw),
+        "last_object_key": public_backup_state_text(raw.get("last_object_key"), 2048),
+        "pending_object_key": public_backup_state_text(raw.get("pending_object_key"), 2048),
+    }))
+}
+
 fn backup_key_file(state: &AppState, key: &str) -> Result<PathBuf, ApiError> {
-    let key = key.trim().replace('\\', "/");
+    let key = key.trim();
     let Some(name) = key.strip_prefix("backups/") else {
-        return Err(ApiError::invalid_request());
+        return Err(ApiError::backup_r2_message(
+            "backup_key_invalid",
+            "备份对象 key 无效",
+        ));
     };
     if name.is_empty()
         || name.contains('/')
+        || name.contains('\\')
         || name.contains("..")
         || !name.starts_with("backup-")
-        || !name.ends_with(".tar.gz")
+        || !(name.ends_with(".tar.gz") || name.ends_with(".tar.gz.enc"))
     {
-        return Err(ApiError::invalid_request());
+        return Err(ApiError::backup_r2_message(
+            "backup_key_invalid",
+            "备份对象 key 无效",
+        ));
     }
     Ok(backup_dir(state).join(name))
+}
+
+fn backup_key_prefix(state: &AppState) -> String {
+    let prefix = backup_raw_text(&backup_raw_settings(state), "prefix");
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        "backups".to_owned()
+    } else {
+        prefix.to_owned()
+    }
+}
+
+fn validate_remote_backup_key(state: &AppState, key: &str) -> Result<String, ApiError> {
+    let key = key.trim();
+    let prefix = backup_key_prefix(state);
+    let Some(name) = key.strip_prefix(&format!("{prefix}/")) else {
+        return Err(ApiError::backup_r2_message(
+            "backup_key_invalid",
+            "备份对象 key 无效",
+        ));
+    };
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || !name.is_ascii()
+        || !name.starts_with("backup-")
+        || !(name.ends_with(".tar.gz") || name.ends_with(".tar.gz.enc"))
+    {
+        return Err(ApiError::backup_r2_message(
+            "backup_key_invalid",
+            "备份对象 key 无效",
+        ));
+    }
+    Ok(key.to_owned())
 }
 
 fn add_tar_bytes(
@@ -3320,23 +4552,68 @@ fn add_tar_file(
     add_tar_bytes(builder, name, &payload)
 }
 
-fn build_backup(state: &AppState, key: &str) -> Result<Vec<u8>, ApiError> {
-    let settings = object_or_empty(backup_settings(state));
+async fn build_backup(state: &AppState, key: &str) -> Result<Vec<u8>, ApiError> {
+    let settings = backup_raw_settings(state);
     let include = object_or_empty(
         settings
             .get("include")
             .cloned()
             .unwrap_or_else(|| json!({})),
     );
-    let metadata = json!({
-        "version": 1,
+    let mut metadata = json!({
+        "version": 2,
         "created_at": iso_timestamp(SystemTime::now()),
         "trigger": "manual",
         "app_version": state.config.version,
-        "storage_backend": {"type": "local"},
-        "sensitive_snapshots_excluded": true,
+        "storage_backend": state
+            .storage_backend
+            .as_deref()
+            .map(super::storage::StorageBackend::info)
+            .unwrap_or_else(|| json!({"type": "json", "description": "本地 JSON 存储"})),
         "object_key": key,
     });
+    let account_snapshot = if bool_or(include.get("accounts_snapshot"), true) {
+        let snapshot = if let Some(backend) = state.storage_backend.as_deref() {
+            backend
+                .load_accounts()
+                .await
+                .map_err(|_| ApiError::unavailable())?
+        } else {
+            let records = state.account_store.raw_records();
+            let health = state.account_store.health_stats();
+            super::storage::StorageSnapshot {
+                revision: [0; 32],
+                records,
+                cumulative_total: Some(health.cumulative_total),
+            }
+        };
+        if let Some(cumulative_total) = snapshot.cumulative_total {
+            metadata["snapshot_manifest"] = json!({
+                "version": 1,
+                "accounts": {"cumulative_total": cumulative_total},
+            });
+        }
+        Some(snapshot.records)
+    } else {
+        None
+    };
+    let auth_snapshot = if bool_or(include.get("auth_keys_snapshot"), true) {
+        let snapshot = if let Some(backend) = state.storage_backend.as_deref() {
+            backend
+                .load_auth_keys()
+                .await
+                .map_err(|_| ApiError::unavailable())?
+        } else {
+            super::storage::StorageSnapshot {
+                revision: [0; 32],
+                records: state.auth_store.raw_records(),
+                cumulative_total: None,
+            }
+        };
+        Some(snapshot.records)
+    } else {
+        None
+    };
     let encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut builder = Builder::new(encoder);
     add_tar_bytes(
@@ -3379,6 +4656,20 @@ fn build_backup(state: &AppState, key: &str) -> Result<Vec<u8>, ApiError> {
             )?;
         }
     }
+    if let Some(records) = account_snapshot {
+        add_tar_bytes(
+            &mut builder,
+            "snapshots/accounts.json",
+            &serde_json::to_vec(&records).map_err(|_| ApiError::unavailable())?,
+        )?;
+    }
+    if let Some(records) = auth_snapshot {
+        add_tar_bytes(
+            &mut builder,
+            "snapshots/auth_keys.json",
+            &serde_json::to_vec(&records).map_err(|_| ApiError::unavailable())?,
+        )?;
+    }
     let encoder = builder.into_inner().map_err(|_| ApiError::unavailable())?;
     encoder.finish().map_err(|_| ApiError::unavailable())
 }
@@ -3393,22 +4684,96 @@ fn backup_items(state: &AppState) -> Result<Vec<Value>, ApiError> {
         .map_err(|_| ApiError::unavailable())?
         .flatten()
     {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("gz") {
-            continue;
-        }
         let metadata = entry.metadata().map_err(|_| ApiError::unavailable())?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.ends_with(".tar.gz") || name.ends_with(".tar.gz.enc")) {
+            continue;
+        }
+        let encrypted = name.ends_with(".enc");
         items.push(json!({
             "key": format!("backups/{name}"),
             "name": name,
             "size": metadata.len(),
             "updated_at": metadata.modified().ok().map(iso_timestamp),
-            "encrypted": false,
+            "encrypted": encrypted,
         }));
     }
     items.sort_by(|left, right| right["name"].as_str().cmp(&left["name"].as_str()));
     Ok(items)
+}
+
+async fn remote_backup_items(state: &AppState, client: &R2Client) -> Result<Vec<Value>, ApiError> {
+    let mut items = Vec::new();
+    for object in client.list_objects().await? {
+        let Ok(key) = validate_remote_backup_key(state, &object.key) else {
+            continue;
+        };
+        let name = key.rsplit('/').next().unwrap_or_default().to_owned();
+        items.push(json!({
+            "key": key,
+            "name": name,
+            "size": object.size,
+            "updated_at": public_backup_timestamp(&object.updated_at),
+            "encrypted": name.ends_with(".enc"),
+        }));
+    }
+    Ok(items)
+}
+
+fn public_backup_timestamp(value: &str) -> Value {
+    if value.len() <= 64
+        && time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .is_ok()
+    {
+        Value::String(value.to_owned())
+    } else {
+        Value::Null
+    }
+}
+
+async fn rotate_remote_backups(
+    state: &AppState,
+    client: &R2Client,
+    current_key: &str,
+    keep: usize,
+) -> Result<(), ApiError> {
+    if keep == 0 {
+        return Ok(());
+    }
+    let items = client.list_objects().await?;
+    let protected = {
+        let current = backup_state_map(state)?;
+        [
+            Some(current_key.to_owned()),
+            current
+                .get("pending_object_key")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            current
+                .get("last_object_key")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<HashSet<_>>()
+    };
+    let eligible = items
+        .into_iter()
+        .filter(|item| validate_remote_backup_key(state, &item.key).is_ok())
+        .filter(|item| !protected.contains(&item.key))
+        .collect::<Vec<_>>();
+    let delete_count = eligible
+        .len()
+        .saturating_sub(keep.saturating_sub(protected.len()));
+    for item in eligible
+        .into_iter()
+        .skip(keep.saturating_sub(protected.len()))
+        .take(delete_count)
+    {
+        client.delete_object(&item.key).await?;
+    }
+    Ok(())
 }
 
 pub(super) async fn test_backup(
@@ -3417,7 +4782,8 @@ pub(super) async fn test_backup(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     if backup_is_remote(&state) {
-        return Err(ApiError::unavailable());
+        let client = R2Client::from_state(&state)?;
+        return Ok(Json(json!({"result": client.test_connection().await?})));
     }
     Ok(Json(
         json!({"result": {"ok": true, "status": 200, "backend": "local", "error": null}}),
@@ -3429,12 +4795,14 @@ pub(super) async fn list_backups(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
-    if backup_is_remote(&state) {
-        return Err(ApiError::unavailable());
-    }
+    let items = if backup_is_remote(&state) {
+        remote_backup_items(&state, &R2Client::from_state(&state)?).await?
+    } else {
+        backup_items(&state)?
+    };
     Ok(Json(json!({
-        "items": backup_items(&state)?,
-        "state": backup_state(&state),
+        "items": items,
+        "state": backup_state(&state)?,
         "settings": backup_settings(&state),
     })))
 }
@@ -3444,44 +4812,201 @@ pub(super) async fn run_backup(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
-    if backup_is_remote(&state) {
-        return Err(ApiError::unavailable());
+    let remote = backup_is_remote(&state);
+    let state_path = backup_state_path(&state);
+    let owner_gate = super::backup_owner_gate(&state_path);
+    let _owner_guard = owner_gate
+        .try_lock_owned()
+        .map_err(|_| ApiError::backup_busy())?;
+    let Some(_state_lock) = super::try_acquire_path_write_lock(&state_path).await? else {
+        return Err(ApiError::backup_busy());
+    };
+
+    let current = backup_state_map(&state)?;
+    if !remote {
+        fs::create_dir_all(backup_dir(&state)).map_err(|_| ApiError::unavailable())?;
     }
+    let target_fingerprint = backup_target_fingerprint(&state);
+    let encryption_enabled = backup_encryption_enabled(&state);
+    let pending_raw = current
+        .get("pending_object_key")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let key = format!(
-        "backups/backup-{}-{}.tar.gz",
+        "{}/backup-{}-{}.{}",
+        if remote {
+            backup_key_prefix(&state)
+        } else {
+            "backups".to_owned()
+        },
         unix_seconds(SystemTime::now()),
-        now_nanos()
+        now_nanos(),
+        if encryption_enabled {
+            "tar.gz.enc"
+        } else {
+            "tar.gz"
+        }
     );
-    let started = iso_timestamp(SystemTime::now());
-    write_json(
-        &backup_state_path(&state),
-        &json!({"running": true, "last_started_at": started, "last_status": "running"}),
-    )?;
-    let result = build_backup(&state, &key);
+    let (key, started) = if let Some(pending_key) = pending_raw.as_deref() {
+        let valid_key = if remote {
+            validate_remote_backup_key(&state, pending_key).is_ok()
+        } else {
+            backup_key_file(&state, pending_key).is_ok()
+        };
+        let pending_is_encrypted = pending_key.ends_with(".tar.gz.enc");
+        let consistent = valid_key
+            && pending_is_encrypted == encryption_enabled
+            && current
+                .get("pending_target_fingerprint")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == target_fingerprint);
+        if !consistent {
+            return Err(ApiError::backup_state_invalid());
+        }
+        (
+            pending_key.to_owned(),
+            current
+                .get("last_started_at")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| iso_timestamp(SystemTime::now())),
+        )
+    } else {
+        (key, iso_timestamp(SystemTime::now()))
+    };
+    let running_state = backup_running_state(&current, &started, &key, &target_fingerprint);
+    write_json_unlocked(&state_path, &running_state)?;
+    #[cfg(test)]
+    backup_test_after_running(&state_path, &key).await;
+    let result = build_backup(&state, &key).await;
     match result {
-        Ok(payload) => {
-            let path = backup_key_file(&state, &key)?;
-            write_atomic(&path, &payload)?;
-            write_json(
-                &backup_state_path(&state),
-                &json!({
-                    "running": false,
-                    "last_started_at": started,
-                    "last_finished_at": iso_timestamp(SystemTime::now()),
-                    "last_status": "success",
-                    "last_error": null,
-                    "last_object_key": key,
-                }),
-            )?;
+        Ok(payload_raw) => {
+            let payload = match if encryption_enabled {
+                let passphrase = backup_raw_text(&backup_raw_settings(&state), "passphrase");
+                if passphrase.is_empty() {
+                    Err(ApiError::backup_r2_message(
+                        "backup_encrypt_passphrase_missing",
+                        "已启用备份加密，但未设置加密口令",
+                    ))
+                } else {
+                    openssl_backup_crypt(payload_raw, passphrase, false)
+                        .await
+                        .map_err(|_| {
+                            ApiError::backup_r2_message(
+                                "backup_encrypt_failed",
+                                "加密备份失败：openssl 执行失败",
+                            )
+                        })
+                }
+            } else {
+                Ok(payload_raw)
+            } {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let failure = backup_error_state_from_api(
+                        &current,
+                        &started,
+                        &key,
+                        &target_fingerprint,
+                        &error,
+                    );
+                    let _ = write_json_unlocked(&state_path, &failure);
+                    return Err(error);
+                }
+            };
+            let commit = if remote {
+                let metadata = vec![
+                    ("created-at".to_owned(), iso_timestamp(SystemTime::now())),
+                    (
+                        "encrypted".to_owned(),
+                        if encryption_enabled { "true" } else { "false" }.to_owned(),
+                    ),
+                    ("trigger".to_owned(), "manual".to_owned()),
+                ];
+                match R2Client::from_state(&state) {
+                    Ok(client) => client.upload_bytes(&key, &payload, &metadata).await,
+                    Err(error) => Err(error),
+                }
+            } else {
+                let path = backup_key_file(&state, &key)?;
+                write_atomic(&path, &payload)
+            };
+            if let Err(error) = commit {
+                let failure = backup_error_state_from_api(
+                    &current,
+                    &started,
+                    &key,
+                    &target_fingerprint,
+                    &error,
+                );
+                let _ = write_json_unlocked(&state_path, &failure);
+                return Err(error);
+            }
+            if remote {
+                let keep = backup_raw_settings(&state)
+                    .get("rotation_keep")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(10);
+                let rotation = match R2Client::from_state(&state) {
+                    Ok(client) => rotate_remote_backups(&state, &client, &key, keep).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = rotation {
+                    let failure = backup_error_state_from_api(
+                        &current,
+                        &started,
+                        &key,
+                        &target_fingerprint,
+                        &error,
+                    );
+                    let _ = write_json_unlocked(&state_path, &failure);
+                    return Err(error);
+                }
+            }
+            #[cfg(test)]
+            backup_test_after_archive_commit(&state_path).await;
+            let mut success = running_state
+                .as_object()
+                .cloned()
+                .expect("running backup state object");
+            success.insert("running".to_owned(), Value::Bool(false));
+            success.insert("last_status".to_owned(), json!("success"));
+            success.insert(
+                "last_finished_at".to_owned(),
+                json!(iso_timestamp(SystemTime::now())),
+            );
+            success.insert("last_error".to_owned(), Value::Null);
+            success.remove("last_error_code");
+            success.remove("last_error_status");
+            success.insert("last_object_key".to_owned(), json!(key));
+            success.insert("pending_object_key".to_owned(), Value::Null);
+            success.insert("pending_target_fingerprint".to_owned(), Value::Null);
+            if let Err(error) = write_json_unlocked(&state_path, &Value::Object(success)) {
+                let failure = backup_error_state(
+                    &current,
+                    &started,
+                    &key,
+                    &target_fingerprint,
+                    "backup_failed",
+                );
+                let _ = write_json_unlocked(&state_path, &failure);
+                return Err(error);
+            }
             Ok(Json(
-                json!({"result": {"key": key, "size": payload.len(), "encrypted": false}}),
+                json!({"result": {"key": key, "size": payload.len(), "encrypted": encryption_enabled}}),
             ))
         }
         Err(error) => {
-            let _ = write_json(
-                &backup_state_path(&state),
-                &json!({"running": false, "last_status": "error", "last_error": "备份执行失败，请稍后重试"}),
+            let failure = backup_error_state(
+                &current,
+                &started,
+                &key,
+                &target_fingerprint,
+                "backup_failed",
             );
+            let _ = write_json_unlocked(&state_path, &failure);
             Err(error)
         }
     }
@@ -3499,23 +5024,68 @@ fn content_type(name: &str) -> &'static str {
     }
 }
 
+fn public_archive_member_name(name: &str) -> Option<&str> {
+    if name.is_empty() || name.len() > 256 || !name.is_ascii() {
+        return None;
+    }
+    if name
+        .chars()
+        .any(|character| !character.is_ascii_alphanumeric() && !"._/-".contains(character))
+    {
+        return None;
+    }
+    let parts = name.split('/').collect::<Vec<_>>();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || matches!(*part, "." | ".."))
+    {
+        return None;
+    }
+    if name == "config.json"
+        || matches!(name, "snapshots/accounts.json" | "snapshots/auth_keys.json")
+        || (parts.len() >= 2 && parts.first() == Some(&"data"))
+    {
+        return Some(name);
+    }
+    None
+}
+
 fn read_backup_detail(state: &AppState, key: &str) -> Result<Value, ApiError> {
     let path = backup_key_file(state, key)?;
     let payload = read_bounded(&path, MAX_BACKUP_BYTES)?;
+    read_backup_detail_payload(key, payload)
+}
+
+fn read_backup_detail_payload(key: &str, payload: Vec<u8>) -> Result<Value, ApiError> {
     let decoder = GzDecoder::new(Cursor::new(payload));
     let mut archive = Archive::new(decoder);
     let mut files = Vec::new();
     let mut snapshots = BTreeMap::<String, usize>::new();
+    let mut metadata = Map::new();
     let entries = archive.entries().map_err(|_| ApiError::invalid_request())?;
-    for entry in entries {
-        let entry = entry.map_err(|_| ApiError::invalid_request())?;
-        let name = entry
-            .path()
-            .map_err(|_| ApiError::invalid_request())?
-            .to_string_lossy()
-            .replace('\\', "/");
-        if name.contains("..") || name.starts_with('/') {
+    for (member_index, entry) in entries.enumerate() {
+        if member_index >= MAX_BACKUP_DETAIL_MEMBERS {
             return Err(ApiError::invalid_request());
+        }
+        let entry = entry.map_err(|_| ApiError::invalid_request())?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        if entry.header().path_bytes().contains(&b'\\') {
+            continue;
+        }
+        let name = match std::str::from_utf8(entry.path_bytes().as_ref()) {
+            Ok(name) => name.to_owned(),
+            Err(_) => continue,
+        };
+        let is_metadata = name == "backup-metadata.json";
+        let public_name = if is_metadata {
+            Some(name.as_str())
+        } else {
+            public_archive_member_name(&name)
+        };
+        if public_name.is_none() {
+            continue;
         }
         let size = entry
             .header()
@@ -3532,32 +5102,131 @@ fn read_backup_detail(state: &AppState, key: &str) -> Result<Value, ApiError> {
         if bytes.len() as u64 > MAX_BACKUP_MEMBER_BYTES {
             return Err(ApiError::validation());
         }
+        if name == "backup-metadata.json" {
+            metadata = serde_json::from_slice::<Value>(&bytes)
+                .map_err(|_| ApiError::invalid_request())?
+                .as_object()
+                .cloned()
+                .ok_or_else(ApiError::invalid_request)?;
+            continue;
+        }
+        let public_name = public_name.expect("validated public archive member");
+        if let Some(snapshot_name) = public_name
+            .strip_prefix("snapshots/")
+            .and_then(|value| value.strip_suffix(".json"))
+        {
+            if !matches!(snapshot_name, "accounts" | "auth_keys") {
+                continue;
+            }
+            let snapshot =
+                serde_json::from_slice::<Value>(&bytes).map_err(|_| ApiError::invalid_request())?;
+            let count = snapshot
+                .as_array()
+                .map(Vec::len)
+                .ok_or_else(ApiError::invalid_request)?;
+            snapshots.insert(snapshot_name.to_owned(), count);
+            continue;
+        }
         let digest = Sha256::digest(&bytes);
         let hash = digest
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        if let Some(snapshot) = name.strip_prefix("snapshots/") {
-            *snapshots.entry(snapshot.to_owned()).or_default() += 1;
-        }
         files.push(json!({
-            "name": name,
+            "name": public_name,
             "exists": true,
-            "content_type": content_type(&name),
+            "content_type": content_type(public_name),
             "size": bytes.len(),
             "sha256": hash,
         }));
     }
+    let created_at = metadata
+        .get("created_at")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() <= 64
+                && !value.is_empty()
+                && time::OffsetDateTime::parse(
+                    value,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .is_ok()
+        })
+        .map(|value| Value::String(value.to_owned()))
+        .unwrap_or(Value::Null);
+    let trigger = metadata
+        .get("trigger")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "manual" | "schedule"))
+        .map(|value| Value::String(value.to_owned()))
+        .unwrap_or(Value::Null);
+    let app_version = metadata
+        .get("app_version")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value.is_ascii()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".-_+".contains(character)
+                })
+        })
+        .map(|value| Value::String(value.to_owned()))
+        .unwrap_or(Value::Null);
+    let storage_backend = metadata
+        .get("storage_backend")
+        .and_then(Value::as_object)
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("backend").and_then(Value::as_str))
+        })
+        .filter(|value| matches!(*value, "json" | "database" | "git"))
+        .map(|value| json!({"type": value}))
+        .unwrap_or_else(|| json!({}));
+    let cumulative_total = match metadata.get("snapshot_manifest") {
+        None => None,
+        Some(Value::Object(manifest)) if manifest.get("version") == Some(&json!(1)) => {
+            let accounts = manifest
+                .get("accounts")
+                .and_then(Value::as_object)
+                .ok_or_else(ApiError::invalid_request)?;
+            Some(
+                accounts
+                    .get("cumulative_total")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(ApiError::invalid_request)?,
+            )
+        }
+        Some(_) => return Err(ApiError::invalid_request()),
+    };
+    let snapshots = snapshots
+        .into_iter()
+        .map(|(name, count)| {
+            if name == "accounts"
+                && let Some(cumulative_total) = cumulative_total
+            {
+                return json!({
+                    "name": name,
+                    "count": count,
+                    "cumulative_total": cumulative_total,
+                });
+            }
+            json!({"name": name, "count": count})
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
     Ok(json!({
         "key": key,
         "name": key.rsplit('/').next().unwrap_or("backup.tar.gz"),
         "encrypted": false,
-        "created_at": null,
-        "trigger": "manual",
-        "app_version": null,
-        "storage_backend": {"type": "local"},
+        "created_at": created_at,
+        "trigger": trigger,
+        "app_version": app_version,
+        "storage_backend": storage_backend,
         "files": files,
-        "snapshots": snapshots.into_iter().map(|(name, count)| json!({"name": name, "count": count})).collect::<Vec<_>>(),
+        "snapshots": snapshots,
     }))
 }
 
@@ -3568,13 +5237,45 @@ pub(super) async fn delete_backup(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let value = super::account_json_body(body).await?;
-    let key = value
-        .get("key")
+    let key = value.get("key").and_then(Value::as_str).ok_or_else(|| {
+        ApiError::backup_r2_message("backup_key_required", "备份对象 key 不能为空")
+    })?;
+    let state_path = backup_state_path(&state);
+    let owner_gate = super::backup_owner_gate(&state_path);
+    let _owner_guard = owner_gate
+        .try_lock_owned()
+        .map_err(|_| ApiError::backup_delete_busy())?;
+    let current = {
+        let Some(_state_lock) = super::try_acquire_path_write_lock(&state_path).await? else {
+            return Err(ApiError::backup_delete_busy());
+        };
+        backup_state_map(&state)?
+    };
+    if current
+        .get("last_status")
         .and_then(Value::as_str)
-        .ok_or_else(ApiError::invalid_request)?;
-    let path = backup_key_file(&state, key)?;
-    if fs::remove_file(path).is_err() {
-        return Err(ApiError::not_found());
+        .is_some_and(|value| value == "running")
+        && current
+            .get("pending_object_key")
+            .and_then(Value::as_str)
+            .is_some_and(|pending| pending == key)
+    {
+        return Err(ApiError::backup_delete_busy());
+    }
+    if backup_is_remote(&state) {
+        let candidate = validate_remote_backup_key(&state, key)?;
+        R2Client::from_state(&state)?
+            .delete_object(&candidate)
+            .await?;
+    } else {
+        let path = backup_key_file(&state, key)?;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ApiError::not_found());
+            }
+            Err(_) => return Err(ApiError::unavailable()),
+        }
     }
     Ok(Json(json!({"ok": true})))
 }
@@ -3585,11 +5286,37 @@ pub(super) async fn backup_detail(
     Query(query): Query<BackupKeyQuery>,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
-    if backup_is_remote(&state) {
-        return Err(ApiError::unavailable());
-    }
-    let key = query.key.as_deref().ok_or_else(ApiError::invalid_request)?;
-    Ok(Json(json!({"item": read_backup_detail(&state, key)?})))
+    let key = query.key.as_deref().unwrap_or_default();
+    let detail = if backup_is_remote(&state) {
+        let key = validate_remote_backup_key(&state, key)?;
+        let payload = R2Client::from_state(&state)?.download_bytes(&key).await?;
+        let payload = decrypt_backup_if_needed(
+            &state,
+            &key,
+            payload,
+            "backup_detail_passphrase_missing",
+            "当前未配置加密口令，无法查看已加密备份",
+        )
+        .await?;
+        read_backup_detail_payload(&key, payload)?
+    } else {
+        if key.ends_with(".enc") {
+            let path = backup_key_file(&state, key)?;
+            let payload = read_bounded(&path, MAX_BACKUP_BYTES)?;
+            let payload = decrypt_backup_if_needed(
+                &state,
+                key,
+                payload,
+                "backup_detail_passphrase_missing",
+                "当前未配置加密口令，无法查看已加密备份",
+            )
+            .await?;
+            read_backup_detail_payload(key, payload)?
+        } else {
+            read_backup_detail(&state, key)?
+        }
+    };
+    Ok(Json(json!({"item": detail})))
 }
 
 pub(super) async fn download_backup(
@@ -3598,16 +5325,44 @@ pub(super) async fn download_backup(
     Query(query): Query<BackupKeyQuery>,
 ) -> Result<Response, ApiError> {
     admin_authenticated(&headers, &state).await?;
-    if backup_is_remote(&state) {
-        return Err(ApiError::unavailable());
-    }
-    let key = query.key.as_deref().ok_or_else(ApiError::invalid_request)?;
-    let path = backup_key_file(&state, key)?;
-    let payload = read_bounded(&path, MAX_BACKUP_BYTES)?;
-    let filename = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("backup.tar.gz");
+    let key = query.key.as_deref().unwrap_or_default();
+    let (payload, filename) = if backup_is_remote(&state) {
+        let key = validate_remote_backup_key(&state, key)?;
+        let payload = R2Client::from_state(&state)?.download_bytes(&key).await?;
+        let payload = decrypt_backup_if_needed(
+            &state,
+            &key,
+            payload,
+            "backup_download_passphrase_missing",
+            "当前未配置加密口令，无法下载并解密已加密备份",
+        )
+        .await?;
+        let filename = key
+            .rsplit('/')
+            .next()
+            .unwrap_or("backup.tar.gz")
+            .trim_end_matches(".enc")
+            .to_owned();
+        (payload, filename)
+    } else {
+        let path = backup_key_file(&state, key)?;
+        let payload = read_bounded(&path, MAX_BACKUP_BYTES)?;
+        let payload = decrypt_backup_if_needed(
+            &state,
+            key,
+            payload,
+            "backup_download_passphrase_missing",
+            "当前未配置加密口令，无法下载并解密已加密备份",
+        )
+        .await?;
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("backup.tar.gz")
+            .trim_end_matches(".enc")
+            .to_owned();
+        (payload, filename)
+    };
     let disposition = format!("attachment; filename*=UTF-8''{filename}");
     Ok((
         StatusCode::OK,
@@ -3619,4 +5374,101 @@ pub(super) async fn download_backup(
         Body::from(payload),
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
+        parse_r2_list_xml, public_backup_error,
+    };
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn r2_list_parser_matches_python_optional_fields_and_cleaning() {
+        let xml = concat!(
+            "<ListBucketResult>",
+            "<Contents><Key>  backups/backup-one.tar.gz  </Key>",
+            "<LastModified> 2026-08-24T00:00:00Z </LastModified></Contents>",
+            "<Contents><Key>   </Key><Size>not-a-size</Size></Contents>",
+            "<Contents><Size>9</Size></Contents>",
+            "<Contents><Key>backups/backup-two.tar.gz</Key><Size>  </Size></Contents>",
+            "<IsTruncated>false</IsTruncated>",
+            "</ListBucketResult>",
+        );
+        let (items, truncated, continuation) = parse_r2_list_xml(xml).expect("valid R2 XML");
+        assert!(!truncated);
+        assert!(continuation.is_none());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "backups/backup-one.tar.gz");
+        assert_eq!(items[0].size, 0);
+        assert_eq!(items[0].updated_at, "2026-08-24T00:00:00Z");
+        assert_eq!(items[1].key, "backups/backup-two.tar.gz");
+        assert_eq!(items[1].size, 0);
+    }
+
+    #[test]
+    fn r2_list_budget_matches_python_contract() {
+        assert_eq!(MAX_R2_LIST_RESPONSE_BYTES, 4 * 1024 * 1024);
+        assert_eq!(MAX_R2_DOWNLOAD_BYTES, 512 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn r2_management_errors_use_python_safe_detail_contract() {
+        let error = match R2Client::from_settings(&Map::new()) {
+            Ok(_) => panic!("missing R2 settings must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "r2_config_incomplete");
+        let response = error.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("R2 error body");
+        let value: Value = serde_json::from_slice(&body).expect("R2 error JSON");
+        assert_eq!(
+            value["detail"]["error"],
+            "R2 配置不完整：缺少 Account ID、Access Key ID、Secret Access Key、Bucket"
+        );
+
+        let response =
+            ApiError::backup_r2_status("r2_connection_failed", "连接 R2 失败", 503).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("R2 status error body");
+        let value: Value = serde_json::from_slice(&body).expect("R2 status error JSON");
+        assert_eq!(value["detail"]["error"], "连接 R2 失败：HTTP 503");
+    }
+
+    #[test]
+    fn backup_state_projects_all_python_r2_status_errors() {
+        for (code, expected) in [
+            ("r2_connection_failed", "连接 R2 失败：HTTP 503"),
+            ("r2_upload_failed", "上传备份失败：HTTP 503"),
+            ("r2_delete_failed", "删除备份失败：HTTP 503"),
+            ("r2_read_failed", "读取备份失败：HTTP 503"),
+            ("r2_list_failed", "获取备份列表失败：HTTP 503"),
+        ] {
+            let mut raw = Map::new();
+            raw.insert("last_error_code".to_owned(), Value::String(code.to_owned()));
+            raw.insert("last_error_status".to_owned(), Value::from(503));
+            assert_eq!(
+                public_backup_error(&raw),
+                Value::String(expected.to_owned()),
+                "Python public backup state mapping for {code}"
+            );
+        }
+
+        let mut malformed = Map::new();
+        malformed.insert(
+            "last_error_code".to_owned(),
+            Value::String("r2_list_failed".to_owned()),
+        );
+        malformed.insert("last_error_status".to_owned(), Value::from(700));
+        assert_eq!(
+            public_backup_error(&malformed),
+            Value::String("备份执行失败，请稍后重试".to_owned())
+        );
+    }
 }

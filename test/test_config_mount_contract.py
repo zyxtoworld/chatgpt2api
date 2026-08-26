@@ -4,6 +4,7 @@ import errno
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from unittest import mock
@@ -132,14 +133,55 @@ def test_bind_mounted_config_rejects_hardlinked_target(tmp_path: Path) -> None:
     assert alias_path.read_text(encoding="utf-8") == original_payload
 
 
-def test_container_runtime_keeps_python_until_rust_parity_gate_is_closed() -> None:
+def test_container_keeps_python_app_and_isolates_rust_candidate_until_parity_zero() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")
 
-    assert "FROM --platform=$TARGETPLATFORM python:3.13-slim AS app" in dockerfile
-    assert "uv sync --frozen --no-dev --no-install-project" in dockerfile
-    assert 'CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--no-access-log"]' in dockerfile
-    assert "rust-build" not in dockerfile
-    assert "chatgpt2api-rust" not in dockerfile
+    rust_marker = re.search(r"^FROM [^\n]+ AS rust-app-candidate$", dockerfile, re.MULTILINE)
+    app_marker = re.search(r"^FROM [^\n]+ AS app$", dockerfile, re.MULTILINE)
+    assert rust_marker is not None
+    assert app_marker is not None
+    assert rust_marker.start() < app_marker.start()
+    rust_stage = dockerfile[rust_marker.start() : app_marker.start()]
+    app_stage = dockerfile[app_marker.start() :]
+    assert " AS rust-build" in dockerfile
+    assert "COPY rust/Cargo.toml rust/Cargo.lock ./" in dockerfile
+    assert "COPY account_snapshot_contract.json /app/account_snapshot_contract.json" in dockerfile
+    assert (
+        "COPY services/protocol/codex_public_item_manifest.json "
+        "/app/services/protocol/codex_public_item_manifest.json"
+    ) in dockerfile
+    assert "COPY rust/file_identity ./file_identity" in dockerfile
+    assert "COPY rust/src ./src" in dockerfile
+    assert "cargo build --release --locked --bin chatgpt2api-rust" in dockerfile
+    assert (
+        "COPY --from=rust-build /app/rust/target/release/chatgpt2api-rust "
+        "/usr/local/bin/chatgpt2api-rust"
+    ) in rust_stage
+    assert "COPY --from=web-build /app/web/out ./web_dist" in rust_stage
+    assert 'CMD ["/usr/local/bin/chatgpt2api-rust"]' in rust_stage
+    for forbidden_runtime in (
+        "python:",
+        "pip install",
+        "pyproject.toml",
+        "uv.lock",
+        "uv sync",
+        "COPY main.py",
+        "COPY api",
+        "COPY services",
+        "COPY utils",
+        "COPY scripts",
+        "uvicorn",
+        "main:app",
+    ):
+        assert forbidden_runtime not in rust_stage
+
+    assert "FROM --platform=$TARGETPLATFORM python:3.13-slim AS app" in app_stage
+    assert "uv sync --frozen --no-dev --no-install-project" in app_stage
+    assert 'CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--no-access-log"]' in app_stage
+    docker_job = workflow.split("\n  docker:\n", 1)[1]
+    assert "target: app" in docker_job
+    assert "target: rust-app-candidate" not in docker_job
 
 
 def test_container_carries_the_pinned_codex_client_version() -> None:
@@ -151,6 +193,81 @@ def test_container_carries_the_pinned_codex_client_version() -> None:
     assert "CODEX_CLIENT_VERSION=0.147.0" in workflow
     assert "CODEX_MODELS_CLIENT_VERSION" not in dockerfile
     assert "CODEX_MODELS_CLIENT_VERSION" not in workflow
+
+
+def test_publish_workflow_blocks_docker_on_full_program_and_dependency_gates() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")
+
+    assert "\n  verify:\n" in workflow
+    docker_job = workflow.split("\n  docker:\n", 1)[1]
+    assert docker_job.startswith("    needs: verify\n")
+    for required_command in (
+        "uv run pytest -q",
+        "cargo fmt --all -- --check",
+        "cargo check --workspace --locked --all-targets",
+        "cargo clippy --workspace --locked --all-targets -- -D warnings",
+        "cargo test --workspace --locked --all-targets",
+        "cargo audit --deny warnings --ignore RUSTSEC-2023-0071 --file rust/Cargo.lock",
+        "cargo deny --manifest-path rust/Cargo.toml --locked check all",
+        "bun install --frozen-lockfile",
+        "node --test test/*.test.mjs",
+        "bun x tsc --noEmit",
+        "bun run build",
+    ):
+        assert required_command in workflow
+    assert "continue-on-error: true" not in workflow
+
+
+def test_rust_ci_runs_locked_path_dependency_tests_as_workspace_members() -> None:
+    manifest = (ROOT / "rust" / "Cargo.toml").read_text(encoding="utf-8")
+    assert "[workspace]" in manifest
+    assert 'members = ["file_identity"]' in manifest
+
+    for workflow_path in (
+        ROOT / ".github" / "workflows" / "rust-canary.yml",
+        ROOT / ".github" / "workflows" / "docker-publish.yml",
+    ):
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for command in (
+            "cargo check --workspace --locked --all-targets",
+            "cargo clippy --workspace --locked --all-targets -- -D warnings",
+            "cargo test --workspace --locked --all-targets",
+        ):
+            assert command in workflow, f"{workflow_path.name} omits locked workspace gate: {command}"
+
+
+def test_docker_and_rust_ci_use_the_verified_toolchain_versions() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")
+    rust_workflow = (ROOT / ".github" / "workflows" / "rust-canary.yml").read_text(encoding="utf-8")
+
+    assert (
+        "FROM --platform=$BUILDPLATFORM "
+        "oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb "
+        "AS web-build"
+    ) in dockerfile
+    assert (
+        "FROM --platform=$TARGETPLATFORM "
+        "rust:1.98-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7 "
+        "AS rust-build"
+    ) in dockerfile
+    assert "toolchain: 1.98.0" in workflow
+    assert "toolchain: 1.98.0" in rust_workflow
+    assert "oven/bun:1-alpine" not in dockerfile
+    assert "rust:1.89-bookworm" not in dockerfile
+
+
+def test_workflows_pin_external_actions_to_immutable_commits() -> None:
+    floating: list[str] = []
+    for workflow_path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        workflow = workflow_path.read_text(encoding="utf-8")
+        for reference in re.findall(r"^\s*uses:\s*([^\s#]+)", workflow, re.MULTILINE):
+            if reference.startswith("./"):
+                continue
+            if re.fullmatch(r"[^@]+@[0-9a-f]{40}", reference) is None:
+                floating.append(f"{workflow_path.name}:{reference}")
+
+    assert floating == [], f"floating GitHub Actions references: {floating}"
 
 
 def test_rust_release_matrix_keeps_unimplemented_public_contracts_as_hard_blocks() -> None:
@@ -166,12 +283,24 @@ def test_rust_release_matrix_keeps_unimplemented_public_contracts_as_hard_blocks
 def test_container_frontend_build_uses_the_bun_lock() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
-    assert "FROM --platform=$BUILDPLATFORM oven/bun:1-alpine AS web-build" in dockerfile
+    assert (
+        "FROM --platform=$BUILDPLATFORM "
+        "oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb "
+        "AS web-build"
+    ) in dockerfile
     assert "COPY web/package.json web/bun.lock ./" in dockerfile
     assert "RUN bun install --frozen-lockfile" in dockerfile
     assert 'RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" bun run build' in dockerfile
     assert "npm install" not in dockerfile
     assert "npm run build" not in dockerfile
+
+
+def test_container_healthcheck_requires_public_healthy_boolean() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "/health?format=json" in dockerfile
+    assert '"healthy":true' in dockerfile
+    assert "output-document=-" in dockerfile
 
 
 def test_settings_endpoint_persists_global_proxy_through_real_config_store(tmp_path: Path) -> None:
