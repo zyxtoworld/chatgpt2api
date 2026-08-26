@@ -236,6 +236,16 @@ def test_rust_ci_runs_locked_path_dependency_tests_as_workspace_members() -> Non
             assert command in workflow, f"{workflow_path.name} omits locked workspace gate: {command}"
 
 
+def test_rust_canary_provisions_python_for_cross_runtime_lock_tests() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "rust-canary.yml").read_text(encoding="utf-8")
+
+    assert "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9" in workflow
+    assert 'version: "0.12.1"' in workflow
+    assert "uv python install 3.13" in workflow
+    assert "uv sync --frozen --all-groups --no-install-project" in workflow
+    assert "CHATGPT2API_TEST_PYTHON: ${{ github.workspace }}/.venv/bin/python" in workflow
+
+
 def test_docker_and_rust_ci_use_the_verified_toolchain_versions() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     workflow = (ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")

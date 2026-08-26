@@ -523,6 +523,43 @@ pub fn remove_open_file_at(
 }
 
 #[cfg(unix)]
+pub fn remove_open_file_at_bound(
+    directory: &DirectoryHandle,
+    name: &OsStr,
+    file: &File,
+) -> io::Result<()> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+
+    validate_entry_name(name)?;
+    if identity(directory.file())? != directory.identity {
+        return Err(io::Error::other("directory handle changed"));
+    }
+    let expected = identity(file)?;
+    let current = File::from(
+        openat(
+            directory.file(),
+            name,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(nix_error)?,
+    );
+    if !current.metadata()?.is_file() || identity(&current)? != expected {
+        return Err(io::Error::other("directory entry changed"));
+    }
+    if identity(directory.file())? != directory.identity {
+        return Err(io::Error::other("directory handle changed"));
+    }
+    nix::unistd::unlinkat(
+        directory.file(),
+        name,
+        nix::unistd::UnlinkatFlags::NoRemoveDir,
+    )
+    .map_err(nix_error)
+}
+
+#[cfg(unix)]
 pub fn replace_file_at(
     directory: &DirectoryHandle,
     temporary_name: &OsStr,
@@ -972,6 +1009,102 @@ fn dispose_file_by_handle(file: &File) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::{
+        ffi::OsStr,
+        fs,
+        io::Write,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn test_root(label: &str) -> PathBuf {
+        let base = std::env::var_os("CHATGPT2API_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(Path::parent)
+                    .expect("project root above file_identity manifest")
+                    .join(".local")
+                    .join("codex")
+                    .join("tmp")
+            });
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        base.join(format!(
+            "file-identity-{label}-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn bound_remove_follows_original_directory_after_parent_rebind() {
+        let root = test_root("parent-rebind");
+        let parent = root.join("parent");
+        let moved = root.join("parent-moved");
+        let name = OsStr::new("owned.bin");
+        fs::create_dir_all(&parent).expect("parent");
+        let directory = open_directory(&parent).expect("directory handle");
+        let mut created = create_regular_file_at(&directory, name).expect("owned file");
+        created.write_all(b"owned").expect("owned bytes");
+        created.sync_all().expect("owned sync");
+        drop(created);
+        let retained = open_regular_file_for_replace_at(&directory, name).expect("retained");
+
+        fs::rename(&parent, &moved).expect("rebind parent");
+        fs::create_dir(&parent).expect("replacement parent");
+        fs::write(parent.join(name), b"external").expect("external file");
+
+        remove_open_file_at_bound(&directory, name, &retained).expect("bound removal");
+        assert_eq!(
+            fs::read(parent.join(name)).expect("external survives"),
+            b"external"
+        );
+        assert!(
+            !moved.join(name).exists(),
+            "owned entry remains in old parent"
+        );
+
+        drop(retained);
+        fs::remove_dir(&parent).expect("replacement parent cleanup");
+        fs::remove_dir(&moved).expect("old parent cleanup");
+        fs::remove_dir(&root).expect("root cleanup");
+    }
+
+    #[test]
+    fn bound_remove_rejects_same_name_replacement() {
+        let root = test_root("entry-replacement");
+        let parent = root.join("parent");
+        let name = OsStr::new("owned.bin");
+        fs::create_dir_all(&parent).expect("parent");
+        let directory = open_directory(&parent).expect("directory handle");
+        let mut created = create_regular_file_at(&directory, name).expect("owned file");
+        created.write_all(b"owned").expect("owned bytes");
+        created.sync_all().expect("owned sync");
+        drop(created);
+        let retained = open_regular_file_for_replace_at(&directory, name).expect("retained");
+
+        fs::remove_file(parent.join(name)).expect("replace original");
+        fs::write(parent.join(name), b"attacker").expect("replacement");
+        assert!(
+            remove_open_file_at_bound(&directory, name, &retained).is_err(),
+            "replacement must not be removed"
+        );
+        assert_eq!(
+            fs::read(parent.join(name)).expect("replacement survives"),
+            b"attacker"
+        );
+
+        drop(retained);
+        fs::remove_dir_all(&root).expect("root cleanup");
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1506,6 +1639,20 @@ pub fn remove_open_file_at(
     if !directory.same_identity()? {
         return Err(io::Error::other("directory parent changed"));
     }
+    dispose_file_by_handle(file)
+}
+
+#[cfg(windows)]
+pub fn remove_open_file_at_bound(
+    directory: &DirectoryHandle,
+    name: &OsStr,
+    file: &File,
+) -> io::Result<()> {
+    validate_entry_name(name)?;
+    if identity(&directory.file)? != directory.identity {
+        return Err(io::Error::other("directory handle changed"));
+    }
+    identity(file)?;
     dispose_file_by_handle(file)
 }
 

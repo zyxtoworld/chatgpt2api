@@ -93,7 +93,8 @@ use file_identity::{
     identity as kernel_identity, open_directory, open_or_create_directory, open_regular_file_at,
     open_regular_file_for_delete_at, open_regular_file_for_lock_at,
     open_regular_file_for_replace_at, open_regular_file_for_replace_check_at, remove_directory_at,
-    remove_file_at, remove_open_file_at, replace_file_at, version as kernel_file_version,
+    remove_file_at, remove_open_file_at, remove_open_file_at_bound, replace_file_at,
+    version as kernel_file_version,
 };
 use fs2::FileExt;
 use futures_util::{Stream, StreamExt, stream, stream::FuturesUnordered};
@@ -3217,7 +3218,7 @@ fn next_atomic_temp_path(path: &Path, use_image_test_hooks: bool) -> PathBuf {
 
 fn remove_temp_file(parent: &CheckedDirectory, name: &OsStr, file: Option<&fs::File>) {
     if let Some(file) = file {
-        let _ = remove_open_file_at(&parent._file, name, file);
+        let _ = remove_open_file_at_bound(&parent._file, name, file);
     } else {
         let _ = remove_file_at(&parent._file, name);
     }
@@ -33827,6 +33828,7 @@ data: [DONE]
                 fs::read(parent.join("external.txt")).expect("rebound sentinel survives"),
                 b"external"
             );
+            fs::remove_file(parent.join("external.txt")).expect("remove rebound sentinel");
             fs::remove_dir(&parent).expect("remove empty rebound parent");
             fs::rename(&moved, &parent).expect("restore original parent");
         } else {
