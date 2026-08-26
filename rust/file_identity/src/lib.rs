@@ -1073,6 +1073,7 @@ mod unix_tests {
         );
 
         drop(retained);
+        fs::remove_file(parent.join(name)).expect("replacement file cleanup");
         fs::remove_dir(&parent).expect("replacement parent cleanup");
         fs::remove_dir(&moved).expect("old parent cleanup");
         fs::remove_dir(&root).expect("root cleanup");
