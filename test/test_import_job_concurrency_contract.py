@@ -339,6 +339,67 @@ class ImportJobConcurrencyContractTests(unittest.TestCase):
             self.assertEqual(current["job_id"], "job-b")
             self.assertEqual(current["status"], "pending")
 
+    def test_cpa_late_worker_conflict_is_treated_as_stale_job(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "cpa.json"
+            config = cpa_module.CPAConfig(path)
+            pool = config.add_pool("CPA", "https://cpa.example.test", "management-secret")
+            job_a = {
+                "job_id": "job-a",
+                "status": "running",
+                "created_at": "2026-08-11T00:00:00+00:00",
+                "updated_at": "2026-08-11T00:00:01+00:00",
+                "total": 1,
+                "completed": 0,
+                "added": 0,
+                "skipped": 0,
+                "refreshed": 0,
+                "failed": 0,
+                "errors": [],
+            }
+            config.set_import_job(pool["id"], job_a)
+            replacement = cpa_module.CPAConfig(path)
+            failed_job_a = dict(job_a, status="failed", completed=1, failed=1)
+            job_b = dict(failed_job_a, job_id="job-b", status="pending", completed=0, failed=0)
+            original_set_import_job = config.set_import_job
+            conflict_injected = False
+
+            def replace_then_conflict(
+                pool_id: str,
+                import_job: dict | None,
+                *,
+                expected_job_id: str | None = None,
+            ) -> dict | None:
+                nonlocal conflict_injected
+                if not conflict_injected:
+                    conflict_injected = True
+                    replacement.set_import_job(
+                        pool_id,
+                        failed_job_a,
+                        expected_job_id="job-a",
+                    )
+                    replacement.begin_import_job(pool_id, job_b)
+                    raise cpa_module.StorageConflictError()
+                return original_set_import_job(
+                    pool_id,
+                    import_job,
+                    expected_job_id=expected_job_id,
+                )
+
+            service = cpa_module.CPAImportService(config)
+            with mock.patch.object(config, "set_import_job", side_effect=replace_then_conflict):
+                result = service._update_job(
+                    pool["id"],
+                    expected_job_id="job-a",
+                    status="completed",
+                )
+
+            self.assertIsNone(result)
+            current = config.get_import_job(pool["id"])
+            self.assertIsNotNone(current)
+            self.assertEqual(current["job_id"], "job-b")
+            self.assertEqual(current["status"], "pending")
+
     def test_ccload_late_worker_cannot_write_after_job_replacement_between_check_and_add(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "ccload.json"

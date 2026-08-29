@@ -618,17 +618,34 @@ class CPAImportService:
         return dict(saved_pool.get("import_job") or job)
 
     def _update_job(self, pool_id: str, *, expected_job_id: str | None = None, **updates) -> dict | None:
-        current = self._config.get_import_job(pool_id)
-        if current is None:
-            return None
-        if expected_job_id is not None and current.get("job_id") != expected_job_id:
-            return None
-        next_job = {**current, **updates, "updated_at": _now_iso()}
-        pool = self._config.set_import_job(pool_id, next_job, expected_job_id=expected_job_id)
-        if pool is None:
-            return None
-        job = pool.get("import_job")
-        return dict(job) if isinstance(job, dict) else None
+        attempts = 2 if expected_job_id is not None else 1
+        for attempt in range(attempts):
+            current = self._config.get_import_job(pool_id)
+            if current is None:
+                return None
+            if expected_job_id is not None and current.get("job_id") != expected_job_id:
+                return None
+            next_job = {**current, **updates, "updated_at": _now_iso()}
+            try:
+                pool = self._config.set_import_job(
+                    pool_id,
+                    next_job,
+                    expected_job_id=expected_job_id,
+                )
+            except StorageConflictError:
+                if expected_job_id is None:
+                    raise
+                latest = self._config.get_import_job(pool_id)
+                if latest is None or latest.get("job_id") != expected_job_id:
+                    return None
+                if attempt + 1 >= attempts:
+                    return None
+                continue
+            if pool is None:
+                return None
+            job = pool.get("import_job")
+            return dict(job) if isinstance(job, dict) else None
+        return None
 
     def _append_error(
         self,
