@@ -8,7 +8,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
 from urllib.parse import quote, urlparse
 
 from curl_cffi import requests
@@ -30,7 +29,6 @@ from services.storage.base import StorageDataError, canonical_path_write_lock
 from services.url_utils import normalize_public_http_url, redact_url_credentials
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
-IMAGE_INDEX_LOCK = Lock()
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 _MAX_WEBDAV_IMAGE_BYTES = 50 * 1024 * 1024
 _MAX_LOCAL_IMAGE_BYTES = 50 * 1024 * 1024
@@ -359,13 +357,12 @@ class WebDAVClient:
 class ImageStorageService:
     def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
         self.index_file = index_file
-        self._index_lock = IMAGE_INDEX_LOCK
         self._index_path_lock = canonical_path_write_lock(self.index_file.absolute())
 
     @contextmanager
     def _index_guard(self):
-        """Serialize index read-modify-write across processes and threads."""
-        with self._index_lock, self._index_path_lock:
+        """Serialize one index read-modify-write across processes and threads."""
+        with self._index_path_lock:
             yield
 
     def settings(self) -> dict[str, object]:

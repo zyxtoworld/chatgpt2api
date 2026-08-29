@@ -124,6 +124,39 @@ class ImageStorageServiceTests(unittest.TestCase):
     def service(self) -> ImageStorageService:
         return ImageStorageService(self.data_dir / "image_index.json")
 
+    def test_different_index_paths_do_not_share_process_index_lock(self):
+        first = ImageStorageService(self.data_dir / "first-index.json")
+        second = ImageStorageService(self.data_dir / "second-index.json")
+        entered = threading.Event()
+        release = threading.Event()
+        acquired = threading.Event()
+
+        def hold_first_index() -> None:
+            with first._index_guard():
+                entered.set()
+                release.wait(2)
+
+        def acquire_second_index() -> None:
+            with second._index_guard():
+                acquired.set()
+
+        first_thread = threading.Thread(target=hold_first_index)
+        second_thread = threading.Thread(target=acquire_second_index)
+        try:
+            first_thread.start()
+            self.assertTrue(entered.wait(2))
+            second_thread.start()
+            self.assertTrue(
+                acquired.wait(1),
+                "independent image indexes must not share a process lock",
+            )
+        finally:
+            release.set()
+            first_thread.join(3)
+            second_thread.join(3)
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+
     def test_local_mode_saves_to_local_directory(self):
         stored = self.service().save(png_bytes(), "http://app.test")
 

@@ -273,6 +273,9 @@ static AUTH_DOCUMENT_PARSE_COUNTS: LazyLock<StdMutex<HashMap<PathBuf, usize>>> =
 #[cfg(test)]
 static MODEL_DOCUMENT_PARSE_COUNTS: LazyLock<StdMutex<HashMap<PathBuf, usize>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+#[cfg(test)]
+static BOUNDED_FILE_READ_COUNTS: LazyLock<StdMutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 #[cfg(test)]
 struct ValidatedFileRebindTestGuard;
@@ -990,16 +993,43 @@ fn read_account_document(
 ) -> Result<(Value, Vec<AccountRecord>, [u8; 32], FileVersion), AppInitError> {
     let (bytes, version) = read_bounded_validated_file(path, MAX_ACCOUNT_SNAPSHOT_BYTES)
         .map_err(|()| AppInitError::AccountSnapshot)?;
-    #[cfg(test)]
-    {
-        let mut counts = ACCOUNT_DOCUMENT_PARSE_COUNTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let count = counts.entry(path.to_owned()).or_default();
-        *count = count.saturating_add(1);
-    }
-    let (value, records, fingerprint) = parse_account_document_bytes(&bytes)?;
+    let (value, records, fingerprint) = parse_account_snapshot_bytes(path, &bytes)?;
     Ok((value, records, fingerprint, version))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountRevisionDecision {
+    UseCached,
+    Reload,
+}
+
+fn account_revision_decision(
+    cached_valid: bool,
+    cached_version: Option<FileVersion>,
+    cached_fingerprint: [u8; 32],
+    observed_version: FileVersion,
+    observed_fingerprint: [u8; 32],
+) -> AccountRevisionDecision {
+    if cached_valid
+        && cached_version == Some(observed_version)
+        && cached_fingerprint == observed_fingerprint
+    {
+        AccountRevisionDecision::UseCached
+    } else {
+        AccountRevisionDecision::Reload
+    }
+}
+
+fn parse_account_snapshot_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(Value, Vec<AccountRecord>, [u8; 32]), AppInitError> {
+    #[cfg(test)]
+    record_document_parse(&ACCOUNT_DOCUMENT_PARSE_COUNTS, path);
+    #[cfg(not(test))]
+    let _ = path;
+    let (value, records, fingerprint) = parse_account_document_bytes(bytes)?;
+    Ok((value, records, fingerprint))
 }
 
 #[cfg(test)]
@@ -1020,6 +1050,16 @@ fn record_model_document_parse(path: &Path) {
 #[cfg(test)]
 fn model_document_parse_count(path: &Path) -> usize {
     document_parse_count(&MODEL_DOCUMENT_PARSE_COUNTS, path)
+}
+
+#[cfg(test)]
+fn record_bounded_file_read(path: &Path) {
+    record_document_parse(&BOUNDED_FILE_READ_COUNTS, path);
+}
+
+#[cfg(test)]
+fn bounded_file_read_count(path: &Path) -> usize {
+    document_parse_count(&BOUNDED_FILE_READ_COUNTS, path)
 }
 
 #[cfg(test)]
@@ -3083,6 +3123,8 @@ fn validated_file_version(path: &Path) -> Result<FileVersion, ()> {
 }
 
 fn read_bounded_validated_file(path: &Path, limit: u64) -> Result<(Vec<u8>, FileVersion), ()> {
+    #[cfg(test)]
+    record_bounded_file_read(path);
     let parent = checked_parent_identity(path).map_err(|_| ())?.ok_or(())?;
     if !checked_directory_still_same(&parent) {
         return Err(());
@@ -18230,9 +18272,9 @@ else:
                 .account_store
                 .set_last_used_at_for_test("time-token", Some("2026-08-23 01:02:03"))
         );
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
-            serde_json::to_vec(&json!([{
+            &serde_json::to_vec(&json!([{
                 "access_token": "time-token",
                 "chatgpt_account_id": "account-time",
                 "status": "正常",
@@ -18240,6 +18282,8 @@ else:
                 "last_used_at": "2026-08-23 04:05:06"
             }]))
             .expect("disk-new snapshot"),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("write disk-new snapshot");
         assert!(state.account_store.reload().await);
@@ -18253,9 +18297,9 @@ else:
                 .account_store
                 .set_last_used_at_for_test("time-token", Some("2026-08-23 07:08:09"))
         );
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
-            serde_json::to_vec(&json!([{
+            &serde_json::to_vec(&json!([{
                 "access_token": "time-token",
                 "chatgpt_account_id": "account-time",
                 "status": "正常",
@@ -18263,6 +18307,8 @@ else:
                 "last_used_at": "2026-08-23 06:05:04"
             }]))
             .expect("memory-new snapshot"),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("write memory-new snapshot");
         assert!(state.account_store.reload().await);
@@ -18271,9 +18317,9 @@ else:
             Some("2026-08-23 07:08:09".to_owned())
         );
 
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
-            serde_json::to_vec(&json!([{
+            &serde_json::to_vec(&json!([{
                 "access_token": "time-token",
                 "chatgpt_account_id": "account-time",
                 "status": "正常",
@@ -18281,6 +18327,8 @@ else:
                 "last_used_at": "9999-99-99 99:99:99"
             }]))
             .expect("malformed snapshot"),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("write malformed snapshot");
         assert!(state.account_store.reload().await);
@@ -18316,14 +18364,16 @@ else:
                 .set_last_used_at_for_test("status-token", Some(marker))
         );
 
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
-            serde_json::to_vec(&json!([{
+            &serde_json::to_vec(&json!([{
                 "access_token": "status-token",
                 "status": "限流",
                 "type": "plus"
             }]))
             .expect("status-only snapshot"),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("write status-only snapshot");
         assert!(state.account_store.reload().await);
@@ -18362,15 +18412,17 @@ else:
                 .set_last_used_at_for_test("missing-present-token", Some("2026-08-23 11:12:13"))
         );
 
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
-            serde_json::to_vec(&json!([{
+            &serde_json::to_vec(&json!([{
                 "access_token": "missing-present-token",
                 "chatgpt_account_id": "new-account",
                 "status": "正常",
                 "type": "plus"
             }]))
             .expect("identity-added snapshot"),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("write identity-added snapshot");
         assert!(state.account_store.reload().await);
@@ -18405,14 +18457,16 @@ else:
                 .set_last_used_at_for_test("present-missing-token", Some("2026-08-23 12:13:14"))
         );
 
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
-            serde_json::to_vec(&json!([{
+            &serde_json::to_vec(&json!([{
                 "access_token": "present-missing-token",
                 "status": "正常",
                 "type": "plus"
             }]))
             .expect("identity-removed snapshot"),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("write identity-removed snapshot");
         assert!(state.account_store.reload().await);
@@ -18448,15 +18502,17 @@ else:
                 .set_last_used_at_for_test("old-rotation-token", Some(marker))
         );
 
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
-            serde_json::to_vec(&json!([{
+            &serde_json::to_vec(&json!([{
                 "access_token": "new-rotation-token",
                 "chatgpt_account_id": "account-rotation",
                 "status": "正常",
                 "type": "plus"
             }]))
             .expect("rotated snapshot"),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("write rotated snapshot");
         assert!(state.account_store.reload().await);
@@ -18492,15 +18548,17 @@ else:
                 .set_last_used_at_for_test("reused-token", Some("2026-08-23 10:11:12"))
         );
 
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
-            serde_json::to_vec(&json!([{
+            &serde_json::to_vec(&json!([{
                 "access_token": "reused-token",
                 "chatgpt_account_id": "new-account",
                 "status": "正常",
                 "type": "plus"
             }]))
             .expect("reused-token snapshot"),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("write reused-token snapshot");
         assert!(state.account_store.reload().await);
@@ -23980,10 +24038,12 @@ data: [DONE]
 
         let old_lease = store.acquire("gpt-test").await.expect("old lease");
         assert_eq!(old_lease.token(), "account-token");
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
             r#"{"items":[{"access_token":"rotated-token","status":"正常","models":["gpt-test"]}]}"#
                 .as_bytes(),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("rotated snapshot");
         let rotated_lease = store.acquire("gpt-test").await.expect("rotated lease");
@@ -23992,25 +24052,112 @@ data: [DONE]
         drop(old_lease);
         assert_eq!(store.inflight(), 1);
         drop(rotated_lease);
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
             r#"{"items":[{"access_token":"rotated-token","status":"禁用","models":["gpt-test"]}]}"#
                 .as_bytes(),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("disabled snapshot");
         assert!(store.acquire("gpt-test").await.is_none());
-        fs::write(&path, br#"{"items":[{"access_token":{"secret":true}}]}"#)
-            .expect("invalid snapshot");
+        atomic_replace_checked_with_limit(
+            &path,
+            br#"{"items":[{"access_token":{"secret":true}}]}"#,
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
+        )
+        .expect("invalid snapshot");
         assert!(store.acquire("gpt-test").await.is_none());
-        fs::write(
+        atomic_replace_checked_with_limit(
             &path,
             r#"{"items":[{"access_token":"recovered-token","status":"正常","models":["gpt-test"]}]}"#
                 .as_bytes(),
+            MAX_ACCOUNT_SNAPSHOT_BYTES,
+            false,
         )
         .expect("recovered snapshot");
         let recovered = store.acquire("gpt-test").await.expect("recovered lease");
         assert_eq!(recovered.token(), "recovered-token");
         drop(recovered);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn account_content_revision_collision_forces_reload_and_same_revision_keeps_cache() {
+        let version = FileVersion {
+            identity: file_identity::Identity {
+                first: 7,
+                second: 11,
+            },
+            size: 84,
+            modified: 123,
+            changed: 456,
+        };
+        let old_fingerprint = [0x11; 32];
+        let new_fingerprint = [0x22; 32];
+        assert_eq!(
+            account_revision_decision(
+                true,
+                Some(version),
+                old_fingerprint,
+                version,
+                new_fingerprint,
+            ),
+            AccountRevisionDecision::Reload,
+            "same FileVersion plus different content revision must reload/fail closed"
+        );
+        assert_eq!(
+            account_revision_decision(
+                true,
+                Some(version),
+                old_fingerprint,
+                version,
+                old_fingerprint,
+            ),
+            AccountRevisionDecision::UseCached,
+            "same FileVersion plus same fingerprint must keep the bounded fast path"
+        );
+        assert_eq!(
+            account_revision_decision(
+                false,
+                Some(version),
+                old_fingerprint,
+                version,
+                old_fingerprint,
+            ),
+            AccountRevisionDecision::Reload,
+            "an unvalidated snapshot must reload/fail closed even with an unchanged revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn account_acquire_hot_path_does_not_rescan_snapshot_content() {
+        let path = account_snapshot_path("account-acquire-hot-path");
+        fs::write(
+            &path,
+            r#"{"items":[{"access_token":"hot-path-token","status":"正常","models":["gpt-test"]}]}"#,
+        )
+        .expect("account snapshot");
+        let store = account_pool::AccountStore::load(Some(&path)).expect("account store");
+        let initial_content_reads = bounded_file_read_count(&path);
+        assert_eq!(
+            initial_content_reads, 1,
+            "store load reads the snapshot once"
+        );
+        assert_eq!(account_document_parse_count(&path), 1);
+
+        for _ in 0..32 {
+            let lease = store.acquire("gpt-test").await.expect("eligible account");
+            drop(lease);
+        }
+
+        assert_eq!(
+            bounded_file_read_count(&path),
+            initial_content_reads,
+            "repeated acquire must use the bounded FileVersion fast path instead of reading and hashing the snapshot"
+        );
+        assert_eq!(account_document_parse_count(&path), 1);
         fs::remove_file(path).expect("cleanup");
     }
 

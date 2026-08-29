@@ -14,7 +14,8 @@ use tokio::sync::Mutex;
 use file_identity::FileVersion;
 
 use super::{
-    ApiError, AppInitError, HealthSnapshotSync, read_account_snapshot,
+    AccountRevisionDecision, ApiError, AppInitError, HealthSnapshotSync, account_revision_decision,
+    read_account_snapshot,
     storage::{StorageBackend, StorageError, StorageSnapshot},
     validated_file_version,
 };
@@ -274,6 +275,11 @@ impl AccountStore {
         };
         {
             let snapshot = self.snapshot.read().expect("account snapshot lock");
+            // File-backed owners publish through the checked atomic-replace
+            // path, so FileVersion is the bounded O(1) request-path revision
+            // key. In-place writers are outside that contract and must use
+            // the explicit invalidation/reload boundary instead of forcing a
+            // content scan here.
             if snapshot.valid && snapshot.file_version == Some(version) {
                 return true;
             }
@@ -283,9 +289,13 @@ impl AccountStore {
             let mut snapshot = self.snapshot.write().expect("account snapshot lock");
             match result {
                 Ok(Ok((accounts, fingerprint, file_version, cumulative_total))) => {
-                    if !snapshot.valid
-                        || snapshot.fingerprint != fingerprint
-                        || snapshot.file_version != Some(file_version)
+                    if account_revision_decision(
+                        snapshot.valid,
+                        snapshot.file_version,
+                        snapshot.fingerprint,
+                        file_version,
+                        fingerprint,
+                    ) == AccountRevisionDecision::Reload
                     {
                         let health = AccountHealthStats::from_records(&accounts, cumulative_total);
                         snapshot.generation = snapshot.generation.saturating_add(1);

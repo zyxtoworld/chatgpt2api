@@ -735,7 +735,7 @@ class ImageTaskServiceTests(unittest.TestCase):
             path.write_text(json.dumps(snapshot), encoding="utf-8")
             original = path.read_bytes()
 
-            service = ImageTaskService(path)
+            service = ImageTaskService(path, retention_days_getter=lambda: 30)
             item = service.list_tasks(OWNER, ["corrupt-error"])["items"][0]
             self.assertEqual(item["error"], "image task failed")
             self.assertNotIn(canary, repr(item))
