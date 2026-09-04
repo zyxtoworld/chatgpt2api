@@ -63,7 +63,9 @@ import { writeClipboardText } from "@/lib/clipboard";
 import { downloadTextFile } from "@/lib/download-text.js";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { parseModelList } from "@/lib/model-catalog";
 import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
+import { maskToken } from "@/lib/token-display";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
@@ -130,12 +132,6 @@ function formatRestoreAt(value?: string | null) {
 function formatQuotaSummary(accounts: Account[]) {
   const availableAccounts = accounts.filter((account) => account.status === "正常");
   return availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0);
-}
-
-function maskToken(token?: string) {
-  if (!token) return "—";
-  if (token.length <= 18) return token;
-  return `${token.slice(0, 16)}...${token.slice(-8)}`;
 }
 
 function downloadTokens(accounts: Account[]) {
@@ -319,7 +315,11 @@ function AccountsPageContent() {
       if (!mountedRef.current || !ownsModelRequest()) {
         return;
       }
-      setAvailableModels(Array.isArray(data.data) ? data.data : []);
+      const models = parseModelList(data);
+      if (models === null) {
+        throw new Error("模型列表响应格式无效");
+      }
+      setAvailableModels(models);
     } catch (error) {
       if (!mountedRef.current || !ownsModelRequest()) {
         return;

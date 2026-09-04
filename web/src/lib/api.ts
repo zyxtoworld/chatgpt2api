@@ -60,6 +60,7 @@ export type Model = {
   parent: string | null;
   allow_anonymous: boolean;
   supported_account_types: string[];
+  supported_reasoning_efforts?: string[];
 };
 
 type AccountListResponse = {

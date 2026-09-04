@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { createUserKey, deleteUserKey, fetchUserKeys, updateUserKey, type UserKey } from "@/lib/api";
+import { writeClipboardText } from "@/lib/clipboard";
 import { createMutationRequestGate } from "@/lib/mutation-request-gate";
 import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
 
@@ -254,12 +255,11 @@ export function UserKeysCard() {
   };
 
   const handleCopy = async (value: string) => {
-    try {
-      await navigator.clipboard.writeText(value);
+    if (await writeClipboardText(value)) {
       toast.success("已复制到剪贴板");
-    } catch {
-      toast.error("复制失败，请手动复制");
+      return;
     }
+    toast.error("复制失败，请手动复制");
   };
 
   const hasMutation = isCreating || pendingIds.size > 0;

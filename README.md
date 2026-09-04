@@ -36,11 +36,12 @@
 ```bash
 git clone git@github.com:basketikun/chatgpt2api.git
 cd chatgpt2api
+cp config.example.json config.json
 chmod 600 config.json
 docker compose up -d
 ```
 
-启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。当前 `latest` 镜像的主服务入口是 Rust release 二进制；Compose 使用固定的 `/app/config.json` 和 `/app/data`，不需要额外的配置目录或路径环境变量。
+启动前请将宿主机 `config.json` 中的 `auth-key` 换成真实值，或通过 `CHATGPT2API_AUTH_KEY` 环境变量提供。`config.json` 只作为外置挂载进入容器，不会被构建进镜像；当前 `latest` 镜像的主服务入口是 Rust release 二进制。Compose 使用固定的 `/app/config.json` 和 `/app/data`，不需要额外的配置目录或路径环境变量。
 
 - Web 面板：`http://localhost:3000`
 - API 地址：`http://localhost:3000/v1`
@@ -72,10 +73,7 @@ docker compose -f docker-compose.warp.yml up -d --build
 启动后端：
 
 ```bash
-git clone git@github.com:basketikun/chatgpt2api.git
-cd chatgpt2api
-uv sync
-uv run main.py
+cargo run --manifest-path rust/Cargo.toml --bin chatgpt2api-rust
 ```
 
 启动前端：
@@ -101,9 +99,8 @@ CHATGPT2API_LIVE_UPSTREAM=1 CHATGPT2API_LIVE_BASE_URL=https://<explicit-host> CH
 后续更新新版本：
 
 ```bash
-docker pull ghcr.io/basketikun/chatgpt2api:latest
-docker-compose down
-docker-compose up -d
+docker compose pull app
+docker compose up -d app
 
 ```
 
