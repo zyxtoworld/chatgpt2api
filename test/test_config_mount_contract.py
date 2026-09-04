@@ -133,16 +133,12 @@ def test_bind_mounted_config_rejects_hardlinked_target(tmp_path: Path) -> None:
     assert alias_path.read_text(encoding="utf-8") == original_payload
 
 
-def test_container_keeps_python_app_and_isolates_rust_candidate_until_parity_zero() -> None:
+def test_container_uses_rust_app_and_external_config() -> None:
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     workflow = (ROOT / ".github" / "workflows" / "docker-publish.yml").read_text(encoding="utf-8")
 
-    rust_marker = re.search(r"^FROM [^\n]+ AS rust-app-candidate$", dockerfile, re.MULTILINE)
     app_marker = re.search(r"^FROM [^\n]+ AS app$", dockerfile, re.MULTILINE)
-    assert rust_marker is not None
     assert app_marker is not None
-    assert rust_marker.start() < app_marker.start()
-    rust_stage = dockerfile[rust_marker.start() : app_marker.start()]
     app_stage = dockerfile[app_marker.start() :]
     assert " AS rust-build" in dockerfile
     assert "COPY rust/Cargo.toml rust/Cargo.lock ./" in dockerfile
@@ -157,9 +153,9 @@ def test_container_keeps_python_app_and_isolates_rust_candidate_until_parity_zer
     assert (
         "COPY --from=rust-build /app/rust/target/release/chatgpt2api-rust "
         "/usr/local/bin/chatgpt2api-rust"
-    ) in rust_stage
-    assert "COPY --from=web-build /app/web/out ./web_dist" in rust_stage
-    assert 'CMD ["/usr/local/bin/chatgpt2api-rust"]' in rust_stage
+    ) in app_stage
+    assert "COPY --from=web-build /app/web/out ./web_dist" in app_stage
+    assert 'CMD ["/usr/local/bin/chatgpt2api-rust"]' in app_stage
     for forbidden_runtime in (
         "python:",
         "pip install",
@@ -174,14 +170,12 @@ def test_container_keeps_python_app_and_isolates_rust_candidate_until_parity_zer
         "uvicorn",
         "main:app",
     ):
-        assert forbidden_runtime not in rust_stage
+        assert forbidden_runtime not in app_stage
 
-    assert "FROM --platform=$TARGETPLATFORM python:3.13-slim AS app" in app_stage
-    assert "uv sync --frozen --no-dev --no-install-project" in app_stage
-    assert 'CMD ["uv", "run", "--no-sync", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--no-access-log"]' in app_stage
+    assert "FROM --platform=$TARGETPLATFORM python:3.13-slim AS app" not in dockerfile
+    assert "COPY config.json" not in dockerfile
     docker_job = workflow.split("\n  docker:\n", 1)[1]
     assert "target: app" in docker_job
-    assert "target: rust-app-candidate" not in docker_job
 
 
 def test_container_carries_the_pinned_codex_client_version() -> None:
