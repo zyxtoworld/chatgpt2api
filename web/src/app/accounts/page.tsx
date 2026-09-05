@@ -1277,6 +1277,8 @@ function AccountsPageContent() {
                             </span>
                             <button
                               type="button"
+                              aria-label="复制 token"
+                              title="复制 token"
                               className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => {
                                 void copyText(account.access_token, "token 已复制");

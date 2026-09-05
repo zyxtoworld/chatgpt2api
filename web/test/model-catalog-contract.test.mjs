@@ -34,6 +34,19 @@ test("invalid model responses fail closed so the caller can retain its last good
   assert.deepEqual(previous, [{ id: "last-good-model" }]);
 });
 
+test("upstream model entries may carry optional fields without a local static catalog", () => {
+  const upstream = {
+    object: "list",
+    data: [
+      { id: "gpt-image-2", object: "model" },
+      { id: "gpt-5-3-mini", object: "model", supported_reasoning_efforts: ["low", "high"] },
+    ],
+  };
+
+  assert.deepEqual(parseModelList(upstream), upstream.data);
+  assert.doesNotMatch(accountsSource, /gpt-image-2|gpt-5-3-mini/);
+});
+
 test("the account directory uses the authenticated non-paginated upstream model endpoint", () => {
   assert.match(apiSource, /httpRequest<ModelListResponse>\("\/v1\/models", \{ signal \}\)/);
   assert.match(requestSource, /headers\.Authorization = `Bearer \$\{authKey\}`/);
