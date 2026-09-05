@@ -527,6 +527,22 @@ class ImportJobConcurrencyContractTests(unittest.TestCase):
             self.assertEqual(current["job_id"], "job-b")
             self.assertEqual(current["status"], "pending")
 
+    def test_ccload_job_current_fails_closed_on_secure_snapshot_change(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = ccload_module.CCLoadConfig(Path(temp_dir) / "ccload.json")
+            service = ccload_module.CCLoadImportService(config)
+
+            for error in (
+                OSError("file changed during secure open"),
+                ccload_module.StorageDataError(),
+            ):
+                with self.subTest(error=type(error).__name__), mock.patch.object(
+                    config,
+                    "get_import_job",
+                    side_effect=error,
+                ):
+                    self.assertFalse(service._job_is_current("server-a", "job-a"))
+
     def test_cpa_cross_instance_cas_rejects_late_job_overwrite(self) -> None:
         with TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "cpa.json"

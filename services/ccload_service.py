@@ -992,7 +992,12 @@ class CCLoadImportService:
         return False
 
     def _job_is_current(self, server_id: str, expected_job_id: str) -> bool:
-        current = self._config.get_import_job(server_id)
+        try:
+            current = self._config.get_import_job(server_id)
+        except (OSError, StorageDataError):
+            # A concurrent atomic replacement or invalid snapshot means the
+            # worker cannot prove ownership; cancel it without touching data.
+            return False
         return current is not None and current.get("job_id") == expected_job_id
 
     def _run_import(self, server_id: str, server: dict, channel_ids: list[str]) -> None:
