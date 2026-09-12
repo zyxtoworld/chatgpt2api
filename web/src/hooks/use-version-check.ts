@@ -4,12 +4,7 @@ import { useCallback, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import webConfig from "@/constants/common-env";
-import { parseChangelog, type ReleaseInfo } from "@/lib/release";
-
-const latestVersionUrl =
-  "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/VERSION";
-const latestChangelogUrl =
-  "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/CHANGELOG.md";
+import type { ReleaseInfo } from "@/lib/release";
 
 function readLocalReleases(): ReleaseInfo[] {
   return JSON.parse(process.env.NEXT_PUBLIC_APP_RELEASES || "[]");
@@ -44,18 +39,9 @@ export function useVersionCheck() {
     async (showMessage = false) => {
       setChecking(true);
       try {
-        const [versionResponse, changelogResponse] = await Promise.all([
-          fetch(latestVersionUrl),
-          fetch(latestChangelogUrl),
-        ]);
-        if (!versionResponse.ok || !changelogResponse.ok) throw new Error();
-        const [version, changelog] = await Promise.all([
-          versionResponse.text(),
-          changelogResponse.text(),
-        ]);
-        setLatestVersion(version.trim() || currentVersion);
-        if (changelog.trim()) setReleases(parseChangelog(changelog));
-        if (showMessage) toast.success("已获取最新版本信息");
+        setLatestVersion(currentVersion);
+        setReleases(localReleases);
+        if (showMessage) toast.success("已刷新本地版本说明");
       } catch {
         setLatestVersion(currentVersion);
         setReleases(localReleases);

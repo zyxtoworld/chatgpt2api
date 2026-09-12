@@ -2,20 +2,47 @@ name: Publish Docker Image
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 env:
   IMAGE_NAME: chatgpt2api
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile backend
+        run: python -m compileall -q api services utils main.py scripts/init_proxy_config.py
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build web frontend
+        working-directory: web
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+
   docker:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +68,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+            type=ref,event=branch
             type=ref,event=tag
             type=sha
             type=semver,pattern={{version}}

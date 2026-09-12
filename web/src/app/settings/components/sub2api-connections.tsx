@@ -600,7 +600,7 @@ export function Sub2APIConnections() {
                   <Input
                     value={formEmail}
                     onChange={(event) => setFormEmail(event.target.value)}
-                    placeholder="admin@example.com"
+                    placeholder="account-name"
                     className="h-11 rounded-xl border-stone-200 bg-white"
                   />
                 </div>

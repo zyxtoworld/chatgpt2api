@@ -809,7 +809,7 @@ function AccountsPageContent() {
                 <Input
                   value={editProxy}
                   onChange={(event) => setEditProxy(event.target.value)}
-                  placeholder="留空走全局代理，例如 http://127.0.0.1:7890"
+                  placeholder="留空走全局代理，例如 http://proxy.example.invalid:port"
                   className="h-11 rounded-xl border-stone-200 bg-white"
                 />
                 <Button

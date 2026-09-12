@@ -384,7 +384,7 @@ export function UserKeysCard() {
               <Input
                 value={editKey}
                 onChange={(event) => setEditKey(event.target.value)}
-                placeholder="例如：sk-your-custom-user-key"
+                placeholder="例如：custom-user-key"
                 className="h-11 rounded-xl border-stone-200 bg-white font-mono"
               />
               <p className="text-xs leading-5 text-stone-500">

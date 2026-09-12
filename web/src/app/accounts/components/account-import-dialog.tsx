@@ -566,7 +566,7 @@ export function AccountImportDialog({ disabled, onImported }: AccountImportDialo
             <label className="text-sm font-medium text-stone-700">邮箱（可选预填）</label>
             <input
               type="email"
-              placeholder="you@example.com"
+              placeholder="account-name"
               value={oauthEmailHint}
               onChange={(event) => setOauthEmailHint(event.target.value)}
               disabled={Boolean(oauthSession) || oauthStarting}

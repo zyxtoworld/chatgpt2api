@@ -45,12 +45,12 @@ class GitStorageBackend(StorageBackend):
         if not token:
             return repo_url
         
-        # 支持 HTTPS 格式：https://github.com/user/repo.git
+        # 支持 HTTPS 格式：https://host.example/repository.git
         if repo_url.startswith("https://"):
             # 插入 token
             return repo_url.replace("https://", f"https://{token}@")
         
-        # 支持 git@ 格式：git@github.com:user/repo.git
+        # 支持 git@ 格式：git@host.example:repository.git
         # 转换为 HTTPS 格式
         if repo_url.startswith("git@"):
             repo_url = repo_url.replace("git@", "https://")

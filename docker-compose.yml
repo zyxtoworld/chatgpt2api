@@ -1,6 +1,9 @@
 services:
   app:
-    image: ghcr.io/basketikun/chatgpt2api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${CHATGPT2API_IMAGE:-chatgpt2api:latest}
     container_name: chatgpt2api
     restart: unless-stopped
     ports:
@@ -17,8 +20,8 @@ services:
       # - DATABASE_URL=sqlite:///app/data/accounts.db
       
       # Git 仓库配置 (当 STORAGE_BACKEND=git 时使用)
-      # - GIT_REPO_URL=https://github.com/user/repo.git
-      # - GIT_TOKEN=ghp_xxxxxxxxxxxx
+      # - GIT_REPO_URL=https://example.invalid/private-repository.git
+      # - GIT_TOKEN=replace-with-a-secret
       # - GIT_BRANCH=main
       # - GIT_FILE_PATH=accounts.json
       

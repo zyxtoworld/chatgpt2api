@@ -1,14 +1,19 @@
-.git
-.gitignore
-.idea
-.venv
-__pycache__
-*.pyc
-*.pyo
-*.pyd
+# Local files and secrets
+.git/
+.codex/
+.local/
+.reasonix/
+superpowers/
+data/
+config.json
+.env
 
-web/.next
-web/node_modules
-
-assets
-README.md
+# Python and frontend build state
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+web/node_modules/
+web/.next/
+web/out/
+web/tsconfig.tsbuildinfo

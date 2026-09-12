@@ -1,35 +1,35 @@
-# Python-generated files
+# Python and build artifacts
 __pycache__/
-*.py[oc]
+*.py[cod]
 build/
 dist/
 wheels/
-*.egg-info
-web_dist
-# Virtual environments
-.venv
-.idea
-data
+*.egg-info/
+.venv/
+.uv/
+.idea/
+
+# Local runtime state and secrets
+data/
 config.json
-edit
-
-docker-compose-local.yml
-
-.claude/settings.local.json
-
-# Environment variables
 .env
-.env.local
-
-# Database files
+.env.*
+!.env.example
 *.db
 *.sqlite
 *.sqlite3
+*.log
 
-# Git cache
+# Local tools and generated workspaces
+.codex/
+.local/
+.reasonix/
+superpowers/
 git_cache/
 
-# 调试/测试输出目录
-loginwithpassword_*/
-logwithemailverifycode_*/
-test_batch_output/
+# Frontend build state
+web/node_modules/
+web/.next/
+web/out/
+web/tsconfig.tsbuildinfo
+web/next-env.d.ts
