@@ -1,0 +1,9 @@
+{
+  "max_bytes": 16777216,
+  "max_records": 10000,
+  "max_depth": 16,
+  "max_nodes": 262144,
+  "max_object_fields": 128,
+  "max_key_bytes": 256,
+  "max_string_bytes": 16384
+}
