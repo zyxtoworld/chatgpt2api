@@ -1,19 +1,23 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Menu } from "lucide-react";
 import { usePathname, useRouter } from "next/navigation";
 
 import { HeaderActions } from "@/components/header-actions";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Sheet, SheetClose, SheetContent, SheetFooter, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
+import { Sheet, SheetClose, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import webConfig from "@/constants/common-env";
 import { fetchThirdPartyApps, type ThirdPartyAppsSettings } from "@/lib/api";
 import { getValidatedAuthSession } from "@/lib/auth-session";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { runLogoutAfterClear } from "@/lib/logout-action";
+import { buildThirdPartyHref, formatThirdPartyDisplayHref } from "@/lib/third-party-url";
 import { cn } from "@/lib/utils";
 import { clearStoredAuthSession, type StoredAuthSession } from "@/store/auth";
+import { toast } from "sonner";
 
 const adminNavItems = [
   { href: "/image", label: "生图" },
@@ -26,31 +30,27 @@ const adminNavItems = [
 
 const userNavItems = [{ href: "/image", label: "画图" }];
 
-function buildThirdPartyHref(appUrl: string, baseUrl: string, apiKey: string) {
-  const url = appUrl.trim();
-  try {
-    const target = new URL(url);
-    target.searchParams.set("apiKey", apiKey);
-    target.searchParams.set("baseUrl", baseUrl);
-    return target.toString();
-  } catch {
-    return `${url}${url.includes("?") ? "&" : "?"}apiKey=${encodeURIComponent(apiKey)}&baseUrl=${encodeURIComponent(baseUrl)}`;
-  }
-}
-
 export function TopNav() {
   const pathname = usePathname();
   const router = useRouter();
   const [session, setSession] = useState<StoredAuthSession | null | undefined>(undefined);
-  const [thirdPartyApps, setThirdPartyApps] = useState<ThirdPartyAppsSettings | null>(null);
+  const [thirdPartyState, setThirdPartyState] = useState<{
+    owner: StoredAuthSession;
+    apps: ThirdPartyAppsSettings;
+  } | null>(null);
   const [isCanvasDialogOpen, setIsCanvasDialogOpen] = useState(false);
+  const authSessionOwnerRef = useRef(createLatestActionOwner());
+  const thirdPartyOwnerRef = useRef(createLatestActionOwner());
+  const thirdPartyAbortControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    let active = true;
+    const authSessionOwner = authSessionOwnerRef.current;
+    authSessionOwner.activate();
+    const requestOwner = authSessionOwner.begin(pathname);
 
     const load = async () => {
       if (pathname === "/login") {
-        if (!active) {
+        if (!authSessionOwner.accepts(requestOwner, pathname)) {
           return;
         }
         setSession(null);
@@ -58,7 +58,7 @@ export function TopNav() {
       }
 
       const storedSession = await getValidatedAuthSession();
-      if (!active) {
+      if (!authSessionOwner.accepts(requestOwner, pathname)) {
         return;
       }
       setSession(storedSession);
@@ -66,25 +66,34 @@ export function TopNav() {
 
     void load();
     return () => {
-      active = false;
+      authSessionOwner.invalidate();
     };
   }, [pathname]);
 
   useEffect(() => {
     if (!session) {
-      setThirdPartyApps(null);
       return;
     }
-    let active = true;
+    const owner = session;
+    const thirdPartyOwner = thirdPartyOwnerRef.current;
+    thirdPartyOwner.activate();
     const load = async () => {
+      const requestOwner = thirdPartyOwner.begin(owner);
+      thirdPartyAbortControllerRef.current?.abort();
+      const abortController = new AbortController();
+      thirdPartyAbortControllerRef.current = abortController;
       try {
-        const data = await fetchThirdPartyApps();
-        if (active) {
-          setThirdPartyApps(data.third_party_apps);
+        const data = await fetchThirdPartyApps(abortController.signal);
+        if (thirdPartyOwner.accepts(requestOwner, owner)) {
+          setThirdPartyState({ owner, apps: data.third_party_apps });
         }
       } catch {
-        if (active) {
-          setThirdPartyApps(null);
+        if (thirdPartyOwner.accepts(requestOwner, owner)) {
+          setThirdPartyState((current) => current?.owner === owner ? null : current);
+        }
+      } finally {
+        if (thirdPartyAbortControllerRef.current === abortController) {
+          thirdPartyAbortControllerRef.current = null;
         }
       }
     };
@@ -93,14 +102,23 @@ export function TopNav() {
     void load();
     window.addEventListener("third-party-apps-updated", reload);
     return () => {
-      active = false;
+      thirdPartyOwner.cancel();
+      thirdPartyAbortControllerRef.current?.abort();
+      thirdPartyAbortControllerRef.current = null;
       window.removeEventListener("third-party-apps-updated", reload);
     };
   }, [session]);
 
   const handleLogout = async () => {
-    await clearStoredAuthSession();
-    router.replace("/login");
+    authSessionOwnerRef.current.invalidate();
+    await runLogoutAfterClear({
+      clearSession: clearStoredAuthSession,
+      onSuccess: () => {
+        setThirdPartyState(null);
+        router.replace("/login");
+      },
+      onFailure: () => toast.error("退出登录失败，请重试"),
+    });
   };
 
   if (pathname === "/login" || session === undefined || !session) {
@@ -111,9 +129,11 @@ export function TopNav() {
   const roleLabel = session.role === "admin" ? "管理员" : "普通用户";
   const displayName = session.name.trim() || roleLabel;
   const baseUrl = webConfig.apiUrl.replace(/\/$/, "") || window.location.origin;
+  const thirdPartyApps = thirdPartyState?.owner === session ? thirdPartyState.apps : null;
   const canvas = thirdPartyApps?.infinite_canvas;
-  const canvasHref = canvas?.enabled && canvas.url.trim() ? buildThirdPartyHref(canvas.url, baseUrl, session.key) : "";
-  const canvasDisplayHref = canvasHref ? decodeURIComponent(canvasHref) : "";
+  const canvasUrl = canvas && typeof canvas.url === "string" ? canvas.url.trim() : "";
+  const canvasHref = canvas?.enabled === true && canvasUrl ? buildThirdPartyHref(canvasUrl, baseUrl) : "";
+  const canvasDisplayHref = canvasHref ? formatThirdPartyDisplayHref(canvasHref) : "";
 
   const handleCanvasOpen = () => {
     if (!canvasHref) {
@@ -132,17 +152,19 @@ export function TopNav() {
   return (
     <>
       <header className="border-b border-stone-100/50 dark:border-white/10">
-        <div className="flex min-h-12 flex-col gap-1 px-3 py-2 sm:h-12 sm:flex-row sm:items-center sm:justify-between sm:gap-3 sm:px-6 sm:py-0">
-          <div className="flex items-center justify-between gap-2 sm:justify-start sm:gap-3">
+        <div className="flex min-h-12 flex-col gap-1 px-3 py-2 lg:h-12 lg:flex-row lg:items-center lg:justify-between lg:gap-3 lg:px-6 lg:py-0">
+          <div className="flex items-center justify-between gap-2 lg:justify-start lg:gap-3">
             <Sheet>
-              <SheetTrigger className="inline-flex size-8 items-center justify-center text-stone-700 transition hover:text-stone-950 sm:hidden dark:text-stone-200 dark:hover:text-white">
+              <SheetTrigger className="inline-flex size-8 items-center justify-center text-stone-700 transition hover:text-stone-950 lg:hidden dark:text-stone-200 dark:hover:text-white">
                 <Menu className="size-4" />
                 <span className="sr-only">打开导航</span>
               </SheetTrigger>
               <SheetContent side="left">
                 <SheetHeader>
                   <SheetTitle>chatgpt2api</SheetTitle>
-                  <span className="text-xs text-stone-500 dark:text-stone-400">{roleLabel} · {displayName}</span>
+                  <SheetDescription className="text-xs text-stone-500 dark:text-stone-400">
+                    {roleLabel} · {displayName}
+                  </SheetDescription>
                 </SheetHeader>
                 <nav className="mt-8 flex flex-col gap-1">
                   {canvasHref ? (
@@ -186,14 +208,14 @@ export function TopNav() {
             >
               chatgpt2api
             </Link>
-            <HeaderActions className="ml-auto sm:hidden" />
+            <HeaderActions className="ml-auto lg:hidden" showGithubText={false} />
           </div>
-          <nav className="hide-scrollbar -mx-1 hidden min-w-0 flex-1 gap-1 overflow-x-auto px-1 sm:mx-0 sm:flex sm:justify-center sm:gap-8 sm:overflow-visible sm:px-0">
+          <nav className="hide-scrollbar -mx-1 hidden min-w-0 flex-1 gap-1 overflow-x-auto px-1 lg:mx-0 lg:flex lg:justify-center lg:gap-8 lg:overflow-visible lg:px-0">
             {canvasHref ? (
               <button
                 type="button"
                 onClick={handleCanvasOpen}
-                className="relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium text-stone-500 transition hover:text-stone-900 sm:rounded-none sm:px-0 sm:text-[15px] dark:text-stone-400 dark:hover:text-stone-100"
+                className="relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium text-stone-500 transition hover:text-stone-900 lg:rounded-none lg:px-0 lg:text-[15px] dark:text-stone-400 dark:hover:text-stone-100"
               >
                 无限画布
               </button>
@@ -205,26 +227,26 @@ export function TopNav() {
                   key={item.href}
                   href={item.href}
                   className={cn(
-                    "relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium transition sm:rounded-none sm:px-0 sm:text-[15px]",
+                    "relative shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-[13px] font-medium transition lg:rounded-none lg:px-0 lg:text-[15px]",
                     active
-                      ? "bg-stone-950 text-white sm:bg-transparent sm:font-semibold sm:text-stone-950 dark:bg-white dark:text-stone-950 dark:sm:bg-transparent dark:sm:text-white"
+                      ? "bg-stone-950 text-white lg:bg-transparent lg:font-semibold lg:text-stone-950 dark:bg-white dark:text-stone-950 dark:lg:bg-transparent dark:lg:text-white"
                       : "text-stone-500 hover:text-stone-900 dark:text-stone-400 dark:hover:text-stone-100",
                   )}
                 >
                   {item.label}
-                  {active ? <span className="absolute inset-x-0 -bottom-[1px] hidden h-0.5 bg-stone-950 dark:bg-white sm:block" /> : null}
+                  {active ? <span className="absolute inset-x-0 -bottom-[1px] hidden h-0.5 bg-stone-950 dark:bg-white lg:block" /> : null}
                 </Link>
               );
             })}
           </nav>
-          <div className="hidden items-center justify-end gap-2 sm:flex sm:gap-3">
+          <div className="hidden items-center justify-end gap-2 lg:flex lg:gap-3">
             <HeaderActions />
-            <span className="hidden rounded-md bg-stone-100 px-2 py-1 text-[10px] font-medium text-stone-500 dark:bg-white/8 dark:text-stone-300 sm:inline-block sm:text-[11px]">
+            <span className="hidden rounded-md bg-stone-100 px-2 py-1 text-[10px] font-medium text-stone-500 dark:bg-white/8 dark:text-stone-300 lg:inline-block lg:text-[11px]">
               {roleLabel} · {displayName}
             </span>
             <button
               type="button"
-              className="py-1 text-xs text-stone-400 transition hover:text-stone-700 dark:text-stone-500 dark:hover:text-stone-200 sm:text-sm"
+              className="py-1 text-xs text-stone-400 transition hover:text-stone-700 dark:text-stone-500 dark:hover:text-stone-200 lg:text-sm"
               onClick={() => void handleLogout()}
             >
               退出
@@ -237,7 +259,7 @@ export function TopNav() {
           <DialogHeader className="gap-2">
             <DialogTitle>跳转到三方应用</DialogTitle>
             <DialogDescription className="text-sm leading-6">
-              该入口仅供个人测试使用，建议自行本机部署后再长期使用。跳转地址会默认带上本项目地址和当前密钥，用于自动填充连接信息；如果不放心，可以取消后手动前往应用并自行输入。
+              该入口仅供个人测试使用，建议自行本机部署后再长期使用。跳转地址只会带上本项目地址；请在三方应用内手工输入独立 API key。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">

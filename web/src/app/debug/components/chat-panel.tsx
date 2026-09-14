@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ImagePlus, LoaderCircle, Send, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { createChatPanelRequestGate } from "@/lib/chat-panel-request-gate";
 import { httpRequest } from "@/lib/request";
 
 import { pretty, type ChatCompletionResponse, type ChatContentPart, type ChatMessage } from "./types";
@@ -70,6 +71,9 @@ function messageImages(message: ChatMessage): string[] {
 }
 
 export function ChatPanel() {
+  const chatRequestGateRef = useRef(createChatPanelRequestGate());
+  const chatAbortControllerRef = useRef<AbortController | null>(null);
+  const pendingImageReadsRef = useRef(0);
   const [model, setModel] = useState("auto");
   const [reasoningEffort, setReasoningEffort] = useState("");
   const [input, setInput] = useState("你好，先记住我的项目叫 chatgpt2api。");
@@ -77,22 +81,55 @@ export function ChatPanel() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [raw, setRaw] = useState<ChatCompletionResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [pendingImageReads, setPendingImageReads] = useState(0);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    const requestGate = chatRequestGateRef.current;
+    requestGate.activate();
+    return () => {
+      requestGate.cancel();
+      chatAbortControllerRef.current?.abort();
+      chatAbortControllerRef.current = null;
+    };
+  }, []);
 
   const handleImagesChange = async (files: FileList | null) => {
     if (!files?.length) return;
+    const requestGate = chatRequestGateRef.current;
+    const readOwner = requestGate.beginImageRead();
+    pendingImageReadsRef.current += 1;
+    setPendingImageReads(pendingImageReadsRef.current);
     setError("");
     try {
       const images = await Promise.all(Array.from(files).map(readImage));
-      setSelectedImages((current) => [...current, ...images].slice(0, 4));
+      if (requestGate.acceptsImageRead(readOwner)) {
+        setSelectedImages((current) => [...current, ...images].slice(0, 4));
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestGate.acceptsImageRead(readOwner)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (requestGate.acceptsImageRead(readOwner)) {
+        pendingImageReadsRef.current = Math.max(0, pendingImageReadsRef.current - 1);
+        setPendingImageReads(pendingImageReadsRef.current);
+      }
     }
   };
 
   const sendChat = async () => {
+    if (pendingImageReads > 0) {
+      setError("请等待图片读取完成");
+      return;
+    }
     const text = input.trim();
     if (!text && !selectedImages.length) return;
+    const requestGate = chatRequestGateRef.current;
+    const requestOwner = requestGate.beginChat();
+    chatAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    chatAbortControllerRef.current = abortController;
     const content: string | ChatContentPart[] = selectedImages.length
       ? [
           ...(text ? [{ type: "text" as const, text }] : []),
@@ -111,21 +148,37 @@ export function ChatPanel() {
         messages: nextMessages,
         ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
       };
-      const result = await httpRequest<ChatCompletionResponse>("/v1/chat/completions", { method: "POST", body });
-      setRaw(result);
-      setMessages([...nextMessages, { role: "assistant", content: String(result.choices?.[0]?.message?.content || "") }]);
+      const result = await httpRequest<ChatCompletionResponse>("/v1/chat/completions", { method: "POST", body, signal: abortController.signal });
+      if (requestGate.acceptsChat(requestOwner)) {
+        setRaw(result);
+        setMessages([...nextMessages, { role: "assistant", content: String(result.choices?.[0]?.message?.content || "") }]);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestGate.acceptsChat(requestOwner)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setLoading(false);
+      if (requestGate.acceptsChat(requestOwner)) {
+        setLoading(false);
+      }
+      if (chatAbortControllerRef.current === abortController) {
+        chatAbortControllerRef.current = null;
+      }
     }
   };
 
   const clearChat = () => {
+    const requestGate = chatRequestGateRef.current;
+    requestGate.clear();
+    chatAbortControllerRef.current?.abort();
+    chatAbortControllerRef.current = null;
+    pendingImageReadsRef.current = 0;
+    setPendingImageReads(0);
     setMessages([]);
     setSelectedImages([]);
     setRaw(null);
     setError("");
+    setLoading(false);
   };
 
   return (
@@ -185,7 +238,7 @@ export function ChatPanel() {
             ) : null}
           </div>
           <div className="flex gap-2">
-            <Button size="sm" onClick={() => void sendChat()} disabled={loading || (!input.trim() && !selectedImages.length)}>
+            <Button size="sm" onClick={() => void sendChat()} disabled={loading || pendingImageReads > 0 || (!input.trim() && !selectedImages.length)}>
               {loading ? <LoaderCircle className="animate-spin" /> : <Send />}
               发送
             </Button>

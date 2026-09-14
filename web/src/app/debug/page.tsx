@@ -32,13 +32,15 @@ export default function DebugPage() {
 
   return (
     <Tabs defaultValue="skills" className="mx-auto flex min-h-[calc(100vh-49px)] w-full max-w-[1600px] flex-col gap-4 px-4 pt-3 pb-6 md:px-8">
-      <TabsList variant="line" className="w-full">
-        {tabs.map(({ value, title }) => (
-          <TabsTrigger key={value} value={value}>
-            {title}
-          </TabsTrigger>
-        ))}
-      </TabsList>
+      <div className="hide-scrollbar overflow-x-auto">
+        <TabsList variant="line" className="w-full min-w-max">
+          {tabs.map(({ value, title }) => (
+            <TabsTrigger key={value} value={value} className="px-4">
+              {title}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+      </div>
       <TabsContent value="skills">
         <SkillPanel />
       </TabsContent>

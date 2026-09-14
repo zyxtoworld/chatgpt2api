@@ -4,6 +4,12 @@ import { memo, useEffect, useRef, useState } from "react";
 import { Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { createDownloadAbortRegistry } from "@/lib/download-lifecycle.js";
+import { downloadBlobFile } from "@/lib/download-text.js";
+import { fetchImageAsFile } from "@/lib/image-download.js";
+import { getElapsedSeconds } from "@/lib/elapsed-display";
+import { setImageDimension } from "@/lib/image-dimensions";
+import { getStoredImageSrc, normalizeStoredImageUrl } from "@/lib/stored-image-source";
 import { cn } from "@/lib/utils";
 import type { ImageConversation, ImageTurnStatus, StoredImage, StoredReferenceImage } from "@/store/image-conversations";
 
@@ -28,60 +34,37 @@ type ImageResultsProps = {
   formatConversationTime: (value: string) => string;
 };
 
-// Blob URL 缓存：避免 base64 超长字符串在 DOM 中，改用短小的 blob: URL
-const b64BlobUrlCache = new Map<string, string>();
-
-function getStoredImageSrc(image: StoredImage) {
-  if (image.b64_json) {
-    let url = b64BlobUrlCache.get(image.b64_json);
-    if (!url) {
-      const binary = atob(image.b64_json);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      const blob = new Blob([bytes], { type: "image/png" });
-      url = URL.createObjectURL(blob);
-      b64BlobUrlCache.set(image.b64_json, url);
-    }
-    return url;
-  }
-  return image.url || "";
-}
-
-async function downloadStoredImage(image: StoredImage, index: number) {
+async function downloadStoredImage(image: StoredImage, index: number, signal?: AbortSignal) {
   let blob: Blob | null = null;
   try {
+    if (signal?.aborted) return;
     if (image.b64_json) {
       const binary = atob(image.b64_json);
       const bytes = new Uint8Array(binary.length);
       for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      if (signal?.aborted) return;
       blob = new Blob([bytes], { type: "image/png" });
     } else if (image.url) {
       // 确保 URL 是绝对路径
-      const url = image.url.startsWith("http") ? image.url : `${window.location.origin}${image.url}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      blob = await res.blob();
+      const safeUrl = normalizeStoredImageUrl(image.url);
+      if (!safeUrl) return;
+      const url = safeUrl.startsWith("http") ? safeUrl : `${window.location.origin}${safeUrl}`;
+      blob = await fetchImageAsFile(url, `image-${index + 1}.png`, signal);
     } else {
       return;
     }
   } catch (err) {
+    if (signal?.aborted) return;
     console.error("Failed to download image:", err);
     // 如果 fetch 失败，尝试直接在新窗口打开
-    if (image.url) {
-      window.open(image.url, "_blank");
+    const safeUrl = normalizeStoredImageUrl(image.url);
+    if (safeUrl) {
+      window.open(safeUrl, "_blank", "noopener,noreferrer");
     }
     return;
   }
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `image-${index + 1}.png`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  if (!blob || signal?.aborted) return;
+  downloadBlobFile(blob, `image-${index + 1}.png`);
 }
 
 export function ImageResults({
@@ -97,8 +80,15 @@ export function ImageResults({
   onDismissErrors,
   formatConversationTime,
 }: ImageResultsProps) {
-  const imageDimensionsRef = useRef<Record<string, string>>({});
-  const [currentTime, setCurrentTime] = useState(Date.now());
+  const [imageDimensions, setImageDimensions] = useState<Record<string, string>>({});
+  const [currentTime, setCurrentTime] = useState(0);
+  const downloadOwnerRef = useRef(createDownloadAbortRegistry());
+
+  useEffect(() => {
+    const downloadOwner = downloadOwnerRef.current;
+    downloadOwner.activate();
+    return () => downloadOwner.cancel();
+  }, []);
   
   // 仅在存在 loading 图片时启动定时器，避免空闲时无谓重渲染
   const hasLoadingImages = selectedConversation?.turns.some(
@@ -106,18 +96,18 @@ export function ImageResults({
   );
   useEffect(() => {
     if (!hasLoadingImages) return;
-    const timer = setInterval(() => {
+    const initialTimer = window.setTimeout(() => setCurrentTime(Date.now()), 0);
+    const timer = window.setInterval(() => {
       setCurrentTime(Date.now());
     }, 500);
-    return () => clearInterval(timer);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(timer);
+    };
   }, [hasLoadingImages]);
 
   const updateImageDimensions = (id: string, width: number, height: number) => {
-    const dimensions = formatImageDimensions(width, height);
-    // 使用 ref 存储，不触发 React 重渲染，消除级联重渲染
-    if (imageDimensionsRef.current[id] !== dimensions) {
-      imageDimensionsRef.current[id] = dimensions;
-    }
+    setImageDimensions((current) => setImageDimension(current, id, width, height));
   };
 
   if (!selectedConversation) {
@@ -160,7 +150,7 @@ export function ImageResults({
                   id: image.id,
                   src,
                   sizeLabel: image.b64_json ? formatBase64ImageSize(image.b64_json) : undefined,
-                  dimensions: imageDimensionsRef.current[image.id],
+                  dimensions: imageDimensions[image.id],
                 },
               ]
             : [];
@@ -251,7 +241,7 @@ export function ImageResults({
                       if (image.status === "success" && imageSrc) {
                         const currentIndex = successfulTurnImages.findIndex((item) => item.id === image.id);
                         const sizeLabel = image.b64_json ? formatBase64ImageSize(image.b64_json) : "";
-                        const dimensions = imageDimensionsRef.current[image.id];
+                        const dimensions = imageDimensions[image.id];
                         const imageMeta = [sizeLabel, dimensions].filter(Boolean).join(" · ");
 
                         return (
@@ -293,7 +283,13 @@ export function ImageResults({
                                   variant="outline"
                                   size="sm"
                                   className="h-7 w-7 rounded-full border-stone-200 bg-white px-0 text-[10px] text-stone-700 hover:bg-stone-50 sm:h-8 sm:w-fit sm:px-3 sm:text-xs"
-                                  onClick={() => void downloadStoredImage(image, index)}
+                                      onClick={() => {
+                                        const downloadOwner = downloadOwnerRef.current;
+                                        const controller = downloadOwner.begin();
+                                        void downloadStoredImage(image, index, controller.signal).finally(() => {
+                                          downloadOwner.finish(controller);
+                                        });
+                                      }}
                                   aria-label="下载"
                                 >
                                   <Download className="size-3 sm:size-4" />
@@ -359,9 +355,7 @@ export function ImageResults({
                       const showElapsed = imageTaskStatus === "running" && image.elapsedSecs != null;
                       const elapsedDisplay = showElapsed
                         ? formatElapsed(
-                            image.elapsedUpdatedAt != null
-                              ? image.elapsedSecs! + (currentTime - image.elapsedUpdatedAt!) / 1000
-                              : image.elapsedSecs!,
+                            getElapsedSeconds(image.elapsedSecs!, image.elapsedUpdatedAt, currentTime),
                           )
                         : null;
                       return (
@@ -481,27 +475,18 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
-const base64SizeCache = new Map<string, string>();
 function formatBase64ImageSize(base64: string) {
-  let cached = base64SizeCache.get(base64);
-  if (cached !== undefined) return cached;
   const normalized = base64.replace(/\s/g, "");
   const padding = normalized.endsWith("==") ? 2 : normalized.endsWith("=") ? 1 : 0;
   const bytes = Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
 
   if (bytes >= 1024 * 1024) {
-    cached = `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-  } else if (bytes >= 1024) {
-    cached = `${(bytes / 1024).toFixed(1)} KB`;
-  } else {
-    cached = `${bytes} B`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   }
-  base64SizeCache.set(base64, cached);
-  return cached;
-}
-
-function formatImageDimensions(width: number, height: number) {
-  return `${width} x ${height}`;
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KB`;
+  }
+  return `${bytes} B`;
 }
 
 const LazyImage = memo(function LazyImage({ src, alt, className, onLoad, onOpen }: {

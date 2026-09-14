@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { AlertCircle, CheckCircle2, Clock3, FileArchive, FileText, History, ImagePlus, LoaderCircle, Pencil, Play, Plus, RefreshCw, Trash2, XCircle } from "lucide-react";
 
@@ -9,7 +9,15 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { formatElapsedSeconds, getElapsedSeconds } from "@/lib/elapsed-display";
+import { filenameFromUrl } from "@/lib/file-display";
+import { createLifecycleActionOwner, observeLifecycleAction } from "@/lib/lifecycle-action-owner";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { mergeDeletedEditableFileIds, resolveDeletedEditableFileIds } from "@/lib/editable-file-history-state";
+import { createEditableTaskPollingLifecycle } from "@/lib/editable-task-polling";
 import { httpRequest } from "@/lib/request";
+import { createLinkedAbortController } from "@/lib/serial-poll";
+import { commitSynchronousSnapshot } from "@/lib/synchronous-snapshot";
 import { cn } from "@/lib/utils";
 import {
   listDeletedEditableFileIds,
@@ -35,7 +43,6 @@ const taskIdOf = (task: EditableFileTask | null | undefined) => task?.taskId || 
 const isRunning = (task: EditableFileTask | null | undefined) => task?.status === "queued" || task?.status === "running";
 const statusText = (status: string) => ({ queued: "排队中", running: "生成中", success: "已完成", error: "失败" }[status] || status);
 const statusClass = (status: string) => status === "success" ? "border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/20 dark:text-emerald-300" : status === "error" ? "border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/20 dark:text-rose-300" : "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/20 dark:text-amber-300";
-const formatElapsed = (seconds: number) => `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 const titleOfPrompt = (prompt: string, fallback: string) => prompt.trim().replace(/\s+/g, " ").slice(0, 24) || fallback;
 const createClientTaskId = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
@@ -64,14 +71,6 @@ const removeTasks = (current: EditableFileTask[], ids: string[]) => {
   return missing.size ? current.filter((task) => !missing.has(taskIdOf(task))) : current;
 };
 
-const fileNameOf = (url: string) => {
-  try {
-    return decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
-  } catch {
-    return decodeURIComponent(url.split("/").pop() || "");
-  }
-};
-
 function ResultFile({ href, icon, label }: { href?: string; icon: ReactNode; label: string }) {
   if (!href) return null;
   return (
@@ -81,7 +80,7 @@ function ResultFile({ href, icon, label }: { href?: string; icon: ReactNode; lab
       </div>
       <div className="min-w-0 flex-1">
         <div className="text-sm font-semibold text-stone-950 dark:text-stone-50">{label}</div>
-        <div className="truncate text-xs text-stone-500 dark:text-stone-400">{fileNameOf(href)}</div>
+        <div className="truncate text-xs text-stone-500 dark:text-stone-400">{filenameFromUrl(href)}</div>
       </div>
       <Button size="sm" asChild>
         <a href={href} target="_blank" rel="noreferrer">下载</a>
@@ -93,96 +92,249 @@ function ResultFile({ href, icon, label }: { href?: string; icon: ReactNode; lab
 export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageRequired }: Props) {
   const [prompt, setPrompt] = useState(defaultPrompt);
   const [images, setImages] = useState<string[]>([]);
+  const [pendingImageReads, setPendingImageReads] = useState(0);
   const [tasks, setTasks] = useState<EditableFileTask[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState("");
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, EditableFileDraft>>({});
   const [deletedIds, setDeletedIds] = useState<Set<string>>(new Set());
   const [renamingId, setRenamingId] = useState("");
   const [renamingTitle, setRenamingTitle] = useState("");
   const [deleteConfirm, setDeleteConfirm] = useState<{ type: "one"; id: string } | { type: "all"; ids: string[] } | null>(null);
+  const mountedRef = useRef(false);
+  const taskFetchRequestRef = useRef(0);
+  const submitOwnerRef = useRef(createLatestActionOwner());
+  const imageReadOwnerRef = useRef(createLifecycleActionOwner());
+  const historyPersistenceOwnerRef = useRef(createLifecycleActionOwner());
+  const taskFetchAbortControllerRef = useRef<AbortController | null>(null);
+  const taskPollingLifecycleRef = useRef<{ replace: (ids: string[]) => void; dispose: () => void } | null>(null);
+  const pendingImageReadsRef = useRef(0);
+  const draftsRef = useRef<Record<string, EditableFileDraft>>({});
+  const deletedIdsRef = useRef<Set<string>>(new Set());
   const visibleTasks = useMemo(() => tasks.filter((task) => task.kind === kind && !deletedIds.has(taskIdOf(task))).slice(0, MAX_HISTORY), [deletedIds, kind, tasks]);
   const selectedTask = selectedId === DRAFT_ID ? null : visibleTasks.find((task) => taskIdOf(task) === selectedId) || visibleTasks[0] || null;
   const running = visibleTasks.some(isRunning);
   const runningIds = visibleTasks.filter(isRunning).map(taskIdOf).join(",");
+  const selectedDraft = selectedId ? drafts[selectedId] : undefined;
+  const selectedPromptPreview = selectedId ? visibleTasks.find((task) => taskIdOf(task) === selectedId)?.prompt_preview : undefined;
+
+  const commitDrafts = useCallback((next: Record<string, EditableFileDraft> | ((current: Record<string, EditableFileDraft>) => Record<string, EditableFileDraft>)) => {
+    const resolved = commitSynchronousSnapshot(draftsRef, next);
+    setDrafts(resolved);
+    return resolved;
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    const submitOwner = submitOwnerRef.current;
+    const imageReadOwner = imageReadOwnerRef.current;
+    const historyPersistenceOwner = historyPersistenceOwnerRef.current;
+    submitOwner.activate();
+    imageReadOwner.activate();
+    historyPersistenceOwner.activate();
+    return () => {
+      mountedRef.current = false;
+      submitOwner.cancel();
+      imageReadOwner.cancel();
+      historyPersistenceOwner.cancel();
+      taskPollingLifecycleRef.current?.dispose();
+      taskPollingLifecycleRef.current = null;
+      taskFetchAbortControllerRef.current?.abort();
+      taskFetchAbortControllerRef.current = null;
+    };
+  }, []);
 
   const elapsedOf = (task: EditableFileTask | null | undefined) => {
     if (!task) return 0;
     const base = Math.max(0, Number(task.elapsed_seconds || 0));
-    return Math.max(0, isRunning(task) && task.polled_at ? base + Math.floor((now - task.polled_at) / 1000) : base);
+    return isRunning(task) ? getElapsedSeconds(base, task.polled_at, now) : base;
   };
 
-  const fetchTasks = useCallback(async (ids: string[] = []) => {
+  const fetchTasks = useCallback(async (ids: string[] = [], parentSignal?: AbortSignal) => {
+    const requestId = ++taskFetchRequestRef.current;
+    taskFetchAbortControllerRef.current?.abort();
+    const { controller: abortController, unlink: unlinkAbortSignal } = createLinkedAbortController(parentSignal);
+    taskFetchAbortControllerRef.current = abortController;
     const taskIds = Array.from(new Set(ids.filter(Boolean))).slice(0, MAX_HISTORY);
     setPolling(true);
     try {
       const path = taskIds.length ? `/v1/editable-file-tasks?ids=${taskIds.map(encodeURIComponent).join(",")}` : "/v1/editable-file-tasks";
-      const result = await httpRequest<{ items: EditableFileTask[]; missing_ids?: string[] }>(path);
+      const result = await httpRequest<{ items: EditableFileTask[]; missing_ids?: string[] }>(path, { signal: abortController.signal });
       const missingIds = result.missing_ids || [];
-      const hidden = await listDeletedEditableFileIds(kind);
+      const { ids: hidden, storageFailed } = await resolveDeletedEditableFileIds(
+        deletedIdsRef.current,
+        () => listDeletedEditableFileIds(kind),
+      );
+      if (requestId !== taskFetchRequestRef.current) return;
+      if (storageFailed) setError("本地历史记录读取失败");
       setTasks((current) => (taskIds.length ? mergeTasks(removeTasks(current, missingIds), result.items || []) : (result.items || [])).filter((task) => !hidden.has(taskIdOf(task))));
       setSelectedId((current) => missingIds.includes(current) ? "" : current);
     } catch (err) {
+      if (requestId !== taskFetchRequestRef.current) return;
+      if (abortController.signal.aborted) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setPolling(false);
+      if (requestId === taskFetchRequestRef.current) setPolling(false);
+      if (taskFetchAbortControllerRef.current === abortController) {
+        taskFetchAbortControllerRef.current = null;
+      }
+      unlinkAbortSignal();
     }
   }, [kind]);
 
   useEffect(() => {
-    void listEditableFileDrafts(kind).then(setDrafts);
-    void listDeletedEditableFileIds(kind).then(setDeletedIds);
-    void fetchTasks();
-  }, [fetchTasks, kind]);
+    const lifecycle = createEditableTaskPollingLifecycle({
+      fetchTasks,
+      onError: () => undefined,
+      onPollingChange: (nextPolling: boolean) => {
+        if (mountedRef.current) setPolling(nextPolling);
+      },
+    });
+    taskPollingLifecycleRef.current = lifecycle;
+    return () => {
+      lifecycle.dispose();
+      if (taskPollingLifecycleRef.current === lifecycle) taskPollingLifecycleRef.current = null;
+    };
+  }, [fetchTasks]);
 
   useEffect(() => {
-    if (selectedId === DRAFT_ID) return;
-    const draft = drafts[selectedId];
-    const task = visibleTasks.find((item) => taskIdOf(item) === selectedId);
-    setPrompt(draft?.prompt || task?.prompt_preview || defaultPrompt);
-    setImages(Array.isArray(draft?.images) ? draft.images : []);
-  }, [defaultPrompt, drafts, selectedId, visibleTasks]);
+    let cancelled = false;
+    const historyPersistenceOwner = historyPersistenceOwnerRef.current;
+    void observeLifecycleAction(historyPersistenceOwner, () => listEditableFileDrafts(kind), {
+      onSuccess: (nextDrafts: Record<string, EditableFileDraft>) => {
+        if (!cancelled) commitDrafts((current) => ({ ...nextDrafts, ...current }));
+      },
+      onError: () => {
+        if (!cancelled) setError("本地历史记录读取失败");
+      },
+    });
+    void observeLifecycleAction(historyPersistenceOwner, () => listDeletedEditableFileIds(kind), {
+      onSuccess: (nextDeletedIds: Set<string>) => {
+        if (!cancelled) {
+          const mergedDeletedIds = mergeDeletedEditableFileIds(deletedIdsRef.current, [...nextDeletedIds]);
+          deletedIdsRef.current = mergedDeletedIds;
+          setDeletedIds(mergedDeletedIds);
+        }
+      },
+      onError: () => {
+        if (!cancelled) setError("本地历史记录读取失败");
+      },
+    });
+    queueMicrotask(() => {
+      if (!cancelled) void fetchTasks();
+    });
+    return () => {
+      cancelled = true;
+      taskFetchRequestRef.current += 1;
+    };
+  }, [commitDrafts, fetchTasks, kind]);
 
   useEffect(() => {
-    if (selectedId === DRAFT_ID) return;
-    if (visibleTasks.length && (!selectedId || !visibleTasks.some((task) => taskIdOf(task) === selectedId))) setSelectedId(taskIdOf(visibleTasks[0]));
-    if (!visibleTasks.length && selectedId) setSelectedId("");
+    imageReadOwnerRef.current.invalidate();
+    pendingImageReadsRef.current = 0;
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setPendingImageReads(pendingImageReadsRef.current);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled || selectedId === DRAFT_ID) return;
+      setPrompt(selectedDraft?.prompt || selectedPromptPreview || defaultPrompt);
+      setImages(Array.isArray(selectedDraft?.images) ? selectedDraft.images : []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [defaultPrompt, selectedDraft?.images, selectedDraft?.prompt, selectedId, selectedPromptPreview]);
+
+  useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled || selectedId === DRAFT_ID) return;
+      if (visibleTasks.length && (!selectedId || !visibleTasks.some((task) => taskIdOf(task) === selectedId))) setSelectedId(taskIdOf(visibleTasks[0]));
+      if (!visibleTasks.length && selectedId) setSelectedId("");
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [selectedId, visibleTasks]);
 
   useEffect(() => {
     if (!running) return;
+    const initialTimer = window.setTimeout(() => setNow(Date.now()), 0);
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(timer);
+    };
   }, [running]);
 
   useEffect(() => {
     const ids = runningIds.split(",").filter(Boolean);
-    if (!ids.length) return;
-    const timer = window.setInterval(() => void fetchTasks(ids), 5000);
-    return () => window.clearInterval(timer);
+    const lifecycle = taskPollingLifecycleRef.current;
+    if (!lifecycle) return;
+    lifecycle.replace(ids);
+    return () => {
+      taskFetchRequestRef.current += 1;
+      lifecycle.replace([]);
+    };
   }, [fetchTasks, runningIds]);
 
   const appendFiles = async (files: FileList | null) => {
     if (!files?.length) return;
-    const values = await Promise.all(Array.from(files).map(readFile));
-    setImages((current) => [...current, ...values]);
+    const imageReadOwner = imageReadOwnerRef.current;
+    const readOwner = imageReadOwner.begin();
+    pendingImageReadsRef.current += 1;
+    setPendingImageReads(pendingImageReadsRef.current);
+    try {
+      const values = await Promise.all(Array.from(files).map(readFile));
+      if (imageReadOwner.accepts(readOwner)) {
+        setImages((current) => [...current, ...values]);
+      }
+    } catch (err) {
+      if (imageReadOwner.accepts(readOwner)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (imageReadOwner.accepts(readOwner)) {
+        pendingImageReadsRef.current = Math.max(0, pendingImageReadsRef.current - 1);
+        setPendingImageReads(pendingImageReadsRef.current);
+      }
+    }
   };
 
   const persistDrafts = (updater: (current: Record<string, EditableFileDraft>) => Record<string, EditableFileDraft>) => {
-    setDrafts((current) => {
-      const next = updater(current);
-      void saveEditableFileDrafts(kind, next);
-      return next;
+    const next = commitDrafts(updater);
+    void observeLifecycleAction(historyPersistenceOwnerRef.current, () => saveEditableFileDrafts(kind, next), {
+      onError: () => setError("本地历史记录保存失败"),
     });
   };
 
   const createDraft = () => {
+    imageReadOwnerRef.current.invalidate();
+    pendingImageReadsRef.current = 0;
+    setPendingImageReads(0);
+    submitOwnerRef.current.invalidate();
+    setSubmitting(false);
     setError("");
     setSelectedId(DRAFT_ID);
     setPrompt(defaultPrompt);
+    setImages([]);
+  };
+
+  const clearImages = () => {
+    imageReadOwnerRef.current.invalidate();
+    pendingImageReadsRef.current = 0;
+    setPendingImageReads(0);
     setImages([]);
   };
 
@@ -194,9 +346,13 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
 
   const deleteTask = (id: string) => {
     if (!id) return;
-    const nextDeleted = new Set(deletedIds);
-    nextDeleted.add(id);
-    void saveDeletedEditableFileIds(kind, nextDeleted);
+    taskFetchRequestRef.current += 1;
+    setPolling(false);
+    const nextDeleted = mergeDeletedEditableFileIds(deletedIdsRef.current, [id]);
+    deletedIdsRef.current = nextDeleted;
+    void observeLifecycleAction(historyPersistenceOwnerRef.current, () => saveDeletedEditableFileIds(kind, nextDeleted), {
+      onError: () => setError("本地历史记录保存失败"),
+    });
     setDeletedIds(nextDeleted);
     setTasks((current) => current.filter((task) => taskIdOf(task) !== id));
     persistDrafts((current) => {
@@ -210,8 +366,15 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
   const clearHistory = () => {
     const ids = deleteConfirm?.type === "all" ? deleteConfirm.ids : tasks.filter((task) => task.kind === kind).map(taskIdOf).filter(Boolean);
     if (!ids.length) return;
-    const nextDeleted = new Set([...deletedIds, ...ids]);
-    void saveDeletedEditableFileIds(kind, nextDeleted);
+    taskFetchRequestRef.current += 1;
+    submitOwnerRef.current.invalidate();
+    setPolling(false);
+    setSubmitting(false);
+    const nextDeleted = mergeDeletedEditableFileIds(deletedIdsRef.current, ids);
+    deletedIdsRef.current = nextDeleted;
+    void observeLifecycleAction(historyPersistenceOwnerRef.current, () => saveDeletedEditableFileIds(kind, nextDeleted), {
+      onError: () => setError("本地历史记录保存失败"),
+    });
     setDeletedIds(nextDeleted);
     setTasks((current) => current.filter((task) => task.kind !== kind || !ids.includes(taskIdOf(task))));
     persistDrafts((current) => {
@@ -230,12 +393,19 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
   };
 
   const submit = async () => {
+    if (pendingImageReads > 0) {
+      setError("请等待图片读取完成");
+      return;
+    }
+    const submitOwner = submitOwnerRef.current;
+    const requestOwner = submitOwner.begin(kind);
     setError("");
     setSubmitting(true);
     try {
       const base64_images = images;
       if (imageRequired && !base64_images.length) throw new Error("base64_images is empty");
       const task = await httpRequest<EditableFileTask>(endpoint, { method: "POST", body: { client_task_id: createClientTaskId(), prompt, base64_images } });
+      if (!submitOwner.accepts(requestOwner, kind)) return;
       const polledAt = Date.now();
       const id = taskIdOf(task);
       const draft = { prompt: prompt.trim(), images: base64_images, title: titleOfPrompt(prompt, title) };
@@ -245,14 +415,23 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
       setTasks((current) => mergeTasks(current.filter((item) => taskIdOf(item) !== taskIdOf(nextTask)), [nextTask]));
       setSelectedId(id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (submitOwner.accepts(requestOwner, kind)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setSubmitting(false);
+      if (submitOwner.accepts(requestOwner, kind)) {
+        setSubmitting(false);
+      }
     }
   };
 
   const refreshAll = () => void fetchTasks();
   const selectTask = (id: string) => {
+    imageReadOwnerRef.current.invalidate();
+    pendingImageReadsRef.current = 0;
+    setPendingImageReads(0);
+    submitOwnerRef.current.invalidate();
+    setSubmitting(false);
     setRenamingId("");
     setSelectedId(id);
     const draft = drafts[id];
@@ -320,7 +499,7 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
                     </div>
                     <div className="mt-2 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400">
                       <Clock3 className="size-3.5" />
-                      <span className="tabular-nums">{formatElapsed(elapsedOf(task))}</span>
+                      <span className="tabular-nums">{formatElapsedSeconds(elapsedOf(task))}</span>
                       <span className="truncate">{task.created_at || id}</span>
                     </div>
                     {(task.prompt_preview || drafts[id]?.prompt) ? <div className="mt-2 line-clamp-2 text-xs leading-5 text-stone-500 dark:text-stone-400">{task.prompt_preview || drafts[id]?.prompt}</div> : null}
@@ -345,7 +524,7 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
       <section className="flex min-h-0 flex-col border-b border-stone-200 dark:border-white/10 lg:border-r lg:border-b-0">
         <div className="flex h-14 items-center justify-between border-b border-stone-200 px-5 dark:border-white/10">
           <h2 className="text-sm font-semibold text-stone-950 dark:text-stone-50">{title}</h2>
-          <Button size="sm" onClick={() => void submit()} disabled={submitting || running}>
+          <Button size="sm" onClick={() => void submit()} disabled={submitting || running || pendingImageReads > 0}>
             {submitting ? <LoaderCircle className="animate-spin" /> : <Play />}
             生成
           </Button>
@@ -374,7 +553,7 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
             ) : null}
           </div>
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" variant="outline" onClick={() => setImages([])}>
+                <Button size="sm" variant="outline" onClick={clearImages}>
               <Trash2 />
               清空图片
             </Button>
@@ -401,7 +580,7 @@ export function EditableFilePanel({ title, kind, endpoint, defaultPrompt, imageR
                 </div>
                 <div className="rounded-md border border-stone-200 bg-stone-50 p-4 dark:border-white/10 dark:bg-white/[0.03]">
                   <div className="text-xs text-stone-500 dark:text-stone-400">已执行</div>
-                  <div className="mt-2 text-2xl font-semibold tabular-nums text-stone-950 dark:text-stone-50">{formatElapsed(elapsedOf(selectedTask))}</div>
+                  <div className="mt-2 text-2xl font-semibold tabular-nums text-stone-950 dark:text-stone-50">{formatElapsedSeconds(elapsedOf(selectedTask))}</div>
                 </div>
                 <div className="rounded-md border border-stone-200 bg-stone-50 p-4 dark:border-white/10 dark:bg-white/[0.03]">
                   <div className="text-xs text-stone-500 dark:text-stone-400">Task ID</div>

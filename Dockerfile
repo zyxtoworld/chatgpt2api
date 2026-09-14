@@ -2,54 +2,87 @@ ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 ARG TARGETARCH
 
-FROM --platform=$BUILDPLATFORM node:22-alpine AS web-build
+FROM --platform=$BUILDPLATFORM oven/bun:1.4.0-alpine@sha256:07235578f79ef8c6f97d94aee7938e76f5cdba5f21ae5dbfdd3d3d38058437eb AS web-build
 
 WORKDIR /app/web
 
 COPY web/package.json web/bun.lock ./
-RUN npm install
+RUN bun install --frozen-lockfile
 
 COPY VERSION /app/VERSION
 COPY CHANGELOG.md /app/CHANGELOG.md
 COPY web ./
-RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" npm run build
+RUN NEXT_PUBLIC_APP_VERSION="$(cat /app/VERSION)" bun run build
 
 
-FROM --platform=$TARGETPLATFORM python:3.13-slim AS app
+FROM --platform=$BUILDPLATFORM rust:1.98-bookworm@sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7 AS rust-build
 
-ARG TARGETPLATFORM
 ARG TARGETARCH
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy
 
 WORKDIR /app
 
-# 安装系统依赖
-# - git: Git 存储后端需要
-# - libpq-dev: PostgreSQL 客户端库
-# - gcc: 编译 psycopg2-binary 需要
+COPY account_snapshot_contract.json /app/account_snapshot_contract.json
+COPY Cargo.toml Cargo.lock ./
+COPY file_identity ./file_identity
+COPY src ./src
+RUN set -eux; \
+    case "$TARGETARCH" in \
+        amd64) \
+            apt-get update; \
+            apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross; \
+            rustup target add x86_64-unknown-linux-gnu; \
+            rust_target=x86_64-unknown-linux-gnu; \
+            cargo_linker=x86_64-linux-gnu-gcc; \
+            cargo_env=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER; \
+            ;; \
+        arm64) \
+            apt-get update; \
+            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross; \
+            rustup target add aarch64-unknown-linux-gnu; \
+            rust_target=aarch64-unknown-linux-gnu; \
+            cargo_linker=aarch64-linux-gnu-gcc; \
+            cargo_env=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER; \
+            ;; \
+        *) \
+            echo "unsupported TARGETARCH: $TARGETARCH" >&2; \
+            exit 1; \
+            ;; \
+    esac; \
+    rm -rf /var/lib/apt/lists/*; \
+    export "$cargo_env=$cargo_linker"; \
+    cargo build --release --locked --bin chatgpt2api-rust --target "$rust_target"; \
+    install -Dm755 "target/$rust_target/release/chatgpt2api-rust" /out/chatgpt2api-rust
+
+
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS app
+
+ARG TARGETPLATFORM
+ARG TARGETARCH
+ARG CODEX_CLIENT_VERSION
+
+ENV CODEX_CLIENT_VERSION=${CODEX_CLIENT_VERSION} \
+    RUST_PRODUCTION=1 \
+    RUST_BIND=0.0.0.0:80 \
+    RUST_DATA_DIR=/app/data \
+    RUST_UPSTREAM_PROTOCOL=chatgpt \
+    RUST_UPSTREAM_BASE_URL=https://chatgpt.com
+
+WORKDIR /app
+
+# Rust runtime needs CA roots for ChatGPT and a small HTTP client for the
+# public JSON health contract. Build-only compilers are not shipped.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     git \
-    libpq-dev \
-    gcc \
-    openssl \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir uv
-
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
-
-COPY main.py ./
 COPY VERSION ./
-COPY api ./api
-COPY services ./services
-COPY utils ./utils
-COPY scripts ./scripts
 COPY --from=web-build /app/web/out ./web_dist
+COPY --from=rust-build /out/chatgpt2api-rust /usr/local/bin/chatgpt2api-rust
 
 EXPOSE 80
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD wget --quiet --output-document=- 'http://127.0.0.1:80/health?format=json' | grep --quiet '"healthy":true' || exit 1
+
+CMD ["/usr/local/bin/chatgpt2api-rust"]

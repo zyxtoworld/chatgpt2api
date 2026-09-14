@@ -1,4 +1,6 @@
 import { httpRequest, request } from "@/lib/request";
+import { encodeApiPath } from "@/lib/api-path";
+import { downloadBlobFile } from "@/lib/download-text.js";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";
@@ -41,7 +43,6 @@ export type Account = {
 
 export type AccountImportPayload = {
   access_token: string;
-  accessToken?: string;
   type?: string;
   export_type?: string;
   source_type?: string;
@@ -56,6 +57,9 @@ export type Model = {
   permission: unknown[];
   root: string;
   parent: string | null;
+  allow_anonymous: boolean;
+  supported_account_types: string[];
+  supported_reasoning_efforts?: string[];
 };
 
 type AccountListResponse = {
@@ -178,7 +182,6 @@ export type SettingsConfig = {
   image_timeout_retry_secs?: number | string;
   auto_remove_invalid_accounts?: boolean;
   auto_remove_rate_limited_accounts?: boolean;
-  auto_relogin_after_refresh?: boolean;
   log_levels?: string[];
   image_storage?: ImageStorageSettings;
   proxy_runtime?: ProxyRuntimeSettings;
@@ -192,6 +195,7 @@ export type BackupInclude = {
   config: boolean;
   cpa: boolean;
   sub2api: boolean;
+  ccload: boolean;
   logs: boolean;
   image_tasks: boolean;
   accounts_snapshot: boolean;
@@ -331,39 +335,18 @@ export async function login(authKey: string) {
   });
 }
 
-export async function fetchAccounts() {
-  return httpRequest<AccountListResponse>("/api/accounts");
+export async function fetchAccounts(signal?: AbortSignal) {
+  return httpRequest<AccountListResponse>("/api/accounts", { signal });
 }
 
-export async function fetchModels() {
-  return httpRequest<ModelListResponse>("/v1/models");
+export async function fetchModels(signal?: AbortSignal) {
+  return httpRequest<ModelListResponse>("/v1/models", { signal });
 }
 
 export async function createAccounts(tokens: string[], accounts: AccountImportPayload[] = []) {
   return httpRequest<AccountMutationResponse>("/api/accounts", {
     method: "POST",
     body: { tokens, accounts },
-  });
-}
-
-export type OAuthLoginStartResponse = {
-  session_id: string;
-  authorize_url: string;
-  expires_in: string;
-  redirect_uri_prefix: string;
-};
-
-export async function startOAuthLogin(emailHint?: string) {
-  return httpRequest<OAuthLoginStartResponse>("/api/accounts/oauth/start", {
-    method: "POST",
-    body: { email_hint: emailHint ?? "" },
-  });
-}
-
-export async function finishOAuthLogin(sessionId: string, callback: string) {
-  return httpRequest<AccountMutationResponse>("/api/accounts/oauth/finish", {
-    method: "POST",
-    body: { session_id: sessionId, callback },
   });
 }
 
@@ -381,19 +364,8 @@ export async function refreshAccounts(accessTokens: string[]) {
   });
 }
 
-export async function fetchRefreshProgress(progressId: string) {
-  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`);
-}
-
-export async function reLoginAccounts(accessTokens: string[]) {
-  return httpRequest<{ progress_id: string }>("/api/accounts/re-login", {
-    method: "POST",
-    body: { access_tokens: accessTokens },
-  });
-}
-
-export async function fetchReLoginProgress(progressId: string) {
-  return httpRequest<RefreshProgressResponse>(`/api/accounts/re-login/progress/${progressId}`);
+export async function fetchRefreshProgress(progressId: string, signal?: AbortSignal) {
+  return httpRequest<RefreshProgressResponse>(`/api/accounts/refresh/progress/${progressId}`, { signal });
 }
 
 export async function updateAccount(
@@ -516,8 +488,8 @@ export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
   });
 }
 
-export async function fetchSettingsConfig() {
-  return httpRequest<{ config: SettingsConfig }>("/api/settings");
+export async function fetchSettingsConfig(signal?: AbortSignal) {
+  return httpRequest<{ config: SettingsConfig }>("/api/settings", { signal });
 }
 
 export async function updateSettingsConfig(settings: SettingsConfig) {
@@ -527,8 +499,8 @@ export async function updateSettingsConfig(settings: SettingsConfig) {
   });
 }
 
-export async function fetchThirdPartyApps() {
-  return httpRequest<{ third_party_apps: ThirdPartyAppsSettings }>("/api/third-party-apps");
+export async function fetchThirdPartyApps(signal?: AbortSignal) {
+  return httpRequest<{ third_party_apps: ThirdPartyAppsSettings }>("/api/third-party-apps", { signal });
 }
 
 export async function testBackupConnection() {
@@ -552,8 +524,8 @@ export async function syncImageStorage() {
   });
 }
 
-export async function fetchBackups() {
-  return httpRequest<{ items: BackupItem[]; state: BackupState; settings: BackupSettings }>("/api/backups");
+export async function fetchBackups(signal?: AbortSignal) {
+  return httpRequest<{ items: BackupItem[]; state: BackupState; settings: BackupSettings }>("/api/backups", { signal });
 }
 
 export async function runBackupNow() {
@@ -582,12 +554,13 @@ export function getBackupDownloadUrl(key: string) {
   return `/api/backups/download?${params.toString()}`;
 }
 
-export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }) {
+export async function fetchManagedImages(filters: { start_date?: string; end_date?: string }, signal?: AbortSignal) {
   const params = new URLSearchParams();
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
   return httpRequest<{ items: ManagedImage[]; groups: Array<{ date: string; items: ManagedImage[] }> }>(
     `/api/images${params.toString() ? `?${params.toString()}` : ""}`,
+    { signal },
   );
 }
 
@@ -595,34 +568,26 @@ export async function deleteManagedImages(body: { paths?: string[]; start_date?:
   return httpRequest<{ removed: number }>("/api/images/delete", { method: "POST", body });
 }
 
-export async function downloadImages(paths: string[]) {
-  const response = await request.post("/api/images/download", { paths }, { responseType: "blob" });
+export async function downloadImages(paths: string[], isActive?: () => boolean, signal?: AbortSignal): Promise<boolean> {
+  if (isActive && !isActive()) return false;
+  const response = await request.post("/api/images/download", { paths }, { responseType: "blob", signal });
+  if (isActive && !isActive()) return false;
   const blob = response.data as Blob;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = "images.zip";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  downloadBlobFile(blob, "images.zip");
+  return true;
 }
 
-export async function downloadSingleImage(path: string) {
-  const response = await request.get(`/api/images/download/${path}`, { responseType: "blob" });
+export async function downloadSingleImage(path: string, isActive?: () => boolean, signal?: AbortSignal): Promise<boolean> {
+  if (isActive && !isActive()) return false;
+  const response = await request.get(`/api/images/download/${encodeApiPath(path)}`, { responseType: "blob", signal });
+  if (isActive && !isActive()) return false;
   const blob = response.data as Blob;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = path.split("/").pop() || "image.png";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  downloadBlobFile(blob, path.split("/").pop() || "image.png");
+  return true;
 }
 
-export async function fetchImageTags() {
-  return httpRequest<{ tags: string[] }>("/api/images/tags");
+export async function fetchImageTags(signal?: AbortSignal) {
+  return httpRequest<{ tags: string[] }>("/api/images/tags", { signal });
 }
 
 export async function setImageTags(path: string, tags: string[]) {
@@ -643,8 +608,8 @@ export type ImageStorageStats = {
   image_count: number; image_size_mb: number; image_size_bytes: number;
 };
 
-export async function fetchImageStorage() {
-  return httpRequest<ImageStorageStats>("/api/images/storage");
+export async function fetchImageStorage(signal?: AbortSignal) {
+  return httpRequest<ImageStorageStats>("/api/images/storage", { signal });
 }
 
 export async function compressAllImages() {
@@ -658,12 +623,12 @@ export async function deleteToTarget(targetFreeMb: number) {
   );
 }
 
-export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }) {
+export async function fetchSystemLogs(filters: { type?: string; start_date?: string; end_date?: string }, signal?: AbortSignal) {
   const params = new URLSearchParams();
   if (filters.type) params.set("type", filters.type);
   if (filters.start_date) params.set("start_date", filters.start_date);
   if (filters.end_date) params.set("end_date", filters.end_date);
-  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`);
+  return httpRequest<{ items: SystemLog[] }>(`/api/logs${params.toString() ? `?${params.toString()}` : ""}`, { signal });
 }
 
 export async function deleteSystemLogs(ids: string[]) {
@@ -673,8 +638,8 @@ export async function deleteSystemLogs(ids: string[]) {
   });
 }
 
-export async function fetchUserKeys() {
-  return httpRequest<{ items: UserKey[] }>("/api/auth/users");
+export async function fetchUserKeys(signal?: AbortSignal) {
+  return httpRequest<{ items: UserKey[] }>("/api/auth/users", { signal });
 }
 
 export async function createUserKey(name: string) {
@@ -725,8 +690,8 @@ export type CPAImportJob = {
   errors: Array<{ name: string; error: string }>;
 };
 
-export async function fetchCPAPools() {
-  return httpRequest<{ pools: CPAPool[] }>("/api/cpa/pools");
+export async function fetchCPAPools(signal?: AbortSignal) {
+  return httpRequest<{ pools: CPAPool[] }>("/api/cpa/pools", { signal });
 }
 
 export async function createCPAPool(pool: { name: string; base_url: string; secret_key: string }) {
@@ -752,8 +717,8 @@ export async function deleteCPAPool(poolId: string) {
   });
 }
 
-export async function fetchCPAPoolFiles(poolId: string) {
-  return httpRequest<{ pool_id: string; files: CPARemoteFile[] }>(`/api/cpa/pools/${poolId}/files`);
+export async function fetchCPAPoolFiles(poolId: string, signal?: AbortSignal) {
+  return httpRequest<{ pool_id: string; files: CPARemoteFile[] }>(`/api/cpa/pools/${poolId}/files`, { signal });
 }
 
 export async function startCPAImport(poolId: string, names: string[]) {
@@ -786,7 +751,6 @@ export type Sub2APIRemoteAccount = {
   plan_type: string;
   status: string;
   expires_at: string;
-  has_refresh_token: boolean;
 };
 
 export type Sub2APIRemoteGroup = {
@@ -799,8 +763,8 @@ export type Sub2APIRemoteGroup = {
   active_account_count: number;
 };
 
-export async function fetchSub2APIServers() {
-  return httpRequest<{ servers: Sub2APIServer[] }>("/api/sub2api/servers");
+export async function fetchSub2APIServers(signal?: AbortSignal) {
+  return httpRequest<{ servers: Sub2APIServer[] }>("/api/sub2api/servers", { signal });
 }
 
 export async function createSub2APIServer(server: {
@@ -863,6 +827,71 @@ export async function fetchSub2APIImportJob(serverId: string) {
   return httpRequest<{ import_job: CPAImportJob | null }>(`/api/sub2api/servers/${serverId}/import`);
 }
 
+// ── ccLoad connections ─────────────────────────────────────────────
+
+export type CCLoadServer = {
+  id: string;
+  name: string;
+  base_url: string;
+  has_password: boolean;
+  import_job?: CPAImportJob | null;
+};
+
+export type CCLoadChannel = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  plan_type: string;
+  subscription_active_until: string;
+  models: string[];
+  models_loaded: boolean;
+};
+
+export type CCLoadChannelModels = Pick<CCLoadChannel, "id" | "plan_type" | "models" | "models_loaded">;
+
+export async function fetchCCLoadServers(signal?: AbortSignal) {
+  return httpRequest<{ servers: CCLoadServer[] }>("/api/ccload/servers", { signal });
+}
+
+export async function createCCLoadServer(server: { name: string; base_url: string; password: string }) {
+  return httpRequest<{ server: CCLoadServer; servers: CCLoadServer[] }>("/api/ccload/servers", {
+    method: "POST",
+    body: server,
+  });
+}
+
+export async function updateCCLoadServer(
+  serverId: string,
+  updates: { name?: string; base_url?: string; password?: string },
+) {
+  return httpRequest<{ server: CCLoadServer; servers: CCLoadServer[] }>(`/api/ccload/servers/${serverId}`, {
+    method: "POST",
+    body: updates,
+  });
+}
+
+export async function deleteCCLoadServer(serverId: string) {
+  return httpRequest<{ servers: CCLoadServer[] }>(`/api/ccload/servers/${serverId}`, { method: "DELETE" });
+}
+
+export async function fetchCCLoadChannels(serverId: string) {
+  return httpRequest<{ server_id: string; channels: CCLoadChannel[] }>(`/api/ccload/servers/${serverId}/channels`);
+}
+
+export async function fetchCCLoadChannelModels(serverId: string, channelIds: string[]) {
+  return httpRequest<{ server_id: string; channels: CCLoadChannelModels[] }>(
+    `/api/ccload/servers/${serverId}/channel-models`,
+    { method: "POST", body: { channel_ids: channelIds } },
+  );
+}
+
+export async function startCCLoadImport(serverId: string, channelIds: string[]) {
+  return httpRequest<{ import_job: CPAImportJob | null }>(`/api/ccload/servers/${serverId}/import`, {
+    method: "POST",
+    body: { channel_ids: channelIds },
+  });
+}
+
 // ── Upstream proxy ────────────────────────────────────────────────
 
 export type ProxySettings = {
@@ -889,8 +918,8 @@ export type ClearanceTestResult = {
   runtime: ProxyRuntimeStatus;
 };
 
-export async function fetchProxy() {
-  return httpRequest<{ proxy: ProxySettings }>("/api/proxy");
+export async function fetchProxy(signal?: AbortSignal) {
+  return httpRequest<{ proxy: ProxySettings }>("/api/proxy", { signal });
 }
 
 export async function updateProxy(updates: { enabled?: boolean; url?: string }) {

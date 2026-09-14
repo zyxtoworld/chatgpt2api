@@ -13,7 +13,6 @@ import {
   Download,
   Link2,
   LoaderCircle,
-  LogIn,
   Pencil,
   RefreshCw,
   Search,
@@ -47,17 +46,22 @@ import {
   fetchAccounts,
   fetchModels,
   fetchRefreshProgress,
-  fetchReLoginProgress,
-  reLoginAccounts,
   refreshAccounts,
   testProxy,
   updateAccount,
   type Account,
-  type AccountRefreshResponse,
   type AccountStatus,
   type Model,
   type RefreshProgressResponse,
 } from "@/lib/api";
+import { createSerialPoller } from "@/lib/serial-poll";
+import { writeClipboardText } from "@/lib/clipboard";
+import { downloadTextFile } from "@/lib/download-text.js";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { parseModelList } from "@/lib/model-catalog";
+import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
+import { maskToken } from "@/lib/token-display";
 import { useAuthGuard } from "@/lib/use-auth-guard";
 import { cn } from "@/lib/utils";
 
@@ -93,13 +97,6 @@ const metricCards = [
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
-function formatCompact(value: number) {
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(1)}k`;
-  }
-  return String(value);
-}
-
 function formatQuota(account: Account) {
   return String(Math.max(0, account.quota));
 }
@@ -130,24 +127,20 @@ function formatRestoreAt(value?: string | null) {
 
 function formatQuotaSummary(accounts: Account[]) {
   const availableAccounts = accounts.filter((account) => account.status === "正常");
-  return formatCompact(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
-}
-
-function maskToken(token?: string) {
-  if (!token) return "—";
-  if (token.length <= 18) return token;
-  return `${token.slice(0, 16)}...${token.slice(-8)}`;
+  return availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0);
 }
 
 function downloadTokens(accounts: Account[]) {
   const content = `${accounts.map((account) => account.access_token).join("\n")}\n`;
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `accounts-${Date.now()}.txt`;
-  link.click();
-  URL.revokeObjectURL(url);
+  downloadTextFile(content, `accounts-${Date.now()}.txt`, { mimeType: "text/plain;charset=utf-8" });
+}
+
+async function copyText(value: string, successMessage: string) {
+  if (await writeClipboardText(value)) {
+    toast.success(successMessage);
+    return;
+  }
+  toast.error("复制失败，请检查浏览器剪贴板权限");
 }
 
 function displayAccountType(account: Account) {
@@ -165,8 +158,18 @@ function displayAccountSource(account: Account) {
   return source;
 }
 
+type AccountMutationOwner = { accepted: boolean; epoch: number };
+
 function AccountsPageContent() {
-  const didLoadRef = useRef(false);
+  const mountedRef = useRef(false);
+  const activePollersRef = useRef(new Set<{ stop: () => void }>());
+  const accountListGateRef = useRef(createMutationRequestGate());
+  const accountListAbortControllerRef = useRef<AbortController | null>(null);
+  const modelAbortControllerRef = useRef<AbortController | null>(null);
+  const accountListLoadingOwnerRef = useRef<unknown>(null);
+  const accountMutationOwnerRef = useRef<AccountMutationOwner | null>(null);
+  const accountProxyTestOwnerRef = useRef(createLatestActionOwner());
+  const progressOwnerRef = useRef<AccountMutationOwner | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [availableModels, setAvailableModels] = useState<Model[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -182,10 +185,9 @@ function AccountsPageContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingModels, setIsLoadingModels] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const [refreshingTokens, setRefreshingTokens] = useState<Set<string>>(new Set());
   const [isDeleting, setIsDeleting] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
-  const [isRelogining, setIsRelogining] = useState(false);
+  const [isAccountMutationBusy, setIsAccountMutationBusy] = useState(false);
   const [progress, setProgress] = useState<{
     visible: boolean;
     current: number;
@@ -199,51 +201,147 @@ function AccountsPageContent() {
     message: "",
     email: "",
   });
-  const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [refreshSummary, setRefreshSummary] = useState<Record<string, number | string> | null>(null);
 
+  useEffect(() => {
+    mountedRef.current = true;
+    const accountProxyTestOwner = accountProxyTestOwnerRef.current;
+    accountProxyTestOwner.activate();
+    const pollers = activePollersRef.current;
+    const gate = accountListGateRef.current;
+    return () => {
+      mountedRef.current = false;
+      for (const poller of pollers) {
+        poller.stop();
+      }
+      pollers.clear();
+      accountListAbortControllerRef.current?.abort();
+      accountListAbortControllerRef.current = null;
+      modelAbortControllerRef.current?.abort();
+      modelAbortControllerRef.current = null;
+      accountListLoadingOwnerRef.current = null;
+      accountMutationOwnerRef.current = null;
+      progressOwnerRef.current = null;
+      accountProxyTestOwner.cancel();
+      gate.cancel();
+    };
+  }, []);
+
+  const beginAccountMutation = (): AccountMutationOwner | null => {
+    const owner = accountListGateRef.current.beginMutation();
+    if (!owner.accepted) {
+      toast.error("账户列表操作正在进行，请稍候");
+      return null;
+    }
+    accountMutationOwnerRef.current = owner;
+    accountListAbortControllerRef.current?.abort();
+    accountListAbortControllerRef.current = null;
+    accountListLoadingOwnerRef.current = null;
+    if (mountedRef.current) {
+      setIsLoading(false);
+      setIsAccountMutationBusy(true);
+    }
+    return owner;
+  };
+
+  const acceptsAccountMutation = (owner: AccountMutationOwner) => Boolean(
+    mountedRef.current
+      && accountMutationOwnerRef.current === owner
+      && accountListGateRef.current.acceptsMutation(owner),
+  );
+
+  const finishAccountMutation = (owner: AccountMutationOwner, finish: () => void) => {
+    const current = accountMutationOwnerRef.current === owner
+      && accountListGateRef.current.acceptsMutation(owner);
+    if (current) {
+      accountMutationOwnerRef.current = null;
+      if (mountedRef.current) {
+        finish();
+        setIsAccountMutationBusy(false);
+      }
+    }
+    accountListGateRef.current.finishMutation(owner);
+  };
+
   const loadAccounts = async (silent = false) => {
+    const gate = accountListGateRef.current;
+    const queryOwner = gate.beginQuery("list");
+    if (!queryOwner.allowed) return;
+    accountListAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    accountListAbortControllerRef.current = abortController;
     if (!silent) {
+      accountListLoadingOwnerRef.current = queryOwner;
       setIsLoading(true);
     }
     try {
-      const data = await fetchAccounts();
+      const data = await fetchAccounts(abortController.signal);
+      if (!gate.acceptsQuery(queryOwner)) return;
       setAccounts(data.items);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
     } catch (error) {
-      const message = error instanceof Error ? error.message : "加载账户失败";
-      toast.error(message);
+      if (gate.acceptsQuery(queryOwner)) {
+        const message = error instanceof Error ? error.message : "加载账户失败";
+        toast.error(message);
+      }
     } finally {
-      if (!silent) {
+      if (!silent && accountListLoadingOwnerRef.current === queryOwner) {
+        accountListLoadingOwnerRef.current = null;
         setIsLoading(false);
+      }
+      if (accountListAbortControllerRef.current === abortController) {
+        accountListAbortControllerRef.current = null;
       }
     }
   };
 
   const loadModels = async () => {
+    if (!mountedRef.current) {
+      return;
+    }
+    modelAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    modelAbortControllerRef.current = abortController;
+    const ownsModelRequest = () => modelAbortControllerRef.current === abortController;
     setIsLoadingModels(true);
     try {
-      const data = await fetchModels();
-      setAvailableModels(Array.isArray(data.data) ? data.data : []);
+      const data = await fetchModels(abortController.signal);
+      if (!mountedRef.current || !ownsModelRequest()) {
+        return;
+      }
+      const models = parseModelList(data);
+      if (models === null) {
+        throw new Error("模型列表响应格式无效");
+      }
+      setAvailableModels(models);
     } catch (error) {
+      if (!mountedRef.current || !ownsModelRequest()) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "加载模型列表失败";
       toast.error(message);
     } finally {
-      setIsLoadingModels(false);
+      if (mountedRef.current && ownsModelRequest()) {
+        setIsLoadingModels(false);
+      }
+      if (ownsModelRequest()) {
+        modelAbortControllerRef.current = null;
+      }
     }
   };
 
   useEffect(() => {
-    if (didLoadRef.current) {
-      return;
-    }
-    didLoadRef.current = true;
-    void loadAccounts();
-    void loadModels();
-
-    // 清理进度条定时器
+    let active = true;
+    const cancelInitialLoad = scheduleOwnedMicrotask(() => {
+      if (!active) {
+        return;
+      }
+      void loadAccounts();
+      void loadModels();
+    });
     return () => {
-      if (progressRef.current) clearInterval(progressRef.current);
+      active = false;
+      cancelInitialLoad();
     };
   }, []);
 
@@ -293,6 +391,13 @@ function AccountsPageContent() {
     return accounts.filter((item) => item.status === "异常").map((item) => item.access_token);
   }, [accounts]);
 
+  const trackPoller = <T,>(poller: { start: () => Promise<T>; stop: () => void }) => {
+    activePollersRef.current.add(poller);
+    return poller.start().finally(() => {
+      activePollersRef.current.delete(poller);
+    });
+  };
+
   const paginationItems = useMemo(() => {
     const items: (number | "...")[] = [];
     const start = Math.max(1, safePage - 1);
@@ -313,17 +418,24 @@ function AccountsPageContent() {
       return;
     }
 
+    const mutationOwner = beginAccountMutation();
+    if (!mutationOwner) {
+      return;
+    }
     setIsDeleting(true);
     try {
       const data = await deleteAccounts(tokens);
+      if (!acceptsAccountMutation(mutationOwner)) return;
       setAccounts(data.items);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
       toast.success(`删除 ${data.removed ?? 0} 个账户`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "删除账户失败";
-      toast.error(message);
+      if (acceptsAccountMutation(mutationOwner)) {
+        const message = error instanceof Error ? error.message : "删除账户失败";
+        toast.error(message);
+      }
     } finally {
-      setIsDeleting(false);
+      finishAccountMutation(mutationOwner, () => setIsDeleting(false));
     }
   };
 
@@ -333,323 +445,91 @@ function AccountsPageContent() {
       return;
     }
 
-    if (accessTokens.length === 1) {
-      setRefreshingTokens((prev) => new Set([...prev, accessTokens[0]]));
-      try {
-        const { progress_id } = await refreshAccounts(accessTokens);
-        // 单账号：轮询等待完成
-        await pollRefreshProgress(progress_id, (progress) => {
-          if (progress.done && progress.result) {
-            setAccounts(progress.result.items);
-            setSelectedIds((prev) => prev.filter((id) => progress.result!.items.some((item) => item.access_token === id)));
-          }
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "刷新账户失败";
-        toast.error(message);
-      } finally {
-        setRefreshingTokens((prev) => {
-          const next = new Set(prev);
-          next.delete(accessTokens[0]);
-          return next;
-        });
-      }
-      return;
-    }
-
+    const mutationOwner = beginAccountMutation();
+    if (!mutationOwner) return;
     setIsRefreshing(true);
+    progressOwnerRef.current = mutationOwner;
 
-    // 计算非选中账号的基数（统计卡片联动用）
     const selectedTokenSet = new Set(accessTokens);
-    const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
-    const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
-    const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
-    const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
-    const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
-    const baseNormalAccounts = baseAccountsList.filter((a) => a.status === "正常");
-    const baseQuotaNum = baseNormalAccounts.reduce((s, a) => s + Math.max(0, a.quota), 0);
-
-    // 显示进度条（只显示当前任务，不含分类统计）
+    const baseAccountsList = accounts.filter((account) => !selectedTokenSet.has(account.access_token));
+    const baseActive = baseAccountsList.filter((account) => account.status === "正常").length;
+    const baseLimited = baseAccountsList.filter((account) => account.status === "限流").length;
+    const baseAbnormal = baseAccountsList.filter((account) => account.status === "异常").length;
+    const baseDisabled = baseAccountsList.filter((account) => account.status === "禁用").length;
+    const baseQuota = baseAccountsList
+      .filter((account) => account.status === "正常")
+      .reduce((sum, account) => sum + Math.max(0, account.quota), 0);
     const total = accessTokens.length;
-    setProgress({
-      visible: true,
-      current: 0,
-      total,
-      message: "正在刷新账号信息...",
-      email: "",
-    });
+    setProgress({ visible: true, current: 0, total, message: "正在刷新账号信息...", email: "" });
 
     try {
       const { progress_id } = await refreshAccounts(accessTokens);
-
-      // 轮询进度到完成
-      const data = await new Promise<AccountRefreshResponse>((resolve, reject) => {
-        const pollTimer = setInterval(async () => {
-          try {
-            const p = await fetchRefreshProgress(progress_id);
-            if (p.done) {
-              clearInterval(pollTimer);
-              if (p.error) {
-                reject(new Error(p.error));
-                return;
-              }
-              if (!p.result) {
-                reject(new Error("刷新结果为空"));
-                return;
-              }
-              // 更新最终进度显示
-              setProgress((prev) => ({
-                ...prev,
-                current: prev.total,
-                message: "刷新完成",
-              }));
-              // 清除联动统计
-              setRefreshSummary(null);
-              resolve(p.result);
-            } else {
-              // 实时更新进度
-              setProgress((prev) => ({
-                ...prev,
-                current: p.processed,
-              }));
-              // 实时更新统计卡片：基数 + 已刷新的累加结果
-              const runningActive = baseActive + ((p.status_counts?.["正常"]) ?? 0);
-              const runningLimited = baseLimited + ((p.status_counts?.["限流"]) ?? 0);
-              const runningAbnormal = baseAbnormal + ((p.status_counts?.["异常"]) ?? 0);
-              const runningDisabled = baseDisabled + ((p.status_counts?.["禁用"]) ?? 0);
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: runningLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: formatCompact(baseQuotaNum + (p.total_quota ?? 0)),
-              });
-            }
-          } catch (err) {
-            clearInterval(pollTimer);
-            reject(err);
-          }
-        }, 300);
+      if (!acceptsAccountMutation(mutationOwner)) return;
+      const poller = createSerialPoller({
+        intervalMs: 300,
+        poll: (signal: AbortSignal) => fetchRefreshProgress(progress_id, signal),
+        isDone: (value: RefreshProgressResponse) => value.done,
+        onProgress: (value: RefreshProgressResponse) => {
+          if (!acceptsAccountMutation(mutationOwner)) return;
+          setProgress((previous) => ({ ...previous, current: value.processed }));
+          setRefreshSummary({
+            total: accounts.length,
+            active: baseActive + (value.status_counts?.["正常"] ?? 0),
+            limited: baseLimited + (value.status_counts?.["限流"] ?? 0),
+            abnormal: baseAbnormal + (value.status_counts?.["异常"] ?? 0),
+            disabled: baseDisabled + (value.status_counts?.["禁用"] ?? 0),
+            quota: baseQuota + (value.total_quota ?? 0),
+          });
+        },
       });
+      const outcome = await trackPoller(poller);
+      if (outcome.status === "stopped" || !acceptsAccountMutation(mutationOwner)) return;
+      const completed = outcome.value as RefreshProgressResponse;
+      if (completed.error) throw new Error(completed.error);
+      if (!completed.result) throw new Error("刷新结果为空");
 
-      // 刷新完成，更新数据
+      const data = completed.result;
       setAccounts(data.items);
-      setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
-
-      const relogined = data.relogined ?? 0;
-
-      // 显示重新登录进度
-      if (relogined > 0) {
-        setProgress({
-          visible: true,
-          current: 0,
-          total: relogined,
-          message: `正在尝试对 ${relogined} 个账号进行移除异常状态`,
-          email: "",
-        });
-        // 模拟重新登录进度
-        let reCount = 0;
-        await new Promise<void>((resolve) => {
-          const timer = setInterval(() => {
-            reCount += 1;
-            if (reCount >= relogined) {
-              clearInterval(timer);
-              setProgress({
-                visible: true,
-                current: relogined,
-                total: relogined,
-                message: "移除异常状态完成",
-                email: "",
-              });
-              setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-              resolve();
-            } else {
-              setProgress((prev) => ({ ...prev, current: reCount }));
-            }
-          }, 150);
-          setTimeout(resolve, 2000);
-        });
-      } else {
-        setProgress({
-          visible: true,
-          current: total,
-          total,
-          message: "刷新完成",
-          email: "",
-        });
-        setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-      }
+      setSelectedIds((previous) => previous.filter((id) => data.items.some((item) => item.access_token === id)));
+      setRefreshSummary(null);
+      setProgress({ visible: true, current: total, total, message: "刷新完成", email: "" });
+      setTimeout(() => {
+        if (mountedRef.current && progressOwnerRef.current === mutationOwner) {
+          progressOwnerRef.current = null;
+          setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
+        }
+      }, 800);
 
       if ((data.errors ?? []).length > 0) {
         const firstError = data.errors?.[0]?.error;
-        toast.error(
-          `刷新成功 ${data.refreshed} 个，失败 ${(data.errors ?? []).length} 个${firstError ? `，首个错误：${firstError}` : ""}`,
-        );
+        toast.error(`刷新成功 ${data.refreshed} 个，失败 ${(data.errors ?? []).length} 个${firstError ? `，首个错误：${firstError}` : ""}`);
       } else {
-        toast.success(`刷新成功 ${data.refreshed} 个账户${relogined > 0 ? `，已触发 ${relogined} 个账号重新登录` : ""}`);
+        toast.success(`刷新成功 ${data.refreshed} 个账户`);
       }
     } catch (error) {
-      setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
-      setRefreshSummary(null);
-      const message = error instanceof Error ? error.message : "刷新账户失败";
-      toast.error(message);
+      if (acceptsAccountMutation(mutationOwner)) {
+        progressOwnerRef.current = null;
+        setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
+        setRefreshSummary(null);
+        toast.error(error instanceof Error ? error.message : "刷新账户失败");
+      }
     } finally {
-      setIsRefreshing(false);
+      finishAccountMutation(mutationOwner, () => setIsRefreshing(false));
     }
   };
-
-  const pollRefreshProgress = async (
-    progressId: string,
-    onUpdate: (p: RefreshProgressResponse) => void,
-  ): Promise<void> => {
-    return new Promise<void>((resolve, reject) => {
-      const timer = setInterval(async () => {
-        try {
-          const p = await fetchRefreshProgress(progressId);
-          if (p.done) {
-            clearInterval(timer);
-            if (p.error) {
-              reject(new Error(p.error));
-            } else {
-              onUpdate(p);
-              resolve();
-            }
-          }
-        } catch (err) {
-          clearInterval(timer);
-          reject(err);
-        }
-      }, 500);
+  const pollRefreshProgress = (progressId: string) => {
+    const poller = createSerialPoller({
+      intervalMs: 500,
+      poll: (signal: AbortSignal) => fetchRefreshProgress(progressId, signal),
+      isDone: (p: RefreshProgressResponse) => p.done,
+      onProgress: () => undefined,
     });
-  };
-
-  const handleReLogin = async (accessTokens: string[]) => {
-    if (accessTokens.length === 0) {
-      toast.error("请先选择要恢复的账户");
-      return;
-    }
-
-    // 只处理异常账号，过滤非异常账号
-    const abnormalTokens = accessTokens.filter((token) => {
-      const account = accounts.find((a) => a.access_token === token);
-      return account?.status === "异常";
-    });
-
-    if (abnormalTokens.length === 0) {
-      toast.error("选中账号中没有异常账号");
-      return;
-    }
-
-    if (abnormalTokens.length < accessTokens.length) {
-      toast.info(`已过滤 ${accessTokens.length - abnormalTokens.length} 个非异常账号`);
-    }
-
-    setIsRelogining(true);
-
-    // 计算非选中账号的基数（统计卡片联动用）
-    const selectedTokenSet = new Set(abnormalTokens);
-    const baseAccountsList = accounts.filter((a) => !selectedTokenSet.has(a.access_token));
-    const baseActive = baseAccountsList.filter((a) => a.status === "正常").length;
-    const baseLimited = baseAccountsList.filter((a) => a.status === "限流").length;
-    const baseAbnormal = baseAccountsList.filter((a) => a.status === "异常").length;
-    const baseDisabled = baseAccountsList.filter((a) => a.status === "禁用").length;
-
-    // 显示进度条（真实进度）
-    const total = abnormalTokens.length;
-    setProgress({ visible: true, current: 0, total, message: "正在尝试恢复异常账号...", email: "" });
-
-    try {
-      const { progress_id } = await reLoginAccounts(abnormalTokens);
-
-      // 轮询进度到完成
-      await new Promise<void>((resolve, reject) => {
-        const pollTimer = setInterval(async () => {
-          try {
-            const p = await fetchReLoginProgress(progress_id);
-            if (p.done) {
-              clearInterval(pollTimer);
-              if (p.error) {
-                reject(new Error(p.error));
-                return;
-              }
-              setProgress((prev) => ({ ...prev, current: prev.total, message: "恢复流程已完成" }));
-              setRefreshSummary(null);
-              resolve();
-            } else {
-              // 实时更新进度
-              const results = p.results ?? [];
-              // 找到最新一条有错误的结果
-              const lastErrorResult = [...results].reverse().find((r) => r.error);
-              const emailHint = lastErrorResult
-                ? `失败: ${lastErrorResult.token} ${lastErrorResult.error ?? ""}`
-                : `已处理 ${p.processed}/${p.total}`;
-              setProgress((prev) => ({
-                ...prev,
-                current: p.processed,
-                email: emailHint,
-                message: "正在尝试恢复异常账号...",
-              }));
-
-              // 实时更新统计卡片：基数 + 已处理的恢复结果
-              let runningActive = baseActive;
-              let runningAbnormal = baseAbnormal;
-              let runningDisabled = baseDisabled;
-              for (const r of results) {
-                if (r.status === "成功") {
-                  runningActive += 1;
-                  runningAbnormal -= 1;
-                } else if (r.status === "禁用") {
-                  runningDisabled += 1;
-                  runningAbnormal -= 1;
-                }
-                // "异常"或"跳过"：保持异常状态不变
-              }
-              setRefreshSummary({
-                total: accounts.length,
-                active: runningActive,
-                limited: baseLimited,
-                abnormal: runningAbnormal,
-                disabled: runningDisabled,
-                quota: summary.quota,
-              });
-            }
-          } catch (err) {
-            clearInterval(pollTimer);
-            reject(err);
-          }
-        }, 300);
-      });
-
-      // 等待后台线程完成，再拉取最新数据
-      await new Promise<void>((resolve) => setTimeout(resolve, 500));
-      try {
-        const freshData = await fetchAccounts();
-        setAccounts(freshData.items);
-        setSelectedIds((prev) => prev.filter((id) => freshData.items.some((item) => item.access_token === id)));
-      } catch { /* 静默失败 */ }
-
-      setProgress({
-        visible: true,
-        current: total,
-        total,
-        message: "恢复完成",
-        email: "",
-      });
-      setTimeout(() => setProgress({ visible: false, current: 0, total: 0, message: "", email: "" }), 800);
-
-      toast.success(`恢复流程已全部完成`);
-    } catch (error) {
-      setProgress({ visible: false, current: 0, total: 0, message: "", email: "" });
-      setRefreshSummary(null);
-      const message = error instanceof Error ? error.message : "重新登录失败";
-      toast.error(message);
-    } finally {
-      setIsRelogining(false);
-    }
+    return trackPoller(poller);
   };
 
   const openEditDialog = (account: Account) => {
+    accountProxyTestOwnerRef.current.invalidate();
+    setIsTestingProxy(false);
     setEditingAccount(account);
     setEditStatus(account.status);
     setEditProxy(account.proxy ?? "");
@@ -661,16 +541,25 @@ function AccountsPageContent() {
       toast.error("请先填写代理地址");
       return;
     }
+    const testOwner = accountProxyTestOwnerRef.current.begin(candidate);
     setIsTestingProxy(true);
     try {
       const data = await testProxy(candidate);
-      data.result.ok
-        ? toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`)
-        : toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+      if (mountedRef.current && accountProxyTestOwnerRef.current.accepts(testOwner, candidate)) {
+        if (data.result.ok) {
+          toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+        } else {
+          toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+        }
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试代理失败");
+      if (mountedRef.current && accountProxyTestOwnerRef.current.accepts(testOwner, candidate)) {
+        toast.error(error instanceof Error ? error.message : "测试代理失败");
+      }
     } finally {
-      setIsTestingProxy(false);
+      if (mountedRef.current && accountProxyTestOwnerRef.current.accepts(testOwner, candidate)) {
+        setIsTestingProxy(false);
+      }
     }
   };
 
@@ -679,22 +568,40 @@ function AccountsPageContent() {
       return;
     }
 
+    accountProxyTestOwnerRef.current.invalidate();
+    setIsTestingProxy(false);
+    const mutationOwner = beginAccountMutation();
+    if (!mutationOwner) {
+      return;
+    }
     setIsUpdating(true);
+    const token = editingAccount.access_token;
+    const status = editStatus;
+    const proxy = editProxy.trim();
     try {
-      const data = await updateAccount(editingAccount.access_token, {
-        status: editStatus,
-        proxy: editProxy.trim(),
+      const data = await updateAccount(token, {
+        status,
+        proxy,
       });
+      if (!acceptsAccountMutation(mutationOwner)) return;
       setAccounts(data.items);
       setSelectedIds((prev) => prev.filter((id) => data.items.some((item) => item.access_token === id)));
       setEditingAccount(null);
       toast.success("账号信息已更新");
     } catch (error) {
-      const message = error instanceof Error ? error.message : "更新账号失败";
-      toast.error(message);
+      if (acceptsAccountMutation(mutationOwner)) {
+        const message = error instanceof Error ? error.message : "更新账号失败";
+        toast.error(message);
+      }
     } finally {
-      setIsUpdating(false);
+      finishAccountMutation(mutationOwner, () => setIsUpdating(false));
     }
+  };
+
+  const closeEditDialog = () => {
+    accountProxyTestOwnerRef.current.invalidate();
+    setIsTestingProxy(false);
+    setEditingAccount(null);
   };
 
   const toggleSelectAll = (checked: boolean) => {
@@ -720,23 +627,20 @@ function AccountsPageContent() {
             variant="outline"
             className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
             onClick={() => void loadAccounts()}
-            disabled={isLoading || isRefreshing || isDeleting}
+            disabled={isLoading || isAccountMutationBusy || isRefreshing || isDeleting}
           >
             <RefreshCw className={cn("size-4", isLoading ? "animate-spin" : "")} />
             刷新
           </Button>
-          <Button
-            variant="outline"
-            className="h-10 rounded-xl border-stone-200 bg-white/80 px-4 text-stone-700 hover:bg-white"
-            onClick={() => void handleRefreshAccounts(accounts.map((item) => item.access_token))}
-            disabled={isLoading || isRefreshing || isDeleting || accounts.length === 0}
-          >
-            <RefreshCw className={cn("size-4", isRefreshing ? "animate-spin" : "")} />
-            一键刷新所有账号信息和额度
-          </Button>
           <AccountImportDialog
-            disabled={isLoading || isRefreshing || isDeleting}
+            disabled={isLoading || isAccountMutationBusy || isRefreshing || isDeleting}
+            onMutationStart={beginAccountMutation}
+            onMutationFinish={(owner) => finishAccountMutation(owner, () => undefined)}
             onImported={(items) => {
+              const mutationOwner = accountMutationOwnerRef.current;
+              if (!mutationOwner || !acceptsAccountMutation(mutationOwner)) {
+                return;
+              }
               setAccounts(items);
               setSelectedIds([]);
               setPage(1);
@@ -777,7 +681,7 @@ function AccountsPageContent() {
         </div>
       )}
 
-      <Dialog open={Boolean(editingAccount)} onOpenChange={(open) => (!open ? setEditingAccount(null) : null)}>
+      <Dialog open={Boolean(editingAccount)} onOpenChange={(open) => (!open ? closeEditDialog() : null)}>
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>编辑账户</DialogTitle>
@@ -808,8 +712,12 @@ function AccountsPageContent() {
               <div className="flex flex-col gap-2 sm:flex-row">
                 <Input
                   value={editProxy}
-                  onChange={(event) => setEditProxy(event.target.value)}
-                  placeholder="留空走全局代理，例如 http://proxy.example.invalid:port"
+                  onChange={(event) => {
+                    accountProxyTestOwnerRef.current.invalidate();
+                    setIsTestingProxy(false);
+                    setEditProxy(event.target.value);
+                  }}
+                  placeholder="留空走全局代理，例如 http://127.0.0.1:7890"
                   className="h-11 rounded-xl border-stone-200 bg-white"
                 />
                 <Button
@@ -828,7 +736,7 @@ function AccountsPageContent() {
             <Button
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
-              onClick={() => setEditingAccount(null)}
+              onClick={closeEditDialog}
               disabled={isUpdating}
             >
               取消
@@ -836,7 +744,7 @@ function AccountsPageContent() {
             <Button
               className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
               onClick={() => void handleUpdateAccount()}
-              disabled={isUpdating}
+              disabled={isUpdating || isAccountMutationBusy}
             >
               {isUpdating ? <LoaderCircle className="size-4 animate-spin" /> : null}
               保存修改
@@ -858,9 +766,7 @@ function AccountsPageContent() {
                     <Icon className="size-4 text-stone-400" />
                   </div>
                   <div className={cn("text-[1.75rem] font-semibold tracking-tight", item.color)}>
-                    <span className={typeof value === "number" ? "" : "text-[1.1rem]"}>
-                      {typeof value === "number" ? formatCompact(value) : value}
-                    </span>
+                    <span>{value}</span>
                   </div>
                 </CardContent>
               </Card>
@@ -881,8 +787,7 @@ function AccountsPageContent() {
                     type="button"
                     className="inline-flex cursor-pointer items-center rounded-full border border-stone-200 bg-white px-2.5 py-1 text-xs font-medium text-stone-700 transition hover:border-stone-300 hover:bg-stone-50"
                     onClick={() => {
-                      void navigator.clipboard.writeText(model.id);
-                      toast.success("模型名已复制");
+                      void copyText(model.id, "模型名已复制");
                     }}
                     title={`点击复制 ${model.id}`}
                   >
@@ -991,28 +896,18 @@ function AccountsPageContent() {
               <div className="flex flex-wrap items-center gap-2 text-sm text-stone-500">
                 <Button
                   variant="ghost"
-                  className="h-8 rounded-lg px-3 text-stone-500 hover:bg-stone-100"
-                  onClick={() => void handleRefreshAccounts(selectedTokens)}
-                  disabled={selectedTokens.length === 0 || isRefreshing}
+                  className="h-8 rounded-lg px-3 text-stone-700 hover:bg-stone-100"
+                  onClick={() => void handleRefreshAccounts(selectedTokens.length > 0 ? selectedTokens : accounts.map((account) => account.access_token))}
+                  disabled={accounts.length === 0 || isAccountMutationBusy || isRefreshing || isDeleting}
                 >
                   {isRefreshing ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
-                  刷新选中账号信息和额度
-                </Button>
-                <Button
-                  variant="ghost"
-                  className="h-8 rounded-lg px-3 text-amber-600 hover:bg-amber-50 hover:text-amber-700"
-                  onClick={() => void handleReLogin(selectedTokens)}
-                  disabled={selectedTokens.length === 0 || isRelogining}
-                  title="尝试密码登录恢复账号"
-                >
-                  {isRelogining ? <LoaderCircle className="size-4 animate-spin" /> : <LogIn className="size-4" />}
-                  尝试恢复异常账号
+                  刷新账号信息
                 </Button>
                 <Button
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
                   onClick={() => void handleDeleteTokens(abnormalTokens)}
-                  disabled={abnormalTokens.length === 0 || isDeleting}
+                  disabled={abnormalTokens.length === 0 || isAccountMutationBusy || isDeleting}
                 >
                   {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                   移除异常账号
@@ -1021,7 +916,7 @@ function AccountsPageContent() {
                   variant="ghost"
                   className="h-8 rounded-lg px-3 text-rose-500 hover:bg-rose-50 hover:text-rose-600"
                   onClick={() => void handleDeleteTokens(selectedTokens)}
-                  disabled={selectedTokens.length === 0 || isDeleting}
+                  disabled={selectedTokens.length === 0 || isAccountMutationBusy || isDeleting}
                 >
                   {isDeleting ? <LoaderCircle className="size-4 animate-spin" /> : <Trash2 className="size-4" />}
                   删除所选
@@ -1082,15 +977,19 @@ function AccountsPageContent() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-2">
-                            <span className="font-medium tracking-tight text-stone-700">
+                            <span
+                              className="max-w-[13rem] truncate font-mono text-xs tracking-tight text-stone-700"
+                              title="复制按钮会复制完整 token"
+                            >
                               {maskToken(account.access_token)}
                             </span>
                             <button
                               type="button"
+                              aria-label="复制 token"
+                              title="复制 token"
                               className="rounded-lg p-1 text-stone-400 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => {
-                                void navigator.clipboard.writeText(account.access_token);
-                                toast.success("token 已复制");
+                                void copyText(account.access_token, "token 已复制");
                               }}
                             >
                               <Copy className="size-4" />
@@ -1175,23 +1074,15 @@ function AccountsPageContent() {
                               type="button"
                               className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
                               onClick={() => openEditDialog(account)}
-                              disabled={isUpdating}
+                              disabled={isAccountMutationBusy}
                             >
                               <Pencil className="size-4" />
                             </button>
                             <button
                               type="button"
-                              className="rounded-lg p-2 transition hover:bg-stone-100 hover:text-stone-700"
-                              onClick={() => void handleRefreshAccounts([account.access_token])}
-                              disabled={isRefreshing || refreshingTokens.has(account.access_token)}
-                            >
-                              <RefreshCw className={cn("size-4", (isRefreshing || refreshingTokens.has(account.access_token)) ? "animate-spin" : "")} />
-                            </button>
-                            <button
-                              type="button"
                               className="rounded-lg p-2 transition hover:bg-rose-50 hover:text-rose-500"
                               onClick={() => void handleDeleteTokens([account.access_token])}
-                              disabled={isDeleting}
+                              disabled={isAccountMutationBusy || isDeleting}
                             >
                               <Trash2 className="size-4" />
                             </button>

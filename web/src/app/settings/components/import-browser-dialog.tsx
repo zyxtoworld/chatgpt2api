@@ -27,6 +27,8 @@ export function ImportBrowserDialog() {
   const filePage = useSettingsStore((state) => state.filePage);
   const pageSize = useSettingsStore((state) => state.pageSize);
   const isStartingImport = useSettingsStore((state) => state.isStartingImport);
+  const isSavingPool = useSettingsStore((state) => state.isSavingPool);
+  const deletingId = useSettingsStore((state) => state.deletingId);
   const setBrowserOpen = useSettingsStore((state) => state.setBrowserOpen);
   const toggleFile = useSettingsStore((state) => state.toggleFile);
   const replaceSelectedNames = useSettingsStore((state) => state.replaceSelectedNames);
@@ -34,6 +36,7 @@ export function ImportBrowserDialog() {
   const setFilePage = useSettingsStore((state) => state.setFilePage);
   const setPageSize = useSettingsStore((state) => state.setPageSize);
   const startImport = useSettingsStore((state) => state.startImport);
+  const hasMutation = isStartingImport || isSavingPool || deletingId !== null;
 
   const filteredFiles = useMemo(() => {
     const query = fileQuery.trim().toLowerCase();
@@ -71,7 +74,7 @@ export function ImportBrowserDialog() {
         </DialogHeader>
 
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-          <div className="relative min-w-[260px]">
+          <div className="relative w-full min-w-0 sm:min-w-[260px]">
             <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
             <Input
               value={fileQuery}
@@ -80,7 +83,7 @@ export function ImportBrowserDialog() {
               className="h-10 rounded-xl border-stone-200 bg-white pl-10"
             />
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <Select value={pageSize} onValueChange={(value) => setPageSize(value as (typeof PAGE_SIZE_OPTIONS)[number])}>
               <SelectTrigger className="h-10 w-[120px] rounded-xl border-stone-200 bg-white">
                 <SelectValue />
@@ -104,7 +107,7 @@ export function ImportBrowserDialog() {
         </div>
 
         <div className="rounded-xl border border-stone-200">
-          <div className="flex items-center justify-between border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
             <div className="flex items-center gap-3">
               <Checkbox checked={allFilteredSelected} onCheckedChange={(checked) => toggleSelectAllFiltered(Boolean(checked))} />
               <span>筛选结果 {filteredFiles.length} 个</span>
@@ -133,7 +136,7 @@ export function ImportBrowserDialog() {
           </div>
         </div>
 
-        <div className="flex items-center justify-between text-sm text-stone-500">
+        <div className="flex flex-col gap-3 text-sm text-stone-500 sm:flex-row sm:items-center sm:justify-between">
           <span>
             第 {filteredFiles.length === 0 ? 0 : (safeFilePage - 1) * currentPageSize + 1} -{" "}
             {Math.min(safeFilePage * currentPageSize, filteredFiles.length)} 条，共 {filteredFiles.length} 条
@@ -166,14 +169,14 @@ export function ImportBrowserDialog() {
             variant="secondary"
             className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
             onClick={() => setBrowserOpen(false)}
-            disabled={isStartingImport}
+              disabled={hasMutation}
           >
             取消
           </Button>
           <Button
             className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
             onClick={() => void startImport()}
-            disabled={isStartingImport || selectedNames.length === 0}
+            disabled={hasMutation || selectedNames.length === 0}
           >
             {isStartingImport ? <LoaderCircle className="size-4 animate-spin" /> : <Import className="size-4" />}
             导入选中账号

@@ -1,7 +1,7 @@
 "use client";
 
 import { Cloud, LoaderCircle, PlugZap, RefreshCw, Save } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -12,10 +12,12 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Textarea } from "@/components/ui/textarea";
 import type { ImageStorageMode } from "@/lib/api";
 import { testProxy, type ProxyTestResult } from "@/lib/api";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
 
 import { useSettingsStore } from "../store";
 
 export function ConfigCard() {
+  const proxyTestOwnerRef = useRef(createLatestActionOwner());
   const [isTestingProxy, setIsTestingProxy] = useState(false);
   const [proxyTestResult, setProxyTestResult] = useState<ProxyTestResult | null>(null);
   const logLevelOptions = ["debug", "info", "warning", "error"];
@@ -33,7 +35,6 @@ export function ConfigCard() {
   const setImageTimeoutRetrySecs = useSettingsStore((state) => state.setImageTimeoutRetrySecs);
   const setAutoRemoveInvalidAccounts = useSettingsStore((state) => state.setAutoRemoveInvalidAccounts);
   const setAutoRemoveRateLimitedAccounts = useSettingsStore((state) => state.setAutoRemoveRateLimitedAccounts);
-  const setAutoReloginAfterRefresh = useSettingsStore((state) => state.setAutoReloginAfterRefresh);
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
@@ -48,6 +49,15 @@ export function ConfigCard() {
   const isTestingImageStorage = useSettingsStore((state) => state.isTestingImageStorage);
   const isSyncingImageStorage = useSettingsStore((state) => state.isSyncingImageStorage);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
+  const imageStorageBusy = isTestingImageStorage || isSyncingImageStorage;
+
+  useEffect(() => {
+    const proxyTestOwner = proxyTestOwnerRef.current;
+    proxyTestOwner.activate();
+    return () => {
+      proxyTestOwner.cancel();
+    };
+  }, []);
 
   const handleTestProxy = async () => {
     const candidate = String(config?.proxy || "").trim();
@@ -55,20 +65,28 @@ export function ConfigCard() {
       toast.error("请先填写代理地址");
       return;
     }
+    const proxyTestOwner = proxyTestOwnerRef.current;
+    const testOwner = proxyTestOwner.begin(candidate);
     setIsTestingProxy(true);
     setProxyTestResult(null);
     try {
       const data = await testProxy(candidate);
-      setProxyTestResult(data.result);
-      if (data.result.ok) {
-        toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
-      } else {
-        toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+      if (proxyTestOwner.accepts(testOwner, candidate)) {
+        setProxyTestResult(data.result);
+        if (data.result.ok) {
+          toast.success(`代理可用（${data.result.latency_ms} ms，HTTP ${data.result.status}）`);
+        } else {
+          toast.error(`代理不可用：${data.result.error ?? "未知错误"}`);
+        }
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "测试代理失败");
+      if (proxyTestOwner.accepts(testOwner, candidate)) {
+        toast.error(error instanceof Error ? error.message : "测试代理失败");
+      }
     } finally {
-      setIsTestingProxy(false);
+      if (proxyTestOwner.accepts(testOwner, candidate)) {
+        setIsTestingProxy(false);
+      }
     }
   };
 
@@ -104,14 +122,16 @@ export function ConfigCard() {
             <Input
               value={String(config?.proxy || "")}
               onChange={(event) => {
+                proxyTestOwnerRef.current.invalidate();
+                setIsTestingProxy(false);
                 setProxy(event.target.value);
                 setProxyTestResult(null);
               }}
-              placeholder="http://proxy.example.invalid:port"
+              placeholder="http://127.0.0.1:7890"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
             <p className="text-xs leading-5 text-stone-500">
-              留空表示不使用代理。支持协议://账号:密码@主机:端口，也可直接粘贴代理商的 主机:端口:账号:密码。账号密码含 @/: 等特殊字符时需 URL 编码。
+              留空表示不使用代理。支持协议://账号:密码@主机:端口，也可直接粘贴代理商的 主机:端口:账号:密码；示例 http://user:pass@127.0.0.1:7890、127.0.0.1:7890:user:pass。账号密码含 @/: 等特殊字符时需 URL 编码。
             </p>
             {proxyTestResult ? (
               <div
@@ -255,7 +275,7 @@ export function ConfigCard() {
               placeholder="30"
               className="h-10 rounded-xl border-stone-200 bg-white"
             />
-            <p className="text-xs text-stone-500">单位秒，超时后点击"继续等待"额外等待的时间。</p>
+            <p className="text-xs text-stone-500">单位秒，超时后点击&quot;继续等待&quot;额外等待的时间。</p>
           </div>
           <div className="space-y-2">
             <label className="text-sm text-stone-700">图片二次确认等待时间</label>
@@ -267,19 +287,6 @@ export function ConfigCard() {
               disabled={!config?.image_settle_enabled}
             />
             <p className="text-xs text-stone-500">单位秒，找到图片后等待多久再次确认。需配合图片二次确认机制使用。</p>
-          </div>
-          <div className="flex gap-4 md:col-span-2">
-            <div className="flex-1 space-y-2">
-              <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
-                <Checkbox
-                  checked={Boolean(config?.auto_relogin_after_refresh)}
-                  onCheckedChange={(checked) => setAutoReloginAfterRefresh(Boolean(checked))}
-                />
-                刷新后自动尝试移除异常状态
-              </label>
-              <p className="text-xs text-stone-500">开启后刷新时自动尝试密码登录恢复账号。</p>
-            </div>
-            <div className="flex-1" aria-hidden="true" />
           </div>
           <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
             <Checkbox
@@ -340,7 +347,7 @@ export function ConfigCard() {
                   variant="outline"
                   className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
                   onClick={() => void testImageStorage()}
-                  disabled={isTestingImageStorage || !config?.image_storage?.enabled}
+                  disabled={imageStorageBusy || !config?.image_storage?.enabled}
                 >
                   {isTestingImageStorage ? <LoaderCircle className="size-4 animate-spin" /> : <Cloud className="size-4" />}
                   测试 WebDAV
@@ -350,7 +357,7 @@ export function ConfigCard() {
                   variant="outline"
                   className="h-9 rounded-xl border-stone-200 bg-white px-4 text-stone-700"
                   onClick={() => void syncImagesToWebDAV()}
-                  disabled={isSyncingImageStorage || !config?.image_storage?.enabled || config?.image_storage?.mode === "local"}
+                  disabled={imageStorageBusy || !config?.image_storage?.enabled || config?.image_storage?.mode === "local"}
                 >
                   {isSyncingImageStorage ? <LoaderCircle className="size-4 animate-spin" /> : <RefreshCw className="size-4" />}
                   全量同步
@@ -479,7 +486,7 @@ export function ConfigCard() {
           <Button
             className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
             onClick={() => void saveConfig()}
-            disabled={isSavingConfig}
+            disabled={isSavingConfig || imageStorageBusy}
           >
             {isSavingConfig ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
             保存

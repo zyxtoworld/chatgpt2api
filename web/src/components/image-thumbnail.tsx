@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -21,11 +21,8 @@ export function getImageThumbnailUrl(src: string) {
 
 export function ImageThumbnail({ src, thumbnailSrc, alt = "", className, imageClassName }: ImageThumbnailProps) {
   const initialSrc = useMemo(() => thumbnailSrc || getImageThumbnailUrl(src), [src, thumbnailSrc]);
-  const [currentSrc, setCurrentSrc] = useState(initialSrc);
-
-  useEffect(() => {
-    setCurrentSrc(initialSrc);
-  }, [initialSrc]);
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const currentSrc = failedSrc === initialSrc && initialSrc !== src ? src : initialSrc;
 
   return (
     <span className={cn("block overflow-hidden bg-stone-100", className)}>
@@ -37,7 +34,7 @@ export function ImageThumbnail({ src, thumbnailSrc, alt = "", className, imageCl
         decoding="async"
         onError={() => {
           if (currentSrc !== src) {
-            setCurrentSrc(src);
+            setFailedSrc(initialSrc);
           }
         }}
       />

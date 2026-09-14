@@ -153,7 +153,13 @@ export function ImageLightbox({
   }, [hasNext, currentIndex, onIndexChange]);
 
   useEffect(() => {
-    resetTransform();
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) resetTransform();
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [current?.id, open, resetTransform]);
 
   useEffect(() => {

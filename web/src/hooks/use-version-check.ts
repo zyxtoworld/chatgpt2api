@@ -1,13 +1,47 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import webConfig from "@/constants/common-env";
-import type { ReleaseInfo } from "@/lib/release";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { parseChangelog, type ReleaseInfo } from "@/lib/release";
+import { fetchReleaseBundle } from "@/lib/version-release-fetch";
+
+const latestVersionUrl =
+  "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/VERSION";
+const latestChangelogUrl =
+  "https://raw.githubusercontent.com/basketikun/chatgpt2api/main/CHANGELOG.md";
+const VERSION_MAX_BYTES = 16 * 1024;
+const CHANGELOG_MAX_BYTES = 2 * 1024 * 1024;
 
 function readLocalReleases(): ReleaseInfo[] {
-  return JSON.parse(process.env.NEXT_PUBLIC_APP_RELEASES || "[]");
+  try {
+    const parsed: unknown = JSON.parse(process.env.NEXT_PUBLIC_APP_RELEASES || "[]");
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    return parsed.filter((release) => {
+      if (!release || typeof release !== "object" || Array.isArray(release)) {
+        return false;
+      }
+      const items = release.items;
+      return (
+        typeof release.version === "string"
+        && typeof release.date === "string"
+        && Array.isArray(items)
+        && items.every(
+          (item) => item
+            && typeof item === "object"
+            && !Array.isArray(item)
+            && typeof item.type === "string"
+            && typeof item.content === "string",
+        )
+      );
+    }) as ReleaseInfo[];
+  } catch {
+    return [];
+  }
 }
 
 function toVersionParts(version: string) {
@@ -28,26 +62,61 @@ function isNewerVersion(latestVersion: string, currentVersion: string) {
 
 export function useVersionCheck() {
   const currentVersion = webConfig.appVersion;
-  const localReleases = useMemo(readLocalReleases, []);
+  const localReleases = useMemo(() => readLocalReleases(), []);
   const [latestVersion, setLatestVersion] = useState(currentVersion);
   const [releases, setReleases] = useState<ReleaseInfo[]>(localReleases);
   const [checking, setChecking] = useState(false);
   const [open, setOpen] = useState(false);
+  const releaseCheckOwnerRef = useRef(createLatestActionOwner());
+  const releaseAbortControllerRef = useRef<AbortController | null>(null);
   const hasNewVersion = isNewerVersion(latestVersion, currentVersion);
+
+  useEffect(() => {
+    const releaseCheckOwner = releaseCheckOwnerRef.current;
+    releaseCheckOwner.activate();
+    return () => {
+      releaseCheckOwner.cancel();
+      releaseAbortControllerRef.current?.abort();
+      releaseAbortControllerRef.current = null;
+    };
+  }, []);
 
   const checkLatestRelease = useCallback(
     async (showMessage = false) => {
+      const releaseCheckOwner = releaseCheckOwnerRef.current;
+      const requestOwner = releaseCheckOwner.begin();
+      releaseAbortControllerRef.current?.abort();
+      const abortController = new AbortController();
+      releaseAbortControllerRef.current = abortController;
       setChecking(true);
       try {
-        setLatestVersion(currentVersion);
-        setReleases(localReleases);
-        if (showMessage) toast.success("已刷新本地版本说明");
+        const [versionResponse, changelogResponse] = await fetchReleaseBundle(
+          latestVersionUrl,
+          latestChangelogUrl,
+          {
+            versionMaxBytes: VERSION_MAX_BYTES,
+            changelogMaxBytes: CHANGELOG_MAX_BYTES,
+            signal: abortController.signal,
+          },
+        );
+        if (releaseCheckOwner.accepts(requestOwner)) {
+          setLatestVersion(versionResponse.trim() || currentVersion);
+          if (changelogResponse.trim()) setReleases(parseChangelog(changelogResponse));
+          if (showMessage) toast.success("已获取最新版本信息");
+        }
       } catch {
-        setLatestVersion(currentVersion);
-        setReleases(localReleases);
-        if (showMessage) toast.error("获取最新版本信息失败");
+        if (releaseCheckOwner.accepts(requestOwner)) {
+          setLatestVersion(currentVersion);
+          setReleases(localReleases);
+          if (showMessage) toast.error("获取最新版本信息失败");
+        }
       } finally {
-        setChecking(false);
+        if (releaseCheckOwner.accepts(requestOwner)) {
+          setChecking(false);
+          if (releaseAbortControllerRef.current === abortController) {
+            releaseAbortControllerRef.current = null;
+          }
+        }
       }
     },
     [currentVersion, localReleases],

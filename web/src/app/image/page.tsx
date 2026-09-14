@@ -26,10 +26,25 @@ import {
   resumeImagePoll,
   type Account,
   type ImageModel,
-  type Model,
   type ImageTask,
 } from "@/lib/api";
 import { useAuthGuard } from "@/lib/use-auth-guard";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { createLifecycleActionOwner } from "@/lib/lifecycle-action-owner";
+import { createConversationQueueGate } from "@/lib/image-conversation-queue-gate";
+import { applyImageConversationUpdate, findImageTaskConversation } from "@/lib/image-conversation-update";
+import { createScrollCleanupSnapshot } from "@/lib/image-scroll-cleanup";
+import { settleImageTaskSubmissions } from "@/lib/image-task-submission";
+import { fetchImageAsFile } from "@/lib/image-download";
+import { formatAvailableImageQuota } from "@/lib/image-account-state";
+import {
+  canSubmitImage,
+  resolveImageModelLoadError,
+  resolveImageModelLoadSuccess,
+  selectImageModel,
+} from "@/lib/image-model-state";
+import { readOptionalStorageItem, removeOptionalStorageItem, writeOptionalStorageItem } from "@/lib/optional-storage";
+import { scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
 import { useSettingsStore } from "@/app/settings/store";
 import {
   clearImageConversations,
@@ -55,6 +70,7 @@ const IMAGE_MODEL_STORAGE_KEY = "chatgpt2api:image_last_model";
 const IMAGE_COUNT_STORAGE_KEY = "chatgpt2api:image_last_count";
 const SCROLL_POSITIONS_STORAGE_KEY = "chatgpt2api:image_scroll_positions";
 const SCROLL_TO_LATEST_THRESHOLD = 160;
+type ImageModelLoadStatus = "loading" | "ready" | "empty" | "error";
 
 function loadScrollPositions(): Map<string, number> {
   if (typeof window === "undefined") return new Map();
@@ -87,9 +103,6 @@ function parseImageSize(size: string) {
   return match ? { width: match[1], height: match[2] } : { width: "1024", height: "1024" };
 }
 
-const activeConversationQueueIds = new Set<string>();
-let pollAbortController: AbortController | null = null;
-
 function getResultsDistanceFromBottom(element: HTMLElement) {
   return element.scrollHeight - element.scrollTop - element.clientHeight;
 }
@@ -116,8 +129,7 @@ function formatConversationTime(value: string) {
 }
 
 function formatAvailableQuota(accounts: Account[]) {
-  const availableAccounts = accounts.filter((account) => account.status !== "禁用");
-  return String(availableAccounts.reduce((sum, account) => sum + Math.max(0, account.quota), 0));
+  return formatAvailableImageQuota(accounts);
 }
 
 function createId() {
@@ -144,20 +156,6 @@ function dataUrlToFile(dataUrl: string, fileName: string, mimeType?: string) {
   return new File([bytes], fileName, { type: mimeType || matchedMimeType || "image/png" });
 }
 
-function filterImageModels(items: Model[]): ImageModel[] {
-  return items
-    .map((item) => String(item.id || "").trim())
-    .filter((id, index, list) => id.toLowerCase().includes("image") && list.indexOf(id) === index);
-}
-
-function normalizeStoredImageModel(value: string | null, availableModels: ImageModel[]): ImageModel {
-  const normalized = String(value || "").trim();
-  if (normalized && availableModels.includes(normalized)) {
-    return normalized;
-  }
-  return availableModels[0] || "gpt-image-2";
-}
-
 function buildReferenceImageFromResult(image: StoredImage, fileName: string): StoredReferenceImage | null {
   if (!image.b64_json) {
     return null;
@@ -170,16 +168,7 @@ function buildReferenceImageFromResult(image: StoredImage, fileName: string): St
   };
 }
 
-async function fetchImageAsFile(url: string, fileName: string) {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error("读取结果图失败");
-  }
-  const blob = await response.blob();
-  return new File([blob], fileName, { type: blob.type || "image/png" });
-}
-
-async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string) {
+async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: string, signal?: AbortSignal) {
   const direct = buildReferenceImageFromResult(image, fileName);
   if (direct) {
     return {
@@ -191,7 +180,7 @@ async function buildReferenceImageFromStoredImage(image: StoredImage, fileName: 
   if (!image.url) {
     return null;
   }
-  const file = await fetchImageAsFile(image.url, fileName);
+  const file = await fetchImageAsFile(image.url, fileName, signal);
   return {
     referenceImage: {
       name: file.name,
@@ -317,7 +306,13 @@ function finalizeIdleQueuedTurn(turn: ImageTurn): ImageTurn {
   };
 }
 
-async function syncConversationImageTasks(items: ImageConversation[]) {
+async function syncConversationImageTasks(
+  items: ImageConversation[],
+  isCurrent: () => boolean = () => true,
+) {
+  if (!isCurrent()) {
+    return items;
+  }
   const taskIds = Array.from(
     new Set(
       items.flatMap((conversation) =>
@@ -341,6 +336,9 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
   try {
     taskList = await fetchImageTasks(taskIds);
   } catch {
+    return items;
+  }
+  if (!isCurrent()) {
     return items;
   }
   const taskMap = new Map(taskList.items.map((task) => [task.id, task]));
@@ -386,13 +384,13 @@ async function syncConversationImageTasks(items: ImageConversation[]) {
     };
   });
 
-  if (changed) {
+  if (changed && isCurrent()) {
     await saveImageConversations(normalized);
   }
   return normalized;
 }
 
-async function recoverConversationHistory(items: ImageConversation[]) {
+async function recoverConversationHistory(items: ImageConversation[], isCurrent: () => boolean) {
   let changed = false;
   const normalized = items.map((conversation) => {
     const turns = conversation.turns.map((turn) => {
@@ -436,18 +434,28 @@ async function recoverConversationHistory(items: ImageConversation[]) {
     };
   });
 
-  if (changed) {
+  if (changed && isCurrent()) {
     await saveImageConversations(normalized);
   }
 
-  return syncConversationImageTasks(normalized);
+  if (!isCurrent()) {
+    return normalized;
+  }
+  return syncConversationImageTasks(normalized, isCurrent);
 }
 
 
 function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
-  const didLoadQuotaRef = useRef(false);
+  const quotaOwnerRef = useRef(createLatestActionOwner());
+  const quotaAbortControllerRef = useRef<AbortController | null>(null);
+  const modelAbortControllerRef = useRef<AbortController | null>(null);
+  const continueEditOwnerRef = useRef(createLatestActionOwner());
+  const continueEditAbortRef = useRef<AbortController | null>(null);
+  const historyLoadOwnerRef = useRef(createLatestActionOwner());
+  const referenceImageReadOwnerRef = useRef(createLifecycleActionOwner());
+  const historyMutationOwnerRef = useRef(createLifecycleActionOwner());
+  const conversationQueueGateRef = useRef(createConversationQueueGate());
   const conversationsRef = useRef<ImageConversation[]>([]);
-  const loadCancelledRef = useRef(false);
   const resultsViewportRef = useRef<HTMLDivElement>(null);
   const lastConversationIdRef = useRef<string | null>(null);
   const shouldStickToBottomRef = useRef(true);
@@ -469,8 +477,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   const [imageWidth, setImageWidth] = useState("1024");
   const [imageHeight, setImageHeight] = useState("1024");
   const [imageQuality, setImageQuality] = useState("auto");
-  const [imageModel, setImageModel] = useState<ImageModel>("gpt-image-2");
-  const [imageModels, setImageModels] = useState<ImageModel[]>(["gpt-image-2"]);
+  const [imageModel, setImageModel] = useState<ImageModel>("");
+  const [imageModels, setImageModels] = useState<ImageModel[]>([]);
+  const [imageModelStatus, setImageModelStatus] = useState<ImageModelLoadStatus>("loading");
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [referenceImageFiles, setReferenceImageFiles] = useState<File[]>([]);
   const [referenceImages, setReferenceImages] = useState<StoredReferenceImage[]>([]);
@@ -489,12 +498,6 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     | { type: "all" }
     | null
   >(null);
-  const [timeoutRetry, setTimeoutRetry] = useState<{
-    conversationId: string;
-    taskId: string;
-    taskError: string;
-  } | null>(null);
-
   const parsedCount = useMemo(() => Number(clampImageCount(imageCount)), [imageCount]);
   const selectedConversation = useMemo(
     () => conversations.find((item) => item.id === selectedConversationId) ?? null,
@@ -591,27 +594,31 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, []);
 
   useEffect(() => {
+    const scrollPositions = scrollPositionsRef.current;
     return () => {
       if (scrollRafRef.current !== null) {
         window.cancelAnimationFrame(scrollRafRef.current);
       }
       if (scrollSaveTimerRef.current !== null) {
         clearTimeout(scrollSaveTimerRef.current);
-        saveScrollPositions(scrollPositionsRef.current);
+        saveScrollPositions(scrollPositions);
       }
     };
   }, []);
 
   const loadHistory = useCallback(async () => {
+    const historyLoadOwner = historyLoadOwnerRef.current;
+    const requestOwner = historyLoadOwner.begin();
+    const isCurrentRequest = () => historyLoadOwner.accepts(requestOwner);
     try {
       const storedRatio =
-        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_RATIO_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_RATIO_STORAGE_KEY) : null;
       const storedTier =
-        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_TIER_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_TIER_STORAGE_KEY) : null;
       const storedQuality =
-        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_QUALITY_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_QUALITY_STORAGE_KEY) : null;
       const storedCount =
-        typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_COUNT_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_COUNT_STORAGE_KEY) : null;
       setImageRatio(storedRatio || "1:1");
       setImageTier(storedTier || "1k");
       setImageWidth("1024");
@@ -620,25 +627,29 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       setImageCount(storedCount ? clampImageCount(storedCount) : "1");
 
       const items = await listImageConversations();
-      const normalizedItems = await recoverConversationHistory(items);
-      if (loadCancelledRef.current) {
+      if (!isCurrentRequest()) {
+        return;
+      }
+      const normalizedItems = await recoverConversationHistory(items, isCurrentRequest);
+      if (!isCurrentRequest()) {
         return;
       }
 
       conversationsRef.current = normalizedItems;
       setConversations(normalizedItems);
       const storedConversationId =
-        typeof window !== "undefined" ? window.localStorage.getItem(ACTIVE_CONVERSATION_STORAGE_KEY) : null;
+        typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, ACTIVE_CONVERSATION_STORAGE_KEY) : null;
       const nextSelectedConversationId =
         (storedConversationId && normalizedItems.some((conversation) => conversation.id === storedConversationId)
           ? storedConversationId
           : null) ?? pickFallbackConversationId(normalizedItems);
       setSelectedConversationId(nextSelectedConversationId);
     } catch (error) {
+      if (!isCurrentRequest()) return;
       const message = error instanceof Error ? error.message : "读取会话记录失败";
       toast.error(message);
     } finally {
-      if (!loadCancelledRef.current) {
+      if (isCurrentRequest()) {
         setIsLoadingHistory(false);
       }
     }
@@ -666,46 +677,50 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   }, [loadHistory]);
 
   useEffect(() => {
-    loadCancelledRef.current = false;
-    void loadHistory();
+    let cancelled = false;
+    const historyLoadOwner = historyLoadOwnerRef.current;
+    historyLoadOwner.activate();
+    const scrollPositions = scrollPositionsRef.current;
+    const scrollCleanup = createScrollCleanupSnapshot(resultsViewportRef.current, scrollPositions);
+    queueMicrotask(() => {
+      if (!cancelled) void loadHistory();
+    });
     return () => {
-      loadCancelledRef.current = true;
+      cancelled = true;
+      historyLoadOwner.cancel();
       // 组件卸载时保存当前滚动位置到 sessionStorage
-      const element = resultsViewportRef.current;
-      const convId = lastConversationIdRef.current;
-      if (element && convId) {
-        scrollPositionsRef.current.set(convId, element.scrollTop);
-        saveScrollPositions(scrollPositionsRef.current);
-      }
-      activeConversationQueueIds.clear();
-      if (pollAbortController) {
-        pollAbortController.abort();
-        pollAbortController = null;
+      if (scrollCleanup.persist(lastConversationIdRef.current)) {
+        saveScrollPositions(scrollPositions);
       }
     };
   }, [loadHistory]);
 
   useEffect(() => {
+    const abortController = new AbortController();
+    modelAbortControllerRef.current?.abort();
+    modelAbortControllerRef.current = abortController;
     let cancelled = false;
 
     const loadImageModels = async () => {
       try {
-        const data = await fetchModels();
-        const available = filterImageModels(Array.isArray(data.data) ? data.data : []);
-        if (cancelled || available.length === 0) {
+        const data = await fetchModels(abortController.signal);
+        const loaded = resolveImageModelLoadSuccess(data);
+        if (cancelled || abortController.signal.aborted) {
           return;
         }
+        const available = loaded.models as ImageModel[];
         setImageModels(available);
-        const storedModel = typeof window !== "undefined" ? window.localStorage.getItem(IMAGE_MODEL_STORAGE_KEY) : null;
+        const storedModel = typeof window !== "undefined" ? readOptionalStorageItem(window.localStorage, IMAGE_MODEL_STORAGE_KEY) : null;
         setImageModel((current) => {
-          if (available.includes(current)) {
-            return current;
-          }
-          return normalizeStoredImageModel(storedModel, available);
+          return selectImageModel(current || storedModel, available);
         });
+        setImageModelStatus(loaded.status as ImageModelLoadStatus);
       } catch {
-        if (!cancelled) {
-          setImageModels(["gpt-image-2"]);
+        if (!cancelled && !abortController.signal.aborted) {
+          const failed = resolveImageModelLoadError();
+          setImageModels(failed.models);
+          setImageModel("");
+          setImageModelStatus(failed.status as ImageModelLoadStatus);
         }
       }
     };
@@ -713,35 +728,96 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     void loadImageModels();
     return () => {
       cancelled = true;
+      abortController.abort();
+      if (modelAbortControllerRef.current === abortController) {
+        modelAbortControllerRef.current = null;
+      }
     };
   }, []);
 
   const loadQuota = useCallback(async () => {
+    const quotaOwner = quotaOwnerRef.current;
+    const requestOwner = quotaOwner.begin();
+    quotaAbortControllerRef.current?.abort();
+    const abortController = new AbortController();
+    quotaAbortControllerRef.current = abortController;
     if (!isAdmin) {
-      setAvailableQuota("--");
+      if (quotaOwner.accepts(requestOwner)) setAvailableQuota("--");
+      if (quotaAbortControllerRef.current === abortController) {
+        quotaAbortControllerRef.current = null;
+      }
       return;
     }
     try {
-      const data = await fetchAccounts();
-      setAvailableQuota(formatAvailableQuota(data.items));
+      const data = await fetchAccounts(abortController.signal);
+      if (quotaOwner.accepts(requestOwner)) {
+        setAvailableQuota(formatAvailableQuota(data.items));
+      }
     } catch {
-      setAvailableQuota((prev) => (prev === "加载中..." ? "--" : prev));
+      if (quotaOwner.accepts(requestOwner)) {
+        setAvailableQuota((prev) => (prev === "加载中..." ? "--" : prev));
+      }
+    } finally {
+      if (quotaAbortControllerRef.current === abortController) {
+        quotaAbortControllerRef.current = null;
+      }
     }
   }, [isAdmin]);
 
   useEffect(() => {
-    if (didLoadQuotaRef.current) {
-      return;
-    }
-    didLoadQuotaRef.current = true;
+    const quotaOwner = quotaOwnerRef.current;
+    quotaOwner.activate();
+    return () => {
+      quotaOwner.cancel();
+      quotaAbortControllerRef.current?.abort();
+      quotaAbortControllerRef.current = null;
+    };
+  }, []);
 
+  useEffect(() => {
+    const continueEditOwner = continueEditOwnerRef.current;
+    continueEditOwner.activate();
+    return () => {
+      continueEditOwner.cancel();
+      continueEditAbortRef.current?.abort();
+      continueEditAbortRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const referenceImageReadOwner = referenceImageReadOwnerRef.current;
+    referenceImageReadOwner.activate();
+    return () => referenceImageReadOwner.cancel();
+  }, []);
+
+  useEffect(() => {
+    const historyMutationOwner = historyMutationOwnerRef.current;
+    historyMutationOwner.activate();
+    return () => historyMutationOwner.cancel();
+  }, []);
+
+  useEffect(() => {
+    const conversationQueueGate = conversationQueueGateRef.current;
+    conversationQueueGate.activate();
+    return () => conversationQueueGate.cancel();
+  }, []);
+
+  useEffect(() => {
+    continueEditOwnerRef.current.invalidate();
+    continueEditAbortRef.current?.abort();
+    continueEditAbortRef.current = null;
+    referenceImageReadOwnerRef.current.invalidate();
+  }, [selectedConversationId]);
+
+  useEffect(() => {
     const handleFocus = () => {
       void loadQuota();
     };
 
-    void loadQuota();
+    const cancelInitialQuotaLoad = scheduleOwnedMicrotask(() => loadQuota());
     window.addEventListener("focus", handleFocus);
     return () => {
+      cancelInitialQuotaLoad();
       window.removeEventListener("focus", handleFocus);
     };
   }, [isAdmin, loadQuota]);
@@ -844,9 +920,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     }
 
     if (selectedConversationId) {
-      window.localStorage.setItem(ACTIVE_CONVERSATION_STORAGE_KEY, selectedConversationId);
+      writeOptionalStorageItem(window.localStorage, ACTIVE_CONVERSATION_STORAGE_KEY, selectedConversationId);
     } else {
-      window.localStorage.removeItem(ACTIVE_CONVERSATION_STORAGE_KEY);
+      removeOptionalStorageItem(window.localStorage, ACTIVE_CONVERSATION_STORAGE_KEY);
     }
   }, [selectedConversationId]);
 
@@ -855,25 +931,43 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
-    window.localStorage.setItem(IMAGE_RATIO_STORAGE_KEY, imageRatio);
-    window.localStorage.setItem(IMAGE_TIER_STORAGE_KEY, imageTier);
-    window.localStorage.setItem(IMAGE_QUALITY_STORAGE_KEY, imageQuality);
-    window.localStorage.setItem(IMAGE_MODEL_STORAGE_KEY, imageModel);
+    writeOptionalStorageItem(window.localStorage, IMAGE_RATIO_STORAGE_KEY, imageRatio);
+    writeOptionalStorageItem(window.localStorage, IMAGE_TIER_STORAGE_KEY, imageTier);
+    writeOptionalStorageItem(window.localStorage, IMAGE_QUALITY_STORAGE_KEY, imageQuality);
+    writeOptionalStorageItem(window.localStorage, IMAGE_MODEL_STORAGE_KEY, imageModel);
   }, [imageRatio, imageTier, imageQuality, imageModel]);
 
   useEffect(() => {
     if (typeof window !== "undefined" && parsedCount > 0) {
-      window.localStorage.setItem(IMAGE_COUNT_STORAGE_KEY, String(parsedCount));
+      writeOptionalStorageItem(window.localStorage, IMAGE_COUNT_STORAGE_KEY, String(parsedCount));
     }
   }, [parsedCount]);
 
   useEffect(() => {
+    let cancelled = false;
     if (selectedConversationId && !conversations.some((conversation) => conversation.id === selectedConversationId)) {
-      setSelectedConversationId(pickFallbackConversationId(conversations));
+      const fallbackId = pickFallbackConversationId(conversations);
+      queueMicrotask(() => {
+        if (!cancelled) setSelectedConversationId(fallbackId);
+      });
     }
+    return () => {
+      cancelled = true;
+    };
   }, [conversations, selectedConversationId]);
 
-  const persistConversation = async (conversation: ImageConversation) => {
+  const invalidateHistoryLoad = useCallback(() => {
+    historyLoadOwnerRef.current.invalidate();
+    setIsLoadingHistory(false);
+  }, []);
+
+  const beginHistoryMutation = useCallback(() => {
+    invalidateHistoryLoad();
+    return historyMutationOwnerRef.current.begin();
+  }, [invalidateHistoryLoad]);
+
+  const persistConversation = useCallback(async (conversation: ImageConversation) => {
+    invalidateHistoryLoad();
     const nextConversations = sortImageConversations([
       conversation,
       ...conversationsRef.current.filter((item) => item.id !== conversation.id),
@@ -881,30 +975,40 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     conversationsRef.current = nextConversations;
     setConversations(nextConversations);
     await saveImageConversation(conversation);
-  };
+  }, [invalidateHistoryLoad]);
 
   const updateConversation = useCallback(
     async (
       conversationId: string,
-      updater: (current: ImageConversation | null) => ImageConversation,
+      updater: (current: ImageConversation | null) => ImageConversation | null,
       options: { persist?: boolean } = {},
     ) => {
-      const current = conversationsRef.current.find((item) => item.id === conversationId) ?? null;
-      const nextConversation = updater(current);
-      const nextConversations = sortImageConversations([
-        nextConversation,
-        ...conversationsRef.current.filter((item) => item.id !== conversationId),
-      ]);
+      invalidateHistoryLoad();
+      const result = applyImageConversationUpdate(conversationsRef.current, conversationId, updater);
+      if (!result.changed) {
+        return;
+      }
+      const nextConversation = (result.conversations as ImageConversation[]).find(
+        (item: ImageConversation) => item.id === conversationId,
+      );
+      if (!nextConversation) {
+        return;
+      }
+      const nextConversations = sortImageConversations(result.conversations);
       conversationsRef.current = nextConversations;
       setConversations(nextConversations);
       if (options.persist !== false) {
         await saveImageConversation(nextConversation);
       }
     },
-    [],
+    [invalidateHistoryLoad],
   );
 
   const clearComposerInputs = useCallback(() => {
+    referenceImageReadOwnerRef.current.invalidate();
+    continueEditOwnerRef.current.invalidate();
+    continueEditAbortRef.current?.abort();
+    continueEditAbortRef.current = null;
     setImagePrompt("");
     setReferenceImageFiles([]);
     setReferenceImages([]);
@@ -927,7 +1031,10 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   };
 
   const handleDeleteConversation = async (id: string) => {
-    const nextConversations = conversations.filter((item) => item.id !== id);
+    const historyMutationOwner = historyMutationOwnerRef.current;
+    const mutationOwner = beginHistoryMutation();
+    conversationQueueGateRef.current.invalidate(id);
+    const nextConversations = conversationsRef.current.filter((item) => item.id !== id);
     conversationsRef.current = nextConversations;
     setConversations(nextConversations);
     if (selectedConversationId === id) {
@@ -937,16 +1044,28 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
     try {
       await deleteImageConversation(id);
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
     } catch (error) {
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "删除会话失败";
       toast.error(message);
       const items = await listImageConversations();
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       conversationsRef.current = items;
       setConversations(items);
     }
   };
 
   const handleDeleteTurnPart = async (conversationId: string, turnId: string, part: "prompt" | "results") => {
+    const historyMutationOwner = historyMutationOwnerRef.current;
+    const mutationOwner = beginHistoryMutation();
+    conversationQueueGateRef.current.invalidate(conversationId);
     const conversation = conversationsRef.current.find((item) => item.id === conversationId);
     if (!conversation) {
       return;
@@ -990,32 +1109,68 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       updatedAt: new Date().toISOString(),
       turns,
     };
-    await persistConversation(nextConversation);
+    try {
+      await persistConversation(nextConversation);
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
+    } catch (error) {
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : "删除记录失败";
+      toast.error(message);
+    }
   };
 
   const handleClearHistory = async () => {
+    const historyMutationOwner = historyMutationOwnerRef.current;
+    const mutationOwner = beginHistoryMutation();
+    conversationQueueGateRef.current.invalidateAll();
     try {
       await clearImageConversations();
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
+      // 清空成功后再移除本地列表，避免迟到队列回调重建已清空的会话。
       conversationsRef.current = [];
       setConversations([]);
       setSelectedConversationId(null);
       resetComposer();
       toast.success("已清空历史记录");
     } catch (error) {
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "清空历史记录失败";
       toast.error(message);
+      try {
+        const items = await listImageConversations();
+        if (!historyMutationOwner.accepts(mutationOwner)) {
+          return;
+        }
+        conversationsRef.current = items;
+        setConversations(items);
+      } catch {
+        // 保留当前快照；后续页面状态变化仍会触发权威重载。
+      }
     }
   };
 
   const handleRenameConversation = async (id: string, title: string) => {
-    const nextConversations = conversations.map((item) =>
-      item.id === id ? { ...item, title, updatedAt: new Date().toISOString() } : item,
+    const historyMutationOwner = historyMutationOwnerRef.current;
+    const mutationOwner = beginHistoryMutation();
+    await updateConversation(
+      id,
+      (current) => current ? { ...current, title, updatedAt: new Date().toISOString() } : null,
+      { persist: false },
     );
-    conversationsRef.current = sortImageConversations(nextConversations);
-    setConversations(conversationsRef.current);
     try {
       await renameImageConversation(id, title);
     } catch (error) {
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "重命名失败";
       toast.error(message);
     }
@@ -1061,6 +1216,8 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
 
+    const readOwner = referenceImageReadOwnerRef.current;
+    const readAction = readOwner.begin();
     try {
       const previews = await Promise.all(
         files.map(async (file) => ({
@@ -1070,12 +1227,19 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         })),
       );
 
+      if (!readOwner.accepts(readAction)) {
+        return;
+      }
+
       setReferenceImageFiles((prev) => [...prev, ...files]);
       setReferenceImages((prev) => [...prev, ...previews]);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
     } catch (error) {
+      if (!readOwner.accepts(readAction)) {
+        return;
+      }
       const message = error instanceof Error ? error.message : "读取参考图失败";
       toast.error(message);
     }
@@ -1105,6 +1269,11 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
   const handleContinueEdit = useCallback(
     async (conversationId: string, image: StoredImage | StoredReferenceImage) => {
+      const continueEditOwner = continueEditOwnerRef.current;
+      const requestOwner = continueEditOwner.begin(conversationId);
+      continueEditAbortRef.current?.abort();
+      const abortController = new AbortController();
+      continueEditAbortRef.current = abortController;
       try {
         const nextReference =
           "dataUrl" in image
@@ -1112,8 +1281,16 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
                 referenceImage: image,
                 file: dataUrlToFile(image.dataUrl, image.name, image.type),
               }
-            : await buildReferenceImageFromStoredImage(image, `conversation-${conversationId}-${Date.now()}.png`);
+            : await buildReferenceImageFromStoredImage(
+                image,
+                `conversation-${conversationId}-${Date.now()}.png`,
+                abortController.signal,
+              );
         if (!nextReference) {
+          return;
+        }
+
+        if (!continueEditOwner.accepts(requestOwner, conversationId)) {
           return;
         }
 
@@ -1125,8 +1302,15 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         textareaRef.current?.focus();
         toast.success("已加入当前参考图，继续输入描述即可编辑");
       } catch (error) {
+        if (!continueEditOwner.accepts(requestOwner, conversationId)) {
+          return;
+        }
         const message = error instanceof Error ? error.message : "读取结果图失败";
         toast.error(message);
+      } finally {
+        if (continueEditAbortRef.current === abortController) {
+          continueEditAbortRef.current = null;
+        }
       }
     },
     [],
@@ -1183,9 +1367,12 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   /* eslint-disable react-hooks/preserve-manual-memoization */
   const runConversationQueue = useCallback(
     async (conversationId: string) => {
-      if (activeConversationQueueIds.has(conversationId)) {
+      const queueGate = conversationQueueGateRef.current;
+      const queueLease = queueGate.begin(conversationId);
+      if (!queueLease) {
         return;
       }
+      const acceptsQueue = () => queueGate.accepts(queueLease);
 
       const snapshot = conversationsRef.current.find((conversation) => conversation.id === conversationId);
       const activeTurn = snapshot?.turns.find(
@@ -1194,14 +1381,20 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           turn.images.some((image) => image.status === "loading"),
       );
       if (!snapshot || !activeTurn) {
+        queueGate.finish(queueLease);
         return;
       }
 
-      activeConversationQueueIds.add(conversationId);
       const applyTasks = async (tasks: ImageTask[]) => {
+        if (!acceptsQueue()) {
+          return false;
+        }
         const taskMap = new Map(tasks.map((task) => [task.id, task]));
         await updateConversation(conversationId, (current) => {
-          const conversation = current ?? snapshot;
+          if (!acceptsQueue() || !current) {
+            return null;
+          }
+          const conversation = current;
           const turns = conversation.turns.map((turn) => {
             if (turn.id !== activeTurn.id) {
               return turn;
@@ -1224,10 +1417,38 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             turns,
           };
         });
+        return acceptsQueue();
+      };
+
+      const applySubmissionFailures = async (
+        failures: Array<{ imageId: string; message: string }>,
+      ) => {
+        if (failures.length === 0 || !acceptsQueue()) {
+          return acceptsQueue();
+        }
+        const failureMessages = new Map(failures.map((failure) => [failure.imageId, failure.message]));
+        await updateConversation(conversationId, (current) => {
+          if (!acceptsQueue() || !current) {
+            return null;
+          }
+          const turns = current.turns.map((turn) => {
+            if (turn.id !== activeTurn.id) {
+              return turn;
+            }
+            const images = turn.images.map((image) => {
+              const message = failureMessages.get(image.id);
+              return message && image.status === "loading"
+                ? { ...image, status: "error" as const, error: message }
+                : image;
+            });
+            return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
+          });
+          return { ...current, updatedAt: new Date().toISOString(), turns };
+        });
+        return acceptsQueue();
       };
 
       try {
-
         const referenceFiles = activeTurn.referenceImages.map((image, index) =>
           dataUrlToFile(image.dataUrl, image.name || `${activeTurn.id}-${index + 1}.png`, image.type),
         );
@@ -1236,19 +1457,38 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
         }
 
         const pendingImages = activeTurn.images.filter((image) => image.status === "loading");
-        const submitted = await Promise.all(
-          pendingImages.map((image) => {
+        if (!acceptsQueue()) {
+          return;
+        }
+        const submission = await settleImageTaskSubmissions(
+          pendingImages,
+          (image: StoredImage) => {
             const taskId = image.taskId || image.id;
             return activeTurn.mode === "edit"
               ? createImageEditTask(taskId, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
               : createImageGenerationTask(taskId, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality);
-          }),
+          },
         );
-        await applyTasks(submitted);
+        if (!acceptsQueue() || (submission.tasks.length > 0 && !(await applyTasks(submission.tasks)))) {
+          return;
+        }
+        if (!(await applySubmissionFailures(submission.failures))) {
+          return;
+        }
+        if (submission.failures.length > 0) {
+          toast.error(
+            submission.failures.length === pendingImages.length
+              ? submission.failures[0].message
+              : `${submission.failures.length} 张图片任务提交失败，其余任务继续生成`,
+          );
+        }
 
         let consecutiveErrors = 0;
         const retryingTaskIdsRef = new Set<string>();
         while (true) {
+          if (!acceptsQueue()) {
+            return;
+          }
           const latestConversation = conversationsRef.current.find((conversation) => conversation.id === conversationId);
           const latestTurn = latestConversation?.turns.find((turn) => turn.id === activeTurn.id);
           const loadingTaskIds =
@@ -1260,8 +1500,14 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           }
 
           await sleep(2000);
+          if (!acceptsQueue()) {
+            return;
+          }
           try {
             const taskList = await fetchImageTasks(loadingTaskIds);
+            if (!acceptsQueue()) {
+              return;
+            }
             consecutiveErrors = 0;
             if (taskList.items.length > 0) {
               // 检测是否有超时错误且需要显示重试按钮
@@ -1274,30 +1520,43 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
               );
               if (timeoutTask && timeoutTask.conversation_id) {
                 retryingTaskIdsRef.add(timeoutTask.id);
-                setTimeoutRetry({
-                  conversationId: timeoutTask.conversation_id,
-                  taskId: timeoutTask.id,
-                  taskError: timeoutTask.error || "生图超时",
-                });
                 // 应用超时错误到对应图片，显示继续等待按钮
-                await applyTasks([timeoutTask]);
+                if (!(await applyTasks([timeoutTask]))) {
+                  return;
+                }
               } else {
-                await applyTasks(taskList.items);
+                if (!(await applyTasks(taskList.items))) {
+                  return;
+                }
               }
             }
-            if (taskList.missing_ids.length > 0 && latestTurn) {
-              const missingImages = latestTurn.images.filter(
+            if (!acceptsQueue() || taskList.missing_ids.length === 0) {
+              continue;
+            }
+            const currentConversation = conversationsRef.current.find((conversation) => conversation.id === conversationId);
+            const currentTurn = currentConversation?.turns.find((turn) => turn.id === activeTurn.id);
+            if (currentTurn) {
+              const missingImages = currentTurn.images.filter(
                 (image) => image.status === "loading" && image.taskId && taskList.missing_ids.includes(image.taskId),
               );
-              const resubmitted = await Promise.all(
-                missingImages.map((image) =>
+              if (!acceptsQueue()) {
+                return;
+              }
+              const resubmission = await settleImageTaskSubmissions(
+                missingImages,
+                (image: StoredImage) =>
                   activeTurn.mode === "edit"
                     ? createImageEditTask(image.taskId || image.id, referenceFiles, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality)
                     : createImageGenerationTask(image.taskId || image.id, activeTurn.prompt, activeTurn.model, activeTurn.size, activeTurn.quality),
-                ),
               );
-              if (resubmitted.length > 0) {
-                await applyTasks(resubmitted);
+              if (!acceptsQueue()) {
+                return;
+              }
+              if (resubmission.tasks.length > 0 && !(await applyTasks(resubmission.tasks))) {
+                return;
+              }
+              if (resubmission.failures.length > 0) {
+                throw new Error(resubmission.failures[0].message);
               }
             }
           } catch (pollError) {
@@ -1308,11 +1567,20 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           }
         }
 
+        if (!acceptsQueue()) {
+          return;
+        }
         await loadQuota();
       } catch (error) {
+        if (!acceptsQueue()) {
+          return;
+        }
         const message = error instanceof Error ? error.message : "生成图片失败";
         await updateConversation(conversationId, (current) => {
-          const conversation = current ?? snapshot;
+          if (!acceptsQueue() || !current) {
+            return null;
+          }
+          const conversation = current;
           return {
             ...conversation,
             updatedAt: new Date().toISOString(),
@@ -1330,12 +1598,16 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             ),
           };
         });
-        toast.error(message);
+        if (acceptsQueue()) {
+          toast.error(message);
+        }
       } finally {
-        activeConversationQueueIds.delete(conversationId);
+        if (!queueGate.finish(queueLease)) {
+          return;
+        }
         for (const conversation of conversationsRef.current) {
           if (
-            !activeConversationQueueIds.has(conversation.id) &&
+            !queueGate.isRunning(conversation.id) &&
             conversation.turns.some(
               (turn) =>
                 (turn.status === "queued" || turn.status === "generating") &&
@@ -1358,6 +1630,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       if (!conversation || !sourceTurn || !sourceTurn.prompt.trim()) {
         return;
       }
+
+      const historyMutationOwner = historyMutationOwnerRef.current;
+      const mutationOwner = beginHistoryMutation();
 
       const now = new Date().toISOString();
       const nextTurnId = createId();
@@ -1385,10 +1660,13 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
       setSelectedConversationId(conversationId);
       await persistConversation(nextConversation);
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       void runConversationQueue(conversationId);
       toast.success("已加入重新生成队列");
     },
-    [runConversationQueue],
+    [beginHistoryMutation, persistConversation, runConversationQueue],
   );
 
   const handleRetryImage = useCallback(
@@ -1397,6 +1675,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       if (!conversation) {
         return;
       }
+
+      const historyMutationOwner = historyMutationOwnerRef.current;
+      const mutationOwner = beginHistoryMutation();
 
       const now = new Date().toISOString();
       const retryImageId = `${turnId}-${createId()}`;
@@ -1431,20 +1712,29 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
 
       setSelectedConversationId(conversationId);
       await persistConversation(nextConversation);
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       void runConversationQueue(conversationId);
     },
-    [runConversationQueue],
+    [beginHistoryMutation, persistConversation, runConversationQueue],
   );
 
-  const handleTimeoutRetryContinue = useCallback(async () => {
-    if (!timeoutRetry) return;
-    const { conversationId, taskId } = timeoutRetry;
+  const handleTimeoutRetryContinue = useCallback(async (taskId: string) => {
+    const targetConversation = findImageTaskConversation(conversationsRef.current, taskId);
+    if (!targetConversation) return;
+    const conversationId = targetConversation.id;
+    const historyMutationOwner = historyMutationOwnerRef.current;
+    const mutationOwner = beginHistoryMutation();
     try {
       await resumeImagePoll(taskId, imageTimeoutRetrySecs);
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       // 将对应图片的状态重置为 loading，并清除错误
-      void updateConversation(conversationId, (current) => {
-        const conversation = current ?? conversationsRef.current.find((c) => c.id === conversationId);
-        if (!conversation) return current!;
+      await updateConversation(conversationId, (current) => {
+        const conversation = current;
+        if (!conversation) return null;
         return {
           ...conversation,
           updatedAt: new Date().toISOString(),
@@ -1464,50 +1754,24 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
           }),
         };
       });
-      // 清除重试状态
-      setTimeoutRetry(null);
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       toast.info(`已继续等待 ${imageTimeoutRetrySecs} 秒`);
     } catch (err) {
+      if (!historyMutationOwner.accepts(mutationOwner)) {
+        return;
+      }
       const msg = err instanceof Error ? err.message : "续轮询失败";
       toast.error(msg);
-      setTimeoutRetry(null);
     }
-  }, [timeoutRetry, updateConversation, imageTimeoutRetrySecs]);
-
-  const handleTimeoutRetryCancel = useCallback(() => {
-    if (!timeoutRetry) return;
-    const { conversationId: convId, taskId, taskError } = timeoutRetry;
-    // 将超时错误应用到对应图片
-    void updateConversation(convId, (current) => {
-      const conversation = current ?? conversationsRef.current.find((c) => c.id === convId);
-      if (!conversation) return current!;
-      return {
-        ...conversation,
-        updatedAt: new Date().toISOString(),
-        turns: conversation.turns.map((turn) => {
-          const hasLoading = turn.images.some((image) => image.status === "loading" && image.taskId === taskId);
-          if (!hasLoading) return turn;
-          const images = turn.images.map((image) =>
-            image.taskId === taskId ? { ...image, status: "error" as const, error: taskError } : image,
-          );
-          const derived = deriveTurnStatus({ ...turn, images });
-          return {
-            ...turn,
-            ...derived,
-            images,
-          };
-        }),
-      };
-    });
-    setTimeoutRetry(null);
-    toast.error(taskError);
-  }, [timeoutRetry, updateConversation]);
+  }, [beginHistoryMutation, updateConversation, imageTimeoutRetrySecs]);
 
   const handleDismissErrors = useCallback(
     async (conversationId: string, turnId: string) => {
       await updateConversation(conversationId, (current) => {
-        const conversation = current ?? conversationsRef.current.find((c) => c.id === conversationId);
-        if (!conversation) return current!;
+        const conversation = current;
+        if (!conversation) return null;
         return {
           ...conversation,
           updatedAt: new Date().toISOString(),
@@ -1531,7 +1795,7 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
   useEffect(() => {
     for (const conversation of conversations) {
       if (
-        !activeConversationQueueIds.has(conversation.id) &&
+        !conversationQueueGateRef.current.isRunning(conversation.id) &&
         conversation.turns.some(
           (turn) =>
             !turn.resultsDeleted &&
@@ -1550,6 +1814,17 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
       toast.error("请输入提示词");
       return;
     }
+    if (!canSubmitImage({ prompt, model: imageModel, models: imageModels, status: imageModelStatus })) {
+      toast.error(
+        imageModelStatus === "loading"
+          ? "模型列表加载中，请稍候"
+          : "当前没有可用的图片模型",
+      );
+      return;
+    }
+
+    const historyMutationOwner = historyMutationOwnerRef.current;
+    const mutationOwner = beginHistoryMutation();
 
     const effectiveImageMode: ImageConversationMode = referenceImageFiles.length > 0 ? "edit" : "generate";
 
@@ -1597,6 +1872,9 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
     clearComposerInputs();
 
     await persistConversation(baseConversation);
+    if (!historyMutationOwner.accepts(mutationOwner)) {
+      return;
+    }
     void runConversationQueue(conversationId);
 
     const targetStats = getImageConversationStats(baseConversation);
@@ -1729,6 +2007,13 @@ function ImagePageContent({ isAdmin }: { isAdmin: boolean }) {
             imageQuality={imageQuality}
             imageModel={imageModel}
             imageModels={imageModels}
+            imageModelStatus={imageModelStatus}
+            canSubmit={canSubmitImage({
+              prompt: imagePrompt,
+              model: imageModel,
+              models: imageModels,
+              status: imageModelStatus,
+            })}
             availableQuota={availableQuota}
             activeTaskCount={activeTaskCount}
             referenceImages={referenceImages}

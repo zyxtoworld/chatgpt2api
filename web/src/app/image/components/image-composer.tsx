@@ -20,6 +20,8 @@ type ImageComposerProps = {
   imageQuality: string;
   imageModel: ImageModel;
   imageModels: ImageModel[];
+  imageModelStatus: "loading" | "ready" | "empty" | "error";
+  canSubmit: boolean;
   availableQuota: string;
   activeTaskCount: number;
   referenceImages: Array<{ name: string; dataUrl: string }>;
@@ -90,6 +92,8 @@ export function ImageComposer({
   imageQuality,
   imageModel,
   imageModels,
+  imageModelStatus,
+  canSubmit,
   availableQuota,
   activeTaskCount,
   referenceImages,
@@ -126,7 +130,15 @@ export function ImageComposer({
   const qualityLabel = qualityOptions.find((option) => option.value === imageQuality)?.label || "自动";
   const ratioLabel = imageRatio === "auto" ? "auto" : `${imageRatio}(${imageTier})`;
   const imageSizeLabel = `${qualityLabel} · ${ratioLabel} · ${imageCount || 1} 张`;
-  const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || imageModel;
+  const modelStatusLabel =
+    imageModelStatus === "loading"
+      ? "模型加载中…"
+      : imageModelStatus === "error"
+        ? "模型加载失败"
+        : imageModelStatus === "empty"
+          ? "暂无可用模型"
+          : "请选择模型";
+  const selectedModelLabel = modelOptions.find((option) => option.value === imageModel)?.label || modelStatusLabel;
   const isCodexModel = imageModel.toLowerCase().includes("codex");
 
   useEffect(() => {
@@ -290,7 +302,9 @@ export function ImageComposer({
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
-                  void onSubmit();
+                  if (canSubmit) {
+                    void onSubmit();
+                  }
                 }
               }}
               className="min-h-[82px] resize-none rounded-[24px] border-0 bg-transparent px-4 pt-4 pb-2 text-[15px] leading-6 text-stone-900 shadow-none placeholder:text-stone-400 focus-visible:ring-0 dark:text-stone-100 dark:placeholder:text-stone-500 sm:min-h-[148px] sm:rounded-[32px] sm:px-6 sm:pt-6 sm:pb-20 sm:leading-7"
@@ -359,6 +373,7 @@ export function ImageComposer({
                           <div className="mb-2 text-sm font-medium text-stone-900">模型</div>
                           <Select
                             value={imageModel}
+                            disabled={imageModelStatus !== "ready"}
                             onValueChange={(value) => {
                               onImageModelChange(value as ImageModel);
                             }}
@@ -526,7 +541,7 @@ export function ImageComposer({
                 <button
                   type="button"
                   onClick={() => void onSubmit()}
-                  disabled={!prompt.trim()}
+                  disabled={!canSubmit}
                   className="inline-flex size-10 shrink-0 items-center justify-center rounded-full bg-stone-950 text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300 sm:size-11"
                   aria-label={referenceImages.length > 0 ? "编辑图片" : "生成图片"}
                 >

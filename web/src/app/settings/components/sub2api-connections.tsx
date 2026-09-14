@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Eye,
   EyeOff,
@@ -52,36 +52,25 @@ import {
   type Sub2APIRemoteGroup,
   type Sub2APIServer,
 } from "@/lib/api";
+import { createMutationRequestGate } from "@/lib/mutation-request-gate";
+import { createLatestActionOwner } from "@/lib/latest-action-owner";
+import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "@/lib/query-lifecycle";
+import { createSerialPoller } from "@/lib/serial-poll";
+import { commitSynchronousSnapshot } from "@/lib/synchronous-snapshot";
+import { normalizeSub2APIRemoteAccounts } from "@/lib/sub2api-selection";
 
 const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
 type AuthMode = "password" | "api_key";
 
-function normalizeAccounts(items: Sub2APIRemoteAccount[]) {
-  const seen = new Set<string>();
-  const accounts: Sub2APIRemoteAccount[] = [];
-  for (const item of items) {
-    const id = String(item.id || "").trim();
-    if (!id || seen.has(id)) {
-      continue;
-    }
-    seen.add(id);
-    accounts.push({
-      id,
-      name: String(item.name || "").trim(),
-      email: String(item.email || "").trim(),
-      plan_type: String(item.plan_type || "").trim(),
-      status: String(item.status || "").trim(),
-      expires_at: String(item.expires_at || "").trim(),
-      has_refresh_token: Boolean(item.has_refresh_token),
-    });
-  }
-  return accounts;
-}
-
 export function Sub2APIConnections() {
-  const didLoadRef = useRef(false);
-  const pollTimerRef = useRef<number | null>(null);
+  const requestGateRef = useRef(createMutationRequestGate());
+  const serversRef = useRef<Sub2APIServer[]>([]);
+  const savingOwnerRef = useRef<{ epoch: number } | null>(null);
+  const deletingOwnerRef = useRef<{ epoch: number } | null>(null);
+  const importingOwnerRef = useRef<{ epoch: number } | null>(null);
+  const browsingOwnerRef = useRef<{ generation: number; mutationEpoch: number; allowed: boolean } | null>(null);
+  const groupsOwnerRef = useRef(createLatestActionOwner());
 
   const [servers, setServers] = useState<Sub2APIServer[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -113,61 +102,108 @@ export function Sub2APIConnections() {
   const [pageSize, setPageSize] = useState<(typeof PAGE_SIZE_OPTIONS)[number]>("100");
   const [isStartingImport, setIsStartingImport] = useState(false);
 
-  const loadServers = async () => {
-    setIsLoading(true);
+  const commitServers = (next: Sub2APIServer[] | ((current: Sub2APIServer[]) => Sub2APIServer[])) => {
+    const resolved = commitSynchronousSnapshot(serversRef, next);
+    setServers(resolved);
+  };
+
+  const listQueryRef = useRef<ReturnType<typeof createOwnedQueryLoader> | null>(null);
+
+  useEffect(() => {
+    const groupsOwner = groupsOwnerRef.current;
+    groupsOwner.activate();
+    return () => groupsOwner.cancel();
+  }, []);
+
+  const requestServers = async (signal?: AbortSignal) => {
+    const gate = requestGateRef.current;
+    const queryOwner = gate.beginQuery("list");
+    if (!queryOwner.allowed) return null;
     try {
-      const data = await fetchSub2APIServers();
-      setServers(data.servers);
+      const data = await fetchSub2APIServers(signal);
+      return { queryOwner, data };
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "加载 Sub2API 连接失败");
-    } finally {
-      setIsLoading(false);
+      if (!gate.acceptsQuery(queryOwner)) return null;
+      throw error;
     }
   };
 
-  useEffect(() => {
-    if (didLoadRef.current) {
-      return;
-    }
-    didLoadRef.current = true;
-    void loadServers();
-  }, []);
+  const loadServers = useCallback(() => listQueryRef.current?.run(), []);
 
   useEffect(() => {
-    const hasRunningJobs = servers.some(
-      (server) => server.import_job?.status === "pending" || server.import_job?.status === "running",
-    );
-    if (!hasRunningJobs) {
-      if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
-        pollTimerRef.current = null;
+    const gate = requestGateRef.current;
+    const loader = createOwnedQueryLoader({
+      gate,
+      domain: "list",
+      request: fetchSub2APIServers,
+      onStart: () => setIsLoading(true),
+      onCommit: (data: Awaited<ReturnType<typeof fetchSub2APIServers>>) => commitServers(data.servers),
+      onError: (error: unknown) => toast.error(error instanceof Error ? error.message : "加载 Sub2API 连接失败"),
+      onFinish: () => setIsLoading(false),
+    });
+    listQueryRef.current = loader;
+    const cancelInitialLoad = scheduleOwnedMicrotask(() => loadServers());
+    return () => {
+      cancelInitialLoad();
+      loader.cancel();
+      if (listQueryRef.current === loader) {
+        listQueryRef.current = null;
       }
+      savingOwnerRef.current = null;
+      deletingOwnerRef.current = null;
+      importingOwnerRef.current = null;
+      browsingOwnerRef.current = null;
+      gate.cancel();
+    };
+  }, [loadServers]);
+
+  const beginMutation = () => {
+    const owner = requestGateRef.current.beginMutation();
+    if (!owner.accepted) {
+      toast.error("已有 Sub2API 操作正在进行，请稍候");
+      return null;
+    }
+    listQueryRef.current?.clearLoadingForMutation();
+    return owner;
+  };
+
+  const hasRunningJobs = servers.some(
+    (server) => server.import_job?.status === "pending" || server.import_job?.status === "running",
+  );
+
+  useEffect(() => {
+    if (!hasRunningJobs) {
       return;
     }
 
-    pollTimerRef.current = window.setInterval(() => {
-      void fetchSub2APIServers()
-        .then((data) => {
-          setServers(data.servers);
-        })
-        .catch((error) => {
-          if (pollTimerRef.current !== null) {
-            window.clearInterval(pollTimerRef.current);
-            pollTimerRef.current = null;
-          }
-          toast.error(error instanceof Error ? error.message : "查询导入进度失败");
-        });
-    }, 1500);
+    let cancelled = false;
+    const gate = requestGateRef.current;
+    const poller = createSerialPoller({
+      intervalMs: 1500,
+      initialDelayMs: 1500,
+      poll: requestServers,
+      isDone: () => false,
+      onProgress: (result: Awaited<ReturnType<typeof requestServers>>) => {
+        if (result && !cancelled && gate.acceptsQuery(result.queryOwner)) {
+          commitServers(result.data.servers);
+        }
+      },
+    });
+    void poller.start().catch((error) => {
+      if (!cancelled) {
+        toast.error(error instanceof Error ? error.message : "查询导入进度失败");
+      }
+    });
 
     return () => {
-      if (pollTimerRef.current !== null) {
-        window.clearInterval(pollTimerRef.current);
-        pollTimerRef.current = null;
-      }
+      cancelled = true;
+      gate.invalidateQueries("list");
+      poller.stop();
     };
-  }, [servers]);
+  }, [hasRunningJobs]);
 
   const openAddDialog = () => {
+    groupsOwnerRef.current.invalidate();
     setEditingServer(null);
     setFormName("");
     setFormBaseUrl("");
@@ -178,10 +214,12 @@ export function Sub2APIConnections() {
     setAuthMode("password");
     setShowSecret(false);
     setRemoteGroups(null);
+    setIsLoadingGroups(false);
     setDialogOpen(true);
   };
 
   const openEditDialog = (server: Sub2APIServer) => {
+    groupsOwnerRef.current.invalidate();
     setEditingServer(server);
     setFormName(server.name);
     setFormBaseUrl(server.base_url);
@@ -192,7 +230,14 @@ export function Sub2APIConnections() {
     setAuthMode(server.has_api_key ? "api_key" : "password");
     setShowSecret(false);
     setRemoteGroups(null);
+    setIsLoadingGroups(false);
     setDialogOpen(true);
+  };
+
+  const closeEditorDialog = () => {
+    groupsOwnerRef.current.invalidate();
+    setIsLoadingGroups(false);
+    setDialogOpen(false);
   };
 
   const handleFetchGroups = async () => {
@@ -200,9 +245,12 @@ export function Sub2APIConnections() {
       toast.error("请先保存连接后再拉取分组");
       return;
     }
+    const serverId = editingServer.id;
+    const owner = groupsOwnerRef.current.begin(serverId);
     setIsLoadingGroups(true);
     try {
-      const data = await fetchSub2APIServerGroups(editingServer.id);
+      const data = await fetchSub2APIServerGroups(serverId);
+      if (!groupsOwnerRef.current.accepts(owner, serverId)) return;
       setRemoteGroups(data.groups);
       if (data.groups.length === 0) {
         toast.message("远端没有配置分组");
@@ -210,9 +258,12 @@ export function Sub2APIConnections() {
         toast.success(`读取到 ${data.groups.length} 个分组`);
       }
     } catch (error) {
+      if (!groupsOwnerRef.current.accepts(owner, serverId)) return;
       toast.error(error instanceof Error ? error.message : "拉取分组失败");
     } finally {
-      setIsLoadingGroups(false);
+      if (groupsOwnerRef.current.accepts(owner, serverId)) {
+        setIsLoadingGroups(false);
+      }
     }
   };
 
@@ -235,6 +286,11 @@ export function Sub2APIConnections() {
       return;
     }
 
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) return;
+    groupsOwnerRef.current.invalidate();
+    setIsLoadingGroups(false);
+    savingOwnerRef.current = mutationOwner;
     setIsSaving(true);
     try {
       if (editingServer) {
@@ -257,8 +313,10 @@ export function Sub2APIConnections() {
           updates.password = "";
         }
         const data = await updateSub2APIServer(editingServer.id, updates);
-        setServers(data.servers);
-        toast.success("连接已更新");
+        if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+          commitServers(data.servers);
+          toast.success("连接已更新");
+        }
       } else {
         const data = await createSub2APIServer({
           name: formName.trim(),
@@ -268,36 +326,66 @@ export function Sub2APIConnections() {
           api_key: authMode === "api_key" ? formApiKey.trim() : "",
           group_id: formGroupId.trim(),
         });
-        setServers(data.servers);
-        toast.success("连接已添加");
+        if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+          commitServers(data.servers);
+          toast.success("连接已添加");
+        }
       }
-      setDialogOpen(false);
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        closeEditorDialog();
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "保存失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "保存失败");
+      }
     } finally {
-      setIsSaving(false);
+      const isOwner = savingOwnerRef.current === mutationOwner;
+      if (isOwner) {
+        savingOwnerRef.current = null;
+        setIsSaving(false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
   const handleDelete = async (server: Sub2APIServer) => {
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) return;
+    deletingOwnerRef.current = mutationOwner;
     setDeletingId(server.id);
     try {
       const data = await deleteSub2APIServer(server.id);
-      setServers(data.servers);
-      toast.success("连接已删除");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        commitServers(data.servers);
+        toast.success("连接已删除");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "删除失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "删除失败");
+      }
     } finally {
-      setDeletingId(null);
+      const isOwner = deletingOwnerRef.current === mutationOwner;
+      if (isOwner) {
+        deletingOwnerRef.current = null;
+        setDeletingId(null);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
 
   const handleBrowseAccounts = async (server: Sub2APIServer) => {
+    const gate = requestGateRef.current;
+    const queryOwner = gate.beginQuery("accounts");
+    if (!queryOwner.allowed) return;
+    browsingOwnerRef.current = queryOwner;
     setLoadingAccountsId(server.id);
     try {
       const data = await fetchSub2APIServerAccounts(server.id);
-      const accounts = normalizeAccounts(data.accounts);
-      setBrowserServer(server);
+      if (!gate.acceptsQuery(queryOwner)) return;
+      const currentServer = serversRef.current.find((item) => item.id === server.id);
+      if (!currentServer) return;
+      const accounts = normalizeSub2APIRemoteAccounts(data.accounts);
+      setBrowserServer(currentServer);
       setRemoteAccounts(accounts);
       setSelectedIds([]);
       setAccountQuery("");
@@ -305,9 +393,14 @@ export function Sub2APIConnections() {
       setBrowserOpen(true);
       toast.success(`读取成功，共 ${accounts.length} 个 OpenAI 账号`);
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "读取 Sub2API 账号失败");
+      if (gate.acceptsQuery(queryOwner)) {
+        toast.error(error instanceof Error ? error.message : "读取 Sub2API 账号失败");
+      }
     } finally {
-      setLoadingAccountsId(null);
+      if (browsingOwnerRef.current === queryOwner) {
+        browsingOwnerRef.current = null;
+        setLoadingAccountsId(null);
+      }
     }
   };
 
@@ -363,22 +456,36 @@ export function Sub2APIConnections() {
       return;
     }
 
+    const mutationOwner = beginMutation();
+    if (!mutationOwner) return;
+    importingOwnerRef.current = mutationOwner;
     setIsStartingImport(true);
     try {
       const result = await startSub2APIImport(browserServer.id, selectedIds);
-      setServers((prev) =>
-        prev.map((server) =>
-          server.id === browserServer.id ? { ...server, import_job: result.import_job } : server,
-        ),
-      );
-      setBrowserOpen(false);
-      toast.success("导入任务已启动");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        commitServers((prev) =>
+          prev.map((server) =>
+            server.id === browserServer.id ? { ...server, import_job: result.import_job } : server,
+          ),
+        );
+        setBrowserOpen(false);
+        toast.success("导入任务已启动");
+      }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "启动导入失败");
+      if (requestGateRef.current.acceptsMutation(mutationOwner)) {
+        toast.error(error instanceof Error ? error.message : "启动导入失败");
+      }
     } finally {
-      setIsStartingImport(false);
+      const isOwner = importingOwnerRef.current === mutationOwner;
+      if (isOwner) {
+        importingOwnerRef.current = null;
+        setIsStartingImport(false);
+      }
+      requestGateRef.current.finishMutation(mutationOwner);
     }
   };
+
+  const hasMutation = isSaving || deletingId !== null || isStartingImport;
 
   return (
     <>
@@ -401,6 +508,7 @@ export function Sub2APIConnections() {
               <Button
                 className="h-9 rounded-xl bg-stone-950 px-4 text-white hover:bg-stone-800"
                 onClick={openAddDialog}
+                disabled={hasMutation}
               >
                 <Plus className="size-4" />
                 添加连接
@@ -423,8 +531,9 @@ export function Sub2APIConnections() {
           ) : (
             <div className="space-y-3">
               {servers.map((server) => {
-                const isBusy = deletingId === server.id || loadingAccountsId === server.id;
                 const importJob = server.import_job ?? null;
+                const importRunning = importJob?.status === "pending" || importJob?.status === "running";
+                const isBusy = hasMutation || importRunning || loadingAccountsId === server.id;
                 return (
                   <div
                     key={server.id}
@@ -548,7 +657,7 @@ export function Sub2APIConnections() {
         </CardContent>
       </Card>
 
-      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+          <Dialog open={dialogOpen} onOpenChange={(open) => (open ? setDialogOpen(true) : closeEditorDialog())}>
         <DialogContent showCloseButton={false} className="rounded-2xl p-6">
           <DialogHeader className="gap-2">
             <DialogTitle>{editingServer ? "编辑连接" : "添加连接"}</DialogTitle>
@@ -600,7 +709,7 @@ export function Sub2APIConnections() {
                   <Input
                     value={formEmail}
                     onChange={(event) => setFormEmail(event.target.value)}
-                    placeholder="account-name"
+                    placeholder="admin@example.com"
                     className="h-11 rounded-xl border-stone-200 bg-white"
                   />
                 </div>
@@ -711,15 +820,15 @@ export function Sub2APIConnections() {
             <Button
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
-              onClick={() => setDialogOpen(false)}
-              disabled={isSaving}
+              onClick={closeEditorDialog}
+              disabled={hasMutation}
             >
               取消
             </Button>
             <Button
               className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
               onClick={() => void handleSave()}
-              disabled={isSaving}
+              disabled={hasMutation}
             >
               {isSaving ? <LoaderCircle className="size-4 animate-spin" /> : <Save className="size-4" />}
               {editingServer ? "保存修改" : "添加"}
@@ -738,7 +847,7 @@ export function Sub2APIConnections() {
           </DialogHeader>
 
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-            <div className="relative min-w-[260px]">
+            <div className="relative w-full min-w-0 sm:min-w-[260px]">
               <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-stone-400" />
               <Input
                 value={accountQuery}
@@ -750,7 +859,7 @@ export function Sub2APIConnections() {
                 className="h-10 rounded-xl border-stone-200 bg-white pl-10"
               />
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Select
                 value={pageSize}
                 onValueChange={(value) => {
@@ -780,7 +889,7 @@ export function Sub2APIConnections() {
           </div>
 
           <div className="rounded-xl border border-stone-200">
-            <div className="flex items-center justify-between border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-100 px-4 py-3 text-sm text-stone-500">
               <div className="flex items-center gap-3">
                 <Checkbox
                   checked={allFilteredSelected}
@@ -833,7 +942,7 @@ export function Sub2APIConnections() {
             </div>
           </div>
 
-          <div className="flex items-center justify-between text-sm text-stone-500">
+          <div className="flex flex-col gap-3 text-sm text-stone-500 sm:flex-row sm:items-center sm:justify-between">
             <span>
               第 {filteredAccounts.length === 0 ? 0 : (safeAccountPage - 1) * currentPageSize + 1} -{" "}
               {Math.min(safeAccountPage * currentPageSize, filteredAccounts.length)} 条，共 {filteredAccounts.length} 条
@@ -866,14 +975,14 @@ export function Sub2APIConnections() {
               variant="secondary"
               className="h-10 rounded-xl bg-stone-100 px-5 text-stone-700 hover:bg-stone-200"
               onClick={() => setBrowserOpen(false)}
-              disabled={isStartingImport}
+              disabled={hasMutation}
             >
               取消
             </Button>
             <Button
               className="h-10 rounded-xl bg-stone-950 px-5 text-white hover:bg-stone-800"
               onClick={() => void handleStartImport()}
-              disabled={isStartingImport || selectedIds.length === 0}
+              disabled={hasMutation || selectedIds.length === 0}
             >
               {isStartingImport ? <LoaderCircle className="size-4 animate-spin" /> : <Import className="size-4" />}
               导入选中账号

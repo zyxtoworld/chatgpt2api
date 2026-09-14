@@ -1,19 +1,16 @@
-# Local files and secrets
-.git/
-.codex/
+.git
+.gitignore
 .local/
-.reasonix/
-superpowers/
-data/
-config.json
-.env
+.idea
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
 
-# Python and frontend build state
-__pycache__/
-*.py[cod]
-.venv/
-.uv/
-web/node_modules/
-web/.next/
-web/out/
-web/tsconfig.tsbuildinfo
+web/.next
+web/node_modules
+
+assets
+chatgpt2api-config/
+README.md

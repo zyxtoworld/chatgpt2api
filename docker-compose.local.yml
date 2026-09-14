@@ -22,8 +22,8 @@ services:
     #   DATABASE_URL: sqlite:////app/data/accounts.db
 
     # Git 仓库配置 (当 STORAGE_BACKEND=git 时使用)
-    #   GIT_REPO_URL: https://example.invalid/private-repository.git
-    #   GIT_TOKEN: replace-with-a-secret
+    #   GIT_REPO_URL: https://github.com/user/repo.git
+    #   GIT_TOKEN: ghp_xxxxxxxxxxxx
     #   GIT_BRANCH: main
     #   GIT_FILE_PATH: accounts.json
 

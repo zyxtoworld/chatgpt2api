@@ -78,11 +78,11 @@ export function ProxySettingsCard() {
                   setProxy(event.target.value);
                   setTestResult(null);
                 }}
-                placeholder="http://user:pass@proxy.example.invalid:port"
+                placeholder="http://user:pass@127.0.0.1:7890"
                 className="h-11 rounded-xl border-stone-200 bg-white"
               />
               <p className="text-sm text-stone-500">
-                留空表示不使用代理。请按完整地址填写，例如 `http://proxy.example.invalid:port` 或 `socks5://proxy.example.invalid:port`。
+                留空表示不使用代理。请按完整地址填写，例如 `http://127.0.0.1:7890`、`http://用户名:密码@127.0.0.1:7890` 或 `socks5://127.0.0.1:7890`。
               </p>
             </div>
 

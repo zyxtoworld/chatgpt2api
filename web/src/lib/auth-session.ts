@@ -1,15 +1,22 @@
 "use client";
 
 import { login } from "@/lib/api";
-import { clearStoredAuthSession, getStoredAuthSession, setStoredAuthSession, type StoredAuthSession } from "@/store/auth";
+import {
+  beginStoredAuthValidation,
+  clearStoredAuthSessionIfCurrent,
+  getStoredAuthSession,
+  setStoredAuthSessionIfCurrent,
+  type StoredAuthSession,
+} from "@/store/auth";
 
 export async function getValidatedAuthSession(): Promise<StoredAuthSession | null> {
-  const storedSession = await getStoredAuthSession();
-  if (!storedSession) {
-    return null;
-  }
-
+  const validationLease = beginStoredAuthValidation();
   try {
+    const storedSession = await getStoredAuthSession(validationLease);
+    if (!storedSession) {
+      return null;
+    }
+
     const data = await login(storedSession.key);
     const nextSession: StoredAuthSession = {
       key: storedSession.key,
@@ -17,10 +24,14 @@ export async function getValidatedAuthSession(): Promise<StoredAuthSession | nul
       subjectId: data.subject_id,
       name: data.name,
     };
-    await setStoredAuthSession(nextSession);
-    return nextSession;
+    const committed = await setStoredAuthSessionIfCurrent(nextSession, validationLease);
+    return committed ? nextSession : null;
   } catch {
-    await clearStoredAuthSession();
+    try {
+      await clearStoredAuthSessionIfCurrent(validationLease);
+    } catch {
+      // The coordinator already invalidated this persisted pair for the current runtime.
+    }
     return null;
   }
 }

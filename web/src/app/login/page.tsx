@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { LoaderCircle, LockKeyhole } from "lucide-react";
 import { toast } from "sonner";
 
@@ -10,14 +10,34 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { HeaderActions } from "@/components/header-actions";
 import { login } from "@/lib/api";
+import { createLoginRequestGate } from "@/lib/login-request-gate";
 import { useRedirectIfAuthenticated } from "@/lib/use-auth-guard";
-import { getDefaultRouteForRole, setStoredAuthSession } from "@/store/auth";
+import {
+  beginStoredAuthMutation,
+  getDefaultRouteForRole,
+  setStoredAuthSessionIfCurrent,
+} from "@/store/auth";
 
 export default function LoginPage() {
   const router = useRouter();
+  const loginGateRef = useRef(createLoginRequestGate(beginStoredAuthMutation));
   const [authKey, setAuthKey] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const { isCheckingAuth } = useRedirectIfAuthenticated();
+
+  useEffect(() => {
+    const loginGate = loginGateRef.current;
+    loginGate.activate();
+    return () => loginGate.cancel();
+  }, []);
+
+  const handleAuthKeyChange = (value: string) => {
+    if (isSubmitting) {
+      loginGateRef.current.invalidate();
+      setIsSubmitting(false);
+    }
+    setAuthKey(value);
+  };
 
   const handleLogin = async () => {
     const normalizedAuthKey = authKey.trim();
@@ -26,21 +46,30 @@ export default function LoginPage() {
       return;
     }
 
+    const loginOwner = loginGateRef.current.begin(normalizedAuthKey);
+    if (!loginOwner) return;
     setIsSubmitting(true);
     try {
       const data = await login(normalizedAuthKey);
-      await setStoredAuthSession({
-        key: normalizedAuthKey,
-        role: data.role,
-        subjectId: data.subject_id,
-        name: data.name,
-      });
+      const committed = await setStoredAuthSessionIfCurrent(
+        {
+          key: normalizedAuthKey,
+          role: data.role,
+          subjectId: data.subject_id,
+          name: data.name,
+        },
+        loginOwner.authLease,
+      );
+      if (!committed || !loginGateRef.current.accepts(loginOwner)) return;
       router.replace(getDefaultRouteForRole(data.role));
     } catch (error) {
+      if (!loginGateRef.current.accepts(loginOwner)) return;
       const message = error instanceof Error ? error.message : "登录失败";
       toast.error(message);
     } finally {
-      setIsSubmitting(false);
+      if (loginGateRef.current.finish(loginOwner)) {
+        setIsSubmitting(false);
+      }
     }
   };
 
@@ -75,7 +104,7 @@ export default function LoginPage() {
               id="auth-key"
               type="password"
               value={authKey}
-              onChange={(event) => setAuthKey(event.target.value)}
+              onChange={(event) => handleAuthKeyChange(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
                   void handleLogin();

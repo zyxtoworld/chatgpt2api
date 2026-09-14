@@ -2,6 +2,11 @@
 
 ## Unreleased
 
++ [修复] `/v1/models` 汇总各账号类型的官方模型列表，文本请求按模型权限选择账号。
++ [架构] Rust release 二进制成为 Docker/Compose 的唯一生产运行时入口，私有 `config.json` 保持外置挂载。
++ [修复] `/v1/images/edits` 接受并返回受约束的 `client_task_id`，同时保持 generation 接口 fail-closed。
++ [修复] Docker 多架构构建在 build platform 交叉编译 Rust，避免 arm64 QEMU 冷编译悬挂。
+
 ## 1.8.0 - 2026-07-28
 
 + [新增] 新增默认请求上游模型名称和默认思考强度配置，支持在设置页面修改，并可通过模型名的 `-standard`、`-extended`、`-max` 后缀覆盖思考强度。
