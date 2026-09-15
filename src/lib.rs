@@ -38,7 +38,10 @@ use codex_upstream::{
 };
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
-use model_pool::{ModelCatalog, ModelStore, PublicModel, project_remote_model_list};
+use model_pool::{
+    ModelCatalog, ModelProvenance, ModelStore, PublicModel, project_imported_model_ids,
+    project_remote_model_list, project_remote_model_list_with_provenance,
+};
 #[cfg(test)]
 use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
 use native_pow::{NativePowResources, native_pow_config, parse_native_pow_resources};
@@ -2236,15 +2239,12 @@ fn merge_account_model_ids(raw: &Value, fetched: Option<Vec<String>>) -> Option<
         }
         models.push(value.to_owned());
     };
-    if let Some(items) = raw.get("models").and_then(Value::as_array) {
-        for item in items {
-            if let Some(value) = item.as_str() {
-                push(value);
-            }
-        }
+    for value in project_imported_model_ids(raw.get("models"), ModelProvenance::Configured) {
+        push(&value);
     }
     if let Some(fetched) = fetched {
-        for value in fetched {
+        let fetched = Value::Array(fetched.into_iter().map(Value::String).collect());
+        for value in project_imported_model_ids(Some(&fetched), ModelProvenance::Web) {
             push(&value);
         }
     }
@@ -4557,6 +4557,19 @@ fn is_native_image_model_id(id: &str) -> bool {
         || ["plus", "team", "pro"]
             .iter()
             .any(|plan| id.eq_ignore_ascii_case(&format!("{plan}-codex-gpt-image-2")))
+}
+
+fn is_public_chatgpt_image_model_id(id: &str) -> bool {
+    id.trim().eq_ignore_ascii_case("gpt-image-2")
+}
+
+fn is_public_chatgpt_model(model: &PublicModel) -> bool {
+    match model.provenance {
+        ModelProvenance::Codex => false,
+        ModelProvenance::Image => is_public_chatgpt_image_model_id(&model.id),
+        ModelProvenance::Web => true,
+        ModelProvenance::Configured => false,
+    }
 }
 
 fn native_image_string_option(
@@ -10582,14 +10595,20 @@ async fn fetch_native_model_catalog(
         let Ok(value) = serde_json::from_slice::<Value>(&body) else {
             continue;
         };
+        let provenance = if target_path == "/backend-api/codex/models" {
+            ModelProvenance::Codex
+        } else {
+            ModelProvenance::Web
+        };
         for field in ["models", "data", "items"] {
-            let Some(projected) = project_remote_model_list(
+            let Some(projected) = project_remote_model_list_with_provenance(
                 &value,
                 field,
                 !authenticated,
                 identity.account_type,
                 true,
                 false,
+                provenance,
             ) else {
                 continue;
             };
@@ -11557,7 +11576,14 @@ impl AccountTypeCatalog {
 
     fn public_models(&self, anonymous: Arc<Vec<PublicModel>>) -> Arc<Vec<PublicModel>> {
         let snapshot = self.snapshot.read().expect("account type catalog lock");
-        let mut models = anonymous.as_ref().clone();
+        let mut models = anonymous
+            .as_ref()
+            .iter()
+            .filter(|model| {
+                self.protocol != UpstreamProtocol::ChatGpt || is_public_chatgpt_model(model)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         for model in &mut models {
             model.allow_anonymous = false;
             model.supported_account_types.clear();
@@ -11568,7 +11594,9 @@ impl AccountTypeCatalog {
             .map(|(index, model)| (model.id.clone(), index))
             .collect::<HashMap<_, _>>();
         if snapshot.anonymous_ready {
-            for model in snapshot.anonymous_models.iter() {
+            for model in snapshot.anonymous_models.iter().filter(|model| {
+                self.protocol != UpstreamProtocol::ChatGpt || is_public_chatgpt_model(model)
+            }) {
                 if let Some(index) = indexes.get(&model.id).copied() {
                     models[index].allow_anonymous = true;
                 } else {
@@ -11589,6 +11617,9 @@ impl AccountTypeCatalog {
             }
             let account_type = account_group;
             for model in entry.models.iter() {
+                if self.protocol == UpstreamProtocol::ChatGpt && !is_public_chatgpt_model(model) {
+                    continue;
+                }
                 if let Some(index) = indexes.get(&model.id).copied() {
                     let supported = &mut models[index].supported_account_types;
                     let public_account_type = account_type.to_ascii_lowercase();
@@ -11606,7 +11637,9 @@ impl AccountTypeCatalog {
         }
 
         if self.protocol == UpstreamProtocol::ChatGpt {
-            models.retain(|model| !is_native_image_model_id(&model.id));
+            models.retain(|model| {
+                is_public_chatgpt_model(model) && !is_native_image_model_id(&model.id)
+            });
             indexes = models
                 .iter()
                 .enumerate()
@@ -11632,6 +11665,7 @@ impl AccountTypeCatalog {
                         allow_anonymous: false,
                         supported_account_types: supported,
                         supported_reasoning_efforts: Vec::new(),
+                        provenance: ModelProvenance::Image,
                     });
                 }
             };
@@ -18685,7 +18719,10 @@ mod tests {
                         "codex_plan_type":"pro",
                         "models":[
                             {"model":"configured-model","redirect_model":"configured-model"},
-                            {"model":"web-page-model","redirect_model":"web-page-model"},
+                            {"model":"web-page-model","redirect_model":"web-page-model","source":"web"},
+                            {"model":"gpt-5-codex","redirect_model":"gpt-5-codex","source":"web"},
+                            {"model":"auto","redirect_model":"auto","source":"web"},
+                            {"model":"codex-endpoint-model","redirect_model":"codex-endpoint-model","source":"codex"},
                             {"model":"configured-model","redirect_model":"configured-model"}
                         ]
                     },
@@ -18768,6 +18805,8 @@ mod tests {
                 assert_eq!(target_path, "/backend-api/models");
                 Json(json!({"models":[
                     {"slug":"web-page-model"},
+                    {"slug":"gpt-5-codex"},
+                    {"slug":"auto"},
                     {"slug":"gpt-image-2"},
                     {"slug":"web-page-model"}
                 ]}))
@@ -18782,7 +18821,20 @@ mod tests {
                 hits.lock()
                     .await
                     .push(format!("GET /backend-api/tpp/models kind={kind}"));
-                Json(json!({"models":[{"slug":"web-tpp-model"}]}))
+                Json(json!({"models":[
+                    {"slug":"web-tpp-model"},
+                    {"slug":"tpp-codex-named-model"},
+                    {"slug":"auto"}
+                ]}))
+            }
+        });
+        let codex_endpoint_hits = Arc::new(AtomicUsize::new(0));
+        let codex_endpoint_hits_for_upstream = codex_endpoint_hits.clone();
+        let codex_endpoint = get(move || {
+            let hits = codex_endpoint_hits_for_upstream.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"models":[{"slug":"codex-endpoint-model"}]}))
             }
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -18808,7 +18860,8 @@ mod tests {
                     .route("/backend-api/conversation/init", init)
                     .route("/backend-api/accounts/check/v4-2023-04-27", check)
                     .route("/backend-api/models", models)
-                    .route("/backend-api/tpp/models/", tpp),
+                    .route("/backend-api/tpp/models/", tpp)
+                    .route("/backend-api/codex/models", codex_endpoint),
             )
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
@@ -18942,15 +18995,27 @@ mod tests {
         .await;
         assert_eq!(channel_models.status(), StatusCode::OK);
         let channel_models = json_response(channel_models).await;
-        assert_eq!(
-            channel_models["channels"][0]["models"],
-            json!([
-                "configured-model",
-                "web-page-model",
-                "gpt-image-2",
-                "web-tpp-model"
-            ])
-        );
+        let channel_model_ids = channel_models["channels"][0]["models"]
+            .as_array()
+            .expect("ccLoad model ids")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        for model_id in [
+            "configured-model",
+            "web-page-model",
+            "gpt-5-codex",
+            "auto",
+            "gpt-image-2",
+            "web-tpp-model",
+            "tpp-codex-named-model",
+        ] {
+            assert!(
+                channel_model_ids.contains(&model_id),
+                "missing channel model {model_id}"
+            );
+        }
+        assert!(!channel_model_ids.contains(&"codex-endpoint-model"));
         let start = management_request(
             &state,
             "POST",
@@ -18980,8 +19045,12 @@ mod tests {
             assert_eq!(item["source_type"], "codex");
             assert!(item["models"].as_array().is_some_and(|models| {
                 models.iter().any(|model| model == "web-page-model")
+                    && models.iter().any(|model| model == "gpt-5-codex")
+                    && models.iter().any(|model| model == "auto")
                     && models.iter().any(|model| model == "gpt-image-2")
                     && models.iter().any(|model| model == "web-tpp-model")
+                    && models.iter().any(|model| model == "tpp-codex-named-model")
+                    && models.iter().all(|model| model != "codex-endpoint-model")
             }));
             for key in ["accessToken", "token", "refresh_token", "id_token"] {
                 assert!(item.get(key).is_none(), "account leaked {key}");
@@ -19043,6 +19112,8 @@ mod tests {
                 .collect::<Vec<_>>();
             if model_ids.contains(&"web-page-model")
                 && model_ids.contains(&"web-tpp-model")
+                && model_ids.contains(&"gpt-5-codex")
+                && model_ids.contains(&"auto")
                 && model_ids.contains(&"gpt-image-2")
             {
                 break;
@@ -19054,12 +19125,15 @@ mod tests {
             "public model ids: {model_ids:?}; body: {models}"
         );
         assert!(model_ids.contains(&"web-tpp-model"));
+        assert!(model_ids.contains(&"gpt-5-codex"));
+        assert!(model_ids.contains(&"auto"));
         assert!(model_ids.contains(&"gpt-image-2"));
-        assert!(!model_ids.contains(&"codex-image-model"));
+        assert!(!model_ids.contains(&"codex-endpoint-model"));
 
         let hit_text = hits.lock().await.join("\n");
         assert!(hit_text.contains("GET /backend-api/models"));
         assert!(!hit_text.contains("/backend-api/codex/models"));
+        assert_eq!(codex_endpoint_hits.load(Ordering::SeqCst), 0);
         state.account_type_catalog.shutdown().await;
         shutdown_tx.send(()).expect("remote import stub shutdown");
         stub_task.await.expect("remote import stub join");
@@ -20573,7 +20647,12 @@ mod tests {
     #[test]
     fn imported_refresh_model_merge_preserves_existing_catalog() {
         let raw = json!({
-            "models": ["configured-model", "web-model", "configured-model"]
+            "models": [
+                "configured-model",
+                {"model":"web-model","source":"web"},
+                {"model":"codex-endpoint-model","source":"codex"},
+                "configured-model"
+            ]
         });
         assert_eq!(
             merge_account_model_ids(&raw, None),
@@ -25300,6 +25379,109 @@ data: [DONE]
     }
 
     #[test]
+    fn remote_model_projection_preserves_web_ids_and_tags_codex_provenance() {
+        let web = project_remote_model_list_with_provenance(
+            &json!({
+                "models": [
+                    {"slug": "gpt-5-codex"},
+                    {"slug": "auto"},
+                    {"slug": "gpt-image-2"}
+                ]
+            }),
+            "models",
+            false,
+            Some("pro"),
+            true,
+            false,
+            ModelProvenance::Web,
+        )
+        .expect("web catalog");
+        assert_eq!(
+            web.iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5-codex", "auto", "gpt-image-2"]
+        );
+        assert!(
+            web.iter()
+                .all(|model| model.provenance == ModelProvenance::Web)
+        );
+
+        let codex = project_remote_model_list_with_provenance(
+            &json!({"models": [{"slug": "gpt-5-codex"}]}),
+            "models",
+            false,
+            Some("pro"),
+            true,
+            false,
+            ModelProvenance::Codex,
+        )
+        .expect("codex catalog fixture");
+        assert_eq!(codex[0].id, "gpt-5-codex");
+        assert_eq!(codex[0].provenance, ModelProvenance::Codex);
+    }
+
+    #[tokio::test]
+    async fn public_chatgpt_models_filter_by_provenance_not_model_id() {
+        let account_path = account_snapshot_path("public-model-provenance");
+        fs::write(
+            &account_path,
+            r#"[{"access_token":"image-account","status":"正常","type":"pro","quota":2}]"#,
+        )
+        .expect("image-capable account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("client".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: Some("http://127.0.0.1:1".to_owned()),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("state");
+        let model = |id: &str, provenance: ModelProvenance| PublicModel {
+            id: id.to_owned(),
+            object: "model",
+            created: 0,
+            owned_by: "chatgpt".to_owned(),
+            permission: Vec::new(),
+            root: id.to_owned(),
+            parent: None,
+            allow_anonymous: false,
+            supported_account_types: Vec::new(),
+            supported_reasoning_efforts: Vec::new(),
+            provenance,
+        };
+        let models = state.account_type_catalog.public_models(Arc::new(vec![
+            model("gpt-5-codex", ModelProvenance::Web),
+            model("auto", ModelProvenance::Web),
+            model("codex-endpoint-model", ModelProvenance::Codex),
+            model("auto", ModelProvenance::Configured),
+            model("gpt-image-2", ModelProvenance::Web),
+        ]));
+        let ids = models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"gpt-5-codex"));
+        assert!(ids.contains(&"auto"), "Web provenance must win for auto");
+        assert!(ids.contains(&"gpt-image-2"));
+        assert!(!ids.contains(&"codex-endpoint-model"));
+        assert_eq!(ids.iter().filter(|id| **id == "auto").count(), 1);
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| model.id == "gpt-image-2")
+                .map(|model| model.provenance),
+            Some(ModelProvenance::Image)
+        );
+        state.account_type_catalog.shutdown().await;
+        fs::remove_file(account_path).expect("cleanup accounts");
+    }
+
+    #[test]
     fn public_models_recompute_stale_static_account_type_metadata() {
         let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-stale-types-{}-{}.json",
@@ -25419,7 +25601,10 @@ data: [DONE]
             models.iter().all(|model| model.id != "gpt-image-2"),
             "an image model is not requestable without an upstream base URL"
         );
-        assert!(models.iter().any(|model| model.id == "image-aware-chat"));
+        assert!(
+            models.iter().all(|model| model.id != "image-aware-chat"),
+            "unverified configured models are not public ChatGPT catalog entries"
+        );
 
         state.account_type_catalog.shutdown().await;
         fs::remove_file(account_path).expect("cleanup");
@@ -25450,7 +25635,7 @@ data: [DONE]
             .account_type_catalog
             .public_models(state.models.current());
         assert!(models.iter().all(|model| model.id != "gpt-image-2"));
-        assert!(models.iter().any(|model| model.id == "image-aware-chat"));
+        assert!(models.iter().all(|model| model.id != "image-aware-chat"));
 
         state.account_type_catalog.shutdown().await;
         fs::remove_file(account_path).expect("cleanup");
@@ -30182,6 +30367,7 @@ data: [DONE]
                 allow_anonymous: true,
                 supported_account_types: Vec::new(),
                 supported_reasoning_efforts: Vec::new(),
+                provenance: ModelProvenance::Web,
             }]);
             snapshot.anonymous_ready = true;
             snapshot.anonymous_expires_at = Instant::now() + Duration::from_secs(60);
@@ -31039,9 +31225,12 @@ data: [DONE]
                             .and_then(|value| value.to_str().ok())
                             == Some("account-id");
                     checks.lock().expect("checks lock").push(valid);
-                    Json(
-                        json!({"models":[{"slug":"web-catalog-model"},{"slug":"web-image-model"}]}),
-                    )
+                    Json(json!({"models":[
+                        {"slug":"web-catalog-model"},
+                        {"slug":"web-codex-named-model"},
+                        {"slug":"auto"},
+                        {"slug":"web-image-model"}
+                    ]}))
                 }
             });
             let codex_calls = codex_calls_for_upstream.clone();
@@ -31056,7 +31245,8 @@ data: [DONE]
                             let calls = codex_calls.clone();
                             async move {
                                 calls.fetch_add(1, Ordering::SeqCst);
-                                StatusCode::NOT_FOUND.into_response()
+                                Json(json!({"models":[{"slug":"codex-endpoint-model"}]}))
+                                    .into_response()
                             }
                         }),
                     ),
@@ -31096,12 +31286,23 @@ data: [DONE]
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["web-catalog-model", "web-image-model"]
+            vec![
+                "web-catalog-model",
+                "web-codex-named-model",
+                "auto",
+                "web-image-model",
+            ]
         );
         assert!(result.2);
         assert_eq!(result.1.candidates[0].token, "representative");
         assert_eq!(web_calls.load(Ordering::SeqCst), 1);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            result
+                .0
+                .iter()
+                .all(|model| model.provenance == ModelProvenance::Web)
+        );
         assert_eq!(checks.lock().expect("checks lock").clone(), vec![true]);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -31141,9 +31342,12 @@ data: [DONE]
                             .and_then(|value| value.to_str().ok()),
                         Some("account-id")
                     );
-                    Json(
-                        json!({"models":[{"slug":"web-catalog-model"},{"slug":"web-image-model"}]}),
-                    )
+                    Json(json!({"models":[
+                        {"slug":"web-catalog-model"},
+                        {"slug":"gpt-5-codex"},
+                        {"slug":"auto"},
+                        {"slug":"web-image-model"}
+                    ]}))
                 }
             });
             let tpp_calls = tpp_calls_for_upstream.clone();
@@ -31165,7 +31369,12 @@ data: [DONE]
                             .and_then(|value| value.to_str().ok()),
                         Some("account-id")
                     );
-                    Json(json!({"models":[{"slug":"tpp-model"},{"slug":"web-catalog-model"}]}))
+                    Json(json!({"models":[
+                        {"slug":"tpp-model"},
+                        {"slug":"tpp-codex-named-model"},
+                        {"slug":"auto"},
+                        {"slug":"web-catalog-model"}
+                    ]}))
                 }
             });
             let codex_calls = codex_calls_for_upstream.clone();
@@ -31219,11 +31428,24 @@ data: [DONE]
                 .iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["web-catalog-model", "web-image-model", "tpp-model"]
+            vec![
+                "web-catalog-model",
+                "gpt-5-codex",
+                "auto",
+                "web-image-model",
+                "tpp-model",
+                "tpp-codex-named-model",
+            ]
         );
         assert_eq!(web_calls.load(Ordering::SeqCst), 1);
         assert_eq!(tpp_calls.load(Ordering::SeqCst), 1);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            result
+                .0
+                .iter()
+                .all(|model| model.provenance == ModelProvenance::Web)
+        );
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
@@ -34447,6 +34669,7 @@ data: [DONE]
             allow_anonymous: false,
             supported_account_types: vec!["pro".to_owned()],
             supported_reasoning_efforts: Vec::new(),
+            provenance: ModelProvenance::Web,
         };
         {
             let mut catalog = state

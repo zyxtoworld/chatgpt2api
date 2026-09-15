@@ -32,6 +32,9 @@ use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
 use tokio::sync::Semaphore;
 
+use super::model_pool::{
+    ModelProvenance, project_imported_model_entries, project_imported_model_ids,
+};
 use super::{
     ApiError, AppState, admin_authenticated, authenticated, config, data_file, image_content_type,
     image_root, read_image_tags, redact_config, safe_relative_path,
@@ -2164,28 +2167,21 @@ fn normalized_ccload_credential(value: Option<&Value>) -> Option<HashMap<String,
     Some(credential)
 }
 
-fn ccload_model_ids(value: Option<&Value>) -> Vec<String> {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut seen = HashSet::new();
-    items
-        .iter()
-        .filter_map(|item| {
-            let text = match item {
-                Value::String(text) => Some(text.as_str()),
-                Value::Object(object) => object.get("model").and_then(Value::as_str),
-                _ => None,
-            }?
-            .trim();
-            if text.is_empty() || text.chars().count() > super::MAX_MODEL_TEXT_LENGTH {
-                return None;
-            }
-            let owned = text.to_owned();
-            seen.insert(owned.clone()).then_some(owned)
-        })
-        .take(super::MAX_MODELS)
+#[derive(Clone)]
+struct CcLoadModelEntry {
+    id: String,
+    provenance: ModelProvenance,
+}
+
+fn ccload_model_entries(value: Option<&Value>) -> Vec<CcLoadModelEntry> {
+    project_imported_model_entries(value, ModelProvenance::Configured)
+        .into_iter()
+        .map(|(id, provenance)| CcLoadModelEntry { id, provenance })
         .collect()
+}
+
+fn ccload_model_ids(value: Option<&Value>) -> Vec<String> {
+    project_imported_model_ids(value, ModelProvenance::Configured)
 }
 
 fn public_sub2api_item(value: &Value) -> Value {
@@ -5388,8 +5384,10 @@ pub(super) async fn download_backup(
 mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
-        normalized_ccload_credential, parse_r2_list_xml, public_backup_error,
+        ccload_model_entries, ccload_model_ids, normalized_ccload_credential, parse_r2_list_xml,
+        public_backup_error,
     };
+    use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
 
     #[test]
@@ -5498,5 +5496,30 @@ mod tests {
         assert!(!credential.contains_key("id_token"));
         assert!(!credential.contains_key("refresh_token"));
         assert!(credential.get("expired").is_some_and(String::is_empty));
+    }
+
+    #[test]
+    fn ccload_model_catalog_uses_explicit_provenance() {
+        let value = serde_json::json!([
+            {"model":"gpt-5-codex","source":"codex"},
+            {"model":"gpt-5-codex","source":"web"},
+            {"model":"auto","source":"web"},
+            {"model":"codex-endpoint-only","endpoint":"/backend-api/codex/models"},
+            {"model":"configured-codex-name"}
+        ]);
+        let entries = ccload_model_entries(Some(&value));
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].id, "gpt-5-codex");
+        assert_eq!(entries[0].provenance, ModelProvenance::Web);
+        assert_eq!(entries[1].provenance, ModelProvenance::Web);
+        assert_eq!(entries[2].provenance, ModelProvenance::Codex);
+        assert_eq!(
+            ccload_model_ids(Some(&value)),
+            vec![
+                "gpt-5-codex".to_owned(),
+                "auto".to_owned(),
+                "configured-codex-name".to_owned()
+            ]
+        );
     }
 }
