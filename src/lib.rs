@@ -2222,6 +2222,35 @@ fn account_token(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn merge_account_model_ids(raw: &Value, fetched: Option<Vec<String>>) -> Option<Vec<String>> {
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |value: &str| {
+        let value = value.trim();
+        if value.is_empty()
+            || value.chars().count() > MAX_MODEL_TEXT_LENGTH
+            || models.len() >= MAX_MODELS
+            || !seen.insert(value.to_owned())
+        {
+            return;
+        }
+        models.push(value.to_owned());
+    };
+    if let Some(items) = raw.get("models").and_then(Value::as_array) {
+        for item in items {
+            if let Some(value) = item.as_str() {
+                push(value);
+            }
+        }
+    }
+    if let Some(fetched) = fetched {
+        for value in fetched {
+            push(&value);
+        }
+    }
+    (!models.is_empty()).then_some(models)
+}
+
 fn account_request_payload_token(value: &Value) -> Option<String> {
     value
         .as_object()
@@ -2411,7 +2440,7 @@ async fn refresh_access_token_account(
     let model_token = token.clone();
     let model_account_type = plan_type.to_owned();
     let model_account_id = account_id.map(ToOwned::to_owned);
-    let model_items = state
+    let fetched_model_ids = state
         .imported_model_catalog
         .fetch_or_reuse(&model_cache_key, move || async move {
             fetch_native_model_catalog(
@@ -2428,8 +2457,8 @@ async fn refresh_access_token_account(
             .await
             .map(|models| models.into_iter().map(|model| model.id).collect())
         })
-        .await
-        .unwrap_or_default();
+        .await;
+    let model_items = merge_account_model_ids(raw, fetched_model_ids);
     let mut result = json!({
         "access_token": token,
         "email": me.get("email").and_then(Value::as_str).unwrap_or_default(),
@@ -2441,8 +2470,10 @@ async fn refresh_access_token_account(
         "restore_at": restore_at,
         "status": if quota == 0 { "限流" } else { "正常" },
         "chatgpt_account_id": default.get("account_id").cloned().unwrap_or(Value::Null),
-        "models": model_items,
     });
+    if let Some(model_items) = model_items {
+        result["models"] = json!(model_items);
+    }
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
     }
@@ -17231,6 +17262,27 @@ mod tests {
             .expect("management response")
     }
 
+    async fn wait_for_import_job(state: &AppState, uri: &str) -> Value {
+        let mut latest = Value::Null;
+        for _ in 0..200 {
+            let response = management_request(state, "GET", uri, None, Some("admin")).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "import progress response"
+            );
+            latest = json_response(response).await["import_job"].clone();
+            if matches!(
+                latest.get("status").and_then(Value::as_str),
+                Some("completed" | "failed")
+            ) {
+                return latest;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("import job did not finish: {latest}");
+    }
+
     fn create_backup_owner_data(label: &str) -> PathBuf {
         let data_dir = account_snapshot_path(label).with_extension("backup-owner");
         fs::create_dir_all(&data_dir).expect("backup owner data directory");
@@ -18471,6 +18523,547 @@ mod tests {
             "CPA-updated"
         );
         let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn remote_imports_are_access_token_only_and_publish_web_image_models() {
+        fn token_kind(headers: &HeaderMap) -> &'static str {
+            let authorization = headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if authorization.ends_with("cpa-access-token") {
+                "cpa"
+            } else if authorization.ends_with("sub-access-token") {
+                "sub2api"
+            } else if authorization.ends_with("cc-access-token") {
+                "ccload"
+            } else {
+                "unknown"
+            }
+        }
+
+        fn assert_no_secondary_token_headers(headers: &HeaderMap) {
+            for name in ["refresh_token", "id_token", "x-refresh-token", "x-id-token"] {
+                assert!(
+                    !headers.contains_key(name),
+                    "secondary token header leaked: {name}"
+                );
+            }
+        }
+
+        let account_path = account_snapshot_path("remote-import-access-only");
+        fs::write(&account_path, b"[]").expect("remote import accounts snapshot");
+        let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let root_hits = hits.clone();
+        let root = get(move |headers: HeaderMap| {
+            let hits = root_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                hits.lock().await.push(format!(
+                    "GET / auth={} kind={}",
+                    headers.contains_key(header::AUTHORIZATION),
+                    token_kind(&headers)
+                ));
+                Html("<html><body>stub</body></html>")
+            }
+        });
+        let cpa_files_hits = hits.clone();
+        let cpa_files = get(move |headers: HeaderMap| {
+            let hits = cpa_files_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                hits.lock().await.push(format!(
+                    "GET /v0/management/auth-files auth={}",
+                    headers.contains_key(header::AUTHORIZATION)
+                ));
+                Json(json!({"files":[{"name":"cpa.json","email":"cpa@example.test"}]}))
+            }
+        });
+        let cpa_download_hits = hits.clone();
+        let cpa_download = get(move |headers: HeaderMap| {
+            let hits = cpa_download_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                hits.lock().await.push(format!(
+                    "GET /v0/management/auth-files/download auth={}",
+                    headers.contains_key(header::AUTHORIZATION)
+                ));
+                Json(json!({
+                    "access_token":"cpa-access-token",
+                    "refresh_token":"discarded-cpa-refresh",
+                    "id_token":"discarded-cpa-id"
+                }))
+            }
+        });
+        let sub_accounts_hits = hits.clone();
+        let sub_accounts = get(move |headers: HeaderMap| {
+            let hits = sub_accounts_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                hits.lock().await.push(format!(
+                    "GET /api/v1/admin/accounts auth={}",
+                    headers.contains_key(header::AUTHORIZATION)
+                ));
+                Json(json!({"data":[{
+                    "id":"sub-account",
+                    "name":"Sub2API account",
+                    "credentials":{
+                        "email":"sub@example.test",
+                        "plan_type":"pro",
+                        "refresh_token":"discarded-sub-preview-refresh",
+                        "id_token":"discarded-sub-preview-id"
+                    },
+                    "status":"active"
+                }]}))
+            }
+        });
+        let sub_data_hits = hits.clone();
+        let sub_data = get(move |headers: HeaderMap| {
+            let hits = sub_data_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                hits.lock().await.push(format!(
+                    "GET /api/v1/admin/accounts/data auth={}",
+                    headers.contains_key(header::AUTHORIZATION)
+                ));
+                Json(json!({"accounts":[{
+                    "id":"sub-account",
+                    "credentials":{
+                        "access_token":"sub-access-token",
+                        "plan_type":"pro",
+                        "refresh_token":"discarded-sub-refresh",
+                        "id_token":"discarded-sub-id"
+                    }
+                }]}))
+            }
+        });
+        let cc_login_hits = hits.clone();
+        let cc_login = post(move |headers: HeaderMap| {
+            let hits = cc_login_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                hits.lock().await.push(format!(
+                    "POST /login auth={}",
+                    headers.contains_key(header::AUTHORIZATION)
+                ));
+                Json(json!({"success":true,"data":{"token":"cc-admin-token","role":"admin"}}))
+            }
+        });
+        let cc_channels_hits = hits.clone();
+        let cc_channels = get(move |headers: HeaderMap| {
+            let hits = cc_channels_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                hits.lock().await.push(format!(
+                    "GET /admin/channels auth={}",
+                    headers.contains_key(header::AUTHORIZATION)
+                ));
+                Json(json!({"success":true,"data":[{
+                    "id":7,
+                    "name":"Codex Pro",
+                    "auth_type":"codex_oauth",
+                    "enabled":true,
+                    "codex_plan_type":"pro"
+                }],"count":1}))
+            }
+        });
+        let cc_editor_hits = hits.clone();
+        let cc_editor = get(move |headers: HeaderMap| {
+            let hits = cc_editor_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                hits.lock().await.push(format!(
+                    "GET /admin/channels/7/editor auth={}",
+                    headers.contains_key(header::AUTHORIZATION)
+                ));
+                Json(json!({"success":true,"data":{
+                    "channel":{
+                        "id":7,
+                        "auth_type":"codex_oauth",
+                        "codex_plan_type":"pro",
+                        "models":[
+                            {"model":"configured-model","redirect_model":"configured-model"},
+                            {"model":"web-page-model","redirect_model":"web-page-model"},
+                            {"model":"configured-model","redirect_model":"configured-model"}
+                        ]
+                    },
+                    "oauth_credential":{
+                        "access_token":"cc-access-token",
+                        "type":"Codex",
+                        "plan_type":"pro",
+                        "refresh_token":"discarded-cc-refresh",
+                        "id_token":"discarded-cc-id"
+                    }
+                }}))
+            }
+        });
+        let me_hits = hits.clone();
+        let me = get(move |headers: HeaderMap| {
+            let hits = me_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                let kind = token_kind(&headers);
+                hits.lock()
+                    .await
+                    .push(format!("GET /backend-api/me kind={kind}"));
+                let (email, id) = match kind {
+                    "cpa" => ("cpa@example.test", "cpa-user"),
+                    "sub2api" => ("sub@example.test", "sub-user"),
+                    "ccload" => ("cc@example.test", "cc-user"),
+                    _ => ("unknown@example.test", "unknown-user"),
+                };
+                Json(json!({"email":email,"id":id}))
+            }
+        });
+        let init_hits = hits.clone();
+        let init = post(move |headers: HeaderMap, Json(_body): Json<Value>| {
+            let hits = init_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                let kind = token_kind(&headers);
+                hits.lock()
+                    .await
+                    .push(format!("POST /backend-api/conversation/init kind={kind}"));
+                Json(json!({
+                    "default_model_slug":"web-page-model",
+                    "limits_progress":[{"feature_name":"image_gen","remaining":3,"reset_after":"2099-01-01T00:00:00Z"}]
+                }))
+            }
+        });
+        let check_hits = hits.clone();
+        let check = get(move |headers: HeaderMap| {
+            let hits = check_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                let kind = token_kind(&headers);
+                hits.lock()
+                    .await
+                    .push(format!("GET /backend-api/accounts/check kind={kind}"));
+                let account_id = match kind {
+                    "cpa" => "cpa-account",
+                    "sub2api" => "sub-account",
+                    "ccload" => "cc-account",
+                    _ => "unknown-account",
+                };
+                Json(
+                    json!({"accounts":{"default":{"account":{"account_id":account_id,"plan_type":"pro"}}}}),
+                )
+            }
+        });
+        let model_hits = hits.clone();
+        let models = get(move |headers: HeaderMap| {
+            let hits = model_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                let kind = token_kind(&headers);
+                let target_path = headers
+                    .get("X-OpenAI-Target-Path")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                hits.lock().await.push(format!(
+                    "GET /backend-api/models kind={kind} target={target_path}"
+                ));
+                assert_eq!(target_path, "/backend-api/models");
+                Json(json!({"models":[
+                    {"slug":"web-page-model"},
+                    {"slug":"gpt-image-2"},
+                    {"slug":"web-page-model"}
+                ]}))
+            }
+        });
+        let tpp_hits = hits.clone();
+        let tpp = get(move |headers: HeaderMap| {
+            let hits = tpp_hits.clone();
+            async move {
+                assert_no_secondary_token_headers(&headers);
+                let kind = token_kind(&headers);
+                hits.lock()
+                    .await
+                    .push(format!("GET /backend-api/tpp/models kind={kind}"));
+                Json(json!({"models":[{"slug":"web-tpp-model"}]}))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("remote import stub listener");
+        let address = listener.local_addr().expect("remote import stub address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let stub_task = tokio::spawn(async move {
+            ready_tx.send(()).expect("remote import stub ready");
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/", root)
+                    .route("/v0/management/auth-files", cpa_files)
+                    .route("/v0/management/auth-files/download", cpa_download)
+                    .route("/api/v1/admin/accounts", sub_accounts)
+                    .route("/api/v1/admin/accounts/data", sub_data)
+                    .route("/login", cc_login)
+                    .route("/admin/channels", cc_channels)
+                    .route("/admin/channels/7/editor", cc_editor)
+                    .route("/backend-api/me", me)
+                    .route("/backend-api/conversation/init", init)
+                    .route("/backend-api/accounts/check/v4-2023-04-27", check)
+                    .route("/backend-api/models", models)
+                    .route("/backend-api/tpp/models/", tpp),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("remote import stub server");
+        });
+        ready_rx.await.expect("remote import stub started");
+        let stub = format!("http://{address}");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: Some(stub.clone()),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("remote import state");
+
+        let cpa = management_request(
+            &state,
+            "POST",
+            "/api/cpa/pools",
+            Some(json!({"name":"CPA","base_url":stub,"secret_key":"pool-secret"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(cpa.status(), StatusCode::OK);
+        let cpa_id = json_response(cpa).await["pool"]["id"]
+            .as_str()
+            .expect("CPA pool id")
+            .to_owned();
+        let files = management_request(
+            &state,
+            "GET",
+            &format!("/api/cpa/pools/{cpa_id}/files"),
+            None,
+            Some("admin"),
+        )
+        .await;
+        let files_status = files.status();
+        let files_body = json_response(files).await;
+        assert_eq!(
+            files_status,
+            StatusCode::OK,
+            "CPA files response: {files_body}"
+        );
+        assert_eq!(files_body["files"][0]["name"], "cpa.json");
+        let start = management_request(
+            &state,
+            "POST",
+            &format!("/api/cpa/pools/{cpa_id}/import"),
+            Some(json!({"names":["cpa.json"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(start.status(), StatusCode::OK);
+        let cpa_job = wait_for_import_job(&state, &format!("/api/cpa/pools/{cpa_id}/import")).await;
+        assert_eq!(cpa_job["status"], "completed");
+        assert_eq!(cpa_job["refreshed"], 1);
+
+        let sub = management_request(
+            &state,
+            "POST",
+            "/api/sub2api/servers",
+            Some(json!({"name":"Sub2API","base_url":stub,"api_key":"sub-admin-key"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(sub.status(), StatusCode::OK);
+        let sub_id = json_response(sub).await["server"]["id"]
+            .as_str()
+            .expect("Sub2API server id")
+            .to_owned();
+        let accounts = management_request(
+            &state,
+            "GET",
+            &format!("/api/sub2api/servers/{sub_id}/accounts"),
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(accounts.status(), StatusCode::OK);
+        let start = management_request(
+            &state,
+            "POST",
+            &format!("/api/sub2api/servers/{sub_id}/import"),
+            Some(json!({"account_ids":["sub-account"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(start.status(), StatusCode::OK);
+        let sub_job =
+            wait_for_import_job(&state, &format!("/api/sub2api/servers/{sub_id}/import")).await;
+        assert_eq!(sub_job["status"], "completed");
+        assert_eq!(sub_job["refreshed"], 1);
+
+        let cc = management_request(
+            &state,
+            "POST",
+            "/api/ccload/servers",
+            Some(json!({"name":"ccLoad","base_url":stub,"password":"admin-password"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(cc.status(), StatusCode::OK);
+        let cc_id = json_response(cc).await["server"]["id"]
+            .as_str()
+            .expect("ccLoad server id")
+            .to_owned();
+        let channels = management_request(
+            &state,
+            "GET",
+            &format!("/api/ccload/servers/{cc_id}/channels"),
+            None,
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(channels.status(), StatusCode::OK);
+        assert_eq!(json_response(channels).await["channels"][0]["id"], "7");
+        let channel_models = management_request(
+            &state,
+            "POST",
+            &format!("/api/ccload/servers/{cc_id}/channel-models"),
+            Some(json!({"channel_ids":["7"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(channel_models.status(), StatusCode::OK);
+        let channel_models = json_response(channel_models).await;
+        assert_eq!(
+            channel_models["channels"][0]["models"],
+            json!([
+                "configured-model",
+                "web-page-model",
+                "gpt-image-2",
+                "web-tpp-model"
+            ])
+        );
+        let start = management_request(
+            &state,
+            "POST",
+            &format!("/api/ccload/servers/{cc_id}/import"),
+            Some(json!({"channel_ids":["7"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(start.status(), StatusCode::OK);
+        let cc_job =
+            wait_for_import_job(&state, &format!("/api/ccload/servers/{cc_id}/import")).await;
+        assert_eq!(cc_job["status"], "completed");
+        assert_eq!(cc_job["refreshed"], 1);
+
+        let accounts =
+            management_request(&state, "GET", "/api/accounts", None, Some("admin")).await;
+        assert_eq!(accounts.status(), StatusCode::OK);
+        let accounts = json_response(accounts).await;
+        let items = accounts["items"].as_array().expect("imported accounts");
+        assert_eq!(items.len(), 3);
+        for token in ["cpa-access-token", "sub-access-token", "cc-access-token"] {
+            let item = items
+                .iter()
+                .find(|item| item["access_token"] == token)
+                .unwrap_or_else(|| panic!("missing imported account {token}"));
+            assert_eq!(item["type"], "pro");
+            assert_eq!(item["source_type"], "codex");
+            assert!(item["models"].as_array().is_some_and(|models| {
+                models.iter().any(|model| model == "web-page-model")
+                    && models.iter().any(|model| model == "gpt-image-2")
+                    && models.iter().any(|model| model == "web-tpp-model")
+            }));
+            for key in ["accessToken", "token", "refresh_token", "id_token"] {
+                assert!(item.get(key).is_none(), "account leaked {key}");
+            }
+        }
+        let ccload_item = items
+            .iter()
+            .find(|item| item["access_token"] == "cc-access-token")
+            .expect("ccLoad imported account");
+        assert!(
+            ccload_item["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|model| model == "configured-model"))
+        );
+
+        let persisted = fs::read_to_string(&account_path).expect("persisted imported accounts");
+        for secret in [
+            "discarded-cpa-refresh",
+            "discarded-cpa-id",
+            "discarded-sub-refresh",
+            "discarded-sub-id",
+            "discarded-cc-refresh",
+            "discarded-cc-id",
+        ] {
+            assert!(
+                !persisted.contains(secret),
+                "persisted secondary token: {secret}"
+            );
+        }
+        let persisted: Value = serde_json::from_str(&persisted).expect("persisted accounts JSON");
+        for item in persisted["items"]
+            .as_array()
+            .expect("persisted account items")
+        {
+            assert!(item.get("refresh_token").is_none());
+            assert!(item.get("id_token").is_none());
+        }
+
+        assert!(state.account_type_catalog.enabled());
+        let active_candidates = state
+            .account_store
+            .active_type_candidates()
+            .await
+            .expect("active account candidates");
+        assert_eq!(active_candidates.1.len(), 1);
+        assert!(active_candidates.1.contains_key("pro"));
+        let mut models = Value::Null;
+        let mut model_ids = Vec::new();
+        for _ in 0..100 {
+            let models_response =
+                management_request(&state, "GET", "/v1/models", None, Some("admin")).await;
+            assert_eq!(models_response.status(), StatusCode::OK);
+            models = json_response(models_response).await;
+            model_ids = models["data"]
+                .as_array()
+                .expect("public models")
+                .iter()
+                .filter_map(|model| model["id"].as_str())
+                .collect::<Vec<_>>();
+            if model_ids.contains(&"web-page-model")
+                && model_ids.contains(&"web-tpp-model")
+                && model_ids.contains(&"gpt-image-2")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            model_ids.contains(&"web-page-model"),
+            "public model ids: {model_ids:?}; body: {models}"
+        );
+        assert!(model_ids.contains(&"web-tpp-model"));
+        assert!(model_ids.contains(&"gpt-image-2"));
+        assert!(!model_ids.contains(&"codex-image-model"));
+
+        let hit_text = hits.lock().await.join("\n");
+        assert!(hit_text.contains("GET /backend-api/models"));
+        assert!(!hit_text.contains("/backend-api/codex/models"));
+        state.account_type_catalog.shutdown().await;
+        shutdown_tx.send(()).expect("remote import stub shutdown");
+        stub_task.await.expect("remote import stub join");
+        let _ = fs::remove_dir_all(account_path.parent().expect("account parent"));
     }
 
     #[test]
@@ -19975,6 +20568,29 @@ mod tests {
             Some(vec!["retry-model".to_owned()])
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn imported_refresh_model_merge_preserves_existing_catalog() {
+        let raw = json!({
+            "models": ["configured-model", "web-model", "configured-model"]
+        });
+        assert_eq!(
+            merge_account_model_ids(&raw, None),
+            Some(vec!["configured-model".to_owned(), "web-model".to_owned()])
+        );
+        assert_eq!(
+            merge_account_model_ids(
+                &raw,
+                Some(vec!["web-model".to_owned(), "web-image-model".to_owned()])
+            ),
+            Some(vec![
+                "configured-model".to_owned(),
+                "web-model".to_owned(),
+                "web-image-model".to_owned()
+            ])
+        );
+        assert_eq!(merge_account_model_ids(&json!({}), None), None);
     }
 
     #[tokio::test]

@@ -2157,11 +2157,35 @@ fn normalized_ccload_credential(value: Option<&Value>) -> Option<HashMap<String,
             .is_none_or(|value| value.is_empty())
         || credential
             .get("expired")
-            .is_none_or(|value| !valid_ccload_expired_text(value))
+            .is_some_and(|value| !value.is_empty() && !valid_ccload_expired_text(value))
     {
         return None;
     }
     Some(credential)
+}
+
+fn ccload_model_ids(value: Option<&Value>) -> Vec<String> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| {
+            let text = match item {
+                Value::String(text) => Some(text.as_str()),
+                Value::Object(object) => object.get("model").and_then(Value::as_str),
+                _ => None,
+            }?
+            .trim();
+            if text.is_empty() || text.chars().count() > super::MAX_MODEL_TEXT_LENGTH {
+                return None;
+            }
+            let owned = text.to_owned();
+            seen.insert(owned.clone()).then_some(owned)
+        })
+        .take(super::MAX_MODELS)
+        .collect()
 }
 
 fn public_sub2api_item(value: &Value) -> Value {
@@ -2938,6 +2962,12 @@ async fn load_ccload_channel_models(
                     .map(str::trim)
                     == Some("codex_oauth");
             if channel_matches {
+                let configured_models =
+                    ccload_model_ids(channel.and_then(|value| value.get("models")));
+                if !configured_models.is_empty() {
+                    catalog["models"] = json!(configured_models);
+                    catalog["models_loaded"] = Value::Bool(true);
+                }
                 if let Some(plan_type) = channel
                     .and_then(|value| value.get("codex_plan_type"))
                     .and_then(Value::as_str)
@@ -3018,7 +3048,16 @@ async fn load_ccload_channel_models(
         if let Some(group) = group
             && let Some(Some(model_ids)) = fetched.get(&group)
         {
-            catalogs[catalog_index]["models"] = json!(model_ids);
+            let mut merged = ccload_model_ids(catalogs[catalog_index].get("models"));
+            for model_id in model_ids {
+                if merged.len() >= super::MAX_MODELS {
+                    break;
+                }
+                if !merged.contains(model_id) {
+                    merged.push(model_id.clone());
+                }
+            }
+            catalogs[catalog_index]["models"] = json!(merged);
             catalogs[catalog_index]["models_loaded"] = Value::Bool(true);
         }
     }
@@ -3140,6 +3179,8 @@ async fn execute_ccload_import(
                 if channel_matches
                     && let Some(credential) = normalized_ccload_credential(credential)
                 {
+                    let configured_models =
+                        ccload_model_ids(channel.and_then(|item| item.get("models")));
                     let mut candidate = json!({
                         "access_token": credential
                             .get("access_token")
@@ -3152,6 +3193,9 @@ async fn execute_ccload_import(
                             .cloned()
                             .unwrap_or_default(),
                     });
+                    if !configured_models.is_empty() {
+                        candidate["models"] = json!(configured_models);
+                    }
                     for key in ["account_id", "email", "expired"] {
                         if let Some(value) = credential.get(key).filter(|value| !value.is_empty()) {
                             candidate[key] = Value::String(value.clone());
@@ -5344,7 +5388,7 @@ pub(super) async fn download_backup(
 mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
-        parse_r2_list_xml, public_backup_error,
+        normalized_ccload_credential, parse_r2_list_xml, public_backup_error,
     };
     use axum::response::IntoResponse;
 
@@ -5434,5 +5478,25 @@ mod tests {
             public_backup_error(&malformed),
             Value::String("备份执行失败，请稍后重试".to_owned())
         );
+    }
+
+    #[test]
+    fn ccload_import_accepts_access_token_only_and_drops_secondary_tokens() {
+        let credential = normalized_ccload_credential(Some(&serde_json::json!({
+            "access_token": "access-only",
+            "type": "Codex",
+            "plan_type": "pro",
+            "id_token": "discarded-id",
+            "refresh_token": "discarded-refresh"
+        })))
+        .expect("access-token-only ccLoad credential");
+        assert_eq!(
+            credential.get("access_token").map(String::as_str),
+            Some("access-only")
+        );
+        assert_eq!(credential.get("type").map(String::as_str), Some("codex"));
+        assert!(!credential.contains_key("id_token"));
+        assert!(!credential.contains_key("refresh_token"));
+        assert!(credential.get("expired").is_some_and(String::is_empty));
     }
 }
