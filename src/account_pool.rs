@@ -135,9 +135,13 @@ fn account_counter(value: Option<&serde_json::Value>) -> u64 {
 }
 
 fn image_quota(value: Option<&serde_json::Value>) -> Option<u64> {
-    value
-        .and_then(serde_json::Value::as_u64)
-        .filter(|quota| *quota > 0)
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64().filter(|quota| *quota > 0),
+        Some(serde_json::Value::String(text)) => {
+            text.trim().parse::<u64>().ok().filter(|quota| *quota > 0)
+        }
+        _ => None,
+    }
 }
 
 pub(super) struct AccountLease {

@@ -2237,7 +2237,7 @@ fn public_account(record: &AccountRecord) -> Value {
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
-    let models = record
+    let mut models = record
         .raw
         .as_object()
         .map(|object| {
@@ -2248,6 +2248,14 @@ fn public_account(record: &AccountRecord) -> Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| record.models.iter().cloned().map(Value::String).collect());
+    if record.status == "正常"
+        && image_quota_from_value(record.raw.get("quota")).is_some()
+        && !models
+            .iter()
+            .any(|model| model.as_str() == Some("gpt-image-2"))
+    {
+        models.push(Value::String("gpt-image-2".to_owned()));
+    }
     object.insert("models".to_owned(), Value::Array(models));
     Value::Object(object)
 }
@@ -2509,7 +2517,7 @@ async fn refresh_access_token_account(
                     }
                     if let Some(value) = object
                         .get("remaining")
-                        .and_then(Value::as_u64)
+                        .and_then(|value| nonnegative_u64_from_value(Some(value)))
                         .filter(|value| *value <= 1_000_000_000)
                     {
                         normalized.insert("remaining".to_owned(), json!(value));
@@ -2570,6 +2578,9 @@ async fn refresh_access_token_account(
     }
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
+    }
+    if image_quota_from_value(Some(&result["quota"])).is_some() {
+        ensure_image_model_snapshot(&mut result);
     }
     canonicalize_account_item(&result).map_err(|_| "invalid_account")
 }
@@ -12003,28 +12014,79 @@ fn parse_created(value: Option<&Value>) -> i64 {
 fn image_quota_from_limits_progress(value: Option<&Value>) -> (u64, Option<String>) {
     value
         .and_then(Value::as_array)
-        .and_then(|items| {
-            items.iter().find_map(|item| {
-                let object = item.as_object()?;
-                (object.get("feature_name").and_then(Value::as_str) == Some("image_gen")).then(
-                    || {
-                        (
-                            object
-                                .get("remaining")
-                                .and_then(Value::as_u64)
-                                .unwrap_or_default(),
-                            object
-                                .get("reset_after")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .filter(|value| !value.is_empty())
-                                .map(ToOwned::to_owned),
-                        )
-                    },
-                )
-            })
+        .into_iter()
+        .flat_map(|items| items.iter())
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            if !is_image_quota_feature(object.get("feature_name")) {
+                return None;
+            }
+            let remaining = nonnegative_u64_from_value(object.get("remaining"))?;
+            let reset_after = object
+                .get("reset_after")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            Some((remaining, reset_after))
         })
+        .max_by_key(|(remaining, _)| *remaining)
         .unwrap_or((0, None))
+}
+
+fn nonnegative_u64_from_value(value: Option<&Value>) -> Option<u64> {
+    match value {
+        Some(Value::Number(number)) => number.as_u64(),
+        Some(Value::String(text)) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn image_quota_from_value(value: Option<&Value>) -> Option<u64> {
+    nonnegative_u64_from_value(value).filter(|value| *value > 0)
+}
+
+fn is_image_quota_feature(value: Option<&Value>) -> bool {
+    let Some(name) = value.and_then(Value::as_str) else {
+        return false;
+    };
+    matches!(
+        name.trim().to_ascii_lowercase().replace('-', "_").as_str(),
+        "image_gen" | "image_generation" | "image_generation_v2"
+    )
+}
+
+fn ensure_image_model_snapshot(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if image_quota_from_value(object.get("quota")).is_none() {
+        return;
+    }
+    {
+        let models = object
+            .entry("models".to_owned())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if !models.is_array() {
+            *models = Value::Array(Vec::new());
+        }
+        let models = models.as_array_mut().expect("image models array");
+        if !models
+            .iter()
+            .any(|model| model.as_str() == Some("gpt-image-2"))
+        {
+            models.push(Value::String("gpt-image-2".to_owned()));
+        }
+    }
+    let sources = object
+        .entry("model_sources".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !sources.is_object() {
+        *sources = Value::Object(Map::new());
+    }
+    if let Some(sources) = sources.as_object_mut() {
+        sources.insert("gpt-image-2".to_owned(), Value::String("image".to_owned()));
+    }
 }
 
 async fn models(
@@ -18885,7 +18947,7 @@ mod tests {
                     .push(format!("POST /backend-api/conversation/init kind={kind}"));
                 Json(json!({
                     "default_model_slug":"web-page-model",
-                    "limits_progress":[{"feature_name":"image_gen","remaining":3,"reset_after":"2099-01-01T00:00:00Z"}]
+                    "limits_progress":[{"feature_name":"image_generation","remaining":"3","reset_after":"2099-01-01T00:00:00Z"}]
                 }))
             }
         });
@@ -19214,6 +19276,7 @@ mod tests {
             assert!(sources.values().all(|source| source != "codex"));
             assert_eq!(sources.get("gpt-5-codex"), Some(&json!("web")));
             assert_eq!(sources.get("auto"), Some(&json!("web")));
+            assert_eq!(sources.get("gpt-image-2"), Some(&json!("image")));
         }
 
         assert!(state.account_type_catalog.enabled());
@@ -25654,6 +25717,59 @@ data: [DONE]
     }
 
     #[test]
+    fn positive_image_quota_persists_image_model_for_imported_accounts() {
+        let mut refreshed = json!({
+            "access_token": "account-token",
+            "source_type": "codex",
+            "type": "pro",
+            "quota": "3",
+            "models": ["gpt-5-5"]
+        });
+        ensure_image_model_snapshot(&mut refreshed);
+        let canonical = canonicalize_account_item(&refreshed).expect("canonical account");
+        assert_eq!(canonical["models"], json!(["gpt-5-5", "gpt-image-2"]));
+        assert_eq!(canonical["model_sources"]["gpt-image-2"], "image");
+
+        let without_quota = canonicalize_account_item(&json!({
+            "access_token": "account-token",
+            "source_type": "codex",
+            "type": "pro",
+            "quota": 0,
+            "models": ["gpt-5-5"]
+        }))
+        .expect("canonical account without image quota");
+        assert!(
+            !without_quota["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|model| model == "gpt-image-2"))
+        );
+    }
+
+    #[test]
+    fn image_quota_parser_accepts_known_feature_aliases_and_string_remaining() {
+        assert_eq!(
+            image_quota_from_limits_progress(Some(&json!([
+                {"feature_name":"other","remaining":99},
+                {"feature_name":"image_generation","remaining":"4"}
+            ]))),
+            (4, None)
+        );
+        assert_eq!(
+            image_quota_from_limits_progress(Some(&json!([
+                {"feature_name":"image_gen","remaining":2},
+                {"feature_name":"image_generation_v2","remaining":7}
+            ]))),
+            (7, None)
+        );
+        assert_eq!(
+            image_quota_from_limits_progress(Some(&json!([
+                {"feature_name":"codex_models","remaining":99}
+            ]))),
+            (0, None)
+        );
+    }
+
+    #[test]
     fn public_models_recompute_stale_static_account_type_metadata() {
         let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-models-stale-types-{}-{}.json",
@@ -26154,14 +26270,19 @@ data: [DONE]
             .acquire_image_lease(&HashSet::new())
             .await
             .expect("image lease");
-        assert_eq!(image_lease.token(), "image-token");
+        assert!(matches!(
+            image_lease.token(),
+            "image-token" | "string-token"
+        ));
         assert_eq!(store.inflight(), 2);
-        assert!(
-            store.acquire_image_lease(&HashSet::new()).await.is_none(),
-            "a quota-one account must not admit a second image request"
-        );
+        let second_image_lease = store
+            .acquire_image_lease(&HashSet::new())
+            .await
+            .expect("second image account lease");
+        assert_eq!(store.inflight(), 3);
+        assert!(store.acquire_image_lease(&HashSet::new()).await.is_none());
         drop(text_lease);
-        assert_eq!(store.inflight(), 1);
+        assert_eq!(store.inflight(), 2);
 
         atomic_replace_checked_with_limit(
             &path,
@@ -26185,6 +26306,7 @@ data: [DONE]
         );
 
         drop(image_lease);
+        drop(second_image_lease);
         assert_eq!(store.inflight(), 0);
         let next_image_lease = store
             .acquire_image_lease(&HashSet::new())
@@ -26194,7 +26316,7 @@ data: [DONE]
         assert_eq!(store.inflight(), 0);
         assert_eq!(
             store.image_capable_account_types(),
-            HashSet::from(["plus".to_owned()])
+            HashSet::from(["plus".to_owned(), "team".to_owned()])
         );
         fs::remove_file(path).expect("cleanup");
     }
