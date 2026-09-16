@@ -1423,6 +1423,10 @@ fn public_import_job(value: Option<&Value>) -> Value {
         "skipped",
         "refreshed",
         "failed",
+        "model_fetch_count",
+        "model_cache_hit_count",
+        "model_fetch_by_type",
+        "model_cache_hit_by_type",
         "errors",
     ] {
         if let Some(value) = object.get(key) {
@@ -1430,6 +1434,40 @@ fn public_import_job(value: Option<&Value>) -> Value {
         }
     }
     Value::Object(output)
+}
+
+async fn add_model_catalog_stats(job: &mut Value, state: &AppState) {
+    let (fetch_count, cache_hit_count) = state.imported_model_catalog.stats();
+    let by_type = state.imported_model_catalog.stats_by_type().await;
+    if let Some(object) = job.as_object_mut() {
+        object.insert("model_fetch_count".to_owned(), Value::from(fetch_count));
+        object.insert(
+            "model_cache_hit_count".to_owned(),
+            Value::from(cache_hit_count),
+        );
+        object.insert(
+            "model_fetch_by_type".to_owned(),
+            Value::Array(
+                by_type
+                    .iter()
+                    .map(|(account_type, fetches, _)| {
+                        json!({"account_type": account_type, "count": fetches})
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "model_cache_hit_by_type".to_owned(),
+            Value::Array(
+                by_type
+                    .iter()
+                    .map(|(account_type, _, hits)| {
+                        json!({"account_type": account_type, "count": hits})
+                    })
+                    .collect(),
+            ),
+        );
+    }
 }
 
 fn public_registry_item(kind: &str, value: &Value) -> Value {
@@ -1920,7 +1958,7 @@ async fn execute_cpa_import(
         }
     };
     let refreshed = super::refresh_imported_accounts(&state, &imported_tokens).await;
-    let job = import_job(
+    let mut job = import_job(
         &expected_job_id,
         names.len(),
         added,
@@ -1929,6 +1967,7 @@ async fn execute_cpa_import(
         failed,
         errors,
     );
+    add_model_catalog_stats(&mut job, &state).await;
     let _ = set_registry_job(&state, "cpa_pools", &pool_id, job, Some(&expected_job_id));
 }
 
@@ -2677,7 +2716,7 @@ async fn execute_sub2api_import(
         }
     };
     let refreshed = super::refresh_imported_accounts(&state, &imported_tokens).await;
-    let job = import_job(
+    let mut job = import_job(
         &expected_job_id,
         ids.len(),
         added,
@@ -2686,6 +2725,7 @@ async fn execute_sub2api_import(
         failed,
         errors,
     );
+    add_model_catalog_stats(&mut job, &state).await;
     let _ = set_registry_job(&state, "sub2api", &server_id, job, Some(&expected_job_id));
 }
 
@@ -3425,7 +3465,7 @@ async fn execute_ccload_import(
 
     let failed = fetch_failed.min(ids.len());
     let status = if failed > 0 { "failed" } else { "completed" };
-    let job = progress_job_with_created(
+    let mut job = progress_job_with_created(
         &expected_job_id,
         ImportProgress {
             total: ids.len(),
@@ -3439,6 +3479,7 @@ async fn execute_ccload_import(
         errors,
         created_at.as_deref(),
     );
+    add_model_catalog_stats(&mut job, &state).await;
     let _ = set_registry_job(&state, "ccload", &server_id, job, Some(&expected_job_id));
 }
 

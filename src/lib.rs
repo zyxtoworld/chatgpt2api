@@ -1462,6 +1462,8 @@ enum ImportedModelCatalogState {
 struct ImportedModelCatalogEntry {
     state: Mutex<ImportedModelCatalogState>,
     updates: watch::Sender<ImportedModelCatalogState>,
+    fetch_count: AtomicUsize,
+    cache_hit_count: AtomicUsize,
 }
 
 impl ImportedModelCatalogCache {
@@ -1478,6 +1480,22 @@ impl ImportedModelCatalogCache {
             self.fetch_count.load(Ordering::Relaxed),
             self.cache_hit_count.load(Ordering::Relaxed),
         )
+    }
+
+    async fn stats_by_type(&self) -> Vec<(String, usize, usize)> {
+        let entries = self.entries.lock().await;
+        let mut result = entries
+            .iter()
+            .map(|(key, entry)| {
+                (
+                    key.clone(),
+                    entry.fetch_count.load(Ordering::Relaxed),
+                    entry.cache_hit_count.load(Ordering::Relaxed),
+                )
+            })
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| left.0.cmp(&right.0));
+        result
     }
 
     async fn fetch_or_reuse<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<PublicModel>>
@@ -1498,6 +1516,8 @@ impl ImportedModelCatalogCache {
                             retry_at: Instant::now(),
                         }),
                         updates,
+                        fetch_count: AtomicUsize::new(0),
+                        cache_hit_count: AtomicUsize::new(0),
                     })
                 })
                 .clone()
@@ -1511,6 +1531,7 @@ impl ImportedModelCatalogCache {
                     ImportedModelCatalogState::Ready { models, expires_at }
                         if Instant::now() < *expires_at =>
                     {
+                        entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
                         self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
                         return Some((**models).clone());
                     }
@@ -1527,6 +1548,7 @@ impl ImportedModelCatalogCache {
                 }
             };
             if owner {
+                entry.fetch_count.fetch_add(1, Ordering::Relaxed);
                 self.fetch_count.fetch_add(1, Ordering::Relaxed);
                 let result = fetch().await.filter(|models| !models.is_empty());
                 let next = match &result {
@@ -1542,6 +1564,7 @@ impl ImportedModelCatalogCache {
                 let _ = entry.updates.send(next);
                 return result;
             }
+            entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
             self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
             let _ = updates.changed().await;
         }
@@ -19240,6 +19263,21 @@ mod tests {
             wait_for_import_job(&state, &format!("/api/ccload/servers/{cc_id}/import")).await;
         assert_eq!(cc_job["status"], "completed");
         assert_eq!(cc_job["refreshed"], 1);
+        assert_eq!(cc_job["model_fetch_count"], 1);
+        assert!(
+            cc_job["model_cache_hit_count"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
+        );
+        assert_eq!(
+            cc_job["model_fetch_by_type"],
+            json!([{"account_type":"pro","count":1}])
+        );
+        assert!(
+            cc_job["model_cache_hit_by_type"][0]["count"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
+        );
 
         let channel_models = management_request(
             &state,
