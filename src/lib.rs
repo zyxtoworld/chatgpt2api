@@ -2237,7 +2237,7 @@ fn public_account(record: &AccountRecord) -> Value {
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
-    let mut models = record
+    let models = record
         .raw
         .as_object()
         .map(|object| {
@@ -2248,14 +2248,6 @@ fn public_account(record: &AccountRecord) -> Value {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| record.models.iter().cloned().map(Value::String).collect());
-    if record.status == "正常"
-        && image_quota_from_value(record.raw.get("quota")).is_some()
-        && !models
-            .iter()
-            .any(|model| model.as_str() == Some("gpt-image-2"))
-    {
-        models.push(Value::String("gpt-image-2".to_owned()));
-    }
     object.insert("models".to_owned(), Value::Array(models));
     Value::Object(object)
 }
@@ -4638,7 +4630,7 @@ fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<Str
         Some(Value::String(value)) => value.trim().to_ascii_lowercase(),
         Some(_) => return Err(ApiError::invalid_request()),
     };
-    if model == "gpt-image-2" {
+    if model.starts_with("gpt-image-") {
         return Ok((model, false, None));
     }
     if model == "codex-gpt-image-2" {
@@ -4657,7 +4649,7 @@ fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<Str
 }
 
 fn is_native_image_model_id(id: &str) -> bool {
-    id.eq_ignore_ascii_case("gpt-image-2")
+    id.to_ascii_lowercase().starts_with("gpt-image-")
         || id.eq_ignore_ascii_case("codex-gpt-image-2")
         || ["plus", "team", "pro"]
             .iter()
@@ -4665,7 +4657,7 @@ fn is_native_image_model_id(id: &str) -> bool {
 }
 
 fn is_public_chatgpt_image_model_id(id: &str) -> bool {
-    id.trim().eq_ignore_ascii_case("gpt-image-2")
+    id.trim().to_ascii_lowercase().starts_with("gpt-image-")
 }
 
 fn is_public_chatgpt_model(model: &PublicModel) -> bool {
@@ -11760,13 +11752,12 @@ impl AccountTypeCatalog {
                 .enumerate()
                 .map(|(index, model)| (model.id.clone(), index))
                 .collect();
-            let image_account_types = self.account_store.image_capable_account_types();
-            let mut image_types = image_account_types.into_iter().collect::<Vec<_>>();
-            image_types.sort();
+            let image_models = self.account_store.image_models_by_account_type();
             let mut upsert_image_model = |id: String, supported: Vec<String>| {
                 if let Some(index) = indexes.get(&id).copied() {
                     models[index].allow_anonymous = false;
                     models[index].supported_account_types = supported;
+                    models[index].provenance = ModelProvenance::Image;
                 } else {
                     indexes.insert(id.clone(), models.len());
                     models.push(PublicModel {
@@ -11784,8 +11775,22 @@ impl AccountTypeCatalog {
                     });
                 }
             };
-            if self.enabled() && !image_types.is_empty() {
-                upsert_image_model("gpt-image-2".to_owned(), image_types);
+            if self.enabled() {
+                let mut image_ids = image_models
+                    .values()
+                    .flat_map(|models| models.iter().cloned())
+                    .collect::<HashSet<_>>();
+                let mut image_ids = image_ids.drain().collect::<Vec<_>>();
+                image_ids.sort();
+                for image_id in image_ids {
+                    let mut supported = image_models
+                        .iter()
+                        .filter(|(_, models)| models.contains(&image_id))
+                        .map(|(account_type, _)| account_type.clone())
+                        .collect::<Vec<_>>();
+                    supported.sort();
+                    upsert_image_model(image_id, supported);
+                }
             }
         }
         models.sort_by(|left, right| left.id.cmp(&right.id));
@@ -12063,20 +12068,17 @@ fn ensure_image_model_snapshot(value: &mut Value) {
     if image_quota_from_value(object.get("quota")).is_none() {
         return;
     }
-    {
-        let models = object
-            .entry("models".to_owned())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if !models.is_array() {
-            *models = Value::Array(Vec::new());
-        }
-        let models = models.as_array_mut().expect("image models array");
-        if !models
-            .iter()
-            .any(|model| model.as_str() == Some("gpt-image-2"))
-        {
-            models.push(Value::String("gpt-image-2".to_owned()));
-        }
+    let image_models = object
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flat_map(|models| models.iter())
+        .filter_map(Value::as_str)
+        .filter(|id| id.to_ascii_lowercase().starts_with("gpt-image-"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if image_models.is_empty() {
+        return;
     }
     let sources = object
         .entry("model_sources".to_owned())
@@ -12085,7 +12087,9 @@ fn ensure_image_model_snapshot(value: &mut Value) {
         *sources = Value::Object(Map::new());
     }
     if let Some(sources) = sources.as_object_mut() {
-        sources.insert("gpt-image-2".to_owned(), Value::String("image".to_owned()));
+        for image_model in image_models {
+            sources.insert(image_model, Value::String("image".to_owned()));
+        }
     }
 }
 
@@ -18990,6 +18994,8 @@ mod tests {
                     {"slug":"gpt-5-codex"},
                     {"slug":"auto"},
                     {"slug":"gpt-image-2"},
+                    {"slug":"gpt-image-2.5"},
+                    {"slug":"gpt-image-2.5-flare"},
                     {"slug":"web-page-model"}
                 ]}))
             }
@@ -19226,12 +19232,17 @@ mod tests {
         assert_eq!(channel_models.status(), StatusCode::OK);
         let channel_models = json_response(channel_models).await;
         let channel_models = &channel_models["channels"][0];
-        assert!(
-            channel_models["models"]
-                .as_array()
-                .is_some_and(|models| models.iter().any(|model| model == "gpt-image-2"))
-        );
+        assert!(channel_models["models"].as_array().is_some_and(|models| {
+            ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare"]
+                .iter()
+                .all(|expected| models.iter().any(|model| model == expected))
+        }));
         assert_eq!(channel_models["model_sources"]["gpt-image-2"], "image");
+        assert_eq!(channel_models["model_sources"]["gpt-image-2.5"], "image");
+        assert_eq!(
+            channel_models["model_sources"]["gpt-image-2.5-flare"],
+            "image"
+        );
 
         let accounts =
             management_request(&state, "GET", "/api/accounts", None, Some("admin")).await;
@@ -19251,6 +19262,8 @@ mod tests {
                     && models.iter().any(|model| model == "gpt-5-codex")
                     && models.iter().any(|model| model == "auto")
                     && models.iter().any(|model| model == "gpt-image-2")
+                    && models.iter().any(|model| model == "gpt-image-2.5")
+                    && models.iter().any(|model| model == "gpt-image-2.5-flare")
                     && models.iter().any(|model| model == "web-tpp-model")
                     && models.iter().any(|model| model == "tpp-codex-named-model")
                     && models.iter().all(|model| model != "codex-endpoint-model")
@@ -19295,6 +19308,8 @@ mod tests {
             assert_eq!(sources.get("gpt-5-codex"), Some(&json!("web")));
             assert_eq!(sources.get("auto"), Some(&json!("web")));
             assert_eq!(sources.get("gpt-image-2"), Some(&json!("image")));
+            assert_eq!(sources.get("gpt-image-2.5"), Some(&json!("image")));
+            assert_eq!(sources.get("gpt-image-2.5-flare"), Some(&json!("image")));
         }
 
         assert!(state.account_type_catalog.enabled());
@@ -20620,7 +20635,12 @@ mod tests {
                     .lock()
                     .expect("account refresh calls lock")
                     .push("GET /backend-api/models".to_owned());
-                Json(json!({"models":[{"slug":"gpt-pro"},{"slug":"gpt-5-5"}]}))
+                Json(json!({"models":[
+                    {"slug":"gpt-pro"},
+                    {"slug":"gpt-5-5"},
+                    {"slug":"gpt-image-2"},
+                    {"slug":"gpt-image-2.5"}
+                ]}))
             }
         });
         let upstream = tokio::spawn(async move {
@@ -25607,7 +25627,9 @@ data: [DONE]
                 "models": [
                     {"slug": "gpt-5-codex"},
                     {"slug": "auto"},
-                    {"slug": "gpt-image-2"}
+                    {"slug": "gpt-image-2"},
+                    {"slug": "gpt-image-2.5"},
+                    {"slug": "gpt-image-2.5-flare"}
                 ]
             }),
             "models",
@@ -25622,11 +25644,23 @@ data: [DONE]
             web.iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["gpt-5-codex", "auto", "gpt-image-2"]
+            vec![
+                "gpt-5-codex",
+                "auto",
+                "gpt-image-2",
+                "gpt-image-2.5",
+                "gpt-image-2.5-flare"
+            ]
         );
         assert!(
             web.iter()
+                .take(2)
                 .all(|model| model.provenance == ModelProvenance::Web)
+        );
+        assert!(
+            web.iter()
+                .skip(2)
+                .all(|model| model.provenance == ModelProvenance::Image)
         );
 
         let codex = project_remote_model_list_with_provenance(
@@ -25648,7 +25682,7 @@ data: [DONE]
         let account_path = account_snapshot_path("public-model-provenance");
         fs::write(
             &account_path,
-            r#"[{"access_token":"image-account","status":"正常","type":"pro","quota":2}]"#,
+            r#"[{"access_token":"image-account","status":"正常","type":"pro","quota":2,"models":["gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}}]"#,
         )
         .expect("image-capable account snapshot");
         let state = AppState::new(AppConfig {
@@ -25741,12 +25775,16 @@ data: [DONE]
             "source_type": "codex",
             "type": "pro",
             "quota": "3",
-            "models": ["gpt-5-5"]
+            "models": ["gpt-5-5", "gpt-image-2", "gpt-image-2.5"]
         });
         ensure_image_model_snapshot(&mut refreshed);
         let canonical = canonicalize_account_item(&refreshed).expect("canonical account");
-        assert_eq!(canonical["models"], json!(["gpt-5-5", "gpt-image-2"]));
+        assert_eq!(
+            canonical["models"],
+            json!(["gpt-5-5", "gpt-image-2", "gpt-image-2.5"])
+        );
         assert_eq!(canonical["model_sources"]["gpt-image-2"], "image");
+        assert_eq!(canonical["model_sources"]["gpt-image-2.5"], "image");
 
         let without_quota = canonicalize_account_item(&json!({
             "access_token": "account-token",
@@ -35936,8 +35974,8 @@ data: [DONE]
                 {"access_token":"plus-codex","status":"正常","source_type":"codex","type":"plus","models":["gpt-5.5"]},
                 {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","quota":1,"models":["gpt-5.5"]},
                 {"access_token":"pro-codex-limited","status":"限流","source_type":"codex","type":"pro","models":["gpt-5.5"]},
-                {"access_token":"free-web","status":"正常","source_type":"web","type":"free","quota":1,"models":["gpt-5.5"]},
-                {"access_token":"plus-web","status":"正常","source_type":"web","type":"plus","quota":1,"models":["gpt-5.5"]}
+                {"access_token":"free-web","status":"正常","source_type":"web","type":"free","quota":1,"models":["gpt-5.5","gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}},
+                {"access_token":"plus-web","status":"正常","source_type":"web","type":"plus","quota":1,"models":["gpt-5.5","gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}}
             ]"#,
         )
         .expect("account snapshot");
@@ -35982,7 +36020,11 @@ data: [DONE]
         };
         assert_eq!(
             model("gpt-image-2")["supported_account_types"],
-            json!(["free", "plus", "team"])
+            json!(["free", "plus"])
+        );
+        assert_eq!(
+            model("gpt-image-2.5")["supported_account_types"],
+            json!(["free", "plus"])
         );
         assert!(
             data.iter()

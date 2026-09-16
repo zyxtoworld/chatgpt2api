@@ -434,6 +434,11 @@ pub(super) fn project_remote_model_list_with_provenance(
                 .map(|object| model_provenance_from_object(object, provenance))
                 .unwrap_or(provenance)
         };
+        if model.provenance == ModelProvenance::Web
+            && model.id.to_ascii_lowercase().starts_with("gpt-image-")
+        {
+            model.provenance = ModelProvenance::Image;
+        }
         if let Some(index) = indexes.get(&model.id).copied() {
             if model_provenance_rank(model.provenance)
                 > model_provenance_rank(models[index].provenance)

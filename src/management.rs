@@ -2212,7 +2212,7 @@ fn ccload_model_payload(entries: Vec<CcLoadModelEntry>) -> (Value, Value) {
     (Value::Array(models), Value::Object(sources))
 }
 
-fn apply_ccload_image_capability(catalog: &mut Value, image_capable: bool) {
+fn apply_ccload_image_capability(catalog: &mut Value, image_models: &[String]) {
     let Some(object) = catalog.as_object_mut() else {
         return;
     };
@@ -2226,10 +2226,17 @@ fn apply_ccload_image_capability(catalog: &mut Value, image_capable: bool) {
     models.retain(|model| {
         !model
             .as_str()
-            .is_some_and(|value| value.eq_ignore_ascii_case("gpt-image-2"))
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("gpt-image-"))
     });
-    if image_capable {
-        models.push(Value::String("gpt-image-2".to_owned()));
+    for image_model in image_models {
+        if !models
+            .iter()
+            .any(|model| model.as_str() == Some(image_model))
+        {
+            models.push(Value::String(image_model.clone()));
+        }
+    }
+    if !image_models.is_empty() {
         object.insert("models_loaded".to_owned(), Value::Bool(true));
     }
     let sources = object
@@ -2239,9 +2246,9 @@ fn apply_ccload_image_capability(catalog: &mut Value, image_capable: bool) {
         *sources = Value::Object(Map::new());
     }
     if let Some(sources) = sources.as_object_mut() {
-        sources.remove("gpt-image-2");
-        if image_capable {
-            sources.insert("gpt-image-2".to_owned(), Value::String("image".to_owned()));
+        sources.retain(|id, _| !id.to_ascii_lowercase().starts_with("gpt-image-"));
+        for image_model in image_models {
+            sources.insert(image_model.clone(), Value::String("image".to_owned()));
         }
     }
 }
@@ -3041,7 +3048,7 @@ async fn load_ccload_channel_models(
     for id in ids {
         let mut catalog = json!({"id": id, "plan_type": "", "models": [], "models_loaded": false});
         let mut catalog_group = None;
-        let mut image_capable = false;
+        let mut image_models = Vec::new();
         let editor = remote_json(
             state,
             state
@@ -3093,7 +3100,7 @@ async fn load_ccload_channel_models(
                     let access_token = credential
                         .get("access_token")
                         .expect("validated ccLoad access token");
-                    image_capable = state.account_store.has_image_capable_account(
+                    image_models = state.account_store.image_models_for_account(
                         access_token,
                         credential.get("account_id").map(String::as_str),
                     );
@@ -3123,7 +3130,7 @@ async fn load_ccload_channel_models(
         }
         catalogs.push(catalog);
         catalog_groups.push(catalog_group);
-        catalog_image_capable.push(image_capable);
+        catalog_image_capable.push(image_models);
     }
 
     let model_base = state
@@ -3153,7 +3160,7 @@ async fn load_ccload_channel_models(
     while let Some((group, models)) = requests.next().await {
         fetched.insert(group, models);
     }
-    for (catalog_index, (group, image_capable)) in catalog_groups
+    for (catalog_index, (group, image_models)) in catalog_groups
         .into_iter()
         .zip(catalog_image_capable)
         .enumerate()
@@ -3170,7 +3177,7 @@ async fn load_ccload_channel_models(
             catalogs[catalog_index]["model_sources"] = sources;
             catalogs[catalog_index]["models_loaded"] = Value::Bool(true);
         }
-        apply_ccload_image_capability(&mut catalogs[catalog_index], image_capable);
+        apply_ccload_image_capability(&mut catalogs[catalog_index], &image_models);
     }
     Ok(catalogs)
 }
@@ -5651,7 +5658,7 @@ mod tests {
             "models": ["web-model", "gpt-image-2"],
             "model_sources": {"web-model":"web", "gpt-image-2":"web"}
         });
-        apply_ccload_image_capability(&mut without_capability, false);
+        apply_ccload_image_capability(&mut without_capability, &[]);
         assert_eq!(
             without_capability["models"],
             serde_json::json!(["web-model"])
@@ -5663,14 +5670,18 @@ mod tests {
         );
 
         let mut with_capability = serde_json::json!({
-            "models": ["web-model", "GPT-IMAGE-2"],
-            "model_sources": {"web-model":"web", "GPT-IMAGE-2":"web"}
+            "models": ["web-model", "GPT-IMAGE-2", "gpt-image-2.5"],
+            "model_sources": {"web-model":"web", "GPT-IMAGE-2":"web", "gpt-image-2.5":"web"}
         });
-        apply_ccload_image_capability(&mut with_capability, true);
+        apply_ccload_image_capability(
+            &mut with_capability,
+            &["gpt-image-2".to_owned(), "gpt-image-2.5".to_owned()],
+        );
         assert_eq!(
             with_capability["models"],
-            serde_json::json!(["web-model", "gpt-image-2"])
+            serde_json::json!(["web-model", "gpt-image-2", "gpt-image-2.5"])
         );
         assert_eq!(with_capability["model_sources"]["gpt-image-2"], "image");
+        assert_eq!(with_capability["model_sources"]["gpt-image-2.5"], "image");
     }
 }

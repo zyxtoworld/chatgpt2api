@@ -756,14 +756,18 @@ impl AccountStore {
             .collect()
     }
 
-    pub(super) fn has_image_capable_account(&self, token: &str, account_id: Option<&str>) -> bool {
+    pub(super) fn image_models_for_account(
+        &self,
+        token: &str,
+        account_id: Option<&str>,
+    ) -> Vec<String> {
         let account_id = account_id.map(str::trim).filter(|value| !value.is_empty());
         self.snapshot
             .read()
             .expect("account snapshot lock")
             .accounts
             .iter()
-            .any(|slot| {
+            .find(|slot| {
                 slot.record.status == "正常"
                     && slot
                         .record
@@ -775,6 +779,17 @@ impl AccountStore {
                             slot.record.chatgpt_account_id.as_deref() == Some(value)
                         }))
             })
+            .map(|slot| {
+                super::model_pool::project_account_model_entries(
+                    slot.record.raw.as_object().expect("account object"),
+                    super::model_pool::ModelProvenance::Configured,
+                )
+                .into_iter()
+                .filter(|(_, provenance)| *provenance == super::model_pool::ModelProvenance::Image)
+                .map(|(id, _)| id)
+                .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Match the original image-account contract without tying discovery to
@@ -796,6 +811,40 @@ impl AccountStore {
             })
             .map(|slot| slot.record.account_type.to_ascii_lowercase())
             .collect()
+    }
+
+    pub(super) fn image_models_by_account_type(
+        &self,
+    ) -> HashMap<AccountModelGroup, HashSet<String>> {
+        let mut result = HashMap::new();
+        let snapshot = self.snapshot.read().expect("account snapshot lock");
+        for slot in snapshot.accounts.iter().filter(|slot| {
+            slot.record.status == "正常"
+                && slot
+                    .record
+                    .raw
+                    .get("quota")
+                    .is_some_and(|value| image_quota(Some(value)).is_some())
+        }) {
+            let Some(object) = slot.record.raw.as_object() else {
+                continue;
+            };
+            let models = super::model_pool::project_account_model_entries(
+                object,
+                super::model_pool::ModelProvenance::Configured,
+            )
+            .into_iter()
+            .filter(|(_, provenance)| *provenance == super::model_pool::ModelProvenance::Image)
+            .map(|(id, _)| id)
+            .collect::<HashSet<_>>();
+            if !models.is_empty() {
+                result
+                    .entry(slot.record.account_type.to_ascii_lowercase())
+                    .or_insert_with(HashSet::new)
+                    .extend(models);
+            }
+        }
+        result
     }
 
     pub(super) fn raw_records(&self) -> Vec<serde_json::Value> {
