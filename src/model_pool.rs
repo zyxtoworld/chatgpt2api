@@ -18,6 +18,7 @@ use super::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ModelProvenance {
+    Unknown,
     Configured,
     Web,
     Image,
@@ -42,6 +43,7 @@ fn model_provenance_from_object(
             "image" | "image_generation" => Some(ModelProvenance::Image),
             "web" | "tpp" | "chatgpt_web" => Some(ModelProvenance::Web),
             "configured" | "manual" | "static" => Some(ModelProvenance::Configured),
+            "unknown" | "untrusted" | "unavailable" => Some(ModelProvenance::Unknown),
             value
                 if value.contains("/backend-api/models")
                     || value.contains("/backend-api/tpp/models") =>
@@ -75,6 +77,7 @@ pub(super) fn model_provenance_from_value(
 
 pub(super) fn model_provenance_label(provenance: ModelProvenance) -> &'static str {
     match provenance {
+        ModelProvenance::Unknown => "unknown",
         ModelProvenance::Configured => "configured",
         ModelProvenance::Web => "web",
         ModelProvenance::Image => "image",
@@ -82,8 +85,16 @@ pub(super) fn model_provenance_label(provenance: ModelProvenance) -> &'static st
     }
 }
 
+pub(super) fn model_provenance_is_untrusted(provenance: ModelProvenance) -> bool {
+    matches!(
+        provenance,
+        ModelProvenance::Unknown | ModelProvenance::Codex
+    )
+}
+
 pub(super) fn model_provenance_rank(provenance: ModelProvenance) -> u8 {
     match provenance {
+        ModelProvenance::Unknown => 0,
         ModelProvenance::Codex => 0,
         ModelProvenance::Configured => 1,
         ModelProvenance::Web => 2,
@@ -159,7 +170,7 @@ pub(super) fn project_imported_model_ids(
 ) -> Vec<String> {
     project_imported_model_entries(value, default)
         .into_iter()
-        .filter(|(_, provenance)| *provenance != ModelProvenance::Codex)
+        .filter(|(_, provenance)| !model_provenance_is_untrusted(*provenance))
         .map(|(id, _)| id)
         .collect()
 }
@@ -317,7 +328,7 @@ impl ModelCatalog {
             let Some(model) = Self::project(&item) else {
                 continue;
             };
-            if model.provenance == ModelProvenance::Codex {
+            if model_provenance_is_untrusted(model.provenance) {
                 continue;
             }
             if seen.insert(model.id.clone()) {

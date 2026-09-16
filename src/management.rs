@@ -34,7 +34,7 @@ use tokio::sync::Semaphore;
 
 use super::model_pool::{
     ModelProvenance, model_provenance_label, model_provenance_rank, project_imported_model_entries,
-    project_imported_model_entries_with_sources, project_imported_model_ids,
+    project_imported_model_entries_with_sources,
 };
 use super::{
     ApiError, AppState, admin_authenticated, authenticated, config, data_file, image_content_type,
@@ -2174,26 +2174,34 @@ struct CcLoadModelEntry {
     provenance: ModelProvenance,
 }
 
+fn ccload_model_allowed(provenance: ModelProvenance) -> bool {
+    matches!(provenance, ModelProvenance::Web | ModelProvenance::Image)
+}
+
 fn ccload_model_entries(value: Option<&Value>) -> Vec<CcLoadModelEntry> {
-    project_imported_model_entries(value, ModelProvenance::Configured)
+    project_imported_model_entries(value, ModelProvenance::Unknown)
         .into_iter()
         .map(|(id, provenance)| CcLoadModelEntry { id, provenance })
         .collect()
 }
 
 fn ccload_model_ids(value: Option<&Value>) -> Vec<String> {
-    project_imported_model_ids(value, ModelProvenance::Configured)
+    ccload_model_entries(value)
+        .into_iter()
+        .filter(|entry| ccload_model_allowed(entry.provenance))
+        .map(|entry| entry.id)
+        .collect()
 }
 
 fn ccload_model_payload(entries: Vec<CcLoadModelEntry>) -> (Value, Value) {
     let models = entries
         .iter()
-        .filter(|entry| entry.provenance != ModelProvenance::Codex)
+        .filter(|entry| ccload_model_allowed(entry.provenance))
         .map(|entry| Value::String(entry.id.clone()))
         .collect::<Vec<_>>();
     let sources = entries
         .into_iter()
-        .filter(|entry| entry.provenance != ModelProvenance::Codex)
+        .filter(|entry| ccload_model_allowed(entry.provenance))
         .map(|entry| {
             (
                 entry.id,
@@ -2210,9 +2218,9 @@ fn merge_ccload_model_catalog(
     fetched: Option<&[super::model_pool::PublicModel]>,
 ) -> (Value, Value) {
     let mut entries =
-        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Configured)
+        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Unknown)
             .into_iter()
-            .filter(|(_, provenance)| *provenance != ModelProvenance::Codex)
+            .filter(|(_, provenance)| ccload_model_allowed(*provenance))
             .collect::<Vec<_>>();
     let mut indexes = entries
         .iter()
@@ -2221,7 +2229,7 @@ fn merge_ccload_model_catalog(
         .collect::<HashMap<_, _>>();
     if let Some(fetched) = fetched {
         for model in fetched {
-            if model.provenance == ModelProvenance::Codex {
+            if !ccload_model_allowed(model.provenance) {
                 continue;
             }
             if let Some(index) = indexes.get(&model.id).copied() {
@@ -5444,8 +5452,8 @@ pub(super) async fn download_backup(
 mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
-        ccload_model_entries, ccload_model_ids, normalized_ccload_credential, parse_r2_list_xml,
-        public_backup_error,
+        ccload_model_entries, ccload_model_ids, ccload_model_payload, normalized_ccload_credential,
+        parse_r2_list_xml, public_backup_error,
     };
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
@@ -5565,21 +5573,26 @@ mod tests {
             {"model":"gpt-5-codex","source":"web"},
             {"model":"auto","source":"web"},
             {"model":"codex-endpoint-only","endpoint":"/backend-api/codex/models"},
-            {"model":"configured-codex-name"}
+            {"model":"configured-codex-name"},
+            {"model":"unknown-source","source":"unknown"}
         ]);
         let entries = ccload_model_entries(Some(&value));
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 5);
         assert_eq!(entries[0].id, "gpt-5-codex");
         assert_eq!(entries[0].provenance, ModelProvenance::Web);
         assert_eq!(entries[1].provenance, ModelProvenance::Web);
         assert_eq!(entries[2].provenance, ModelProvenance::Codex);
+        assert_eq!(entries[3].provenance, ModelProvenance::Unknown);
+        assert_eq!(entries[4].provenance, ModelProvenance::Unknown);
         assert_eq!(
             ccload_model_ids(Some(&value)),
-            vec![
-                "gpt-5-codex".to_owned(),
-                "auto".to_owned(),
-                "configured-codex-name".to_owned()
-            ]
+            vec!["gpt-5-codex".to_owned(), "auto".to_owned()]
+        );
+        let (models, sources) = ccload_model_payload(entries);
+        assert_eq!(models, serde_json::json!(["gpt-5-codex", "auto"]));
+        assert_eq!(
+            sources,
+            serde_json::json!({"gpt-5-codex": "web", "auto": "web"})
         );
     }
 }

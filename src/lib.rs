@@ -39,9 +39,9 @@ use codex_upstream::{
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
 use model_pool::{
-    ModelCatalog, ModelProvenance, ModelStore, PublicModel, model_provenance_label,
-    model_provenance_rank, project_account_model_entries, project_remote_model_list,
-    project_remote_model_list_with_provenance,
+    ModelCatalog, ModelProvenance, ModelStore, PublicModel, model_provenance_is_untrusted,
+    model_provenance_label, model_provenance_rank, project_account_model_entries,
+    project_remote_model_list, project_remote_model_list_with_provenance,
 };
 #[cfg(test)]
 use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
@@ -1000,7 +1000,7 @@ fn canonicalize_account_models(object: &mut Map<String, Value>) {
     let default = account_model_default_provenance_from_object(object);
     let entries = project_account_model_entries(object, default)
         .into_iter()
-        .filter(|(_, provenance)| *provenance != ModelProvenance::Codex)
+        .filter(|(_, provenance)| !model_provenance_is_untrusted(*provenance))
         .take(MAX_MODELS)
         .collect::<Vec<_>>();
     if entries.is_empty() {
@@ -2243,7 +2243,7 @@ fn public_account(record: &AccountRecord) -> Value {
         .map(|object| {
             project_account_model_entries(object, account_model_default_provenance(&record.raw))
                 .into_iter()
-                .filter(|(_, provenance)| *provenance != ModelProvenance::Codex)
+                .filter(|(_, provenance)| !model_provenance_is_untrusted(*provenance))
                 .map(|(id, _)| Value::String(id))
                 .collect::<Vec<_>>()
         })
@@ -2300,7 +2300,7 @@ fn merge_account_models(
         let value = value.trim();
         if value.is_empty()
             || value.chars().count() > MAX_MODEL_TEXT_LENGTH
-            || provenance == ModelProvenance::Codex
+            || model_provenance_is_untrusted(provenance)
         {
             return;
         }
@@ -4659,6 +4659,7 @@ fn is_public_chatgpt_image_model_id(id: &str) -> bool {
 
 fn is_public_chatgpt_model(model: &PublicModel) -> bool {
     match model.provenance {
+        ModelProvenance::Unknown => false,
         ModelProvenance::Codex => false,
         ModelProvenance::Image => is_public_chatgpt_image_model_id(&model.id),
         ModelProvenance::Web => true,
@@ -10707,7 +10708,7 @@ async fn fetch_native_model_catalog(
                 continue;
             };
             for model in projected {
-                if model.provenance == ModelProvenance::Codex {
+                if model_provenance_is_untrusted(model.provenance) {
                     continue;
                 }
                 if let Some(index) = indexes.get(&model.id).copied() {
@@ -19121,7 +19122,6 @@ mod tests {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
         for model_id in [
-            "configured-model",
             "web-page-model",
             "gpt-5-codex",
             "auto",
@@ -19134,6 +19134,7 @@ mod tests {
                 "missing channel model {model_id}"
             );
         }
+        assert!(!channel_model_ids.contains(&"configured-model"));
         assert!(
             !channel_model_ids.contains(&"codex-endpoint-model"),
             "unexpected channel models: {channel_models}"
@@ -19183,7 +19184,7 @@ mod tests {
             .find(|item| item["access_token"] == "cc-access-token")
             .expect("ccLoad imported account");
         assert!(
-            ccload_item["models"]
+            !ccload_item["models"]
                 .as_array()
                 .is_some_and(|models| models.iter().any(|model| model == "configured-model"))
         );
@@ -25630,6 +25631,7 @@ data: [DONE]
                 {"model":"configured-model","source":"configured"},
                 {"model":"gpt-5-codex","source":"web"},
                 {"model":"codex-endpoint-model","source":"codex"},
+                {"model":"unknown-channel-model","source":"unknown"},
                 "auto"
             ],
             "model_sources": {"auto":"web"}
@@ -25648,6 +25650,7 @@ data: [DONE]
             })
         );
         assert!(!canonical.to_string().contains("codex-endpoint-model"));
+        assert!(!canonical.to_string().contains("unknown-channel-model"));
     }
 
     #[test]
