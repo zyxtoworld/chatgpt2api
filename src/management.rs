@@ -3144,15 +3144,22 @@ async fn load_ccload_channel_models(
         let request_state = state.clone();
         let model_base = model_base.clone();
         requests.push(async move {
-            let models = super::fetch_native_models_with_provenance(
-                &request_state,
-                &model_base,
-                &access,
-                plan_type.as_deref(),
-                account_id.as_deref(),
-                model_deadline,
-            )
-            .await;
+            let models = plan_type.as_deref().map(|account_type| async move {
+                super::fetch_imported_model_catalog(
+                    &request_state.imported_model_catalog,
+                    &request_state.client,
+                    &model_base,
+                    account_type,
+                    &access,
+                    account_id.as_deref(),
+                    model_deadline,
+                )
+                .await
+            });
+            let models = match models {
+                Some(future) => future.await,
+                None => None,
+            };
             (group, models)
         });
     }

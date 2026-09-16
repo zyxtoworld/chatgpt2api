@@ -1443,6 +1443,8 @@ const IMPORTED_MODEL_CATALOG_RETRY_BACKOFF: Duration = if cfg!(test) {
 #[derive(Clone)]
 struct ImportedModelCatalogCache {
     entries: Arc<Mutex<HashMap<String, Arc<ImportedModelCatalogEntry>>>>,
+    fetch_count: Arc<AtomicUsize>,
+    cache_hit_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -1466,7 +1468,16 @@ impl ImportedModelCatalogCache {
     fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
+            fetch_count: Arc::new(AtomicUsize::new(0)),
+            cache_hit_count: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn stats(&self) -> (usize, usize) {
+        (
+            self.fetch_count.load(Ordering::Relaxed),
+            self.cache_hit_count.load(Ordering::Relaxed),
+        )
     }
 
     async fn fetch_or_reuse<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<PublicModel>>
@@ -1500,6 +1511,7 @@ impl ImportedModelCatalogCache {
                     ImportedModelCatalogState::Ready { models, expires_at }
                         if Instant::now() < *expires_at =>
                     {
+                        self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
                         return Some((**models).clone());
                     }
                     ImportedModelCatalogState::Failed { retry_at }
@@ -1515,6 +1527,7 @@ impl ImportedModelCatalogCache {
                 }
             };
             if owner {
+                self.fetch_count.fetch_add(1, Ordering::Relaxed);
                 let result = fetch().await.filter(|models| !models.is_empty());
                 let next = match &result {
                     Some(models) => ImportedModelCatalogState::Ready {
@@ -1529,6 +1542,7 @@ impl ImportedModelCatalogCache {
                 let _ = entry.updates.send(next);
                 return result;
             }
+            self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
             let _ = updates.changed().await;
         }
     }
@@ -1651,6 +1665,7 @@ impl AppState {
         }
         let auth_store = Arc::new(AuthStore::load(config.auth_keys_path.as_deref())?);
         let account_store = Arc::new(AccountStore::load(config.accounts_path.as_deref())?);
+        let imported_model_catalog = ImportedModelCatalogCache::new();
         let models = ModelStore::load(config.models_path.as_deref(), &config.models)?;
         let data_dir = config
             .accounts_path
@@ -1701,7 +1716,7 @@ impl AppState {
             auth_store,
             account_store,
             account_progress: Arc::new(Mutex::new(HashMap::new())),
-            imported_model_catalog: ImportedModelCatalogCache::new(),
+            imported_model_catalog,
             models: Arc::new(models),
             account_type_catalog: Arc::new(account_type_catalog),
             editable_workers: Arc::new(editable_file_generation::EditableWorkers::new()),
@@ -1855,6 +1870,7 @@ impl AppState {
         });
         backend.install_health_snapshot_validator(validator);
         let models = ModelStore::load(config.models_path.as_deref(), &config.models)?;
+        let imported_model_catalog = ImportedModelCatalogCache::new();
         let config_path = absolute_legacy_config_path(&initial_cwd, &data_dir);
         editable_file_generation::recover_unfinished(&data_dir)
             .map_err(|_| AppInitError::EditableTaskSnapshot)?;
@@ -1874,7 +1890,7 @@ impl AppState {
             auth_store,
             account_store,
             account_progress: Arc::new(Mutex::new(HashMap::new())),
-            imported_model_catalog: ImportedModelCatalogCache::new(),
+            imported_model_catalog,
             models: Arc::new(models),
             account_type_catalog: Arc::new(account_type_catalog),
             editable_workers: Arc::new(editable_file_generation::EditableWorkers::new()),
@@ -2528,30 +2544,17 @@ async fn refresh_access_token_account(
         })
         .unwrap_or_default();
     let (quota, restore_at) = image_quota_from_limits_progress(init.get("limits_progress"));
-    let model_cache_key = plan_type.to_ascii_lowercase();
-    let client = state.client.clone();
-    let model_base = base_url.to_owned();
-    let model_token = token.clone();
-    let model_account_type = plan_type.to_owned();
-    let model_account_id = account_id.map(ToOwned::to_owned);
-    let fetched_model_ids = state
-        .imported_model_catalog
-        .fetch_or_reuse(&model_cache_key, move || async move {
-            fetch_native_model_catalog(
-                &client,
-                &model_base,
-                &NativeRequestContext::new(),
-                NativeModelIdentity {
-                    token: &model_token,
-                    account_type: Some(model_account_type.as_str()),
-                    account_id: model_account_id.as_deref(),
-                },
-                Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
-            )
-            .await
-        })
-        .await;
-    let model_items = merge_account_models(raw, fetched_model_ids);
+    let fetched_models = fetch_imported_model_catalog(
+        &state.imported_model_catalog,
+        &state.client,
+        base_url,
+        plan_type,
+        &token,
+        account_id,
+        Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
+    )
+    .await;
+    let model_items = merge_account_models(raw, fetched_models);
     let mut result = json!({
         "access_token": token,
         "email": me.get("email").and_then(Value::as_str).unwrap_or_default(),
@@ -3004,12 +3007,20 @@ pub(crate) async fn refresh_imported_accounts(state: &AppState, tokens: &[String
     if tokens.is_empty() {
         return 0;
     }
-    refresh_accounts_now(state, tokens)
+    let refreshed = refresh_accounts_now(state, tokens)
         .await
         .ok()
         .and_then(|result| result.get("refreshed").and_then(Value::as_u64))
         .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let (fetch_count, cache_hit_count) = state.imported_model_catalog.stats();
+    log::info!(
+        "canonical imported model catalog stats: refreshed={}, fetch_count={}, cache_hit_count={}",
+        refreshed,
+        fetch_count,
+        cache_hit_count
+    );
+    refreshed
 }
 
 #[allow(dead_code)]
@@ -10730,27 +10741,37 @@ async fn fetch_native_model_catalog(
     (!models.is_empty()).then_some(models)
 }
 
-pub(crate) async fn fetch_native_models_with_provenance(
-    state: &AppState,
+pub(crate) async fn fetch_imported_model_catalog(
+    cache: &ImportedModelCatalogCache,
+    client: &Client,
     base_url: &str,
+    account_type: &str,
     token: &str,
-    account_type: Option<&str>,
     account_id: Option<&str>,
     deadline: Instant,
 ) -> Option<Vec<PublicModel>> {
-    let context = NativeRequestContext::new();
-    fetch_native_model_catalog(
-        &state.client,
-        base_url,
-        &context,
-        NativeModelIdentity {
-            token,
-            account_type,
-            account_id,
-        },
-        deadline,
-    )
-    .await
+    let key = account_type.to_ascii_lowercase();
+    let client = client.clone();
+    let base_url = base_url.to_owned();
+    let token = token.to_owned();
+    let account_type = account_type.to_owned();
+    let account_id = account_id.map(ToOwned::to_owned);
+    cache
+        .fetch_or_reuse(&key, move || async move {
+            fetch_native_model_catalog(
+                &client,
+                &base_url,
+                &NativeRequestContext::new(),
+                NativeModelIdentity {
+                    token: &token,
+                    account_type: Some(account_type.as_str()),
+                    account_id: account_id.as_deref(),
+                },
+                deadline,
+            )
+            .await
+        })
+        .await
 }
 
 // Model discovery is published by normalized account type.  One authenticated
@@ -11623,11 +11644,10 @@ impl AccountTypeCatalog {
         deadline: Instant,
     ) -> Option<Vec<PublicModel>> {
         let base_url = self.base_url.as_deref()?;
-        let context = NativeRequestContext::new();
         fetch_native_model_catalog(
             &self.client,
             base_url,
-            &context,
+            &NativeRequestContext::new(),
             NativeModelIdentity {
                 token,
                 account_type,
@@ -20839,6 +20859,7 @@ mod tests {
             Some(vec!["free-model".to_owned()])
         );
         assert_eq!(model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.stats(), (2, 2));
     }
 
     #[tokio::test]
