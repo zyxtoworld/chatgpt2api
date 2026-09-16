@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
@@ -28,31 +28,61 @@ fn model_provenance_from_object(
     object: &serde_json::Map<String, Value>,
     default: ModelProvenance,
 ) -> ModelProvenance {
-    let source = ["provenance", "source", "source_type", "endpoint"]
+    let mut explicit = None;
+    for source in ["provenance", "source", "source_type", "endpoint"]
         .iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .filter_map(|key| object.get(*key).and_then(Value::as_str))
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_ascii_lowercase);
-    let Some(source) = source.as_deref() else {
-        return default;
-    };
-    match source {
-        "codex" | "codex_api" | "codex_endpoint" => ModelProvenance::Codex,
-        value if value.contains("/backend-api/codex/models") => ModelProvenance::Codex,
-        "image" | "image_generation" => ModelProvenance::Image,
-        "web" | "tpp" | "chatgpt_web" => ModelProvenance::Web,
-        value
-            if value.contains("/backend-api/models")
-                || value.contains("/backend-api/tpp/models") =>
-        {
-            ModelProvenance::Web
+        .map(str::to_ascii_lowercase)
+    {
+        let provenance = match source.as_str() {
+            "codex" | "codex_api" | "codex_endpoint" => Some(ModelProvenance::Codex),
+            value if value.contains("/backend-api/codex/models") => Some(ModelProvenance::Codex),
+            "image" | "image_generation" => Some(ModelProvenance::Image),
+            "web" | "tpp" | "chatgpt_web" => Some(ModelProvenance::Web),
+            "configured" | "manual" | "static" => Some(ModelProvenance::Configured),
+            value
+                if value.contains("/backend-api/models")
+                    || value.contains("/backend-api/tpp/models") =>
+            {
+                Some(ModelProvenance::Web)
+            }
+            _ => None,
+        };
+        if provenance == Some(ModelProvenance::Codex) {
+            return ModelProvenance::Codex;
+        }
+        explicit = explicit.or(provenance);
+    }
+    explicit.unwrap_or(default)
+}
+
+pub(super) fn model_provenance_from_value(
+    value: Option<&Value>,
+    default: ModelProvenance,
+) -> ModelProvenance {
+    match value {
+        Some(Value::Object(object)) => model_provenance_from_object(object, default),
+        Some(Value::String(source)) => {
+            let mut object = serde_json::Map::new();
+            object.insert("source".to_owned(), Value::String(source.clone()));
+            model_provenance_from_object(&object, default)
         }
         _ => default,
     }
 }
 
-fn model_provenance_rank(provenance: ModelProvenance) -> u8 {
+pub(super) fn model_provenance_label(provenance: ModelProvenance) -> &'static str {
+    match provenance {
+        ModelProvenance::Configured => "configured",
+        ModelProvenance::Web => "web",
+        ModelProvenance::Image => "image",
+        ModelProvenance::Codex => "codex",
+    }
+}
+
+pub(super) fn model_provenance_rank(provenance: ModelProvenance) -> u8 {
     match provenance {
         ModelProvenance::Codex => 0,
         ModelProvenance::Configured => 1,
@@ -61,17 +91,19 @@ fn model_provenance_rank(provenance: ModelProvenance) -> u8 {
     }
 }
 
-pub(super) fn project_imported_model_entries(
+pub(super) fn project_imported_model_entries_with_sources(
     value: Option<&Value>,
+    sources: Option<&Value>,
     default: ModelProvenance,
 ) -> Vec<(String, ModelProvenance)> {
     let Some(items) = value.and_then(Value::as_array) else {
         return Vec::new();
     };
+    let source_map = sources.and_then(Value::as_object);
     let mut indexes = HashMap::<String, usize>::new();
     let mut entries: Vec<(String, ModelProvenance)> = Vec::new();
     for item in items.iter().take(MAX_MODELS) {
-        let (text, provenance) = match item {
+        let (text, mut provenance) = match item {
             Value::String(text) => (text.as_str(), default),
             Value::Object(object) => {
                 let Some(text) = ["id", "model", "slug"]
@@ -88,6 +120,9 @@ pub(super) fn project_imported_model_entries(
         else {
             continue;
         };
+        if let Some(source) = source_map.and_then(|map| map.get(&text)) {
+            provenance = model_provenance_from_value(Some(source), provenance);
+        }
         if let Some(index) = indexes.get(&text).copied() {
             if model_provenance_rank(provenance) > model_provenance_rank(entries[index].1) {
                 entries[index].1 = provenance;
@@ -98,6 +133,24 @@ pub(super) fn project_imported_model_entries(
         }
     }
     entries
+}
+
+pub(super) fn project_imported_model_entries(
+    value: Option<&Value>,
+    default: ModelProvenance,
+) -> Vec<(String, ModelProvenance)> {
+    project_imported_model_entries_with_sources(value, None, default)
+}
+
+pub(super) fn project_account_model_entries(
+    object: &serde_json::Map<String, Value>,
+    default: ModelProvenance,
+) -> Vec<(String, ModelProvenance)> {
+    project_imported_model_entries_with_sources(
+        object.get("models"),
+        object.get("model_sources"),
+        default,
+    )
 }
 
 pub(super) fn project_imported_model_ids(
@@ -111,7 +164,7 @@ pub(super) fn project_imported_model_ids(
         .collect()
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(super) struct PublicModel {
     pub(super) id: String,
     pub(super) object: &'static str,
@@ -264,6 +317,9 @@ impl ModelCatalog {
             let Some(model) = Self::project(&item) else {
                 continue;
             };
+            if model.provenance == ModelProvenance::Codex {
+                continue;
+            }
             if seen.insert(model.id.clone()) {
                 models.push(model);
             }
@@ -298,7 +354,7 @@ impl ModelCatalog {
                 .unwrap_or(false),
             supported_account_types,
             supported_reasoning_efforts,
-            provenance: ModelProvenance::Configured,
+            provenance: model_provenance_from_object(object, ModelProvenance::Configured),
         })
     }
 }
@@ -336,8 +392,8 @@ pub(super) fn project_remote_model_list_with_provenance(
     provenance: ModelProvenance,
 ) -> Option<Vec<PublicModel>> {
     let items = value.get(field).and_then(Value::as_array)?;
-    let mut seen = HashSet::new();
-    let mut models = Vec::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut models: Vec<PublicModel> = Vec::new();
     for raw_item in items.iter().take(MAX_MODELS) {
         let mut item = raw_item.clone();
         if codex_api_only && item.get("supported_in_api").and_then(Value::as_bool) != Some(true) {
@@ -360,10 +416,22 @@ pub(super) fn project_remote_model_list_with_provenance(
         let Some(mut model) = ModelCatalog::project(&item) else {
             continue;
         };
-        model.provenance = provenance;
-        if !seen.insert(model.id.clone()) {
+        model.provenance = if provenance == ModelProvenance::Codex {
+            ModelProvenance::Codex
+        } else {
+            item.as_object()
+                .map(|object| model_provenance_from_object(object, provenance))
+                .unwrap_or(provenance)
+        };
+        if let Some(index) = indexes.get(&model.id).copied() {
+            if model_provenance_rank(model.provenance)
+                > model_provenance_rank(models[index].provenance)
+            {
+                models[index] = model;
+            }
             continue;
         }
+        indexes.insert(model.id.clone(), models.len());
         model.allow_anonymous = allow_anonymous;
         model.supported_account_types = account_type
             .map(|value| vec![value.to_owned()])

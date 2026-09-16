@@ -33,7 +33,8 @@ use tar::{Archive, Builder, Header};
 use tokio::sync::Semaphore;
 
 use super::model_pool::{
-    ModelProvenance, project_imported_model_entries, project_imported_model_ids,
+    ModelProvenance, model_provenance_label, model_provenance_rank, project_imported_model_entries,
+    project_imported_model_entries_with_sources, project_imported_model_ids,
 };
 use super::{
     ApiError, AppState, admin_authenticated, authenticated, config, data_file, image_content_type,
@@ -2184,6 +2185,64 @@ fn ccload_model_ids(value: Option<&Value>) -> Vec<String> {
     project_imported_model_ids(value, ModelProvenance::Configured)
 }
 
+fn ccload_model_payload(entries: Vec<CcLoadModelEntry>) -> (Value, Value) {
+    let models = entries
+        .iter()
+        .filter(|entry| entry.provenance != ModelProvenance::Codex)
+        .map(|entry| Value::String(entry.id.clone()))
+        .collect::<Vec<_>>();
+    let sources = entries
+        .into_iter()
+        .filter(|entry| entry.provenance != ModelProvenance::Codex)
+        .map(|entry| {
+            (
+                entry.id,
+                Value::String(model_provenance_label(entry.provenance).to_owned()),
+            )
+        })
+        .collect::<Map<_, _>>();
+    (Value::Array(models), Value::Object(sources))
+}
+
+fn merge_ccload_model_catalog(
+    models: Option<&Value>,
+    sources: Option<&Value>,
+    fetched: Option<&[super::model_pool::PublicModel]>,
+) -> (Value, Value) {
+    let mut entries =
+        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Configured)
+            .into_iter()
+            .filter(|(_, provenance)| *provenance != ModelProvenance::Codex)
+            .collect::<Vec<_>>();
+    let mut indexes = entries
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    if let Some(fetched) = fetched {
+        for model in fetched {
+            if model.provenance == ModelProvenance::Codex {
+                continue;
+            }
+            if let Some(index) = indexes.get(&model.id).copied() {
+                if model_provenance_rank(model.provenance) > model_provenance_rank(entries[index].1)
+                {
+                    entries[index].1 = model.provenance;
+                }
+            } else if entries.len() < super::MAX_MODELS {
+                indexes.insert(model.id.clone(), entries.len());
+                entries.push((model.id.clone(), model.provenance));
+            }
+        }
+    }
+    ccload_model_payload(
+        entries
+            .into_iter()
+            .map(|(id, provenance)| CcLoadModelEntry { id, provenance })
+            .collect(),
+    )
+}
+
 fn public_sub2api_item(value: &Value) -> Value {
     let object = value.as_object().cloned().unwrap_or_default();
     json!({
@@ -2958,10 +3017,12 @@ async fn load_ccload_channel_models(
                     .map(str::trim)
                     == Some("codex_oauth");
             if channel_matches {
-                let configured_models =
-                    ccload_model_ids(channel.and_then(|value| value.get("models")));
-                if !configured_models.is_empty() {
-                    catalog["models"] = json!(configured_models);
+                let configured_entries =
+                    ccload_model_entries(channel.and_then(|value| value.get("models")));
+                if !configured_entries.is_empty() {
+                    let (models, sources) = ccload_model_payload(configured_entries);
+                    catalog["models"] = models;
+                    catalog["model_sources"] = sources;
                     catalog["models_loaded"] = Value::Bool(true);
                 }
                 if let Some(plan_type) = channel
@@ -3024,7 +3085,7 @@ async fn load_ccload_channel_models(
         let request_state = state.clone();
         let model_base = model_base.clone();
         requests.push(async move {
-            let models = super::fetch_native_model_ids(
+            let models = super::fetch_native_models_with_provenance(
                 &request_state,
                 &model_base,
                 &access,
@@ -3036,7 +3097,7 @@ async fn load_ccload_channel_models(
             (group, models)
         });
     }
-    let mut fetched = HashMap::<String, Option<Vec<String>>>::new();
+    let mut fetched = HashMap::<String, Option<Vec<super::model_pool::PublicModel>>>::new();
     while let Some((group, models)) = requests.next().await {
         fetched.insert(group, models);
     }
@@ -3044,16 +3105,13 @@ async fn load_ccload_channel_models(
         if let Some(group) = group
             && let Some(Some(model_ids)) = fetched.get(&group)
         {
-            let mut merged = ccload_model_ids(catalogs[catalog_index].get("models"));
-            for model_id in model_ids {
-                if merged.len() >= super::MAX_MODELS {
-                    break;
-                }
-                if !merged.contains(model_id) {
-                    merged.push(model_id.clone());
-                }
-            }
-            catalogs[catalog_index]["models"] = json!(merged);
+            let (models, sources) = merge_ccload_model_catalog(
+                catalogs[catalog_index].get("models"),
+                catalogs[catalog_index].get("model_sources"),
+                Some(model_ids.as_slice()),
+            );
+            catalogs[catalog_index]["models"] = models;
+            catalogs[catalog_index]["model_sources"] = sources;
             catalogs[catalog_index]["models_loaded"] = Value::Bool(true);
         }
     }
@@ -3175,8 +3233,8 @@ async fn execute_ccload_import(
                 if channel_matches
                     && let Some(credential) = normalized_ccload_credential(credential)
                 {
-                    let configured_models =
-                        ccload_model_ids(channel.and_then(|item| item.get("models")));
+                    let configured_entries =
+                        ccload_model_entries(channel.and_then(|item| item.get("models")));
                     let mut candidate = json!({
                         "access_token": credential
                             .get("access_token")
@@ -3189,8 +3247,10 @@ async fn execute_ccload_import(
                             .cloned()
                             .unwrap_or_default(),
                     });
-                    if !configured_models.is_empty() {
-                        candidate["models"] = json!(configured_models);
+                    if !configured_entries.is_empty() {
+                        let (models, sources) = ccload_model_payload(configured_entries);
+                        candidate["models"] = models;
+                        candidate["model_sources"] = sources;
                     }
                     for key in ["account_id", "email", "expired"] {
                         if let Some(value) = credential.get(key).filter(|value| !value.is_empty()) {

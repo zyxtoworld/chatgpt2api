@@ -39,8 +39,9 @@ use codex_upstream::{
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
 use model_pool::{
-    ModelCatalog, ModelProvenance, ModelStore, PublicModel, project_imported_model_ids,
-    project_remote_model_list, project_remote_model_list_with_provenance,
+    ModelCatalog, ModelProvenance, ModelStore, PublicModel, model_provenance_label,
+    model_provenance_rank, project_account_model_entries, project_remote_model_list,
+    project_remote_model_list_with_provenance,
 };
 #[cfg(test)]
 use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
@@ -995,6 +996,43 @@ fn read_account_document(
     Ok((value, records, fingerprint, version))
 }
 
+fn canonicalize_account_models(object: &mut Map<String, Value>) {
+    let default = account_model_default_provenance_from_object(object);
+    let entries = project_account_model_entries(object, default)
+        .into_iter()
+        .filter(|(_, provenance)| *provenance != ModelProvenance::Codex)
+        .take(MAX_MODELS)
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        object.remove("models");
+        object.remove("model_sources");
+        return;
+    }
+    object.insert(
+        "models".to_owned(),
+        Value::Array(
+            entries
+                .iter()
+                .map(|(id, _)| Value::String(id.clone()))
+                .collect(),
+        ),
+    );
+    object.insert(
+        "model_sources".to_owned(),
+        Value::Object(
+            entries
+                .into_iter()
+                .map(|(id, provenance)| {
+                    (
+                        id,
+                        Value::String(model_provenance_label(provenance).to_owned()),
+                    )
+                })
+                .collect(),
+        ),
+    );
+}
+
 pub(crate) fn canonicalize_account_item(value: &Value) -> Result<Value, AppInitError> {
     let object = value.as_object().ok_or(AppInitError::AccountSnapshot)?;
     if object.contains_key("accessToken") || object.contains_key("token") {
@@ -1011,6 +1049,7 @@ pub(crate) fn canonicalize_account_item(value: &Value) -> Result<Value, AppInitE
         canonical.remove(key);
     }
     canonical.insert("access_token".to_owned(), Value::String(token.to_owned()));
+    canonicalize_account_models(&mut canonical);
     Ok(Value::Object(canonical))
 }
 
@@ -1410,7 +1449,7 @@ struct ImportedModelCatalogCache {
 enum ImportedModelCatalogState {
     InFlight,
     Ready {
-        models: Arc<Vec<String>>,
+        models: Arc<Vec<PublicModel>>,
         expires_at: Instant,
     },
     Failed {
@@ -1430,10 +1469,10 @@ impl ImportedModelCatalogCache {
         }
     }
 
-    async fn fetch_or_reuse<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<String>>
+    async fn fetch_or_reuse<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<PublicModel>>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Option<Vec<String>>>,
+        Fut: Future<Output = Option<Vec<PublicModel>>>,
     {
         let entry = {
             let mut entries = self.entries.lock().await;
@@ -2167,7 +2206,14 @@ async fn web_asset(
 
 fn public_account(record: &AccountRecord) -> Value {
     let mut object = record.raw.as_object().cloned().unwrap_or_default();
-    for key in ["accessToken", "token", "refresh_token", "id_token", "proxy"] {
+    for key in [
+        "accessToken",
+        "token",
+        "refresh_token",
+        "id_token",
+        "proxy",
+        "model_sources",
+    ] {
         object.remove(key);
     }
     object.insert(
@@ -2191,10 +2237,18 @@ fn public_account(record: &AccountRecord) -> Value {
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
-    object.insert(
-        "models".to_owned(),
-        Value::Array(record.models.iter().cloned().map(Value::String).collect()),
-    );
+    let models = record
+        .raw
+        .as_object()
+        .map(|object| {
+            project_account_model_entries(object, account_model_default_provenance(&record.raw))
+                .into_iter()
+                .filter(|(_, provenance)| *provenance != ModelProvenance::Codex)
+                .map(|(id, _)| Value::String(id))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| record.models.iter().cloned().map(Value::String).collect());
+    object.insert("models".to_owned(), Value::Array(models));
     Value::Object(object)
 }
 
@@ -2225,30 +2279,70 @@ fn account_token(value: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn merge_account_model_ids(raw: &Value, fetched: Option<Vec<String>>) -> Option<Vec<String>> {
-    let mut models = Vec::new();
-    let mut seen = HashSet::new();
-    let mut push = |value: &str| {
+fn account_model_default_provenance_from_object(_object: &Map<String, Value>) -> ModelProvenance {
+    ModelProvenance::Configured
+}
+
+fn account_model_default_provenance(raw: &Value) -> ModelProvenance {
+    raw.as_object()
+        .map(account_model_default_provenance_from_object)
+        .unwrap_or(ModelProvenance::Configured)
+}
+
+fn merge_account_models(
+    raw: &Value,
+    fetched: Option<Vec<PublicModel>>,
+) -> Option<(Vec<String>, Value)> {
+    let mut models: Vec<String> = Vec::new();
+    let mut provenances = Vec::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut push = |value: &str, provenance: ModelProvenance| {
         let value = value.trim();
         if value.is_empty()
             || value.chars().count() > MAX_MODEL_TEXT_LENGTH
-            || models.len() >= MAX_MODELS
-            || !seen.insert(value.to_owned())
+            || provenance == ModelProvenance::Codex
         {
             return;
         }
+        if let Some(index) = indexes.get(value).copied() {
+            if model_provenance_rank(provenance) > model_provenance_rank(provenances[index]) {
+                provenances[index] = provenance;
+            }
+            return;
+        }
+        if models.len() >= MAX_MODELS {
+            return;
+        }
+        indexes.insert(value.to_owned(), models.len());
         models.push(value.to_owned());
+        provenances.push(provenance);
     };
-    for value in project_imported_model_ids(raw.get("models"), ModelProvenance::Configured) {
-        push(&value);
-    }
-    if let Some(fetched) = fetched {
-        let fetched = Value::Array(fetched.into_iter().map(Value::String).collect());
-        for value in project_imported_model_ids(Some(&fetched), ModelProvenance::Web) {
-            push(&value);
+    if let Some(object) = raw.as_object() {
+        for (value, provenance) in
+            project_account_model_entries(object, account_model_default_provenance(raw))
+        {
+            push(&value, provenance);
         }
     }
-    (!models.is_empty()).then_some(models)
+    if let Some(fetched) = fetched {
+        for model in fetched {
+            push(&model.id, model.provenance);
+        }
+    }
+    if models.is_empty() {
+        return None;
+    }
+    let sources = models
+        .iter()
+        .zip(provenances)
+        .map(|(id, provenance)| {
+            (
+                id.clone(),
+                Value::String(model_provenance_label(provenance).to_owned()),
+            )
+        })
+        .collect::<Map<_, _>>();
+    Some((models, Value::Object(sources)))
 }
 
 fn account_request_payload_token(value: &Value) -> Option<String> {
@@ -2455,10 +2549,9 @@ async fn refresh_access_token_account(
                 Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
             )
             .await
-            .map(|models| models.into_iter().map(|model| model.id).collect())
         })
         .await;
-    let model_items = merge_account_model_ids(raw, fetched_model_ids);
+    let model_items = merge_account_models(raw, fetched_model_ids);
     let mut result = json!({
         "access_token": token,
         "email": me.get("email").and_then(Value::as_str).unwrap_or_default(),
@@ -2471,8 +2564,9 @@ async fn refresh_access_token_account(
         "status": if quota == 0 { "限流" } else { "正常" },
         "chatgpt_account_id": default.get("account_id").cloned().unwrap_or(Value::Null),
     });
-    if let Some(model_items) = model_items {
+    if let Some((model_items, model_sources)) = model_items {
         result["models"] = json!(model_items);
+        result["model_sources"] = model_sources;
     }
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
@@ -10551,8 +10645,8 @@ async fn fetch_native_model_catalog(
     if authenticated {
         paths.push(LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH);
     }
-    let mut seen = HashSet::new();
-    let mut models = Vec::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    let mut models: Vec<PublicModel> = Vec::new();
     for path in paths {
         if path == LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH && !models.is_empty() {
             break;
@@ -10613,7 +10707,17 @@ async fn fetch_native_model_catalog(
                 continue;
             };
             for model in projected {
-                if seen.insert(model.id.clone()) {
+                if model.provenance == ModelProvenance::Codex {
+                    continue;
+                }
+                if let Some(index) = indexes.get(&model.id).copied() {
+                    if model_provenance_rank(model.provenance)
+                        > model_provenance_rank(models[index].provenance)
+                    {
+                        models[index] = model;
+                    }
+                } else {
+                    indexes.insert(model.id.clone(), models.len());
                     models.push(model);
                 }
             }
@@ -10622,14 +10726,14 @@ async fn fetch_native_model_catalog(
     (!models.is_empty()).then_some(models)
 }
 
-pub(crate) async fn fetch_native_model_ids(
+pub(crate) async fn fetch_native_models_with_provenance(
     state: &AppState,
     base_url: &str,
     token: &str,
     account_type: Option<&str>,
     account_id: Option<&str>,
     deadline: Instant,
-) -> Option<Vec<String>> {
+) -> Option<Vec<PublicModel>> {
     let context = NativeRequestContext::new();
     fetch_native_model_catalog(
         &state.client,
@@ -10643,7 +10747,6 @@ pub(crate) async fn fetch_native_model_ids(
         deadline,
     )
     .await
-    .map(|models| models.into_iter().map(|model| model.id).collect())
 }
 
 // Model discovery is published by normalized account type.  One authenticated
@@ -14985,6 +15088,22 @@ fn project_local_test_tmp_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn test_public_model(id: &str, provenance: ModelProvenance) -> PublicModel {
+        PublicModel {
+            id: id.to_owned(),
+            object: "model",
+            created: 0,
+            owned_by: "chatgpt".to_owned(),
+            permission: Vec::new(),
+            root: id.to_owned(),
+            parent: None,
+            allow_anonymous: false,
+            supported_account_types: Vec::new(),
+            supported_reasoning_efforts: Vec::new(),
+            provenance,
+        }
+    }
+
     struct CatalogRequestGuard {
         completed_normally: Arc<AtomicBool>,
         canceled: Arc<Notify>,
@@ -19015,7 +19134,10 @@ mod tests {
                 "missing channel model {model_id}"
             );
         }
-        assert!(!channel_model_ids.contains(&"codex-endpoint-model"));
+        assert!(
+            !channel_model_ids.contains(&"codex-endpoint-model"),
+            "unexpected channel models: {channel_models}"
+        );
         let start = management_request(
             &state,
             "POST",
@@ -19087,6 +19209,10 @@ mod tests {
         {
             assert!(item.get("refresh_token").is_none());
             assert!(item.get("id_token").is_none());
+            let sources = item["model_sources"].as_object().expect("model sources");
+            assert!(sources.values().all(|source| source != "codex"));
+            assert_eq!(sources.get("gpt-5-codex"), Some(&json!("web")));
+            assert_eq!(sources.get("auto"), Some(&json!("web")));
         }
 
         assert!(state.account_type_catalog.enabled());
@@ -20569,7 +20695,7 @@ mod tests {
                     first_calls.fetch_add(1, Ordering::SeqCst);
                     first_started.notify_one();
                     first_release.notified().await;
-                    Some(vec!["pro-model".to_owned()])
+                    Some(vec![test_public_model("pro-model", ModelProvenance::Web)])
                 })
                 .await
         });
@@ -20585,16 +20711,25 @@ mod tests {
         let isolated_cache = cache.clone();
         let isolated = tokio::spawn(async move {
             isolated_cache
-                .fetch_or_reuse("free", || async { Some(vec!["free-model".to_owned()]) })
+                .fetch_or_reuse("free", || async {
+                    Some(vec![test_public_model("free-model", ModelProvenance::Web)])
+                })
                 .await
+                .map(|models| models.into_iter().map(|model| model.id).collect::<Vec<_>>())
         });
         release.notify_waiters();
         assert_eq!(
-            first.await.expect("first cache join"),
+            first
+                .await
+                .expect("first cache join")
+                .map(|models| models.into_iter().map(|model| model.id).collect::<Vec<_>>()),
             Some(vec!["pro-model".to_owned()])
         );
         assert_eq!(
-            second.await.expect("second cache join"),
+            second
+                .await
+                .expect("second cache join")
+                .map(|models| models.into_iter().map(|model| model.id).collect::<Vec<_>>()),
             Some(vec!["pro-model".to_owned()])
         );
         assert_eq!(
@@ -20635,10 +20770,11 @@ mod tests {
                     let calls = calls.clone();
                     move || async move {
                         calls.fetch_add(1, Ordering::SeqCst);
-                        Some(vec!["retry-model".to_owned()])
+                        Some(vec![test_public_model("retry-model", ModelProvenance::Web)])
                     }
                 })
-                .await,
+                .await
+                .map(|models| models.into_iter().map(|model| model.id).collect::<Vec<_>>()),
             Some(vec!["retry-model".to_owned()])
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -20655,21 +20791,25 @@ mod tests {
             ]
         });
         assert_eq!(
-            merge_account_model_ids(&raw, None),
+            merge_account_models(&raw, None).map(|(models, _)| models),
             Some(vec!["configured-model".to_owned(), "web-model".to_owned()])
         );
         assert_eq!(
-            merge_account_model_ids(
+            merge_account_models(
                 &raw,
-                Some(vec!["web-model".to_owned(), "web-image-model".to_owned()])
-            ),
+                Some(vec![
+                    test_public_model("web-model", ModelProvenance::Web),
+                    test_public_model("web-image-model", ModelProvenance::Web),
+                ]),
+            )
+            .map(|(models, _)| models),
             Some(vec![
                 "configured-model".to_owned(),
                 "web-model".to_owned(),
                 "web-image-model".to_owned()
             ])
         );
-        assert_eq!(merge_account_model_ids(&json!({}), None), None);
+        assert_eq!(merge_account_models(&json!({}), None), None);
     }
 
     #[tokio::test]
@@ -25479,6 +25619,35 @@ data: [DONE]
         );
         state.account_type_catalog.shutdown().await;
         fs::remove_file(account_path).expect("cleanup accounts");
+    }
+
+    #[test]
+    fn account_model_snapshot_filters_codex_provenance_and_persists_sources() {
+        let canonical = canonicalize_account_item(&json!({
+            "access_token": "account-token",
+            "source_type": "codex",
+            "models": [
+                {"model":"configured-model","source":"configured"},
+                {"model":"gpt-5-codex","source":"web"},
+                {"model":"codex-endpoint-model","source":"codex"},
+                "auto"
+            ],
+            "model_sources": {"auto":"web"}
+        }))
+        .expect("canonical account");
+        assert_eq!(
+            canonical["models"],
+            json!(["configured-model", "gpt-5-codex", "auto"])
+        );
+        assert_eq!(
+            canonical["model_sources"],
+            json!({
+                "configured-model": "configured",
+                "gpt-5-codex": "web",
+                "auto": "web"
+            })
+        );
+        assert!(!canonical.to_string().contains("codex-endpoint-model"));
     }
 
     #[test]
