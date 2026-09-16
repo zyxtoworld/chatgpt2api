@@ -18694,7 +18694,7 @@ mod tests {
                 if index == 2 {
                     json!(["gpt-5-5", "gpt-5-6", "free-image-model"])
                 } else {
-                    json!(["gpt-5-5", "gpt-5-6", "gpt-image-2"])
+                    json!(["gpt-5-5", "gpt-5-6"])
                 }
             );
         }
@@ -19187,7 +19187,6 @@ mod tests {
             "web-page-model",
             "gpt-5-codex",
             "auto",
-            "gpt-image-2",
             "web-tpp-model",
             "tpp-codex-named-model",
         ] {
@@ -19197,6 +19196,7 @@ mod tests {
             );
         }
         assert!(!channel_model_ids.contains(&"configured-model"));
+        assert!(!channel_model_ids.contains(&"gpt-image-2"));
         assert!(
             !channel_model_ids.contains(&"codex-endpoint-model"),
             "unexpected channel models: {channel_models}"
@@ -19214,6 +19214,24 @@ mod tests {
             wait_for_import_job(&state, &format!("/api/ccload/servers/{cc_id}/import")).await;
         assert_eq!(cc_job["status"], "completed");
         assert_eq!(cc_job["refreshed"], 1);
+
+        let channel_models = management_request(
+            &state,
+            "POST",
+            &format!("/api/ccload/servers/{cc_id}/channel-models"),
+            Some(json!({"channel_ids":["7"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(channel_models.status(), StatusCode::OK);
+        let channel_models = json_response(channel_models).await;
+        let channel_models = &channel_models["channels"][0];
+        assert!(
+            channel_models["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|model| model == "gpt-image-2"))
+        );
+        assert_eq!(channel_models["model_sources"]["gpt-image-2"], "image");
 
         let accounts =
             management_request(&state, "GET", "/api/accounts", None, Some("admin")).await;

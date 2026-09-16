@@ -756,6 +756,27 @@ impl AccountStore {
             .collect()
     }
 
+    pub(super) fn has_image_capable_account(&self, token: &str, account_id: Option<&str>) -> bool {
+        let account_id = account_id.map(str::trim).filter(|value| !value.is_empty());
+        self.snapshot
+            .read()
+            .expect("account snapshot lock")
+            .accounts
+            .iter()
+            .any(|slot| {
+                slot.record.status == "正常"
+                    && slot
+                        .record
+                        .raw
+                        .get("quota")
+                        .is_some_and(|value| image_quota(Some(value)).is_some())
+                    && (slot.record.token == token
+                        || account_id.is_some_and(|value| {
+                            slot.record.chatgpt_account_id.as_deref() == Some(value)
+                        }))
+            })
+    }
+
     /// Match the original image-account contract without tying discovery to
     /// the import source: healthy accounts with a positive integer quota are
     /// eligible for the ChatGPT Web image model.
