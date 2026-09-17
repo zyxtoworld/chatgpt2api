@@ -36,6 +36,10 @@ function channelIdText(value) {
   return text;
 }
 
+function modelLoadStatus(value) {
+  return ["pending", "loaded", "partial", "failed", "timeout"].includes(value) ? value : "";
+}
+
 export function resetCCLoadModelState() {
   return {
     loadingModelIds: [],
@@ -66,6 +70,8 @@ export function normalizeCCLoadChannels(channels) {
       models: modelIds,
       models_loaded: channel?.models_loaded === true,
     };
+    const status = modelLoadStatus(channel?.model_load_status);
+    if (status) normalized.model_load_status = status;
     return [normalized];
   });
 }
@@ -92,6 +98,7 @@ export function mergeCCLoadChannelModels(channels, catalogs) {
       ...channel,
       models: catalog.models,
       models_loaded: catalog.models_loaded,
+      ...(catalog.model_load_status ? { model_load_status: catalog.model_load_status } : {}),
     };
   });
 }

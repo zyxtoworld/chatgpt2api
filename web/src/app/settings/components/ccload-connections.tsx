@@ -705,10 +705,14 @@ export function CCLoadConnections() {
                         </div>
                         <div className="mt-1 text-xs text-stone-400">
                           模型：{channel.models_loaded
-                            ? channel.models.join(", ") || "暂无可用模型"
+                            ? channel.model_load_status === "partial"
+                              ? "部分可用：" + (channel.models.join(", ") || "暂无可用模型")
+                              : channel.models.join(", ") || "暂无可用模型"
                             : loadingModelIds.includes(channel.id)
                               ? "读取中…"
-                              : modelLoadErrorIds.includes(channel.id) ? "读取失败，重试" : "等待读取"}
+                              : channel.model_load_status === "timeout"
+                                ? "读取超时，重试"
+                                : modelLoadErrorIds.includes(channel.id) ? "读取失败，重试" : "等待读取"}
                           {channel.subscription_active_until ? ` · 到期 ${channel.subscription_active_until}` : ""}
                         </div>
                       </div>

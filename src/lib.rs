@@ -2749,7 +2749,18 @@ async fn refresh_access_token_account(
         image_capable: quota > 0,
     });
     let fetched_models = fetched_models.await;
-    let model_items = merge_account_models(raw, fetched_models, quota > 0);
+    let mut fallback_web_models = state
+        .account_type_catalog
+        .last_good_web_models(plan_type)
+        .unwrap_or_default();
+    if let Some(fetched_models) = fetched_models {
+        fallback_web_models.extend(fetched_models);
+    }
+    let model_items = merge_account_models(
+        raw,
+        (!fallback_web_models.is_empty()).then_some(fallback_web_models),
+        quota > 0,
+    );
     let mut result = json!({
         "access_token": token,
         "email": me.get("email").and_then(Value::as_str).unwrap_or_default(),
@@ -12237,6 +12248,31 @@ impl AccountTypeCatalog {
         }
         models.sort_by(|left, right| left.id.cmp(&right.id));
         Arc::new(models)
+    }
+
+    fn last_good_web_models(&self, account_type: &str) -> Option<Vec<PublicModel>> {
+        let account_type = account_type.trim();
+        if account_type.is_empty() {
+            return None;
+        }
+        let snapshot = self.snapshot.read().expect("account type catalog lock");
+        let (_, entry) = snapshot.entries.iter().find(|(group, entry)| {
+            group.eq_ignore_ascii_case(account_type)
+                && entry.ready
+                && !entry.models.is_empty()
+                && snapshot.live_tokens.contains_key(*group)
+                && snapshot
+                    .live_candidates
+                    .get(*group)
+                    .is_some_and(|candidates| entry.owners.is_current(candidates))
+        })?;
+        let models = entry
+            .models
+            .iter()
+            .filter(|model| model.provenance == ModelProvenance::Web)
+            .cloned()
+            .collect::<Vec<_>>();
+        (!models.is_empty()).then_some(models)
     }
 
     fn supported_types_for(&self, model: &str) -> Option<HashSet<AccountModelGroup>> {

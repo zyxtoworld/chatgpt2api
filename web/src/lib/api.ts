@@ -845,9 +845,13 @@ export type CCLoadChannel = {
   subscription_active_until: string;
   models: string[];
   models_loaded: boolean;
+  model_load_status?: "pending" | "loaded" | "partial" | "failed" | "timeout";
 };
 
-export type CCLoadChannelModels = Pick<CCLoadChannel, "id" | "plan_type" | "models" | "models_loaded">;
+export type CCLoadChannelModels = Pick<
+  CCLoadChannel,
+  "id" | "plan_type" | "models" | "models_loaded" | "model_load_status"
+>;
 
 export async function fetchCCLoadServers(signal?: AbortSignal) {
   return httpRequest<{ servers: CCLoadServer[] }>("/api/ccload/servers", { signal });

@@ -247,6 +247,26 @@ test("ccLoad exposes partial model catalog failures for explicit retry", () => {
   );
 });
 
+test("ccLoad preserves terminal model load status per channel", () => {
+  const normalized = normalizeCCLoadChannels([
+    { id: "80", enabled: true, models: ["gpt-image-2"], models_loaded: true, model_load_status: "partial" },
+    { id: "81", enabled: true, models: [], models_loaded: false, model_load_status: "timeout" },
+    { id: "82", enabled: true, models: [], models_loaded: false, model_load_status: "unexpected" },
+  ]);
+  assert.equal(normalized[0].model_load_status, "partial");
+  assert.equal(normalized[1].model_load_status, "timeout");
+  assert.equal(Object.hasOwn(normalized[2], "model_load_status"), false);
+
+  const merged = mergeCCLoadChannelModels(
+    [{ id: "80", enabled: true, models: [], models_loaded: false }],
+    [{ id: "80", models: ["gpt-image-2"], models_loaded: true, model_load_status: "partial" }],
+  );
+  assert.equal(merged[0].model_load_status, "partial");
+  assert.deepEqual(getCCLoadModelErrorIds([
+    { id: "81", models: [], models_loaded: false, model_load_status: "timeout" },
+  ]), ["81"]);
+});
+
 test("ccLoad treats an omitted requested catalog as a retryable failure", () => {
   assert.deepEqual(
     getCCLoadModelErrorIds(

@@ -23,7 +23,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use image::ImageReader;
 use reqwest::{Client, Method};
 use serde::Deserialize;
@@ -51,6 +51,8 @@ const MAX_BACKUP_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BACKUP_DETAIL_MEMBERS: usize = 5_000;
 const CCLOAD_CHANNEL_BROWSE_DEADLINE: Duration = Duration::from_secs(90);
 const CCLOAD_IMPORT_DEADLINE: Duration = Duration::from_secs(30 * 60);
+const CCLOAD_CHANNEL_MODEL_LOGIN_DEADLINE: Duration = Duration::from_secs(15);
+const CCLOAD_CHANNEL_MODEL_CONCURRENCY: usize = 8;
 const CCLOAD_MAX_CHANNELS: usize = 5_000;
 const CCLOAD_MAX_CHANNEL_PAGES: usize = 25;
 const MAX_R2_DOWNLOAD_BYTES: u64 = MAX_BACKUP_BYTES;
@@ -3186,13 +3188,27 @@ pub(super) async fn ccload_channel_models(
     let server = registry_value(&state, "ccload", &server_id)?;
     let request = super::account_json_body(body).await?;
     let ids = clean_ccload_channel_ids(request.get("channel_ids"), 50)?;
-    let catalogs = tokio::time::timeout(
-        CCLOAD_CHANNEL_MODEL_DEADLINE,
-        load_ccload_channel_models(&state, &server_id, &server, ids),
-    )
-    .await
-    .map_err(|_| ApiError::upstream())??;
+    let requested_ids = ids.clone();
+    let catalogs = load_ccload_channel_models(&state, &server_id, &server, ids)
+        .await
+        .unwrap_or_else(|_| {
+            requested_ids
+                .iter()
+                .map(|id| terminal_ccload_channel_catalog(id, "failed"))
+                .collect()
+        });
     Ok(Json(json!({"server_id": server_id, "channels": catalogs})))
+}
+
+fn terminal_ccload_channel_catalog(id: &str, status: &str) -> Value {
+    json!({
+        "id": id,
+        "plan_type": "",
+        "models": [],
+        "model_sources": {},
+        "models_loaded": false,
+        "model_load_status": status,
+    })
 }
 
 async fn load_ccload_channel_models(
@@ -3201,22 +3217,60 @@ async fn load_ccload_channel_models(
     server: &Map<String, Value>,
     ids: Vec<String>,
 ) -> Result<Vec<Value>, ApiError> {
-    let (base, token) = ccload_login(state, server).await?;
-    let mut catalogs = Vec::with_capacity(ids.len());
-    let mut catalog_credentials =
-        Vec::<Option<(String, Option<String>, Option<String>)>>::with_capacity(ids.len());
-
-    for id in ids {
-        let mut catalog = json!({"id": id, "plan_type": "", "models": [], "models_loaded": false});
-        let editor = remote_json(
-            state,
-            state
-                .client
-                .get(format!("{base}/admin/channels/{id}/editor"))
-                .bearer_auth(&token),
-        )
-        .await;
-        if let Ok(editor) = editor {
+    let deadline = std::time::Instant::now() + CCLOAD_CHANNEL_MODEL_DEADLINE;
+    let login_deadline = std::time::Instant::now() + CCLOAD_CHANNEL_MODEL_LOGIN_DEADLINE;
+    let (base, token) = ccload_login_until(state, server, login_deadline).await?;
+    let catalog_count = ids.len();
+    let permits = Arc::new(Semaphore::new(CCLOAD_CHANNEL_MODEL_CONCURRENCY));
+    let mut requests = FuturesUnordered::new();
+    for (index, id) in ids.into_iter().enumerate() {
+        let request_state = state.clone();
+        let request_client = state.client.clone();
+        let request_base = base.clone();
+        let request_token = token.clone();
+        let request_permits = permits.clone();
+        requests.push(async move {
+            let mut catalog = json!({
+                "id": id,
+                "plan_type": "",
+                "models": [],
+                "model_sources": {},
+                "models_loaded": false,
+                "model_load_status": "pending",
+            });
+            let _permit = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                request_permits.acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    catalog["model_load_status"] = Value::String("timeout".to_owned());
+                    return (index, catalog);
+                }
+            };
+            let editor = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                remote_json(
+                    &request_state,
+                    request_client
+                        .get(format!("{request_base}/admin/channels/{id}/editor"))
+                        .bearer_auth(&request_token),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(editor)) => editor,
+                Ok(Err(_)) => {
+                    catalog["model_load_status"] = Value::String("failed".to_owned());
+                    return (index, catalog);
+                }
+                Err(_) => {
+                    catalog["model_load_status"] = Value::String("timeout".to_owned());
+                    return (index, catalog);
+                }
+            };
             let channel = editor.get("data").and_then(|value| value.get("channel"));
             let channel_matches = channel
                 .and_then(|value| clean_ccload_channel_id(value.get("id")))
@@ -3226,82 +3280,96 @@ async fn load_ccload_channel_models(
                     .and_then(Value::as_str)
                     .map(str::trim)
                     == Some("codex_oauth");
-            if channel_matches {
-                if let Some(plan_type) = channel
-                    .and_then(|value| value.get("codex_plan_type"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| value.chars().count() <= 256)
-                {
-                    catalog["plan_type"] = Value::String(plan_type.to_owned());
-                }
-                let credential = normalized_ccload_credential(
-                    editor
-                        .get("data")
-                        .and_then(|value| value.get("oauth_credential")),
-                );
-                if let Some(plan_type) = credential
-                    .as_ref()
-                    .and_then(|value| value.get("plan_type"))
-                    .filter(|value| value.chars().count() <= 256)
-                {
-                    catalog["plan_type"] = Value::String(plan_type.clone());
-                }
-                if let Some(credential) = credential {
-                    let plan_type = catalog
-                        .get("plan_type")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    catalog_credentials.push(Some((
-                        credential
-                            .get("access_token")
-                            .cloned()
-                            .expect("validated ccLoad access token"),
-                        plan_type,
-                        credential
-                            .get("account_id")
-                            .filter(|value| !value.is_empty())
-                            .cloned(),
-                    )));
-                } else {
-                    catalog_credentials.push(None);
-                }
-            } else {
-                catalog_credentials.push(None);
+            if !channel_matches {
+                catalog["model_load_status"] = Value::String("failed".to_owned());
+                return (index, catalog);
             }
-        } else {
-            catalog_credentials.push(None);
-        }
-        catalogs.push(catalog);
-    }
-
-    let mut fetched = Vec::<Option<Value>>::with_capacity(catalogs.len());
-    for credential in catalog_credentials {
-        let Some((access, plan_type, account_id)) = credential else {
-            fetched.push(None);
-            continue;
-        };
-        let snapshot = super::refresh_access_token_account(
-            state,
-            &json!({
-                "access_token": access,
-                "source_type": "codex",
-                "type": plan_type,
-                "chatgpt_account_id": account_id,
-            }),
-            None,
-        )
-        .await
-        .ok();
-        fetched.push(snapshot);
-    }
-    for (catalog_index, snapshot) in fetched.into_iter().enumerate() {
-        if let Some(snapshot) = snapshot {
+            if let Some(plan_type) = channel
+                .and_then(|value| value.get("codex_plan_type"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| value.chars().count() <= 256)
+            {
+                catalog["plan_type"] = Value::String(plan_type.to_owned());
+            }
+            let Some(credential) = normalized_ccload_credential(
+                editor
+                    .get("data")
+                    .and_then(|value| value.get("oauth_credential")),
+            ) else {
+                catalog["model_load_status"] = Value::String("failed".to_owned());
+                return (index, catalog);
+            };
+            if let Some(plan_type) = credential
+                .get("plan_type")
+                .filter(|value| value.chars().count() <= 256)
+            {
+                catalog["plan_type"] = Value::String(plan_type.clone());
+            }
+            let snapshot = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                super::refresh_access_token_account(
+                    &request_state,
+                    &json!({
+                        "access_token": credential
+                            .get("access_token")
+                            .expect("validated ccLoad access token"),
+                        "source_type": "codex",
+                        "type": catalog.get("plan_type").cloned().unwrap_or(Value::Null),
+                        "chatgpt_account_id": credential.get("account_id").cloned(),
+                    }),
+                    None,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => snapshot,
+                Ok(Err(code)) => {
+                    catalog["model_load_status"] = Value::String(
+                        if code == "upstream_timeout" {
+                            "timeout"
+                        } else {
+                            "failed"
+                        }
+                        .to_owned(),
+                    );
+                    return (index, catalog);
+                }
+                Err(_) => {
+                    catalog["model_load_status"] = Value::String("timeout".to_owned());
+                    return (index, catalog);
+                }
+            };
             let (models, sources) = merge_ccload_account_catalog(None, None, &snapshot);
-            catalogs[catalog_index]["models"] = models;
-            catalogs[catalog_index]["model_sources"] = sources;
-            catalogs[catalog_index]["models_loaded"] = Value::Bool(true);
-        }
+            let has_web = sources.as_object().is_some_and(|sources| {
+                sources
+                    .values()
+                    .any(|source| source.as_str() == Some("web"))
+            });
+            let has_image = sources.as_object().is_some_and(|sources| {
+                sources
+                    .values()
+                    .any(|source| source.as_str() == Some("image"))
+            });
+            catalog["models"] = models;
+            catalog["model_sources"] = sources;
+            catalog["models_loaded"] = Value::Bool(has_web || has_image);
+            catalog["model_load_status"] = Value::String(
+                if has_web {
+                    "loaded"
+                } else if has_image {
+                    "partial"
+                } else {
+                    "failed"
+                }
+                .to_owned(),
+            );
+            (index, catalog)
+        });
+    }
+    let mut catalogs = vec![Value::Null; catalog_count];
+    while let Some((index, catalog)) = requests.next().await {
+        catalogs[index] = catalog;
     }
     Ok(catalogs)
 }
