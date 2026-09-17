@@ -1597,6 +1597,89 @@ impl ImportedModelCatalogCache {
         result
     }
 
+    async fn seed_ready_with_batch(
+        &self,
+        key: &str,
+        models: Vec<PublicModel>,
+        batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+    ) -> Option<Vec<PublicModel>> {
+        if models.is_empty() {
+            return None;
+        }
+        let key = key.to_ascii_lowercase();
+        let entry = {
+            let mut entries = self.entries.lock().await;
+            entries
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    let (updates, _) = watch::channel(ImportedModelCatalogState::Failed {
+                        retry_at: Instant::now(),
+                    });
+                    Arc::new(ImportedModelCatalogEntry {
+                        state: Mutex::new(ImportedModelCatalogState::Failed {
+                            retry_at: Instant::now(),
+                        }),
+                        updates,
+                        fetch_count: AtomicUsize::new(0),
+                        attempt_count: AtomicUsize::new(0),
+                        cache_hit_count: AtomicUsize::new(0),
+                        retry_count: AtomicUsize::new(0),
+                    })
+                })
+                .clone()
+        };
+        let mut updates = None;
+        let mut published_models = None;
+        {
+            let mut state = entry.state.lock().await;
+            let now = Instant::now();
+            let next_models = match &*state {
+                ImportedModelCatalogState::Ready {
+                    models: existing,
+                    expires_at,
+                }
+                | ImportedModelCatalogState::PartialReady {
+                    models: existing,
+                    expires_at,
+                    ..
+                } if now < *expires_at => {
+                    let mut merged = existing.as_ref().clone();
+                    let mut seen = merged
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect::<HashSet<_>>();
+                    for model in models {
+                        if seen.insert(model.id.clone()) {
+                            merged.push(model);
+                        }
+                    }
+                    Some((merged, *expires_at))
+                }
+                ImportedModelCatalogState::InFlight => None,
+                _ => Some((models, now + IMPORTED_MODEL_CATALOG_TTL)),
+            };
+            if let Some((models, expires_at)) = next_models {
+                published_models = Some(models.clone());
+                let next = ImportedModelCatalogState::Ready {
+                    models: Arc::new(models),
+                    expires_at,
+                };
+                *state = next.clone();
+                updates = Some(next);
+            }
+        }
+        updates.as_ref()?;
+        if let Some(next) = updates {
+            let _ = entry.updates.send(next);
+        }
+        entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+        self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(batch) = batch {
+            batch.record(&key, 3);
+        }
+        published_models
+    }
+
     async fn fetch_or_reuse<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<PublicModel>>
     where
         F: FnOnce() -> Fut,
@@ -1874,6 +1957,11 @@ impl AppState {
             config.accounts_path.is_some(),
             config.upstream_protocol,
             codex_client_version(),
+            config
+                .accounts_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(|path| path.join(PERSISTED_WEB_MODEL_CATALOG_FILE)),
         );
         let health_snapshot_cache = Arc::new(StdMutex::new(health_snapshot_cache_from_stores(
             account_store.as_ref(),
@@ -2066,6 +2154,7 @@ impl AppState {
             true,
             config.upstream_protocol,
             codex_client_version(),
+            Some(data_dir.join(PERSISTED_WEB_MODEL_CATALOG_FILE)),
         );
         Ok(Self {
             config: Arc::new(config),
@@ -2737,22 +2826,56 @@ async fn refresh_access_token_account(
         })
         .unwrap_or_default();
     let (quota, restore_at) = image_quota_from_limits_progress(init.get("limits_progress"));
-    let fetched_models = fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
-        cache: state.imported_model_catalog.clone(),
-        client: state.client.clone(),
-        base_url: base_url.to_owned(),
-        account_type: plan_type.to_owned(),
-        token: token.clone(),
-        account_id: account_id.map(ToOwned::to_owned),
-        deadline: Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
-        batch,
-        image_capable: quota > 0,
-    });
-    let fetched_models = fetched_models.await;
+    state
+        .account_type_catalog
+        .hydrate_current_persisted_web_catalog()
+        .await;
     let mut fallback_web_models = state
         .account_type_catalog
         .last_good_web_models(plan_type)
         .unwrap_or_default();
+    let seeded_models = if !fallback_web_models.is_empty() {
+        state
+            .imported_model_catalog
+            .seed_ready_with_batch(plan_type, fallback_web_models.clone(), batch.clone())
+            .await
+    } else {
+        None
+    };
+    let fetched_models = if fallback_web_models.is_empty() {
+        fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
+            cache: state.imported_model_catalog.clone(),
+            client: state.client.clone(),
+            base_url: base_url.to_owned(),
+            account_type: plan_type.to_owned(),
+            token: token.clone(),
+            account_id: account_id.map(ToOwned::to_owned),
+            deadline: Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
+            batch,
+            image_capable: quota > 0,
+        })
+        .await
+    } else if let Some(seeded_models) = seeded_models {
+        Some(seeded_models)
+    } else {
+        state
+            .imported_model_catalog
+            .fetch_or_reuse_with_batch(plan_type, batch.clone(), || async { None })
+            .await
+    };
+    if let Some(models) = fetched_models.as_deref() {
+        state
+            .account_type_catalog
+            .persist_web_models_from_candidate(plan_type, raw, models);
+    }
+    if fallback_web_models.is_empty()
+        && let Some(candidate) = AccountTypeCatalog::catalog_candidate_from_raw(raw)
+    {
+        fallback_web_models = state
+            .account_type_catalog
+            .persisted_web_models_for_candidate(plan_type, &candidate)
+            .unwrap_or_default();
+    }
     if let Some(fetched_models) = fetched_models {
         fallback_web_models.extend(fetched_models);
     }
@@ -10847,6 +10970,10 @@ const ACCOUNT_TYPE_MODEL_TTL: Duration = Duration::from_secs(300);
 const ACCOUNT_TYPE_MODEL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const ACCOUNT_TYPE_MODEL_REFRESH_DEADLINE: Duration = Duration::from_secs(90);
 const ACCOUNT_TYPE_REFRESH_CONCURRENCY: usize = 4;
+const PERSISTED_WEB_MODEL_CATALOG_FILE: &str = "web_model_catalog.json";
+const PERSISTED_WEB_MODEL_CATALOG_SCHEMA_VERSION: u64 = 1;
+const PERSISTED_WEB_MODEL_CATALOG_TTL_SECS: u64 = 24 * 60 * 60;
+const PERSISTED_WEB_MODEL_CATALOG_MAX_BYTES: u64 = 1024 * 1024;
 const AUTHENTICATED_NATIVE_MODEL_PATHS: &[&str] = &[
     "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true",
     "/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true",
@@ -11078,7 +11205,7 @@ async fn fetch_imported_model_catalog_request(
     let key = account_type.to_ascii_lowercase();
     let retry_key = key.clone();
     let retry_cache = cache.clone();
-    cache
+    let models = cache
         .fetch_or_reuse_with_catalog_batch(&key, batch.clone(), move || async move {
             fetch_imported_native_model_catalog_with_retry(NativeModelCatalogRetryRequest {
                 cache: retry_cache,
@@ -11100,7 +11227,12 @@ async fn fetch_imported_model_catalog_request(
                 })
             })
         })
-        .await
+        .await;
+    match models {
+        Some(models) => Some(models),
+        None if image_capable => Some(vec![imported_image_capability_model()]),
+        None => None,
+    }
 }
 
 struct NativeModelCatalogRetryRequest {
@@ -11297,6 +11429,249 @@ struct CatalogFetchResult {
     complete: bool,
 }
 
+#[derive(Clone)]
+struct PersistedWebModelCatalogEntry {
+    account_type: String,
+    source_types: Vec<String>,
+    owner_fingerprints: Vec<String>,
+    models: Arc<Vec<PublicModel>>,
+    updated_at: u64,
+    expires_at: u64,
+    checksum: String,
+}
+
+fn catalog_account_type_key(value: &str) -> Option<String> {
+    let raw = value.trim();
+    if raw.is_empty() || raw.chars().count() > 64 {
+        return None;
+    }
+    let compact = raw
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !matches!(character, '-' | '_' | ' '))
+        .collect::<String>();
+    Some(match compact.as_str() {
+        "free" | "codex" => "free".to_owned(),
+        "plus" => "plus".to_owned(),
+        "pro" => "pro".to_owned(),
+        "prolite" => "prolite".to_owned(),
+        "team" | "business" => "team".to_owned(),
+        "enterprise" => "enterprise".to_owned(),
+        _ => raw.to_ascii_lowercase(),
+    })
+}
+
+fn catalog_candidate_fingerprint(candidate: &CatalogAccountCandidate) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(candidate.source_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(candidate.token.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn persisted_web_model_value(model: &PublicModel) -> Value {
+    let mut model = model.clone();
+    model.allow_anonymous = false;
+    model.supported_account_types.clear();
+    model.provenance = ModelProvenance::Web;
+    let mut value = serde_json::to_value(model).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("provenance".to_owned(), Value::String("web".to_owned()));
+    }
+    value
+}
+
+fn persisted_web_catalog_payload(entry: &PersistedWebModelCatalogEntry) -> Value {
+    json!({
+        "scope": "account_type",
+        "account_type": entry.account_type,
+        "provenance": "web",
+        "source_types": entry.source_types,
+        "owner_fingerprints": entry.owner_fingerprints,
+        "models": entry.models.iter().map(persisted_web_model_value).collect::<Vec<_>>(),
+        "updated_at": entry.updated_at,
+        "expires_at": entry.expires_at,
+    })
+}
+
+fn persisted_web_catalog_checksum(entry: &PersistedWebModelCatalogEntry) -> Option<String> {
+    let bytes = serde_json::to_vec(&persisted_web_catalog_payload(entry)).ok()?;
+    Some(
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
+}
+
+fn persisted_web_catalog_document(
+    entries: &HashMap<AccountModelGroup, PersistedWebModelCatalogEntry>,
+) -> Value {
+    let mut values = entries.values().collect::<Vec<_>>();
+    values.sort_by(|left, right| left.account_type.cmp(&right.account_type));
+    json!({
+        "schema_version": PERSISTED_WEB_MODEL_CATALOG_SCHEMA_VERSION,
+        "entries": values.into_iter().map(|entry| {
+            let mut value = persisted_web_catalog_payload(entry);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("checksum".to_owned(), Value::String(entry.checksum.clone()));
+            }
+            value
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn bounded_string_array(
+    value: Option<&Value>,
+    max_items: usize,
+    max_length: usize,
+) -> Option<Vec<String>> {
+    let values = value?.as_array()?;
+    let mut result = values
+        .iter()
+        .take(max_items)
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && value.chars().count() <= max_length)
+                .map(|value| value.to_ascii_lowercase())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    result.sort();
+    result.dedup();
+    (result.len() == values.len()).then_some(result)
+}
+
+fn parse_persisted_web_model(value: &Value) -> Option<PublicModel> {
+    let object = value.as_object()?;
+    if object.get("provenance").and_then(Value::as_str) != Some("web") {
+        return None;
+    }
+    let mut model = ModelCatalog::project(value)?;
+    if model.provenance != ModelProvenance::Web || is_native_image_model_id(&model.id) {
+        return None;
+    }
+    model.allow_anonymous = false;
+    model.supported_account_types.clear();
+    model.provenance = ModelProvenance::Web;
+    Some(model)
+}
+
+fn load_persisted_web_model_catalog(
+    path: Option<&Path>,
+) -> HashMap<AccountModelGroup, PersistedWebModelCatalogEntry> {
+    let Some(path) = path else {
+        return HashMap::new();
+    };
+    let Ok((bytes, _)) = read_bounded_validated_file(path, PERSISTED_WEB_MODEL_CATALOG_MAX_BYTES)
+    else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return HashMap::new();
+    };
+    if value.get("schema_version").and_then(Value::as_u64)
+        != Some(PERSISTED_WEB_MODEL_CATALOG_SCHEMA_VERSION)
+    {
+        return HashMap::new();
+    }
+    let Some(entries) = value.get("entries").and_then(Value::as_array) else {
+        return HashMap::new();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut result = HashMap::new();
+    for value in entries.iter().take(64) {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        if object.get("scope").and_then(Value::as_str) != Some("account_type")
+            || object.get("provenance").and_then(Value::as_str) != Some("web")
+        {
+            continue;
+        }
+        let Some(account_type) = object
+            .get("account_type")
+            .and_then(Value::as_str)
+            .and_then(catalog_account_type_key)
+        else {
+            continue;
+        };
+        let Some(source_types) = bounded_string_array(object.get("source_types"), 32, 64) else {
+            continue;
+        };
+        if source_types != ["web".to_owned()] {
+            continue;
+        }
+        let Some(owner_fingerprints) =
+            bounded_string_array(object.get("owner_fingerprints"), 64, 64)
+        else {
+            continue;
+        };
+        if owner_fingerprints.is_empty()
+            || owner_fingerprints.iter().any(|value| {
+                value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            continue;
+        }
+        let Some(updated_at) = object.get("updated_at").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(expires_at) = object.get("expires_at").and_then(Value::as_u64) else {
+            continue;
+        };
+        if updated_at > now.saturating_add(300)
+            || expires_at <= now
+            || expires_at <= updated_at
+            || expires_at.saturating_sub(updated_at) > PERSISTED_WEB_MODEL_CATALOG_TTL_SECS
+        {
+            continue;
+        }
+        let Some(raw_models) = object.get("models").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut models = Vec::new();
+        let mut seen = HashSet::new();
+        for raw_model in raw_models.iter().take(MAX_MODELS) {
+            let Some(model) = parse_persisted_web_model(raw_model) else {
+                models.clear();
+                break;
+            };
+            if seen.insert(model.id.clone()) {
+                models.push(model);
+            }
+        }
+        if models.is_empty() {
+            continue;
+        }
+        let Some(checksum) = object.get("checksum").and_then(Value::as_str) else {
+            continue;
+        };
+        let entry = PersistedWebModelCatalogEntry {
+            account_type: account_type.clone(),
+            source_types,
+            owner_fingerprints,
+            models: Arc::new(models),
+            updated_at,
+            expires_at,
+            checksum: checksum.to_ascii_lowercase(),
+        };
+        if persisted_web_catalog_checksum(&entry).as_deref() != Some(entry.checksum.as_str()) {
+            continue;
+        }
+        result.entry(account_type).or_insert(entry);
+    }
+    result
+}
+
 impl CatalogFetchJob {
     fn key(&self) -> CatalogFetchKey {
         match self {
@@ -11338,6 +11713,8 @@ struct AccountTypeCatalog {
     client: Client,
     account_store: Arc<AccountStore>,
     snapshot: Arc<RwLock<AccountTypeCatalogSnapshot>>,
+    persisted_web_catalog_path: Option<Arc<PathBuf>>,
+    persisted_web_catalog: Arc<RwLock<HashMap<AccountModelGroup, PersistedWebModelCatalogEntry>>>,
     refresh_gate: Arc<Mutex<()>>,
     refresh_running: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
@@ -11373,8 +11750,11 @@ impl AccountTypeCatalog {
         enabled: bool,
         protocol: UpstreamProtocol,
         codex_client_version: Option<String>,
+        persisted_web_catalog_path: Option<PathBuf>,
     ) -> Self {
         let (refresh_shutdown, _) = tokio::sync::watch::channel(false);
+        let persisted_web_catalog =
+            load_persisted_web_model_catalog(persisted_web_catalog_path.as_deref());
         Self {
             enabled,
             protocol,
@@ -11383,6 +11763,8 @@ impl AccountTypeCatalog {
             client,
             account_store,
             snapshot: Arc::new(RwLock::new(AccountTypeCatalogSnapshot::default())),
+            persisted_web_catalog_path: persisted_web_catalog_path.map(Arc::new),
+            persisted_web_catalog: Arc::new(RwLock::new(persisted_web_catalog)),
             refresh_gate: Arc::new(Mutex::new(())),
             refresh_running: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -11403,6 +11785,234 @@ impl AccountTypeCatalog {
 
     fn enabled(&self) -> bool {
         self.enabled && self.base_url.is_some()
+    }
+
+    fn hydrate_persisted_web_catalog(
+        &self,
+        candidate_groups: &HashMap<AccountModelGroup, Vec<CatalogAccountCandidate>>,
+    ) {
+        if self.protocol != UpstreamProtocol::ChatGpt {
+            return;
+        }
+        let persisted = self
+            .persisted_web_catalog
+            .read()
+            .expect("persisted web catalog lock")
+            .clone();
+        if persisted.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut snapshot = self.snapshot.write().expect("account type catalog lock");
+        for (account_group, candidates) in candidate_groups {
+            if snapshot.entries.get(account_group).is_some_and(|entry| {
+                entry.ready && !entry.models.is_empty() && entry.owners.is_current(candidates)
+            }) {
+                continue;
+            }
+            let Some(account_type) = catalog_account_type_key(account_group) else {
+                continue;
+            };
+            let Some(cached) = persisted.get(&account_type) else {
+                continue;
+            };
+            if cached.source_types != vec!["web".to_owned()] {
+                continue;
+            }
+            let Some(owner) = candidates.iter().find(|candidate| {
+                cached
+                    .owner_fingerprints
+                    .iter()
+                    .any(|fingerprint| fingerprint == &catalog_candidate_fingerprint(candidate))
+            }) else {
+                continue;
+            };
+            let live_source_types = candidates
+                .iter()
+                .map(|candidate| candidate.source_type.clone())
+                .collect::<HashSet<_>>();
+            let model_sources = cached
+                .models
+                .iter()
+                .map(|model| (model.id.clone(), live_source_types.clone()))
+                .collect();
+            let owners = CatalogOwners::with_model_sources(vec![owner.clone()], model_sources);
+            snapshot.entries.insert(
+                account_group.clone(),
+                AccountTypeCatalogEntry {
+                    models: cached.models.clone(),
+                    model_sources: owners.model_sources.clone(),
+                    ready: true,
+                    tokens: candidates
+                        .iter()
+                        .map(|candidate| candidate.token.clone())
+                        .collect(),
+                    owners,
+                    expires_at: now + ACCOUNT_TYPE_MODEL_TTL,
+                    retry_at: now,
+                },
+            );
+        }
+    }
+
+    async fn hydrate_current_persisted_web_catalog(&self) {
+        let Some((_, candidate_groups)) = self.account_store.active_type_candidates().await else {
+            return;
+        };
+        let live_tokens = candidate_groups
+            .iter()
+            .map(|(group, candidates)| {
+                (
+                    group.clone(),
+                    candidates
+                        .iter()
+                        .map(|candidate| candidate.token.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        {
+            let mut snapshot = self.snapshot.write().expect("account type catalog lock");
+            snapshot.live_tokens = live_tokens;
+            snapshot.live_candidates = candidate_groups.clone();
+        }
+        self.hydrate_persisted_web_catalog(&candidate_groups);
+    }
+
+    fn persist_web_catalog(
+        &self,
+        account_type: &str,
+        models: &[PublicModel],
+        owners: &CatalogOwners,
+    ) {
+        if self.protocol != UpstreamProtocol::ChatGpt {
+            return;
+        }
+        let Some(account_type) = catalog_account_type_key(account_type) else {
+            return;
+        };
+        let web_models = models
+            .iter()
+            .filter(|model| model.provenance == ModelProvenance::Web)
+            .cloned()
+            .collect::<Vec<_>>();
+        let source_types = vec!["web".to_owned()];
+        let mut owner_fingerprints = owners
+            .candidates
+            .iter()
+            .map(catalog_candidate_fingerprint)
+            .collect::<Vec<_>>();
+        owner_fingerprints.sort();
+        owner_fingerprints.dedup();
+        if web_models.is_empty() || source_types.is_empty() || owner_fingerprints.is_empty() {
+            return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        let mut entry = PersistedWebModelCatalogEntry {
+            account_type: account_type.clone(),
+            source_types,
+            owner_fingerprints,
+            models: Arc::new(web_models),
+            updated_at: now,
+            expires_at: now.saturating_add(PERSISTED_WEB_MODEL_CATALOG_TTL_SECS),
+            checksum: String::new(),
+        };
+        entry.checksum = persisted_web_catalog_checksum(&entry).unwrap_or_default();
+        if entry.checksum.is_empty() {
+            return;
+        }
+        let mut persisted = self
+            .persisted_web_catalog
+            .write()
+            .expect("persisted web catalog lock");
+        let previous = persisted.insert(account_type.clone(), entry);
+        let write_result = serde_json::to_vec(&persisted_web_catalog_document(&persisted))
+            .map_err(|_| ())
+            .and_then(|bytes| {
+                self.persisted_web_catalog_path
+                    .as_deref()
+                    .map(|path| {
+                        atomic_replace_checked_with_limit(
+                            path,
+                            &bytes,
+                            PERSISTED_WEB_MODEL_CATALOG_MAX_BYTES,
+                            false,
+                        )
+                        .map_err(|_| ())
+                    })
+                    .unwrap_or(Ok(()))
+            });
+        if write_result.is_err() {
+            if let Some(previous) = previous {
+                persisted.insert(account_type, previous);
+            } else {
+                persisted.remove(&account_type);
+            }
+        }
+    }
+
+    fn persisted_web_models_for_candidate(
+        &self,
+        account_type: &str,
+        candidate: &CatalogAccountCandidate,
+    ) -> Option<Vec<PublicModel>> {
+        let account_type = catalog_account_type_key(account_type)?;
+        let persisted = self
+            .persisted_web_catalog
+            .read()
+            .expect("persisted web catalog lock");
+        let entry = persisted.get(&account_type)?;
+        if entry.source_types != vec!["web".to_owned()]
+            || !entry
+                .owner_fingerprints
+                .iter()
+                .any(|fingerprint| fingerprint == &catalog_candidate_fingerprint(candidate))
+        {
+            return None;
+        }
+        Some(entry.models.as_ref().clone())
+    }
+
+    fn catalog_candidate_from_raw(raw: &Value) -> Option<CatalogAccountCandidate> {
+        let token = account_token(raw)?;
+        let source_type = normalize_source_type(raw.get("source_type")).ok()?;
+        let chatgpt_account_id = raw
+            .get("chatgpt_account_id")
+            .or_else(|| raw.get("account_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        Some(CatalogAccountCandidate {
+            token,
+            source_type,
+            chatgpt_account_id,
+        })
+    }
+
+    fn persist_web_models_from_candidate(
+        &self,
+        account_type: &str,
+        raw: &Value,
+        models: &[PublicModel],
+    ) {
+        let Some(candidate) = Self::catalog_candidate_from_raw(raw) else {
+            return;
+        };
+        let source_type = candidate.source_type.clone();
+        let model_sources = models
+            .iter()
+            .filter(|model| model.provenance == ModelProvenance::Web)
+            .map(|model| (model.id.clone(), HashSet::from([source_type.clone()])))
+            .collect();
+        self.persist_web_catalog(
+            account_type,
+            models,
+            &CatalogOwners::with_model_sources(vec![candidate], model_sources),
+        );
     }
 
     fn codex_client_version(&self) -> Option<String> {
@@ -11505,6 +12115,7 @@ impl AccountTypeCatalog {
             snapshot.live_tokens = groups;
             snapshot.live_candidates = candidate_groups.clone();
         }
+        self.hydrate_persisted_web_catalog(&candidate_groups);
         #[cfg(test)]
         if self
             .live_membership_barrier_enabled
@@ -11644,6 +12255,7 @@ impl AccountTypeCatalog {
             snapshot.live_tokens = groups.clone();
             snapshot.live_candidates = candidate_groups.clone();
         }
+        self.hydrate_persisted_web_catalog(&candidate_groups);
 
         let now = Instant::now();
         let (anonymous_pending, pending) = {
@@ -11766,6 +12378,7 @@ impl AccountTypeCatalog {
                             .collect();
                         match models {
                             Some(models) if complete => {
+                                self.persist_web_catalog(&account_group, &models, &owners);
                                 snapshot.entries.insert(
                                     account_group,
                                     AccountTypeCatalogEntry {
@@ -18360,7 +18973,7 @@ mod tests {
                             "2" => (" PRO ", "imported-cc-pro-2-token", "cc-pro-2-account"),
                             _ => ("pro", "imported-cc-pro-1-token", "cc-pro-1-account"),
                         };
-                        Json(json!({"success": true, "data": {"channel": {"id": channel_id.parse::<u64>().unwrap_or(0), "auth_type": "codex_oauth"}, "oauth_credential": {"access_token": access_token, "account_id": account_id, "type": "Codex", "expired": "2099-01-01T00:00:00Z", "plan_type": plan_type}}}))
+                        Json(json!({"success": true, "data": {"channel": {"id": channel_id.parse::<u64>().unwrap_or(0), "auth_type": "codex_oauth", "enabled": true}, "oauth_credential": {"access_token": access_token, "account_id": account_id, "type": "Codex", "expired": "2099-01-01T00:00:00Z", "plan_type": plan_type}}}))
                     }
                 }),
             );
@@ -21584,6 +22197,28 @@ mod tests {
         let second_stats = second_batch.snapshot();
         assert_eq!(second_stats.fetches, 0);
         assert_eq!(second_stats.cache_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn imported_image_capability_survives_a_prior_web_cache_failure() {
+        let cache = ImportedModelCatalogCache::new();
+        assert_eq!(cache.fetch_or_reuse("pro", || async { None }).await, None);
+        let image = fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
+            cache,
+            client: Client::new(),
+            base_url: "http://127.0.0.1:1".to_owned(),
+            account_type: "pro".to_owned(),
+            token: "access-only".to_owned(),
+            account_id: None,
+            deadline: Instant::now(),
+            batch: None,
+            image_capable: true,
+        })
+        .await
+        .expect("positive image capability after Web cache failure");
+        assert_eq!(image.len(), 1);
+        assert_eq!(image[0].id, "gpt-image-2");
+        assert_eq!(image[0].provenance, ModelProvenance::Image);
     }
 
     #[test]
@@ -26592,6 +27227,812 @@ data: [DONE]
                 .as_array()
                 .is_some_and(|models| models.iter().any(|model| model == "gpt-image-2"))
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_web_catalog_hydrates_after_restart_and_rejects_invalid_entries() {
+        let account_path = account_snapshot_path("persisted-web-catalog");
+        fs::write(
+            &account_path,
+            serde_json::to_vec(&json!([{
+                "access_token": "persisted-web-owner",
+                "status": "正常",
+                "type": "pro",
+                "source_type": "codex",
+                "quota": 3,
+                "models": ["gpt-image-2"],
+                "model_sources": {"gpt-image-2": "image"}
+            }]))
+            .expect("persisted web account snapshot"),
+        )
+        .expect("write persisted web account snapshot");
+        let config = || AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: Some("http://127.0.0.1:1".to_owned()),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        };
+        let state = AppState::new(config()).expect("persisted web state");
+        let candidates = state
+            .account_store
+            .active_type_candidates()
+            .await
+            .expect("persisted web candidates")
+            .1;
+        let candidate = candidates["pro"][0].clone();
+        let web_models = [
+            "web-model-1",
+            "web-model-2",
+            "web-model-3",
+            "web-model-4",
+            "web-model-5",
+            "web-model-6",
+        ]
+        .into_iter()
+        .map(|id| test_public_model(id, ModelProvenance::Web))
+        .collect::<Vec<_>>();
+        let model_sources = web_models
+            .iter()
+            .map(|model| (model.id.clone(), HashSet::from(["codex".to_owned()])))
+            .collect();
+        state.account_type_catalog.persist_web_catalog(
+            "PRO",
+            &web_models,
+            &CatalogOwners::with_model_sources(vec![candidate], model_sources),
+        );
+        let cache_path = account_path
+            .parent()
+            .expect("persisted web cache parent")
+            .join(PERSISTED_WEB_MODEL_CATALOG_FILE);
+        let persisted: Value =
+            serde_json::from_slice(&fs::read(&cache_path).expect("persisted web cache file"))
+                .expect("persisted web cache JSON");
+        assert_eq!(
+            persisted["schema_version"],
+            PERSISTED_WEB_MODEL_CATALOG_SCHEMA_VERSION
+        );
+        assert_eq!(persisted["entries"][0]["scope"], "account_type");
+        assert_eq!(persisted["entries"][0]["provenance"], "web");
+        assert_eq!(persisted["entries"][0]["source_types"], json!(["web"]));
+        assert_eq!(
+            persisted["entries"][0]["models"].as_array().map(Vec::len),
+            Some(6)
+        );
+        let persisted_text = persisted.to_string();
+        for secret in [
+            "persisted-web-owner",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "authorization",
+            "password",
+            "cookie",
+        ] {
+            assert!(!persisted_text.contains(secret), "cache leaked {secret}");
+        }
+        assert!(!persisted_text.contains("gpt-image-2"));
+        state.account_type_catalog.shutdown().await;
+
+        let restarted = AppState::new(config()).expect("restarted persisted web state");
+        let current = restarted
+            .account_store
+            .active_type_candidates()
+            .await
+            .expect("restarted persisted web candidates")
+            .1;
+        {
+            let mut snapshot = restarted
+                .account_type_catalog
+                .snapshot
+                .write()
+                .expect("restarted public catalog lock");
+            snapshot.live_tokens = current
+                .iter()
+                .map(|(group, candidates)| {
+                    (
+                        group.clone(),
+                        candidates
+                            .iter()
+                            .map(|candidate| candidate.token.clone())
+                            .collect(),
+                    )
+                })
+                .collect();
+            snapshot.live_candidates = current.clone();
+        }
+        restarted
+            .account_type_catalog
+            .hydrate_persisted_web_catalog(&current);
+        let hydrated = restarted
+            .account_type_catalog
+            .last_good_web_models("pro")
+            .expect("hydrated web catalog");
+        assert_eq!(hydrated.len(), 6);
+        assert!(
+            hydrated
+                .iter()
+                .all(|model| model.provenance == ModelProvenance::Web)
+        );
+        let public = restarted
+            .account_type_catalog
+            .public_models(restarted.models.current());
+        assert!(public.iter().any(|model| model.id == "web-model-6"));
+        assert!(public.iter().any(|model| model.id == "gpt-image-2"));
+
+        let mismatched = HashMap::from([(
+            "pro".to_owned(),
+            vec![CatalogAccountCandidate {
+                token: "different-owner".to_owned(),
+                source_type: "codex".to_owned(),
+                chatgpt_account_id: None,
+            }],
+        )]);
+        let mismatch_state = AppState::new(config()).expect("mismatch persisted web state");
+        mismatch_state
+            .account_type_catalog
+            .hydrate_persisted_web_catalog(&mismatched);
+        assert!(
+            mismatch_state
+                .account_type_catalog
+                .last_good_web_models("pro")
+                .is_none()
+        );
+
+        let mut invalid = persisted.clone();
+        invalid["entries"][0]["provenance"] = Value::String("codex".to_owned());
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&invalid).expect("invalid cache JSON"),
+        )
+        .expect("write invalid cache");
+        let invalid_state = AppState::new(config()).expect("invalid persisted web state");
+        let invalid_current = invalid_state
+            .account_store
+            .active_type_candidates()
+            .await
+            .expect("invalid persisted web candidates")
+            .1;
+        invalid_state
+            .account_type_catalog
+            .hydrate_persisted_web_catalog(&invalid_current);
+        assert!(
+            invalid_state
+                .account_type_catalog
+                .last_good_web_models("pro")
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(account_path.parent().expect("persisted web parent"));
+    }
+
+    #[test]
+    fn persisted_web_catalog_rejects_invalid_documents_and_preserves_last_good() {
+        let account_path = account_snapshot_path("persisted-web-invalid");
+        fs::write(
+            &account_path,
+            r#"[{"access_token":"cache-owner","status":"正常","type":"pro","source_type":"codex"}]"#.as_bytes(),
+        )
+        .expect("invalid cache account snapshot");
+        let state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        })
+        .expect("invalid cache state");
+        let candidate = CatalogAccountCandidate {
+            token: "cache-owner".to_owned(),
+            source_type: "codex".to_owned(),
+            chatgpt_account_id: None,
+        };
+        let models = vec![test_public_model("cache-web-model", ModelProvenance::Web)];
+        state.account_type_catalog.persist_web_catalog(
+            "pro",
+            &models,
+            &CatalogOwners::with_model_sources(vec![candidate.clone()], HashMap::new()),
+        );
+        let cache_path = account_path
+            .parent()
+            .expect("invalid cache parent")
+            .join(PERSISTED_WEB_MODEL_CATALOG_FILE);
+        let valid_bytes = fs::read(&cache_path).expect("valid cache file");
+        let valid_document: Value = serde_json::from_slice(&valid_bytes).expect("valid cache JSON");
+        let valid_entry = state
+            .account_type_catalog
+            .persisted_web_catalog
+            .read()
+            .expect("valid cache entry lock")
+            .get("pro")
+            .cloned()
+            .expect("valid cache entry");
+        assert_eq!(load_persisted_web_model_catalog(Some(&cache_path)).len(), 1);
+
+        fs::write(&cache_path, b"{broken").expect("corrupt cache");
+        assert!(load_persisted_web_model_catalog(Some(&cache_path)).is_empty());
+
+        let mut bad_checksum = valid_document.clone();
+        bad_checksum["entries"][0]["checksum"] = Value::String("0".repeat(64));
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&bad_checksum).expect("bad checksum JSON"),
+        )
+        .expect("write bad checksum cache");
+        assert!(load_persisted_web_model_catalog(Some(&cache_path)).is_empty());
+
+        let mut bad_source = valid_document.clone();
+        bad_source["entries"][0]["source_types"] = json!(["codex"]);
+        let bad_source_entry = {
+            let object = bad_source["entries"][0]
+                .as_object_mut()
+                .expect("bad source entry");
+            let mut entry = valid_entry.clone();
+            entry.source_types = vec!["codex".to_owned()];
+            object.insert(
+                "checksum".to_owned(),
+                Value::String(persisted_web_catalog_checksum(&entry).expect("bad source checksum")),
+            );
+            object.clone()
+        };
+        bad_source["entries"][0] = Value::Object(bad_source_entry);
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&bad_source).expect("bad source JSON"),
+        )
+        .expect("write bad source cache");
+        assert!(load_persisted_web_model_catalog(Some(&cache_path)).is_empty());
+
+        let mut bad_provenance = valid_document.clone();
+        bad_provenance["entries"][0]["provenance"] = Value::String("codex".to_owned());
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&bad_provenance).expect("bad provenance JSON"),
+        )
+        .expect("write bad provenance cache");
+        assert!(load_persisted_web_model_catalog(Some(&cache_path)).is_empty());
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("cache clock")
+            .as_secs();
+        let mut expired_entry = valid_entry;
+        expired_entry.updated_at = now.saturating_sub(PERSISTED_WEB_MODEL_CATALOG_TTL_SECS + 1);
+        expired_entry.expires_at = now.saturating_sub(1);
+        expired_entry.checksum =
+            persisted_web_catalog_checksum(&expired_entry).expect("expired cache checksum");
+        let expired_document =
+            persisted_web_catalog_document(&HashMap::from([("pro".to_owned(), expired_entry)]));
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&expired_document).expect("expired cache JSON"),
+        )
+        .expect("write expired cache");
+        assert!(load_persisted_web_model_catalog(Some(&cache_path)).is_empty());
+
+        fs::write(&cache_path, &valid_bytes).expect("restore valid cache");
+        let mut mismatch_snapshot = state
+            .account_type_catalog
+            .snapshot
+            .write()
+            .expect("mismatch catalog lock");
+        mismatch_snapshot
+            .live_tokens
+            .insert("pro".to_owned(), vec!["different-owner".to_owned()]);
+        mismatch_snapshot.live_candidates.insert(
+            "pro".to_owned(),
+            vec![CatalogAccountCandidate {
+                token: "different-owner".to_owned(),
+                source_type: "codex".to_owned(),
+                chatgpt_account_id: None,
+            }],
+        );
+        drop(mismatch_snapshot);
+        state
+            .account_type_catalog
+            .hydrate_persisted_web_catalog(&HashMap::from([(
+                "pro".to_owned(),
+                vec![CatalogAccountCandidate {
+                    token: "different-owner".to_owned(),
+                    source_type: "codex".to_owned(),
+                    chatgpt_account_id: None,
+                }],
+            )]));
+        assert!(
+            state
+                .account_type_catalog
+                .last_good_web_models("pro")
+                .is_none()
+        );
+
+        let source_mismatch = HashMap::from([(
+            "pro".to_owned(),
+            vec![CatalogAccountCandidate {
+                token: "cache-owner".to_owned(),
+                source_type: "web".to_owned(),
+                chatgpt_account_id: None,
+            }],
+        )]);
+        state
+            .account_type_catalog
+            .hydrate_persisted_web_catalog(&source_mismatch);
+        assert!(
+            state
+                .account_type_catalog
+                .last_good_web_models("pro")
+                .is_none()
+        );
+
+        let openai_state = AppState::new(AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::OpenAi,
+        })
+        .expect("OpenAI protocol cache state");
+        openai_state
+            .account_type_catalog
+            .hydrate_persisted_web_catalog(&source_mismatch);
+        assert!(
+            openai_state
+                .account_type_catalog
+                .last_good_web_models("pro")
+                .is_none()
+        );
+
+        let blocked_parent = account_path
+            .parent()
+            .expect("blocked cache parent")
+            .join("not-a-directory");
+        fs::write(&blocked_parent, b"blocked").expect("blocked parent marker");
+        let mut broken_writer = (*state.account_type_catalog).clone();
+        broken_writer.persisted_web_catalog_path = Some(Arc::new(
+            blocked_parent.join(PERSISTED_WEB_MODEL_CATALOG_FILE),
+        ));
+        broken_writer.persist_web_catalog(
+            "pro",
+            &[test_public_model(
+                "replacement-web-model",
+                ModelProvenance::Web,
+            )],
+            &CatalogOwners::with_model_sources(vec![candidate], HashMap::new()),
+        );
+        assert_eq!(
+            fs::read(&cache_path).expect("preserved cache file"),
+            valid_bytes
+        );
+        assert_eq!(
+            load_persisted_web_model_catalog(Some(&cache_path))["pro"].models[0].id,
+            "cache-web-model"
+        );
+
+        let _ = fs::remove_dir_all(account_path.parent().expect("invalid cache cleanup"));
+    }
+
+    #[tokio::test]
+    async fn persisted_web_catalog_survives_web_403_and_keeps_channel_image_isolation() {
+        fn bearer_token(headers: &HeaderMap) -> &str {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .unwrap_or_default()
+        }
+
+        let account_path = account_snapshot_path("persisted-web-403-e2e");
+        fs::write(
+            &account_path,
+            serde_json::to_vec(&json!([
+                {
+                    "access_token": "positive-token",
+                    "status": "正常",
+                    "type": "pro",
+                    "source_type": "codex",
+                    "quota": 3,
+                    "models": ["gpt-image-2"],
+                    "model_sources": {"gpt-image-2": "image"}
+                },
+                {
+                    "access_token": "no-image-token",
+                    "status": "正常",
+                    "type": "pro",
+                    "source_type": "codex",
+                    "quota": 0
+                }
+            ]))
+            .expect("persisted web 403 account snapshot"),
+        )
+        .expect("write persisted web 403 account snapshot");
+        let web_available = Arc::new(AtomicBool::new(true));
+        let root_calls = Arc::new(AtomicUsize::new(0));
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let tpp_calls = Arc::new(AtomicUsize::new(0));
+        let root_available = web_available.clone();
+        let root_counter = root_calls.clone();
+        let root = get(move || {
+            let available = root_available.clone();
+            let counter = root_counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if available.load(Ordering::SeqCst) {
+                    Html("<html><body>stub</body></html>").into_response()
+                } else {
+                    StatusCode::FORBIDDEN.into_response()
+                }
+            }
+        });
+        let model_available = web_available.clone();
+        let model_counter = model_calls.clone();
+        let models = get(move || {
+            let available = model_available.clone();
+            let counter = model_counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if available.load(Ordering::SeqCst) {
+                    Json(json!({"models":[
+                        {"slug":"web-model-1"},
+                        {"slug":"web-model-2"},
+                        {"slug":"web-model-3"},
+                        {"slug":"web-model-4"},
+                        {"slug":"web-model-5"},
+                        {"slug":"web-model-6"}
+                    ]}))
+                    .into_response()
+                } else {
+                    StatusCode::FORBIDDEN.into_response()
+                }
+            }
+        });
+        let tpp_available = web_available.clone();
+        let tpp_counter = tpp_calls.clone();
+        let tpp = get(move || {
+            let available = tpp_available.clone();
+            let counter = tpp_counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if available.load(Ordering::SeqCst) {
+                    Json(json!({"models":[{"slug":"web-tpp-model"}]})).into_response()
+                } else {
+                    StatusCode::FORBIDDEN.into_response()
+                }
+            }
+        });
+        let me = get(|| async { Json(json!({"email":"owner@example.test","id":"owner"})) });
+        let init = post(|headers: HeaderMap| async move {
+            let remaining = if bearer_token(&headers) == "no-image-token" {
+                0
+            } else {
+                3
+            };
+            Json(json!({
+                "default_model_slug":"web-model-1",
+                "limits_progress":[{"feature_name":"image_generation","remaining":remaining}]
+            }))
+        });
+        let check = get(|headers: HeaderMap| async move {
+            let account_id = if bearer_token(&headers) == "no-image-token" {
+                "no-image-account"
+            } else {
+                "positive-account"
+            };
+            Json(json!({
+                "accounts":{"default":{"account":{"account_id":account_id,"plan_type":"pro"}}}
+            }))
+        });
+        let login = post(|| async {
+            Json(json!({"success":true,"data":{"token":"cc-admin-token","role":"admin"}}))
+        });
+        let channels = get(|| async {
+            Json(json!({"success":true,"data":[
+                {"id":7,"name":"Positive","auth_type":"codex_oauth","enabled":true,"codex_plan_type":"pro"},
+                {"id":8,"name":"No image","auth_type":"codex_oauth","enabled":true,"codex_plan_type":"pro"},
+                {"id":9,"name":"Disabled","auth_type":"codex_oauth","enabled":false,"codex_plan_type":"pro"}
+            ],"count":3}))
+        });
+        let editor = get(|uri: axum::http::Uri| async move {
+            let id = uri.path().rsplit('/').nth(1).unwrap_or_default();
+            let enabled = id != "9";
+            let token = if id == "8" {
+                "no-image-token"
+            } else {
+                "positive-token"
+            };
+            let account_id = if id == "8" {
+                "no-image-account"
+            } else {
+                "positive-account"
+            };
+            Json(json!({"success":true,"data":{
+                "channel":{"id":id,"auth_type":"codex_oauth","enabled":enabled,"codex_plan_type":"pro"},
+                "oauth_credential":{"access_token":token,"account_id":account_id,"type":"Codex","plan_type":"pro"}
+            }}))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("persisted web 403 listener");
+        let address = listener.local_addr().expect("persisted web 403 address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let stub_task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/ready", get(|| async { StatusCode::NO_CONTENT }))
+                    .route("/", root)
+                    .route("/backend-api/models", models)
+                    .route("/backend-api/tpp/models/", tpp)
+                    .route("/backend-api/me", me)
+                    .route("/backend-api/conversation/init", init)
+                    .route("/backend-api/accounts/check/v4-2023-04-27", check)
+                    .route("/login", login)
+                    .route("/admin/channels", channels)
+                    .route("/admin/channels/{channel_id}/editor", editor),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("persisted web 403 stub server");
+        });
+        let stub = format!("http://{address}");
+        let readiness_client = Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(250))
+            .build()
+            .expect("persisted web 403 readiness client");
+        let readiness_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let ready = readiness_client
+                .get(format!("{stub}/ready"))
+                .send()
+                .await
+                .is_ok_and(|response| response.status() == StatusCode::NO_CONTENT);
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < readiness_deadline,
+                "persisted web 403 stub did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let config = || AppConfig {
+            version: "test".to_owned(),
+            auth_key: Some("admin".to_owned()),
+            models: vec!["auto".to_owned()],
+            upstream_base_url: Some(stub.clone()),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(account_path.clone()),
+            upstream_protocol: UpstreamProtocol::ChatGpt,
+        };
+        let state = AppState::new(config()).expect("persisted web 403 initial state");
+        state
+            .account_type_catalog
+            .refresh_inner_with_budget(Duration::from_secs(5))
+            .await;
+        let cache_path = account_path
+            .parent()
+            .expect("persisted web 403 cache parent")
+            .join(PERSISTED_WEB_MODEL_CATALOG_FILE);
+        let cache: Value = serde_json::from_slice(
+            &fs::read(&cache_path).expect("canonical web cache after successful fetch"),
+        )
+        .expect("canonical web cache JSON");
+        assert_eq!(cache["entries"][0]["provenance"], "web");
+        assert_eq!(cache["entries"][0]["source_types"], json!(["web"]));
+        assert_eq!(
+            cache["entries"][0]["models"].as_array().map(Vec::len),
+            Some(7)
+        );
+        assert!(
+            cache["entries"][0]["models"]
+                .as_array()
+                .is_some_and(|models| {
+                    models
+                        .iter()
+                        .all(|model| !model["id"].as_str().is_some_and(is_native_image_model_id))
+                })
+        );
+        let initial_model_calls = model_calls.load(Ordering::SeqCst);
+        let initial_tpp_calls = tpp_calls.load(Ordering::SeqCst);
+        assert!(root_calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(initial_model_calls, 1);
+        assert_eq!(initial_tpp_calls, 1);
+        web_available.store(false, Ordering::SeqCst);
+
+        let no_cache_path = account_snapshot_path("persisted-web-403-no-cache");
+        fs::write(
+            &no_cache_path,
+            serde_json::to_vec(&json!([{
+                "access_token":"positive-token",
+                "status":"正常",
+                "type":"pro",
+                "source_type":"codex",
+                "quota":3
+            }]))
+            .expect("no-cache account snapshot"),
+        )
+        .expect("write no-cache account snapshot");
+        let no_cache_state = AppState::new(AppConfig {
+            accounts_path: Some(no_cache_path.clone()),
+            ..config()
+        })
+        .expect("no-cache state");
+        let no_cache_snapshot = refresh_access_token_account(
+            &no_cache_state,
+            &json!({"access_token":"positive-token","source_type":"codex","type":"pro"}),
+            None,
+        )
+        .await
+        .expect("no-cache image-only refresh");
+        assert_eq!(no_cache_snapshot["model_sources"]["gpt-image-2"], "image");
+        assert!(
+            no_cache_snapshot["models"]
+                .as_array()
+                .is_some_and(|models| {
+                    models.iter().any(|model| model == "gpt-image-2")
+                        && models.iter().all(|model| model != "web-model-1")
+                })
+        );
+        assert!(
+            !no_cache_path
+                .parent()
+                .expect("no-cache parent")
+                .join(PERSISTED_WEB_MODEL_CATALOG_FILE)
+                .exists()
+        );
+        no_cache_state.account_type_catalog.shutdown().await;
+        let _ = fs::remove_dir_all(no_cache_path.parent().expect("no-cache cleanup parent"));
+
+        root_calls.store(0, Ordering::SeqCst);
+        model_calls.store(0, Ordering::SeqCst);
+        tpp_calls.store(0, Ordering::SeqCst);
+        state.account_type_catalog.shutdown().await;
+        let restarted = AppState::new(config()).expect("persisted web 403 restarted state");
+        let persisted_entry = restarted
+            .account_type_catalog
+            .persisted_web_catalog
+            .read()
+            .expect("e2e persisted cache read")
+            .get("pro")
+            .cloned();
+        let current_candidates = restarted
+            .account_store
+            .active_type_candidates()
+            .await
+            .expect("e2e current candidates")
+            .1;
+        assert_eq!(
+            persisted_entry.as_ref().map(|entry| entry.models.len()),
+            Some(7)
+        );
+        assert_eq!(
+            persisted_entry
+                .as_ref()
+                .map(|entry| entry.source_types.as_slice()),
+            Some(["web".to_owned()].as_slice())
+        );
+        assert_eq!(
+            persisted_entry
+                .as_ref()
+                .map(|entry| entry.owner_fingerprints.len()),
+            Some(1)
+        );
+        assert_eq!(current_candidates.len(), 1);
+        assert_eq!(current_candidates.get("pro").map(Vec::len), Some(2));
+        let public = management_request(&restarted, "GET", "/v1/models", None, Some("admin")).await;
+        assert_eq!(public.status(), StatusCode::OK);
+        let public = json_response(public).await;
+        let public_ids = public["data"]
+            .as_array()
+            .expect("public hydrated models")
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect::<Vec<_>>();
+        for model in ["web-model-1", "web-model-6", "gpt-image-2"] {
+            assert!(
+                public_ids.contains(&model),
+                "missing public model {model}: {public}"
+            );
+        }
+        assert!(public_ids.iter().all(|model| !model.contains("codex")));
+        assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tpp_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            restarted
+                .account_type_catalog
+                .last_good_web_models("pro")
+                .map(|models| models.len()),
+            Some(7)
+        );
+        let cc = management_request(
+            &restarted,
+            "POST",
+            "/api/ccload/servers",
+            Some(json!({"name":"CC","base_url":stub,"password":"admin-password"})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(cc.status(), StatusCode::OK);
+        let cc_id = json_response(cc).await["server"]["id"]
+            .as_str()
+            .expect("persisted web 403 ccload id")
+            .to_owned();
+        let first = management_request(
+            &restarted,
+            "POST",
+            &format!("/api/ccload/servers/{cc_id}/channel-models"),
+            Some(json!({"channel_ids":["7","8","9"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = json_response(first).await;
+        let first_channels = first["channels"]
+            .as_array()
+            .expect("first channel catalogs");
+        assert_eq!(first_channels.len(), 3);
+        for catalog in &first_channels[..2] {
+            assert_eq!(catalog["model_load_status"], "loaded");
+            assert_eq!(catalog["models_loaded"], true);
+            assert_eq!(catalog["model_sources"]["web-model-1"], "web");
+            assert_eq!(catalog["model_sources"]["web-model-6"], "web");
+            assert_eq!(catalog["model_sources"].get("codex-endpoint-model"), None);
+        }
+        assert_eq!(first_channels[0]["model_sources"]["gpt-image-2"], "image");
+        assert_eq!(first_channels[1]["model_sources"].get("gpt-image-2"), None);
+        assert_eq!(first_channels[2]["model_load_status"], "failed");
+        assert_eq!(first_channels[2]["models_loaded"], false);
+        assert_eq!(first_channels[2]["models"], json!([]));
+        assert_eq!(root_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tpp_calls.load(Ordering::SeqCst), 0);
+
+        let second = management_request(
+            &restarted,
+            "POST",
+            &format!("/api/ccload/servers/{cc_id}/channel-models"),
+            Some(json!({"channel_ids":["7","8","9"]})),
+            Some("admin"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = json_response(second).await;
+        assert_eq!(
+            second["channels"][0]["model_sources"]["gpt-image-2"],
+            "image"
+        );
+        assert_eq!(
+            second["channels"][1]["model_sources"].get("gpt-image-2"),
+            None
+        );
+        assert_eq!(root_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tpp_calls.load(Ordering::SeqCst), 0);
+
+        assert!(initial_model_calls > 0 && initial_tpp_calls > 0);
+
+        restarted.account_type_catalog.shutdown().await;
+        shutdown_tx
+            .send(())
+            .expect("persisted web 403 stub shutdown");
+        stub_task.await.expect("persisted web 403 stub join");
+        let _ = fs::remove_dir_all(account_path.parent().expect("persisted web 403 cleanup"));
     }
 
     #[test]

@@ -3276,6 +3276,10 @@ async fn load_ccload_channel_models(
                 .and_then(|value| clean_ccload_channel_id(value.get("id")))
                 .is_some_and(|value| value == id)
                 && channel
+                    .and_then(|value| value.get("enabled"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                && channel
                     .and_then(|value| value.get("auth_type"))
                     .and_then(Value::as_str)
                     .map(str::trim)
