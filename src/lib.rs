@@ -10850,6 +10850,12 @@ struct NativeModelIdentity<'a> {
     account_id: Option<&'a str>,
 }
 
+enum NativeModelCatalogFetchOutcome {
+    Complete(Vec<PublicModel>),
+    RetryableUnavailable,
+    PermanentUnavailable,
+}
+
 async fn fetch_native_model_catalog(
     client: &Client,
     base_url: &str,
@@ -10857,15 +10863,40 @@ async fn fetch_native_model_catalog(
     identity: NativeModelIdentity<'_>,
     deadline: Instant,
 ) -> Option<Vec<PublicModel>> {
+    match fetch_native_model_catalog_with_outcome(client, base_url, context, identity, deadline)
+        .await
+    {
+        NativeModelCatalogFetchOutcome::Complete(models) => Some(models),
+        NativeModelCatalogFetchOutcome::RetryableUnavailable
+        | NativeModelCatalogFetchOutcome::PermanentUnavailable => None,
+    }
+}
+
+async fn fetch_native_model_catalog_with_outcome(
+    client: &Client,
+    base_url: &str,
+    context: &NativeRequestContext,
+    identity: NativeModelIdentity<'_>,
+    deadline: Instant,
+) -> NativeModelCatalogFetchOutcome {
     let authenticated = !identity.token.is_empty();
     if authenticated {
-        tokio::time::timeout_at(
+        let bootstrap = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             native_bootstrap(client, base_url, identity.token, context),
         )
-        .await
-        .ok()?
-        .ok()?;
+        .await;
+        match bootstrap {
+            Ok(Ok(_)) => {}
+            Ok(Err((_, retryable))) => {
+                return if retryable {
+                    NativeModelCatalogFetchOutcome::RetryableUnavailable
+                } else {
+                    NativeModelCatalogFetchOutcome::PermanentUnavailable
+                };
+            }
+            Err(_) => return NativeModelCatalogFetchOutcome::RetryableUnavailable,
+        }
     }
     let mut paths = if authenticated {
         AUTHENTICATED_NATIVE_MODEL_PATHS.to_vec()
@@ -10877,6 +10908,7 @@ async fn fetch_native_model_catalog(
     }
     let mut indexes = HashMap::<String, usize>::new();
     let mut models: Vec<PublicModel> = Vec::new();
+    let mut retryable_failure = false;
     for path in paths {
         if path == LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH && !models.is_empty() {
             break;
@@ -10902,9 +10934,20 @@ async fn fetch_native_model_catalog(
                 .await
             {
                 Ok(Ok(response)) => response,
-                _ => continue,
+                _ => {
+                    retryable_failure = true;
+                    continue;
+                }
             };
-        if !response.status().is_success() || upstream_declares_oversize(&response) {
+        if !response.status().is_success() {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS
+                || response.status().is_server_error()
+            {
+                retryable_failure = true;
+            }
+            continue;
+        }
+        if upstream_declares_oversize(&response) {
             continue;
         }
         let body = match tokio::time::timeout_at(
@@ -10914,7 +10957,10 @@ async fn fetch_native_model_catalog(
         .await
         {
             Ok(Ok(body)) => body,
-            _ => continue,
+            _ => {
+                retryable_failure = true;
+                continue;
+            }
         };
         let Ok(value) = serde_json::from_slice::<Value>(&body) else {
             continue;
@@ -10953,7 +10999,13 @@ async fn fetch_native_model_catalog(
             }
         }
     }
-    (!models.is_empty()).then_some(models)
+    if !models.is_empty() {
+        NativeModelCatalogFetchOutcome::Complete(models)
+    } else if retryable_failure {
+        NativeModelCatalogFetchOutcome::RetryableUnavailable
+    } else {
+        NativeModelCatalogFetchOutcome::PermanentUnavailable
+    }
 }
 
 pub(crate) async fn fetch_imported_model_catalog(
@@ -11017,26 +11069,17 @@ async fn fetch_imported_model_catalog_request(
     let retry_cache = cache.clone();
     cache
         .fetch_or_reuse_with_catalog_batch(&key, batch.clone(), move || async move {
-            fetch_imported_model_catalog_with_retry(
-                &retry_cache,
-                &retry_key,
+            fetch_imported_native_model_catalog_with_retry(NativeModelCatalogRetryRequest {
+                cache: retry_cache,
+                key: retry_key,
                 deadline,
                 batch,
-                || async {
-                    fetch_native_model_catalog(
-                        &client,
-                        &base_url,
-                        &NativeRequestContext::new(),
-                        NativeModelIdentity {
-                            token: &token,
-                            account_type: Some(account_type.as_str()),
-                            account_id: account_id.as_deref(),
-                        },
-                        deadline,
-                    )
-                    .await
-                },
-            )
+                client,
+                base_url,
+                account_type,
+                token,
+                account_id,
+            })
             .await
             .map(ImportedModelCatalogFetch::Complete)
             .or_else(|| {
@@ -11047,6 +11090,73 @@ async fn fetch_imported_model_catalog_request(
             })
         })
         .await
+}
+
+struct NativeModelCatalogRetryRequest {
+    cache: ImportedModelCatalogCache,
+    key: String,
+    deadline: Instant,
+    batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+    client: Client,
+    base_url: String,
+    account_type: String,
+    token: String,
+    account_id: Option<String>,
+}
+
+async fn fetch_imported_native_model_catalog_with_retry(
+    request: NativeModelCatalogRetryRequest,
+) -> Option<Vec<PublicModel>> {
+    let NativeModelCatalogRetryRequest {
+        cache,
+        key,
+        deadline,
+        batch,
+        client,
+        base_url,
+        account_type,
+        token,
+        account_id,
+    } = request;
+    for attempt in 0..IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS {
+        cache.record_attempt(&key).await;
+        if let Some(batch) = &batch {
+            batch.record(&key, 0);
+        }
+        let result = fetch_native_model_catalog_with_outcome(
+            &client,
+            &base_url,
+            &NativeRequestContext::new(),
+            NativeModelIdentity {
+                token: &token,
+                account_type: Some(account_type.as_str()),
+                account_id: account_id.as_deref(),
+            },
+            deadline,
+        )
+        .await;
+        match result {
+            NativeModelCatalogFetchOutcome::Complete(models) => return Some(models),
+            NativeModelCatalogFetchOutcome::PermanentUnavailable => return None,
+            NativeModelCatalogFetchOutcome::RetryableUnavailable
+                if attempt + 1 < IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS =>
+            {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    return None;
+                }
+                cache.record_retry(&key).await;
+                if let Some(batch) = &batch {
+                    batch.record(&key, 1);
+                }
+                tokio::time::sleep(IMPORTED_MODEL_CATALOG_RETRY_BACKOFF.min(remaining)).await;
+            }
+            NativeModelCatalogFetchOutcome::RetryableUnavailable => return None,
+        }
+    }
+    None
 }
 
 async fn fetch_imported_model_catalog_with_retry<F, Fut>(
@@ -21289,6 +21399,52 @@ mod tests {
             Some(vec!["retry-model".to_owned()])
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn imported_model_catalog_does_not_retry_permanent_bootstrap_forbidden() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_calls = calls.clone();
+        let app = Router::new().route(
+            "/",
+            get(move || {
+                let calls = route_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::FORBIDDEN
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("forbidden catalog listener");
+        let address = listener.local_addr().expect("forbidden catalog address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("forbidden catalog server");
+        });
+        let batch = Arc::new(ImportedModelCatalogBatchStats::default());
+        let result =
+            fetch_imported_native_model_catalog_with_retry(NativeModelCatalogRetryRequest {
+                cache: ImportedModelCatalogCache::new(),
+                key: "pro".to_owned(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                batch: Some(batch.clone()),
+                client: Client::new(),
+                base_url: format!("http://{address}"),
+                account_type: "pro".to_owned(),
+                token: "access-only".to_owned(),
+                account_id: None,
+            })
+            .await;
+        assert!(result.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stats = batch.snapshot();
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.retries, 0);
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
