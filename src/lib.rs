@@ -10994,13 +10994,15 @@ where
         if let Some(batch) = &batch {
             batch.record(key, 0);
         }
+        if attempt > 0 {
+            cache.record_retry(key).await;
+            if let Some(batch) = &batch {
+                batch.record(key, 1);
+            }
+        }
         let result = fetch().await.filter(|models| !models.is_empty());
         if result.is_some() || attempt + 1 == IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS {
             return result;
-        }
-        cache.record_retry(key).await;
-        if let Some(batch) = &batch {
-            batch.record(key, 1);
         }
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -21221,6 +21223,8 @@ mod tests {
     #[tokio::test]
     async fn imported_model_catalog_retries_empty_owner_fetch_before_publishing_cache() {
         let cache = ImportedModelCatalogCache::new();
+        let batch = Arc::new(ImportedModelCatalogBatchStats::default());
+        let retry_batch = batch.clone();
         let calls = Arc::new(AtomicUsize::new(0));
         let owner_cache = cache.clone();
         let retry_owner_cache = cache.clone();
@@ -21234,7 +21238,7 @@ mod tests {
                         &retry_cache,
                         "pro",
                         Instant::now() + Duration::from_secs(1),
-                        None,
+                        Some(retry_batch.clone()),
                         || async {
                             if retry_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                                 None
@@ -21257,6 +21261,10 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(cache.retry_count(), 1);
         assert_eq!(cache.attempt_count(), 2);
+        let stats = batch.snapshot();
+        assert_eq!(stats.attempts, 2);
+        assert_eq!(stats.retries, 1);
+        assert_eq!(stats.fetches, 0);
         assert_eq!(
             cache
                 .fetch_or_reuse("pro", || async {
@@ -21266,6 +21274,24 @@ mod tests {
                 .map(|_| ()),
             Some(())
         );
+    }
+
+    #[tokio::test]
+    async fn imported_model_catalog_deadline_expiry_does_not_count_planned_retry() {
+        let cache = ImportedModelCatalogCache::new();
+        let batch = Arc::new(ImportedModelCatalogBatchStats::default());
+        let result = fetch_imported_model_catalog_with_retry(
+            &cache,
+            "pro",
+            Instant::now(),
+            Some(batch.clone()),
+            || async { None },
+        )
+        .await;
+        assert!(result.is_none());
+        let stats = batch.snapshot();
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.retries, 0);
     }
 
     #[test]
