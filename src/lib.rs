@@ -1000,7 +1000,9 @@ fn canonicalize_account_models(object: &mut Map<String, Value>) {
     let default = account_model_default_provenance_from_object(object);
     let entries = project_account_model_entries(object, default)
         .into_iter()
-        .filter(|(_, provenance)| !model_provenance_is_untrusted(*provenance))
+        .filter(|(id, provenance)| {
+            !model_provenance_is_untrusted(*provenance) && !is_codex_auto_review_model_id(id)
+        })
         .take(MAX_MODELS)
         .collect::<Vec<_>>();
     if entries.is_empty() {
@@ -2533,7 +2535,10 @@ fn public_account(record: &AccountRecord) -> Value {
         .map(|object| {
             project_account_model_entries(object, account_model_default_provenance(&record.raw))
                 .into_iter()
-                .filter(|(_, provenance)| !model_provenance_is_untrusted(*provenance))
+                .filter(|(id, provenance)| {
+                    !model_provenance_is_untrusted(*provenance)
+                        && !is_codex_auto_review_model_id(id)
+                })
                 .map(|(id, _)| Value::String(id))
                 .collect::<Vec<_>>()
         })
@@ -2592,6 +2597,7 @@ fn merge_account_models(
         if value.is_empty()
             || value.chars().count() > MAX_MODEL_TEXT_LENGTH
             || model_provenance_is_untrusted(provenance)
+            || is_codex_auto_review_model_id(value)
         {
             return;
         }
@@ -2640,6 +2646,30 @@ fn merge_account_models(
         })
         .collect::<Map<_, _>>();
     Some((models, Value::Object(sources)))
+}
+
+fn account_web_catalog_models(raw: &Value) -> Vec<PublicModel> {
+    let Some(object) = raw.as_object() else {
+        return Vec::new();
+    };
+    project_account_model_entries(object, ModelProvenance::Unknown)
+        .into_iter()
+        .filter(|(id, provenance)| {
+            *provenance == ModelProvenance::Web
+                && !is_native_image_model_id(id)
+                && !is_codex_auto_review_model_id(id)
+        })
+        .filter_map(|(id, _)| {
+            ModelCatalog::project(&json!({
+                "id": id,
+                "provenance": "web"
+            }))
+        })
+        .map(|mut model| {
+            model.provenance = ModelProvenance::Web;
+            model
+        })
+        .collect()
 }
 
 fn account_request_payload_token(value: &Value) -> Option<String> {
@@ -2826,6 +2856,12 @@ async fn refresh_access_token_account(
         })
         .unwrap_or_default();
     let (quota, restore_at) = image_quota_from_limits_progress(init.get("limits_progress"));
+    let editor_web_models = account_web_catalog_models(raw);
+    if !editor_web_models.is_empty() {
+        state
+            .account_type_catalog
+            .persist_web_models_from_candidate(plan_type, raw, &editor_web_models);
+    }
     state
         .account_type_catalog
         .hydrate_current_persisted_web_catalog()
@@ -5014,6 +5050,10 @@ fn is_native_image_model_id(id: &str) -> bool {
         || ["plus", "team", "pro"]
             .iter()
             .any(|plan| id.eq_ignore_ascii_case(&format!("{plan}-codex-gpt-image-2")))
+}
+
+pub(crate) fn is_codex_auto_review_model_id(id: &str) -> bool {
+    id.trim().eq_ignore_ascii_case("codex-auto-review")
 }
 
 fn is_public_chatgpt_image_model_id(id: &str) -> bool {
@@ -11121,7 +11161,9 @@ async fn fetch_native_model_catalog_with_outcome(
                 continue;
             };
             for model in projected {
-                if model_provenance_is_untrusted(model.provenance) {
+                if model_provenance_is_untrusted(model.provenance)
+                    || is_codex_auto_review_model_id(&model.id)
+                {
                     continue;
                 }
                 if let Some(index) = indexes.get(&model.id).copied() {
@@ -11508,6 +11550,30 @@ fn persisted_web_catalog_checksum(entry: &PersistedWebModelCatalogEntry) -> Opti
     )
 }
 
+fn merge_public_model_lists(
+    existing: &[PublicModel],
+    incoming: &[PublicModel],
+) -> Vec<PublicModel> {
+    let mut models: Vec<PublicModel> = Vec::new();
+    let mut indexes = HashMap::<String, usize>::new();
+    for model in existing.iter().chain(incoming.iter()) {
+        if is_codex_auto_review_model_id(&model.id) {
+            continue;
+        }
+        if let Some(index) = indexes.get(&model.id).copied() {
+            if model_provenance_rank(model.provenance)
+                > model_provenance_rank(models[index].provenance)
+            {
+                models[index] = model.clone();
+            }
+        } else if models.len() < MAX_MODELS {
+            indexes.insert(model.id.clone(), models.len());
+            models.push(model.clone());
+        }
+    }
+    models
+}
+
 fn persisted_web_catalog_document(
     entries: &HashMap<AccountModelGroup, PersistedWebModelCatalogEntry>,
 ) -> Value {
@@ -11553,7 +11619,10 @@ fn parse_persisted_web_model(value: &Value) -> Option<PublicModel> {
         return None;
     }
     let mut model = ModelCatalog::project(value)?;
-    if model.provenance != ModelProvenance::Web || is_native_image_model_id(&model.id) {
+    if model.provenance != ModelProvenance::Web
+        || is_native_image_model_id(&model.id)
+        || is_codex_auto_review_model_id(&model.id)
+    {
         return None;
     }
     model.allow_anonymous = false;
@@ -11805,11 +11874,6 @@ impl AccountTypeCatalog {
         let now = Instant::now();
         let mut snapshot = self.snapshot.write().expect("account type catalog lock");
         for (account_group, candidates) in candidate_groups {
-            if snapshot.entries.get(account_group).is_some_and(|entry| {
-                entry.ready && !entry.models.is_empty() && entry.owners.is_current(candidates)
-            }) {
-                continue;
-            }
             let Some(account_type) = catalog_account_type_key(account_group) else {
                 continue;
             };
@@ -11836,6 +11900,28 @@ impl AccountTypeCatalog {
                 .iter()
                 .map(|model| (model.id.clone(), live_source_types.clone()))
                 .collect();
+            if let Some(entry) = snapshot.entries.get_mut(account_group)
+                && entry.ready
+                && !entry.models.is_empty()
+                && entry.owners.is_current(candidates)
+            {
+                entry.models = Arc::new(merge_public_model_lists(&entry.models, &cached.models));
+                entry.model_sources = cached
+                    .models
+                    .iter()
+                    .filter(|model| !entry.model_sources.contains_key(&model.id))
+                    .map(|model| (model.id.clone(), live_source_types.clone()))
+                    .fold(entry.model_sources.clone(), |mut sources, (id, values)| {
+                        sources.insert(id, values);
+                        sources
+                    });
+                entry.tokens = candidates
+                    .iter()
+                    .map(|candidate| candidate.token.clone())
+                    .collect();
+                entry.expires_at = now + ACCOUNT_TYPE_MODEL_TTL;
+                continue;
+            }
             let owners = CatalogOwners::with_model_sources(vec![owner.clone()], model_sources);
             snapshot.entries.insert(
                 account_group.clone(),
@@ -11893,7 +11979,10 @@ impl AccountTypeCatalog {
         };
         let web_models = models
             .iter()
-            .filter(|model| model.provenance == ModelProvenance::Web)
+            .filter(|model| {
+                model.provenance == ModelProvenance::Web
+                    && !is_codex_auto_review_model_id(&model.id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         let source_types = vec!["web".to_owned()];
@@ -11920,14 +12009,20 @@ impl AccountTypeCatalog {
             expires_at: now.saturating_add(PERSISTED_WEB_MODEL_CATALOG_TTL_SECS),
             checksum: String::new(),
         };
-        entry.checksum = persisted_web_catalog_checksum(&entry).unwrap_or_default();
-        if entry.checksum.is_empty() {
-            return;
-        }
         let mut persisted = self
             .persisted_web_catalog
             .write()
             .expect("persisted web catalog lock");
+        if let Some(previous) = persisted.get(&account_type).cloned() {
+            entry.models = Arc::new(merge_public_model_lists(&previous.models, &entry.models));
+            entry.owner_fingerprints.extend(previous.owner_fingerprints);
+            entry.owner_fingerprints.sort();
+            entry.owner_fingerprints.dedup();
+        }
+        entry.checksum = persisted_web_catalog_checksum(&entry).unwrap_or_default();
+        if entry.checksum.is_empty() {
+            return;
+        }
         let previous = persisted.insert(account_type.clone(), entry);
         let write_result = serde_json::to_vec(&persisted_web_catalog_document(&persisted))
             .map_err(|_| ())
@@ -12608,6 +12703,34 @@ impl AccountTypeCatalog {
                     )
                     .await
                 {
+                    let mut models = models;
+                    let mut indexes = models
+                        .iter()
+                        .enumerate()
+                        .map(|(index, model)| (model.id.clone(), index))
+                        .collect::<HashMap<_, _>>();
+                    for owner in candidate_accounts {
+                        let Some(cached) =
+                            self.persisted_web_models_for_candidate(account_group, owner)
+                        else {
+                            continue;
+                        };
+                        for model in cached {
+                            if is_codex_auto_review_model_id(&model.id) {
+                                continue;
+                            }
+                            if let Some(index) = indexes.get(&model.id).copied() {
+                                if model_provenance_rank(model.provenance)
+                                    > model_provenance_rank(models[index].provenance)
+                                {
+                                    models[index] = model;
+                                }
+                            } else if models.len() < MAX_MODELS {
+                                indexes.insert(model.id.clone(), models.len());
+                                models.push(model);
+                            }
+                        }
+                    }
                     let live_sources = candidate_accounts
                         .iter()
                         .map(|candidate| candidate.source_type.clone())
@@ -12753,7 +12876,8 @@ impl AccountTypeCatalog {
             .as_ref()
             .iter()
             .filter(|model| {
-                self.protocol != UpstreamProtocol::ChatGpt || is_public_chatgpt_model(model)
+                (self.protocol != UpstreamProtocol::ChatGpt || is_public_chatgpt_model(model))
+                    && !is_codex_auto_review_model_id(&model.id)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -12768,7 +12892,8 @@ impl AccountTypeCatalog {
             .collect::<HashMap<_, _>>();
         if snapshot.anonymous_ready {
             for model in snapshot.anonymous_models.iter().filter(|model| {
-                self.protocol != UpstreamProtocol::ChatGpt || is_public_chatgpt_model(model)
+                (self.protocol != UpstreamProtocol::ChatGpt || is_public_chatgpt_model(model))
+                    && !is_codex_auto_review_model_id(&model.id)
             }) {
                 if let Some(index) = indexes.get(&model.id).copied() {
                     models[index].allow_anonymous = true;
@@ -12790,7 +12915,9 @@ impl AccountTypeCatalog {
             }
             let account_type = account_group;
             for model in entry.models.iter() {
-                if self.protocol == UpstreamProtocol::ChatGpt && !is_public_chatgpt_model(model) {
+                if (self.protocol == UpstreamProtocol::ChatGpt && !is_public_chatgpt_model(model))
+                    || is_codex_auto_review_model_id(&model.id)
+                {
                     continue;
                 }
                 if let Some(index) = indexes.get(&model.id).copied() {
@@ -12883,6 +13010,7 @@ impl AccountTypeCatalog {
             .models
             .iter()
             .filter(|model| model.provenance == ModelProvenance::Web)
+            .filter(|model| !is_codex_auto_review_model_id(&model.id))
             .cloned()
             .collect::<Vec<_>>();
         (!models.is_empty()).then_some(models)
@@ -20056,12 +20184,13 @@ mod tests {
                         "auth_type":"codex_oauth",
                         "codex_plan_type":"pro",
                         "models":[
-                            {"model":"configured-model","redirect_model":"configured-model"},
+                            {"model":"configured-model","redirect_model":"configured-model","source":"configured"},
+                            {"model":"plain-web-model","redirect_model":"plain-web-model"},
                             {"model":"web-page-model","redirect_model":"web-page-model","source":"web"},
                             {"model":"gpt-5-codex","redirect_model":"gpt-5-codex","source":"web"},
                             {"model":"auto","redirect_model":"auto","source":"web"},
                             {"model":"codex-endpoint-model","redirect_model":"codex-endpoint-model","source":"codex"},
-                            {"model":"configured-model","redirect_model":"configured-model"}
+                            {"model":"configured-model","redirect_model":"configured-model","source":"configured"}
                         ]
                     },
                     "oauth_credential":{
@@ -20345,6 +20474,7 @@ mod tests {
             "web-page-model",
             "gpt-5-codex",
             "auto",
+            "plain-web-model",
             "web-tpp-model",
             "tpp-codex-named-model",
         ] {
@@ -20448,6 +20578,74 @@ mod tests {
                 .as_array()
                 .is_some_and(|models| models.iter().any(|model| model == "configured-model"))
         );
+        assert!(
+            ccload_item["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|model| model == "plain-web-model"))
+        );
+        let cached_web_ids = {
+            let cached_web_catalog = state
+                .account_type_catalog
+                .persisted_web_catalog
+                .read()
+                .expect("persisted web catalog after import");
+            cached_web_catalog
+                .get("pro")
+                .map(|entry| {
+                    entry
+                        .models
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert!(
+            cached_web_ids
+                .iter()
+                .any(|model| model == "plain-web-model"),
+            "cached Web ids: {cached_web_ids:?}"
+        );
+        let ccload_raw = state
+            .account_store
+            .raw_records()
+            .into_iter()
+            .find(|item| item["access_token"] == "cc-access-token")
+            .expect("raw ccLoad account after import");
+        let raw_web_ids = account_web_catalog_models(&ccload_raw)
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+        assert!(
+            raw_web_ids.iter().any(|model| model == "plain-web-model"),
+            "raw Web ids: {raw_web_ids:?}"
+        );
+
+        let models = management_request(&state, "GET", "/v1/models", None, Some("admin")).await;
+        assert_eq!(models.status(), StatusCode::OK);
+        let models = json_response(models).await;
+        let model_ids = models["data"]
+            .as_array()
+            .expect("public model list")
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect::<Vec<_>>();
+        for model in ["plain-web-model", "web-page-model", "gpt-image-2"] {
+            assert!(
+                model_ids.contains(&model),
+                "missing public model {model}: {models}"
+            );
+        }
+        for model in [
+            "configured-model",
+            "codex-auto-review",
+            "codex-endpoint-model",
+        ] {
+            assert!(
+                !model_ids.contains(&model),
+                "unexpected public model {model}"
+            );
+        }
 
         let persisted = fs::read_to_string(&account_path).expect("persisted imported accounts");
         for secret in [
@@ -27756,7 +27954,21 @@ data: [DONE]
                 "positive-account"
             };
             Json(json!({"success":true,"data":{
-                "channel":{"id":id,"auth_type":"codex_oauth","enabled":enabled,"codex_plan_type":"pro"},
+                "channel":{
+                    "id":id,
+                    "auth_type":"codex_oauth",
+                    "enabled":enabled,
+                    "codex_plan_type":"pro",
+                    "models":[
+                        {"model":"gpt-5.5","redirect_model":"gpt-5.5"},
+                        {"model":"gpt-image-1.5","redirect_model":"gpt-image-1.5"},
+                        {"model":"gpt-image-2","redirect_model":"gpt-image-2"},
+                        {"model":"gpt-image-2.5-flare","redirect_model":"gpt-image-2.5-flare"},
+                        {"model":"codex-auto-review","redirect_model":"codex-auto-review"},
+                        {"model":"codex-endpoint-model","redirect_model":"codex-endpoint-model","endpoint":"/backend-api/codex/models"},
+                        {"model":"configured-model","redirect_model":"configured-model","source":"configured"}
+                    ]
+                },
                 "oauth_credential":{"access_token":token,"account_id":account_id,"type":"Codex","plan_type":"pro"}
             }}))
         });
@@ -27993,6 +28205,16 @@ data: [DONE]
             assert_eq!(catalog["model_sources"]["web-model-1"], "web");
             assert_eq!(catalog["model_sources"]["web-model-6"], "web");
             assert_eq!(catalog["model_sources"].get("codex-endpoint-model"), None);
+            assert_eq!(catalog["model_sources"].get("codex-auto-review"), None);
+            assert_eq!(catalog["model_sources"].get("configured-model"), None);
+        }
+        assert_eq!(first_channels[0]["model_sources"]["gpt-5.5"], "web");
+        for model in ["gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare"] {
+            assert_eq!(first_channels[0]["model_sources"][model], "image");
+        }
+        assert_eq!(first_channels[1]["model_sources"]["gpt-5.5"], "web");
+        for model in ["gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare"] {
+            assert_eq!(first_channels[1]["model_sources"].get(model), None);
         }
         assert_eq!(first_channels[0]["model_sources"]["gpt-image-2"], "image");
         assert_eq!(first_channels[1]["model_sources"].get("gpt-image-2"), None);
