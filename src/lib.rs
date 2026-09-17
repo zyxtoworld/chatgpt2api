@@ -1457,8 +1457,21 @@ enum ImportedModelCatalogState {
         models: Arc<Vec<PublicModel>>,
         expires_at: Instant,
     },
+    PartialReady {
+        models: Arc<Vec<PublicModel>>,
+        expires_at: Instant,
+        web_unavailable_reason: &'static str,
+    },
     Failed {
         retry_at: Instant,
+    },
+}
+
+enum ImportedModelCatalogFetch {
+    Complete(Vec<PublicModel>),
+    Partial {
+        models: Vec<PublicModel>,
+        web_unavailable_reason: &'static str,
     },
 }
 
@@ -1602,6 +1615,22 @@ impl ImportedModelCatalogCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Option<Vec<PublicModel>>>,
     {
+        self.fetch_or_reuse_with_catalog_batch(key, batch, || async {
+            fetch().await.map(ImportedModelCatalogFetch::Complete)
+        })
+        .await
+    }
+
+    async fn fetch_or_reuse_with_catalog_batch<F, Fut>(
+        &self,
+        key: &str,
+        batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+        fetch: F,
+    ) -> Option<Vec<PublicModel>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<ImportedModelCatalogFetch>>,
+    {
         let entry = {
             let mut entries = self.entries.lock().await;
             entries
@@ -1631,8 +1660,9 @@ impl ImportedModelCatalogCache {
                 let mut state = entry.state.lock().await;
                 match &*state {
                     ImportedModelCatalogState::Ready { models, expires_at }
-                        if Instant::now() < *expires_at =>
-                    {
+                    | ImportedModelCatalogState::PartialReady {
+                        models, expires_at, ..
+                    } if Instant::now() < *expires_at => {
                         if !counted_waiter_hit {
                             entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
                             self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -1660,9 +1690,25 @@ impl ImportedModelCatalogCache {
                 if let Some(batch) = &batch {
                     batch.record(key, 2);
                 }
-                let result = fetch().await.filter(|models| !models.is_empty());
+                let result = fetch().await.and_then(|result| match result {
+                    ImportedModelCatalogFetch::Complete(models) if !models.is_empty() => {
+                        Some((false, models, ""))
+                    }
+                    ImportedModelCatalogFetch::Partial {
+                        models,
+                        web_unavailable_reason,
+                    } if !models.is_empty() => Some((true, models, web_unavailable_reason)),
+                    _ => None,
+                });
                 let next = match &result {
-                    Some(models) => ImportedModelCatalogState::Ready {
+                    Some((true, models, web_unavailable_reason)) => {
+                        ImportedModelCatalogState::PartialReady {
+                            models: Arc::new(models.clone()),
+                            expires_at: Instant::now() + IMPORTED_MODEL_CATALOG_TTL,
+                            web_unavailable_reason,
+                        }
+                    }
+                    Some((false, models, _)) => ImportedModelCatalogState::Ready {
                         models: Arc::new(models.clone()),
                         expires_at: Instant::now() + IMPORTED_MODEL_CATALOG_TTL,
                     },
@@ -1672,7 +1718,7 @@ impl ImportedModelCatalogCache {
                 };
                 *entry.state.lock().await = next.clone();
                 let _ = entry.updates.send(next);
-                return result;
+                return result.map(|(_, models, _)| models);
             }
             if !counted_waiter_hit {
                 entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -2447,6 +2493,7 @@ fn account_model_default_provenance(raw: &Value) -> ModelProvenance {
 fn merge_account_models(
     raw: &Value,
     fetched: Option<Vec<PublicModel>>,
+    image_capable: bool,
 ) -> Option<(Vec<String>, Value)> {
     let mut models: Vec<String> = Vec::new();
     let mut provenances = Vec::new();
@@ -2476,11 +2523,17 @@ fn merge_account_models(
         for (value, provenance) in
             project_account_model_entries(object, account_model_default_provenance(raw))
         {
+            if provenance == ModelProvenance::Image && !image_capable {
+                continue;
+            }
             push(&value, provenance);
         }
     }
     if let Some(fetched) = fetched {
         for model in fetched {
+            if model.provenance == ModelProvenance::Image && !image_capable {
+                continue;
+            }
             push(&model.id, model.provenance);
         }
     }
@@ -2693,9 +2746,10 @@ async fn refresh_access_token_account(
         account_id: account_id.map(ToOwned::to_owned),
         deadline: Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
         batch,
+        image_capable: quota > 0,
     });
     let fetched_models = fetched_models.await;
-    let model_items = merge_account_models(raw, fetched_models);
+    let model_items = merge_account_models(raw, fetched_models, quota > 0);
     let mut result = json!({
         "access_token": token,
         "email": me.get("email").and_then(Value::as_str).unwrap_or_default(),
@@ -10920,6 +10974,7 @@ pub(crate) async fn fetch_imported_model_catalog(
         account_id: account_id.map(ToOwned::to_owned),
         deadline,
         batch: None,
+        image_capable: false,
     })
     .await
 }
@@ -10933,6 +10988,14 @@ struct ImportedModelCatalogRequest {
     account_id: Option<String>,
     deadline: Instant,
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+    image_capable: bool,
+}
+
+fn imported_image_capability_model() -> PublicModel {
+    let mut model = ModelCatalog::project(&json!({"id": "gpt-image-2"}))
+        .expect("canonical image capability model");
+    model.provenance = ModelProvenance::Image;
+    model
 }
 
 async fn fetch_imported_model_catalog_request(
@@ -10947,12 +11010,13 @@ async fn fetch_imported_model_catalog_request(
         account_id,
         deadline,
         batch,
+        image_capable,
     } = request;
     let key = account_type.to_ascii_lowercase();
     let retry_key = key.clone();
     let retry_cache = cache.clone();
     cache
-        .fetch_or_reuse_with_batch(&key, batch.clone(), move || async move {
+        .fetch_or_reuse_with_catalog_batch(&key, batch.clone(), move || async move {
             fetch_imported_model_catalog_with_retry(
                 &retry_cache,
                 &retry_key,
@@ -10974,6 +11038,13 @@ async fn fetch_imported_model_catalog_request(
                 },
             )
             .await
+            .map(ImportedModelCatalogFetch::Complete)
+            .or_else(|| {
+                image_capable.then(|| ImportedModelCatalogFetch::Partial {
+                    models: vec![imported_image_capability_model()],
+                    web_unavailable_reason: "canonical_web_catalog_unavailable",
+                })
+            })
         })
         .await
 }
@@ -21294,6 +21365,46 @@ mod tests {
         assert_eq!(stats.retries, 0);
     }
 
+    #[tokio::test]
+    async fn imported_partial_ready_reuses_image_capability_without_refetching_web_catalog() {
+        let cache = ImportedModelCatalogCache::new();
+        let first_batch = Arc::new(ImportedModelCatalogBatchStats::default());
+        let second_batch = Arc::new(ImportedModelCatalogBatchStats::default());
+        let image = imported_image_capability_model();
+        let first = cache
+            .fetch_or_reuse_with_catalog_batch("pro", Some(first_batch.clone()), || async {
+                Some(ImportedModelCatalogFetch::Partial {
+                    models: vec![image.clone()],
+                    web_unavailable_reason: "test_web_unavailable",
+                })
+            })
+            .await;
+        let second = cache
+            .fetch_or_reuse_with_catalog_batch("pro", Some(second_batch.clone()), || async {
+                panic!("partial-ready catalog must not refetch web models")
+            })
+            .await;
+        assert_eq!(first.as_ref().map(Vec::len), Some(1));
+        assert_eq!(second.as_ref().map(Vec::len), Some(1));
+        let first_stats = first_batch.snapshot();
+        assert_eq!(first_stats.fetches, 1);
+        assert_eq!(first_stats.cache_hits, 0);
+        let second_stats = second_batch.snapshot();
+        assert_eq!(second_stats.fetches, 0);
+        assert_eq!(second_stats.cache_hits, 1);
+    }
+
+    #[test]
+    fn imported_image_catalog_isolated_by_account_capability() {
+        let fetched = Some(vec![imported_image_capability_model()]);
+        let without_capability = merge_account_models(&json!({}), fetched.clone(), false);
+        assert!(without_capability.is_none());
+        let with_capability = merge_account_models(&json!({}), fetched, true)
+            .expect("positive capability keeps image model");
+        assert_eq!(with_capability.0, vec!["gpt-image-2".to_owned()]);
+        assert_eq!(with_capability.1["gpt-image-2"], "image");
+    }
+
     #[test]
     fn imported_model_catalog_batch_stats_are_isolated_and_consistent() {
         let first = ImportedModelCatalogBatchStats::default();
@@ -21372,7 +21483,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            merge_account_models(&raw, None).map(|(models, _)| models),
+            merge_account_models(&raw, None, false).map(|(models, _)| models),
             Some(vec!["configured-model".to_owned(), "web-model".to_owned()])
         );
         assert_eq!(
@@ -21382,6 +21493,7 @@ mod tests {
                     test_public_model("web-model", ModelProvenance::Web),
                     test_public_model("web-image-model", ModelProvenance::Web),
                 ]),
+                false,
             )
             .map(|(models, _)| models),
             Some(vec![
@@ -21390,7 +21502,7 @@ mod tests {
                 "web-image-model".to_owned()
             ])
         );
-        assert_eq!(merge_account_models(&json!({}), None), None);
+        assert_eq!(merge_account_models(&json!({}), None, false), None);
     }
 
     #[tokio::test]
