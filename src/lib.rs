@@ -2642,7 +2642,6 @@ async fn refresh_access_token_account(
         Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
     )
     .await;
-    let canonical_models_fetched = fetched_models.is_some();
     let model_items = merge_account_models(raw, fetched_models);
     let mut result = json!({
         "access_token": token,
@@ -2663,7 +2662,7 @@ async fn refresh_access_token_account(
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
     }
-    if canonical_models_fetched && image_quota_from_value(Some(&result["quota"])).is_some() {
+    if image_quota_from_value(Some(&result["quota"])).is_some() {
         ensure_image_model_snapshot(&mut result);
     }
     canonicalize_account_item(&result).map_err(|_| "invalid_account")
@@ -26053,6 +26052,16 @@ data: [DONE]
         );
         assert_eq!(canonical["model_sources"]["gpt-image-2"], "image");
         assert_eq!(canonical["model_sources"]["gpt-image-2.5"], "image");
+
+        let mut capability_only = json!({
+            "access_token": "account-token",
+            "source_type": "codex",
+            "type": "pro",
+            "quota": 3
+        });
+        ensure_image_model_snapshot(&mut capability_only);
+        assert_eq!(capability_only["models"], json!(["gpt-image-2"]));
+        assert_eq!(capability_only["model_sources"]["gpt-image-2"], "image");
 
         let without_quota = canonicalize_account_item(&json!({
             "access_token": "account-token",
