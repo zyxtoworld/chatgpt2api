@@ -1439,12 +1439,15 @@ const IMPORTED_MODEL_CATALOG_RETRY_BACKOFF: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(5)
 };
+const IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS: usize = 2;
 
 #[derive(Clone)]
 struct ImportedModelCatalogCache {
     entries: Arc<Mutex<HashMap<String, Arc<ImportedModelCatalogEntry>>>>,
     fetch_count: Arc<AtomicUsize>,
+    attempt_count: Arc<AtomicUsize>,
     cache_hit_count: Arc<AtomicUsize>,
+    retry_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -1463,7 +1466,18 @@ struct ImportedModelCatalogEntry {
     state: Mutex<ImportedModelCatalogState>,
     updates: watch::Sender<ImportedModelCatalogState>,
     fetch_count: AtomicUsize,
+    attempt_count: AtomicUsize,
     cache_hit_count: AtomicUsize,
+    retry_count: AtomicUsize,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ImportedModelCatalogStatsSnapshot {
+    pub(crate) fetch_count: usize,
+    pub(crate) attempt_count: usize,
+    pub(crate) cache_hit_count: usize,
+    pub(crate) retry_count: usize,
+    pub(crate) by_type: HashMap<String, (usize, usize, usize, usize)>,
 }
 
 impl ImportedModelCatalogCache {
@@ -1471,7 +1485,9 @@ impl ImportedModelCatalogCache {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             fetch_count: Arc::new(AtomicUsize::new(0)),
+            attempt_count: Arc::new(AtomicUsize::new(0)),
             cache_hit_count: Arc::new(AtomicUsize::new(0)),
+            retry_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1482,7 +1498,31 @@ impl ImportedModelCatalogCache {
         )
     }
 
-    async fn stats_by_type(&self) -> Vec<(String, usize, usize)> {
+    fn attempt_count(&self) -> usize {
+        self.attempt_count.load(Ordering::Relaxed)
+    }
+
+    async fn record_attempt(&self, key: &str) {
+        self.attempt_count.fetch_add(1, Ordering::Relaxed);
+        let entries = self.entries.lock().await;
+        if let Some(entry) = entries.get(key) {
+            entry.attempt_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn record_retry(&self, key: &str) {
+        self.retry_count.fetch_add(1, Ordering::Relaxed);
+        let entries = self.entries.lock().await;
+        if let Some(entry) = entries.get(key) {
+            entry.retry_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn retry_count(&self) -> usize {
+        self.retry_count.load(Ordering::Relaxed)
+    }
+
+    async fn stats_by_type(&self) -> Vec<(String, usize, usize, usize, usize)> {
         let entries = self.entries.lock().await;
         let mut result = entries
             .iter()
@@ -1490,12 +1530,35 @@ impl ImportedModelCatalogCache {
                 (
                     key.clone(),
                     entry.fetch_count.load(Ordering::Relaxed),
+                    entry.attempt_count.load(Ordering::Relaxed),
                     entry.cache_hit_count.load(Ordering::Relaxed),
+                    entry.retry_count.load(Ordering::Relaxed),
                 )
             })
             .collect::<Vec<_>>();
         result.sort_by(|left, right| left.0.cmp(&right.0));
         result
+    }
+
+    async fn stats_snapshot(&self) -> ImportedModelCatalogStatsSnapshot {
+        let (fetch_count, cache_hit_count) = self.stats();
+        let attempt_count = self.attempt_count();
+        let retry_count = self.retry_count();
+        let by_type = self
+            .stats_by_type()
+            .await
+            .into_iter()
+            .map(|(account_type, fetches, attempts, hits, retries)| {
+                (account_type, (fetches, attempts, hits, retries))
+            })
+            .collect();
+        ImportedModelCatalogStatsSnapshot {
+            fetch_count,
+            attempt_count,
+            cache_hit_count,
+            retry_count,
+            by_type,
+        }
     }
 
     async fn fetch_or_reuse<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<PublicModel>>
@@ -1517,7 +1580,9 @@ impl ImportedModelCatalogCache {
                         }),
                         updates,
                         fetch_count: AtomicUsize::new(0),
+                        attempt_count: AtomicUsize::new(0),
                         cache_hit_count: AtomicUsize::new(0),
+                        retry_count: AtomicUsize::new(0),
                     })
                 })
                 .clone()
@@ -2577,6 +2642,7 @@ async fn refresh_access_token_account(
         Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
     )
     .await;
+    let canonical_models_fetched = fetched_models.is_some();
     let model_items = merge_account_models(raw, fetched_models);
     let mut result = json!({
         "access_token": token,
@@ -2597,7 +2663,7 @@ async fn refresh_access_token_account(
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
     }
-    if image_quota_from_value(Some(&result["quota"])).is_some() {
+    if canonical_models_fetched && image_quota_from_value(Some(&result["quota"])).is_some() {
         ensure_image_model_snapshot(&mut result);
     }
     canonicalize_account_item(&result).map_err(|_| "invalid_account")
@@ -10779,22 +10845,55 @@ pub(crate) async fn fetch_imported_model_catalog(
     let token = token.to_owned();
     let account_type = account_type.to_owned();
     let account_id = account_id.map(ToOwned::to_owned);
+    let retry_key = key.clone();
+    let retry_cache = cache.clone();
     cache
         .fetch_or_reuse(&key, move || async move {
-            fetch_native_model_catalog(
-                &client,
-                &base_url,
-                &NativeRequestContext::new(),
-                NativeModelIdentity {
-                    token: &token,
-                    account_type: Some(account_type.as_str()),
-                    account_id: account_id.as_deref(),
-                },
-                deadline,
-            )
+            fetch_imported_model_catalog_with_retry(&retry_cache, &retry_key, deadline, || async {
+                fetch_native_model_catalog(
+                    &client,
+                    &base_url,
+                    &NativeRequestContext::new(),
+                    NativeModelIdentity {
+                        token: &token,
+                        account_type: Some(account_type.as_str()),
+                        account_id: account_id.as_deref(),
+                    },
+                    deadline,
+                )
+                .await
+            })
             .await
         })
         .await
+}
+
+async fn fetch_imported_model_catalog_with_retry<F, Fut>(
+    cache: &ImportedModelCatalogCache,
+    key: &str,
+    deadline: Instant,
+    mut fetch: F,
+) -> Option<Vec<PublicModel>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<Vec<PublicModel>>>,
+{
+    for attempt in 0..IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS {
+        cache.record_attempt(key).await;
+        let result = fetch().await.filter(|models| !models.is_empty());
+        if result.is_some() || attempt + 1 == IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS {
+            return result;
+        }
+        cache.record_retry(key).await;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            return None;
+        }
+        tokio::time::sleep(IMPORTED_MODEL_CATALOG_RETRY_BACKOFF.min(remaining)).await;
+    }
+    None
 }
 
 // Model discovery is published by normalized account type.  One authenticated
@@ -12111,7 +12210,7 @@ fn ensure_image_model_snapshot(value: &mut Value) {
     if image_quota_from_value(object.get("quota")).is_none() {
         return;
     }
-    let image_models = object
+    let mut image_models = object
         .get("models")
         .and_then(Value::as_array)
         .into_iter()
@@ -12120,8 +12219,21 @@ fn ensure_image_model_snapshot(value: &mut Value) {
         .filter(|id| id.to_ascii_lowercase().starts_with("gpt-image-"))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    if image_models.is_empty() {
-        return;
+    if !image_models.iter().any(|id| id == "gpt-image-2") {
+        image_models.insert(0, "gpt-image-2".to_owned());
+    }
+    let models = object
+        .entry("models".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !models.is_array() {
+        *models = Value::Array(Vec::new());
+    }
+    if let Some(models) = models.as_array_mut()
+        && !models
+            .iter()
+            .any(|model| model.as_str() == Some("gpt-image-2"))
+    {
+        models.push(Value::String("gpt-image-2".to_owned()));
     }
     let sources = object
         .entry("model_sources".to_owned())
@@ -18002,6 +18114,54 @@ mod tests {
                 }
             }),
         );
+        let me_hits = hits.clone();
+        let app = app.route(
+            "/backend-api/me",
+            get(move |_headers: HeaderMap| {
+                let hits = me_hits.clone();
+                async move {
+                    hits.lock().await.push("GET /backend-api/me".to_owned());
+                    Json(json!({"email":"management@example.test","id":"management-user"}))
+                }
+            }),
+        );
+        let init_hits = hits.clone();
+        let app = app.route(
+            "/backend-api/conversation/init",
+            post(move |_headers: HeaderMap| {
+                let hits = init_hits.clone();
+                async move {
+                    hits.lock()
+                        .await
+                        .push("POST /backend-api/conversation/init".to_owned());
+                    Json(json!({
+                        "default_model_slug":"gpt-5-5",
+                        "limits_progress":[{"feature_name":"image_generation","remaining":3}]
+                    }))
+                }
+            }),
+        );
+        let check_hits = hits.clone();
+        let app = app.route(
+            "/backend-api/accounts/check/v4-2023-04-27",
+            get(move |headers: HeaderMap| {
+                let hits = check_hits.clone();
+                async move {
+                    let token = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default();
+                    let free = token.contains("imported-cc-free-token");
+                    hits.lock()
+                        .await
+                        .push("GET /backend-api/accounts/check".to_owned());
+                    Json(json!({"accounts":{"default":{"account":{
+                        "account_id": if free {"cc-free-account"} else {"cc-account"},
+                        "plan_type": if free {"free"} else {"pro"}
+                    }}}}))
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("management stub listener");
@@ -18739,9 +18899,9 @@ mod tests {
             assert_eq!(
                 channel_models_body["channels"][index]["models"],
                 if index == 2 {
-                    json!(["gpt-5-5", "gpt-5-6", "free-image-model"])
+                    json!(["gpt-5-5", "gpt-5-6", "free-image-model", "gpt-image-2"])
                 } else {
-                    json!(["gpt-5-5", "gpt-5-6"])
+                    json!(["gpt-5-5", "gpt-5-6", "gpt-image-2"])
                 }
             );
         }
@@ -19245,7 +19405,7 @@ mod tests {
             );
         }
         assert!(!channel_model_ids.contains(&"configured-model"));
-        assert!(!channel_model_ids.contains(&"gpt-image-2"));
+        assert!(channel_model_ids.contains(&"gpt-image-2"));
         assert!(
             !channel_model_ids.contains(&"codex-endpoint-model"),
             "unexpected channel models: {channel_models}"
@@ -20939,6 +21099,55 @@ mod tests {
             Some(vec!["retry-model".to_owned()])
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn imported_model_catalog_retries_empty_owner_fetch_before_publishing_cache() {
+        let cache = ImportedModelCatalogCache::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let owner_cache = cache.clone();
+        let retry_owner_cache = cache.clone();
+        let owner_calls = calls.clone();
+        let result = owner_cache
+            .fetch_or_reuse("pro", move || {
+                let retry_cache = retry_owner_cache.clone();
+                let retry_calls = owner_calls.clone();
+                async move {
+                    fetch_imported_model_catalog_with_retry(
+                        &retry_cache,
+                        "pro",
+                        Instant::now() + Duration::from_secs(1),
+                        || async {
+                            if retry_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                                None
+                            } else {
+                                Some(vec![test_public_model(
+                                    "retried-model",
+                                    ModelProvenance::Web,
+                                )])
+                            }
+                        },
+                    )
+                    .await
+                }
+            })
+            .await;
+        assert_eq!(
+            result.map(|models| models.into_iter().map(|model| model.id).collect::<Vec<_>>()),
+            Some(vec!["retried-model".to_owned()])
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.retry_count(), 1);
+        assert_eq!(cache.attempt_count(), 2);
+        assert_eq!(
+            cache
+                .fetch_or_reuse("pro", || async {
+                    panic!("successful retry must publish a ready cache")
+                })
+                .await
+                .map(|_| ()),
+            Some(())
+        );
     }
 
     #[test]

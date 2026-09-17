@@ -1424,9 +1424,18 @@ fn public_import_job(value: Option<&Value>) -> Value {
         "refreshed",
         "failed",
         "model_fetch_count",
+        "model_attempt_count",
         "model_cache_hit_count",
         "model_fetch_by_type",
         "model_cache_hit_by_type",
+        "model_retry_count",
+        "model_fetch_count_batch",
+        "model_attempt_count_batch",
+        "model_cache_hit_count_batch",
+        "model_retry_count_batch",
+        "model_fetch_by_type_batch",
+        "model_cache_hit_by_type_batch",
+        "model_retry_by_type_batch",
         "errors",
     ] {
         if let Some(value) = object.get(key) {
@@ -1436,11 +1445,42 @@ fn public_import_job(value: Option<&Value>) -> Value {
     Value::Object(output)
 }
 
-async fn add_model_catalog_stats(job: &mut Value, state: &AppState) {
+async fn add_model_catalog_stats(
+    job: &mut Value,
+    state: &AppState,
+    before: &super::ImportedModelCatalogStatsSnapshot,
+) {
     let (fetch_count, cache_hit_count) = state.imported_model_catalog.stats();
+    let attempt_count = state.imported_model_catalog.attempt_count();
+    let retry_count = state.imported_model_catalog.retry_count();
     let by_type = state.imported_model_catalog.stats_by_type().await;
+    let batch_fetch_count = fetch_count.saturating_sub(before.fetch_count);
+    let batch_attempt_count = attempt_count.saturating_sub(before.attempt_count);
+    let batch_cache_hit_count = cache_hit_count.saturating_sub(before.cache_hit_count);
+    let batch_retry_count = retry_count.saturating_sub(before.retry_count);
+    let mut batch_by_type = by_type
+        .iter()
+        .map(|(account_type, fetches, attempts, hits, retries)| {
+            let (before_fetches, before_attempts, before_hits, before_retries) = before
+                .by_type
+                .get(account_type)
+                .copied()
+                .unwrap_or_default();
+            (
+                account_type,
+                fetches.saturating_sub(before_fetches),
+                attempts.saturating_sub(before_attempts),
+                hits.saturating_sub(before_hits),
+                retries.saturating_sub(before_retries),
+            )
+        })
+        .collect::<Vec<_>>();
+    batch_by_type.retain(|(_, fetches, attempts, hits, retries)| {
+        *fetches > 0 || *attempts > 0 || *hits > 0 || *retries > 0
+    });
     if let Some(object) = job.as_object_mut() {
         object.insert("model_fetch_count".to_owned(), Value::from(fetch_count));
+        object.insert("model_attempt_count".to_owned(), Value::from(attempt_count));
         object.insert(
             "model_cache_hit_count".to_owned(),
             Value::from(cache_hit_count),
@@ -1450,7 +1490,7 @@ async fn add_model_catalog_stats(job: &mut Value, state: &AppState) {
             Value::Array(
                 by_type
                     .iter()
-                    .map(|(account_type, fetches, _)| {
+                    .map(|(account_type, fetches, _, _, _)| {
                         json!({"account_type": account_type, "count": fetches})
                     })
                     .collect(),
@@ -1461,8 +1501,58 @@ async fn add_model_catalog_stats(job: &mut Value, state: &AppState) {
             Value::Array(
                 by_type
                     .iter()
-                    .map(|(account_type, _, hits)| {
+                    .map(|(account_type, _, _, hits, _)| {
                         json!({"account_type": account_type, "count": hits})
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert("model_retry_count".to_owned(), Value::from(retry_count));
+        object.insert(
+            "model_fetch_count_batch".to_owned(),
+            Value::from(batch_fetch_count),
+        );
+        object.insert(
+            "model_attempt_count_batch".to_owned(),
+            Value::from(batch_attempt_count),
+        );
+        object.insert(
+            "model_cache_hit_count_batch".to_owned(),
+            Value::from(batch_cache_hit_count),
+        );
+        object.insert(
+            "model_retry_count_batch".to_owned(),
+            Value::from(batch_retry_count),
+        );
+        object.insert(
+            "model_fetch_by_type_batch".to_owned(),
+            Value::Array(
+                batch_by_type
+                    .iter()
+                    .map(|(account_type, fetches, _, _, _)| {
+                        json!({"account_type": account_type, "count": fetches})
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "model_cache_hit_by_type_batch".to_owned(),
+            Value::Array(
+                batch_by_type
+                    .iter()
+                    .map(|(account_type, _, _, hits, _)| {
+                        json!({"account_type": account_type, "count": hits})
+                    })
+                    .collect(),
+            ),
+        );
+        object.insert(
+            "model_retry_by_type_batch".to_owned(),
+            Value::Array(
+                batch_by_type
+                    .iter()
+                    .map(|(account_type, _, _, _, retries)| {
+                        json!({"account_type": account_type, "count": retries})
                     })
                     .collect(),
             ),
@@ -1900,6 +1990,7 @@ async fn execute_cpa_import(
     names: Vec<String>,
     expected_job_id: String,
 ) {
+    let model_stats_before = state.imported_model_catalog.stats_snapshot().await;
     let Some(pool) = registry_item(&state, "cpa_pools", &pool_id) else {
         return;
     };
@@ -1967,7 +2058,7 @@ async fn execute_cpa_import(
         failed,
         errors,
     );
-    add_model_catalog_stats(&mut job, &state).await;
+    add_model_catalog_stats(&mut job, &state, &model_stats_before).await;
     let _ = set_registry_job(&state, "cpa_pools", &pool_id, job, Some(&expected_job_id));
 }
 
@@ -2331,6 +2422,46 @@ fn merge_ccload_model_catalog(
     )
 }
 
+fn merge_ccload_account_catalog(
+    models: Option<&Value>,
+    sources: Option<&Value>,
+    snapshot: &Value,
+) -> (Value, Value) {
+    let mut entries =
+        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Unknown)
+            .into_iter()
+            .filter(|(_, provenance)| ccload_model_allowed(*provenance))
+            .collect::<Vec<_>>();
+    let mut indexes = entries
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for (id, provenance) in project_imported_model_entries_with_sources(
+        snapshot.get("models"),
+        snapshot.get("model_sources"),
+        ModelProvenance::Unknown,
+    ) {
+        if !ccload_model_allowed(provenance) {
+            continue;
+        }
+        if let Some(index) = indexes.get(&id).copied() {
+            if model_provenance_rank(provenance) > model_provenance_rank(entries[index].1) {
+                entries[index].1 = provenance;
+            }
+        } else if entries.len() < super::MAX_MODELS {
+            indexes.insert(id.clone(), entries.len());
+            entries.push((id, provenance));
+        }
+    }
+    ccload_model_payload(
+        entries
+            .into_iter()
+            .map(|(id, provenance)| CcLoadModelEntry { id, provenance })
+            .collect(),
+    )
+}
+
 fn public_sub2api_item(value: &Value) -> Value {
     let object = value.as_object().cloned().unwrap_or_default();
     json!({
@@ -2641,6 +2772,7 @@ async fn execute_sub2api_import(
     ids: Vec<String>,
     expected_job_id: String,
 ) {
+    let model_stats_before = state.imported_model_catalog.stats_snapshot().await;
     let Ok(server) = registry_value(&state, "sub2api", &server_id) else {
         return;
     };
@@ -2725,7 +2857,7 @@ async fn execute_sub2api_import(
         failed,
         errors,
     );
-    add_model_catalog_stats(&mut job, &state).await;
+    add_model_catalog_stats(&mut job, &state, &model_stats_before).await;
     let _ = set_registry_job(&state, "sub2api", &server_id, job, Some(&expected_job_id));
 }
 
@@ -3082,13 +3214,11 @@ async fn load_ccload_channel_models(
     let (base, token) = ccload_login(state, server).await?;
     let mut catalogs = Vec::with_capacity(ids.len());
     let mut catalog_groups = Vec::<Option<String>>::with_capacity(ids.len());
-    let mut catalog_image_capable = Vec::with_capacity(ids.len());
     let mut model_tokens = HashMap::<String, (String, Option<String>, Option<String>)>::new();
 
     for id in ids {
         let mut catalog = json!({"id": id, "plan_type": "", "models": [], "models_loaded": false});
         let mut catalog_group = None;
-        let mut image_models = Vec::new();
         let editor = remote_json(
             state,
             state
@@ -3137,13 +3267,6 @@ async fn load_ccload_channel_models(
                     catalog["plan_type"] = Value::String(plan_type.clone());
                 }
                 if let Some(credential) = credential {
-                    let access_token = credential
-                        .get("access_token")
-                        .expect("validated ccLoad access token");
-                    image_models = state.account_store.image_models_for_account(
-                        access_token,
-                        credential.get("account_id").map(String::as_str),
-                    );
                     let plan_type = catalog
                         .get("plan_type")
                         .and_then(Value::as_str)
@@ -3170,61 +3293,43 @@ async fn load_ccload_channel_models(
         }
         catalogs.push(catalog);
         catalog_groups.push(catalog_group);
-        catalog_image_capable.push(image_models);
     }
 
-    let model_base = state
-        .config
-        .upstream_base_url
-        .clone()
-        .unwrap_or_else(|| "https://chatgpt.com".to_owned());
-    let model_deadline = std::time::Instant::now() + CCLOAD_CHANNEL_MODEL_DEADLINE;
     let mut requests = FuturesUnordered::new();
     for (group, (access, plan_type, account_id)) in model_tokens {
         let request_state = state.clone();
-        let model_base = model_base.clone();
         requests.push(async move {
-            let models = plan_type.as_deref().map(|account_type| async move {
-                super::fetch_imported_model_catalog(
-                    &request_state.imported_model_catalog,
-                    &request_state.client,
-                    &model_base,
-                    account_type,
-                    &access,
-                    account_id.as_deref(),
-                    model_deadline,
-                )
-                .await
-            });
-            let models = match models {
-                Some(future) => future.await,
-                None => None,
-            };
-            (group, models)
+            let snapshot = super::refresh_access_token_account(
+                &request_state,
+                &json!({
+                    "access_token": access,
+                    "source_type": "codex",
+                    "type": plan_type,
+                    "chatgpt_account_id": account_id,
+                }),
+            )
+            .await
+            .ok();
+            (group, snapshot)
         });
     }
-    let mut fetched = HashMap::<String, Option<Vec<super::model_pool::PublicModel>>>::new();
+    let mut fetched = HashMap::<String, Option<Value>>::new();
     while let Some((group, models)) = requests.next().await {
         fetched.insert(group, models);
     }
-    for (catalog_index, (group, image_models)) in catalog_groups
-        .into_iter()
-        .zip(catalog_image_capable)
-        .enumerate()
-    {
+    for (catalog_index, group) in catalog_groups.into_iter().enumerate() {
         if let Some(group) = group
-            && let Some(Some(model_ids)) = fetched.get(&group)
+            && let Some(Some(snapshot)) = fetched.get(&group)
         {
-            let (models, sources) = merge_ccload_model_catalog(
+            let (models, sources) = merge_ccload_account_catalog(
                 catalogs[catalog_index].get("models"),
                 catalogs[catalog_index].get("model_sources"),
-                Some(model_ids.as_slice()),
+                snapshot,
             );
             catalogs[catalog_index]["models"] = models;
             catalogs[catalog_index]["model_sources"] = sources;
             catalogs[catalog_index]["models_loaded"] = Value::Bool(true);
         }
-        apply_ccload_image_capability(&mut catalogs[catalog_index], &image_models);
     }
     Ok(catalogs)
 }
@@ -3266,6 +3371,7 @@ async fn execute_ccload_import(
     ids: Vec<String>,
     expected_job_id: String,
 ) {
+    let model_stats_before = state.imported_model_catalog.stats_snapshot().await;
     let deadline = std::time::Instant::now() + CCLOAD_IMPORT_DEADLINE;
     let Ok(server) = registry_value(&state, "ccload", &server_id) else {
         return;
@@ -3479,7 +3585,7 @@ async fn execute_ccload_import(
         errors,
         created_at.as_deref(),
     );
-    add_model_catalog_stats(&mut job, &state).await;
+    add_model_catalog_stats(&mut job, &state, &model_stats_before).await;
     let _ = set_registry_job(&state, "ccload", &server_id, job, Some(&expected_job_id));
 }
 
