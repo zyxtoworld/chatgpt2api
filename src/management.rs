@@ -1448,36 +1448,22 @@ fn public_import_job(value: Option<&Value>) -> Value {
 async fn add_model_catalog_stats(
     job: &mut Value,
     state: &AppState,
-    before: &super::ImportedModelCatalogStatsSnapshot,
+    batch: &super::ImportedModelCatalogBatchStats,
 ) {
     let (fetch_count, cache_hit_count) = state.imported_model_catalog.stats();
     let attempt_count = state.imported_model_catalog.attempt_count();
     let retry_count = state.imported_model_catalog.retry_count();
     let by_type = state.imported_model_catalog.stats_by_type().await;
-    let batch_fetch_count = fetch_count.saturating_sub(before.fetch_count);
-    let batch_attempt_count = attempt_count.saturating_sub(before.attempt_count);
-    let batch_cache_hit_count = cache_hit_count.saturating_sub(before.cache_hit_count);
-    let batch_retry_count = retry_count.saturating_sub(before.retry_count);
-    let mut batch_by_type = by_type
-        .iter()
-        .map(|(account_type, fetches, attempts, hits, retries)| {
-            let (before_fetches, before_attempts, before_hits, before_retries) = before
-                .by_type
-                .get(account_type)
-                .copied()
-                .unwrap_or_default();
-            (
-                account_type,
-                fetches.saturating_sub(before_fetches),
-                attempts.saturating_sub(before_attempts),
-                hits.saturating_sub(before_hits),
-                retries.saturating_sub(before_retries),
-            )
-        })
+    let batch_snapshot = batch.snapshot();
+    let batch_attempt_count = batch_snapshot.attempts;
+    let batch_retry_count = batch_snapshot.retries;
+    let batch_fetch_count = batch_snapshot.fetches;
+    let batch_cache_hit_count = batch_snapshot.cache_hits;
+    let batch_by_type = batch_snapshot.by_type;
+    let batch_by_type = batch_by_type
+        .into_iter()
+        .filter(|(_, values)| values.iter().any(|value| *value > 0))
         .collect::<Vec<_>>();
-    batch_by_type.retain(|(_, fetches, attempts, hits, retries)| {
-        *fetches > 0 || *attempts > 0 || *hits > 0 || *retries > 0
-    });
     if let Some(object) = job.as_object_mut() {
         object.insert("model_fetch_count".to_owned(), Value::from(fetch_count));
         object.insert("model_attempt_count".to_owned(), Value::from(attempt_count));
@@ -1529,8 +1515,8 @@ async fn add_model_catalog_stats(
             Value::Array(
                 batch_by_type
                     .iter()
-                    .map(|(account_type, fetches, _, _, _)| {
-                        json!({"account_type": account_type, "count": fetches})
+                    .map(|(account_type, values)| {
+                        json!({"account_type": account_type, "count": values[2]})
                     })
                     .collect(),
             ),
@@ -1540,8 +1526,8 @@ async fn add_model_catalog_stats(
             Value::Array(
                 batch_by_type
                     .iter()
-                    .map(|(account_type, _, _, hits, _)| {
-                        json!({"account_type": account_type, "count": hits})
+                    .map(|(account_type, values)| {
+                        json!({"account_type": account_type, "count": values[3]})
                     })
                     .collect(),
             ),
@@ -1551,8 +1537,8 @@ async fn add_model_catalog_stats(
             Value::Array(
                 batch_by_type
                     .iter()
-                    .map(|(account_type, _, _, _, retries)| {
-                        json!({"account_type": account_type, "count": retries})
+                    .map(|(account_type, values)| {
+                        json!({"account_type": account_type, "count": values[1]})
                     })
                     .collect(),
             ),
@@ -1990,7 +1976,7 @@ async fn execute_cpa_import(
     names: Vec<String>,
     expected_job_id: String,
 ) {
-    let model_stats_before = state.imported_model_catalog.stats_snapshot().await;
+    let batch_stats = Arc::new(super::ImportedModelCatalogBatchStats::default());
     let Some(pool) = registry_item(&state, "cpa_pools", &pool_id) else {
         return;
     };
@@ -2048,7 +2034,9 @@ async fn execute_cpa_import(
             (0, 0, failed.saturating_add(successful))
         }
     };
-    let refreshed = super::refresh_imported_accounts(&state, &imported_tokens).await;
+    let refreshed =
+        super::refresh_imported_accounts_with_batch(&state, &imported_tokens, batch_stats.clone())
+            .await;
     let mut job = import_job(
         &expected_job_id,
         names.len(),
@@ -2058,7 +2046,7 @@ async fn execute_cpa_import(
         failed,
         errors,
     );
-    add_model_catalog_stats(&mut job, &state, &model_stats_before).await;
+    add_model_catalog_stats(&mut job, &state, &batch_stats).await;
     let _ = set_registry_job(&state, "cpa_pools", &pool_id, job, Some(&expected_job_id));
 }
 
@@ -2772,7 +2760,7 @@ async fn execute_sub2api_import(
     ids: Vec<String>,
     expected_job_id: String,
 ) {
-    let model_stats_before = state.imported_model_catalog.stats_snapshot().await;
+    let batch_stats = Arc::new(super::ImportedModelCatalogBatchStats::default());
     let Ok(server) = registry_value(&state, "sub2api", &server_id) else {
         return;
     };
@@ -2847,7 +2835,9 @@ async fn execute_sub2api_import(
             (0, 0, failed.saturating_add(successful))
         }
     };
-    let refreshed = super::refresh_imported_accounts(&state, &imported_tokens).await;
+    let refreshed =
+        super::refresh_imported_accounts_with_batch(&state, &imported_tokens, batch_stats.clone())
+            .await;
     let mut job = import_job(
         &expected_job_id,
         ids.len(),
@@ -2857,7 +2847,7 @@ async fn execute_sub2api_import(
         failed,
         errors,
     );
-    add_model_catalog_stats(&mut job, &state, &model_stats_before).await;
+    add_model_catalog_stats(&mut job, &state, &batch_stats).await;
     let _ = set_registry_job(&state, "sub2api", &server_id, job, Some(&expected_job_id));
 }
 
@@ -3307,6 +3297,7 @@ async fn load_ccload_channel_models(
                     "type": plan_type,
                     "chatgpt_account_id": account_id,
                 }),
+                None,
             )
             .await
             .ok();
@@ -3371,7 +3362,7 @@ async fn execute_ccload_import(
     ids: Vec<String>,
     expected_job_id: String,
 ) {
-    let model_stats_before = state.imported_model_catalog.stats_snapshot().await;
+    let batch_stats = Arc::new(super::ImportedModelCatalogBatchStats::default());
     let deadline = std::time::Instant::now() + CCLOAD_IMPORT_DEADLINE;
     let Ok(server) = registry_value(&state, "ccload", &server_id) else {
         return;
@@ -3558,7 +3549,9 @@ async fn execute_ccload_import(
             return;
         }
     };
-    let refreshed = super::refresh_imported_accounts(&state, &imported_tokens).await;
+    let refreshed =
+        super::refresh_imported_accounts_with_batch(&state, &imported_tokens, batch_stats.clone())
+            .await;
     publish_progress(
         ids.len(),
         added,
@@ -3585,7 +3578,7 @@ async fn execute_ccload_import(
         errors,
         created_at.as_deref(),
     );
-    add_model_catalog_stats(&mut job, &state, &model_stats_before).await;
+    add_model_catalog_stats(&mut job, &state, &batch_stats).await;
     let _ = set_registry_job(&state, "ccload", &server_id, job, Some(&expected_job_id));
 }
 

@@ -1471,13 +1471,57 @@ struct ImportedModelCatalogEntry {
     retry_count: AtomicUsize,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct ImportedModelCatalogStatsSnapshot {
-    pub(crate) fetch_count: usize,
-    pub(crate) attempt_count: usize,
-    pub(crate) cache_hit_count: usize,
-    pub(crate) retry_count: usize,
-    pub(crate) by_type: HashMap<String, (usize, usize, usize, usize)>,
+#[derive(Default)]
+pub(crate) struct ImportedModelCatalogBatchStats {
+    attempts: AtomicUsize,
+    retries: AtomicUsize,
+    fetches: AtomicUsize,
+    cache_hits: AtomicUsize,
+    by_type: StdMutex<HashMap<String, [usize; 4]>>,
+}
+
+struct ImportedModelCatalogBatchSnapshot {
+    attempts: usize,
+    retries: usize,
+    fetches: usize,
+    cache_hits: usize,
+    by_type: Vec<(String, [usize; 4])>,
+}
+
+impl ImportedModelCatalogBatchStats {
+    fn record(&self, key: &str, slot: usize) {
+        let counters = match slot {
+            0 => &self.attempts,
+            1 => &self.retries,
+            2 => &self.fetches,
+            3 => &self.cache_hits,
+            _ => return,
+        };
+        counters.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut by_type) = self.by_type.lock() {
+            by_type.entry(key.to_owned()).or_default()[slot] += 1;
+        }
+    }
+
+    fn snapshot(&self) -> ImportedModelCatalogBatchSnapshot {
+        let by_type = self
+            .by_type
+            .lock()
+            .map(|value| {
+                value
+                    .iter()
+                    .map(|(key, value)| (key.clone(), *value))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ImportedModelCatalogBatchSnapshot {
+            attempts: self.attempts.load(Ordering::Relaxed),
+            retries: self.retries.load(Ordering::Relaxed),
+            fetches: self.fetches.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+            by_type,
+        }
+    }
 }
 
 impl ImportedModelCatalogCache {
@@ -1540,28 +1584,20 @@ impl ImportedModelCatalogCache {
         result
     }
 
-    async fn stats_snapshot(&self) -> ImportedModelCatalogStatsSnapshot {
-        let (fetch_count, cache_hit_count) = self.stats();
-        let attempt_count = self.attempt_count();
-        let retry_count = self.retry_count();
-        let by_type = self
-            .stats_by_type()
-            .await
-            .into_iter()
-            .map(|(account_type, fetches, attempts, hits, retries)| {
-                (account_type, (fetches, attempts, hits, retries))
-            })
-            .collect();
-        ImportedModelCatalogStatsSnapshot {
-            fetch_count,
-            attempt_count,
-            cache_hit_count,
-            retry_count,
-            by_type,
-        }
+    async fn fetch_or_reuse<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<PublicModel>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<Vec<PublicModel>>>,
+    {
+        self.fetch_or_reuse_with_batch(key, None, fetch).await
     }
 
-    async fn fetch_or_reuse<F, Fut>(&self, key: &str, fetch: F) -> Option<Vec<PublicModel>>
+    async fn fetch_or_reuse_with_batch<F, Fut>(
+        &self,
+        key: &str,
+        batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+        fetch: F,
+    ) -> Option<Vec<PublicModel>>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Option<Vec<PublicModel>>>,
@@ -1588,6 +1624,7 @@ impl ImportedModelCatalogCache {
                 .clone()
         };
 
+        let mut counted_waiter_hit = false;
         loop {
             let mut updates = entry.updates.subscribe();
             let owner = {
@@ -1596,8 +1633,13 @@ impl ImportedModelCatalogCache {
                     ImportedModelCatalogState::Ready { models, expires_at }
                         if Instant::now() < *expires_at =>
                     {
-                        entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
-                        self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                        if !counted_waiter_hit {
+                            entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                            self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                            if let Some(batch) = &batch {
+                                batch.record(key, 3);
+                            }
+                        }
                         return Some((**models).clone());
                     }
                     ImportedModelCatalogState::Failed { retry_at }
@@ -1615,6 +1657,9 @@ impl ImportedModelCatalogCache {
             if owner {
                 entry.fetch_count.fetch_add(1, Ordering::Relaxed);
                 self.fetch_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(batch) = &batch {
+                    batch.record(key, 2);
+                }
                 let result = fetch().await.filter(|models| !models.is_empty());
                 let next = match &result {
                     Some(models) => ImportedModelCatalogState::Ready {
@@ -1629,8 +1674,14 @@ impl ImportedModelCatalogCache {
                 let _ = entry.updates.send(next);
                 return result;
             }
-            entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
-            self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+            if !counted_waiter_hit {
+                entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                if let Some(batch) = &batch {
+                    batch.record(key, 3);
+                }
+                counted_waiter_hit = true;
+            }
             let _ = updates.changed().await;
         }
     }
@@ -2540,6 +2591,7 @@ pub(crate) async fn account_upstream_json_at(
 async fn refresh_access_token_account(
     state: &AppState,
     raw: &Value,
+    batch: Option<Arc<ImportedModelCatalogBatchStats>>,
 ) -> Result<Value, &'static str> {
     let token = account_token(raw).ok_or("invalid_account")?;
     let context = NativeRequestContext::new();
@@ -2632,16 +2684,17 @@ async fn refresh_access_token_account(
         })
         .unwrap_or_default();
     let (quota, restore_at) = image_quota_from_limits_progress(init.get("limits_progress"));
-    let fetched_models = fetch_imported_model_catalog(
-        &state.imported_model_catalog,
-        &state.client,
-        base_url,
-        plan_type,
-        &token,
-        account_id,
-        Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
-    )
-    .await;
+    let fetched_models = fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
+        cache: state.imported_model_catalog.clone(),
+        client: state.client.clone(),
+        base_url: base_url.to_owned(),
+        account_type: plan_type.to_owned(),
+        token: token.clone(),
+        account_id: account_id.map(ToOwned::to_owned),
+        deadline: Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
+        batch,
+    });
+    let fetched_models = fetched_models.await;
     let model_items = merge_account_models(raw, fetched_models);
     let mut result = json!({
         "access_token": token,
@@ -2985,7 +3038,7 @@ async fn api_accounts_refresh(
                 item["status"] = Value::String("running".to_owned());
             }
         }
-        let result = refresh_accounts_now(&task_state, &requested).await;
+        let result = refresh_accounts_now(&task_state, &requested, None).await;
         let mut progress = task_state.account_progress.lock().await;
         if let Some(item) = progress.get_mut(&task_progress_id) {
             match result {
@@ -3012,7 +3065,11 @@ async fn api_accounts_refresh(
 }
 
 #[allow(dead_code)]
-async fn refresh_accounts_now(state: &AppState, requested: &[String]) -> Result<Value, ApiError> {
+async fn refresh_accounts_now(
+    state: &AppState,
+    requested: &[String],
+    batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+) -> Result<Value, ApiError> {
     // Refresh account metadata with the existing access token only. Never
     // exchange, rotate, read, or persist another token type.
     let mut errors = Vec::new();
@@ -3028,7 +3085,7 @@ async fn refresh_accounts_now(state: &AppState, requested: &[String]) -> Result<
             errors.push(json!({"token": public_token_ref(token), "code": "not_found"}));
             continue;
         };
-        match refresh_access_token_account(state, &records[index]).await {
+        match refresh_access_token_account(state, &records[index], batch.clone()).await {
             Ok(updated) => {
                 updated_records.push((token.clone(), updated));
                 refreshed += 1;
@@ -3095,7 +3152,7 @@ pub(crate) async fn refresh_imported_accounts(state: &AppState, tokens: &[String
     if tokens.is_empty() {
         return 0;
     }
-    let refreshed = refresh_accounts_now(state, tokens)
+    let refreshed = refresh_accounts_now(state, tokens, None)
         .await
         .ok()
         .and_then(|result| result.get("refreshed").and_then(Value::as_u64))
@@ -3109,6 +3166,22 @@ pub(crate) async fn refresh_imported_accounts(state: &AppState, tokens: &[String
         cache_hit_count
     );
     refreshed
+}
+
+pub(crate) async fn refresh_imported_accounts_with_batch(
+    state: &AppState,
+    tokens: &[String],
+    batch: Arc<ImportedModelCatalogBatchStats>,
+) -> usize {
+    if tokens.is_empty() {
+        return 0;
+    }
+    refresh_accounts_now(state, tokens, Some(batch))
+        .await
+        .ok()
+        .and_then(|result| result.get("refreshed").and_then(Value::as_u64))
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_default()
 }
 
 #[allow(dead_code)]
@@ -10838,30 +10911,68 @@ pub(crate) async fn fetch_imported_model_catalog(
     account_id: Option<&str>,
     deadline: Instant,
 ) -> Option<Vec<PublicModel>> {
+    fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
+        cache: cache.clone(),
+        client: client.clone(),
+        base_url: base_url.to_owned(),
+        account_type: account_type.to_owned(),
+        token: token.to_owned(),
+        account_id: account_id.map(ToOwned::to_owned),
+        deadline,
+        batch: None,
+    })
+    .await
+}
+
+struct ImportedModelCatalogRequest {
+    cache: ImportedModelCatalogCache,
+    client: Client,
+    base_url: String,
+    account_type: String,
+    token: String,
+    account_id: Option<String>,
+    deadline: Instant,
+    batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+}
+
+async fn fetch_imported_model_catalog_request(
+    request: ImportedModelCatalogRequest,
+) -> Option<Vec<PublicModel>> {
+    let ImportedModelCatalogRequest {
+        cache,
+        client,
+        base_url,
+        account_type,
+        token,
+        account_id,
+        deadline,
+        batch,
+    } = request;
     let key = account_type.to_ascii_lowercase();
-    let client = client.clone();
-    let base_url = base_url.to_owned();
-    let token = token.to_owned();
-    let account_type = account_type.to_owned();
-    let account_id = account_id.map(ToOwned::to_owned);
     let retry_key = key.clone();
     let retry_cache = cache.clone();
     cache
-        .fetch_or_reuse(&key, move || async move {
-            fetch_imported_model_catalog_with_retry(&retry_cache, &retry_key, deadline, || async {
-                fetch_native_model_catalog(
-                    &client,
-                    &base_url,
-                    &NativeRequestContext::new(),
-                    NativeModelIdentity {
-                        token: &token,
-                        account_type: Some(account_type.as_str()),
-                        account_id: account_id.as_deref(),
-                    },
-                    deadline,
-                )
-                .await
-            })
+        .fetch_or_reuse_with_batch(&key, batch.clone(), move || async move {
+            fetch_imported_model_catalog_with_retry(
+                &retry_cache,
+                &retry_key,
+                deadline,
+                batch,
+                || async {
+                    fetch_native_model_catalog(
+                        &client,
+                        &base_url,
+                        &NativeRequestContext::new(),
+                        NativeModelIdentity {
+                            token: &token,
+                            account_type: Some(account_type.as_str()),
+                            account_id: account_id.as_deref(),
+                        },
+                        deadline,
+                    )
+                    .await
+                },
+            )
             .await
         })
         .await
@@ -10871,6 +10982,7 @@ async fn fetch_imported_model_catalog_with_retry<F, Fut>(
     cache: &ImportedModelCatalogCache,
     key: &str,
     deadline: Instant,
+    batch: Option<Arc<ImportedModelCatalogBatchStats>>,
     mut fetch: F,
 ) -> Option<Vec<PublicModel>>
 where
@@ -10879,11 +10991,17 @@ where
 {
     for attempt in 0..IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS {
         cache.record_attempt(key).await;
+        if let Some(batch) = &batch {
+            batch.record(key, 0);
+        }
         let result = fetch().await.filter(|models| !models.is_empty());
         if result.is_some() || attempt + 1 == IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS {
             return result;
         }
         cache.record_retry(key).await;
+        if let Some(batch) = &batch {
+            batch.record(key, 1);
+        }
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
@@ -11156,7 +11274,7 @@ impl AccountTypeCatalog {
         }
         let _ = tokio::time::timeout(
             Duration::from_secs(25),
-            refresh_accounts_now(state, &tokens),
+            refresh_accounts_now(state, &tokens, None),
         )
         .await;
         if let Ok(mut last) = self.image_quota_refreshed_at.lock() {
@@ -21056,7 +21174,7 @@ mod tests {
             Some(vec!["free-model".to_owned()])
         );
         assert_eq!(model_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(cache.stats(), (2, 2));
+        assert_eq!(cache.stats(), (2, 1));
     }
 
     #[tokio::test]
@@ -21116,6 +21234,7 @@ mod tests {
                         &retry_cache,
                         "pro",
                         Instant::now() + Duration::from_secs(1),
+                        None,
                         || async {
                             if retry_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                                 None
@@ -21147,6 +21266,73 @@ mod tests {
                 .map(|_| ()),
             Some(())
         );
+    }
+
+    #[test]
+    fn imported_model_catalog_batch_stats_are_isolated_and_consistent() {
+        let first = ImportedModelCatalogBatchStats::default();
+        first.record("pro", 0);
+        first.record("pro", 0);
+        first.record("pro", 1);
+        first.record("pro", 2);
+        first.record("pro", 3);
+        let second = ImportedModelCatalogBatchStats::default();
+        second.record("pro", 3);
+        let first_snapshot = first.snapshot();
+        assert_eq!(first_snapshot.attempts, 2);
+        assert_eq!(first_snapshot.retries, 1);
+        assert_eq!(first_snapshot.fetches, 1);
+        assert_eq!(first_snapshot.cache_hits, 1);
+        let second_snapshot = second.snapshot();
+        assert_eq!(second_snapshot.attempts, 0);
+        assert_eq!(second_snapshot.retries, 0);
+        assert_eq!(second_snapshot.fetches, 0);
+        assert_eq!(second_snapshot.cache_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn imported_model_catalog_interleaved_batches_do_not_share_counters() {
+        let cache = ImportedModelCatalogCache::new();
+        let first = Arc::new(ImportedModelCatalogBatchStats::default());
+        let second = Arc::new(ImportedModelCatalogBatchStats::default());
+        let release = Arc::new(Notify::new());
+        let first_cache = cache.clone();
+        let first_stats = first.clone();
+        let first_release = release.clone();
+        let owner = tokio::spawn(async move {
+            first_cache
+                .fetch_or_reuse_with_batch("pro", Some(first_stats.clone()), || async move {
+                    first_stats.record("pro", 0);
+                    first_release.notified().await;
+                    first_stats.record("pro", 1);
+                    first_stats.record("pro", 0);
+                    Some(vec![test_public_model("batch-model", ModelProvenance::Web)])
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        let waiter_cache = cache.clone();
+        let waiter_stats = second.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_cache
+                .fetch_or_reuse_with_batch("pro", Some(waiter_stats), || async {
+                    panic!("interleaved waiter must not become owner")
+                })
+                .await
+        });
+        release.notify_one();
+        assert!(owner.await.expect("owner join").is_some());
+        assert!(waiter.await.expect("waiter join").is_some());
+        let first_snapshot = first.snapshot();
+        assert_eq!(first_snapshot.attempts, 2);
+        assert_eq!(first_snapshot.retries, 1);
+        assert_eq!(first_snapshot.fetches, 1);
+        assert_eq!(first_snapshot.cache_hits, 0);
+        let second_snapshot = second.snapshot();
+        assert_eq!(second_snapshot.attempts, 0);
+        assert_eq!(second_snapshot.retries, 0);
+        assert_eq!(second_snapshot.fetches, 0);
+        assert_eq!(second_snapshot.cache_hits, 1);
     }
 
     #[test]
