@@ -23,7 +23,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::StreamExt;
 use image::ImageReader;
 use reqwest::{Client, Method};
 use serde::Deserialize;
@@ -3203,12 +3203,11 @@ async fn load_ccload_channel_models(
 ) -> Result<Vec<Value>, ApiError> {
     let (base, token) = ccload_login(state, server).await?;
     let mut catalogs = Vec::with_capacity(ids.len());
-    let mut catalog_groups = Vec::<Option<String>>::with_capacity(ids.len());
-    let mut model_tokens = HashMap::<String, (String, Option<String>, Option<String>)>::new();
+    let mut catalog_credentials =
+        Vec::<Option<(String, Option<String>, Option<String>)>>::with_capacity(ids.len());
 
     for id in ids {
         let mut catalog = json!({"id": id, "plan_type": "", "models": [], "models_loaded": false});
-        let mut catalog_group = None;
         let editor = remote_json(
             state,
             state
@@ -3228,14 +3227,6 @@ async fn load_ccload_channel_models(
                     .map(str::trim)
                     == Some("codex_oauth");
             if channel_matches {
-                let configured_entries =
-                    ccload_model_entries(channel.and_then(|value| value.get("models")));
-                if !configured_entries.is_empty() {
-                    let (models, sources) = ccload_model_payload(configured_entries);
-                    catalog["models"] = models;
-                    catalog["model_sources"] = sources;
-                    catalog["models_loaded"] = Value::Bool(true);
-                }
                 if let Some(plan_type) = channel
                     .and_then(|value| value.get("codex_plan_type"))
                     .and_then(Value::as_str)
@@ -3261,13 +3252,7 @@ async fn load_ccload_channel_models(
                         .get("plan_type")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
-                    let group = plan_type
-                        .as_deref()
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_ascii_lowercase)
-                        .unwrap_or_else(|| format!("channel:{id}"));
-                    catalog_group = Some(group.clone());
-                    model_tokens.entry(group).or_insert((
+                    catalog_credentials.push(Some((
                         credential
                             .get("access_token")
                             .cloned()
@@ -3277,46 +3262,42 @@ async fn load_ccload_channel_models(
                             .get("account_id")
                             .filter(|value| !value.is_empty())
                             .cloned(),
-                    ));
+                    )));
+                } else {
+                    catalog_credentials.push(None);
                 }
+            } else {
+                catalog_credentials.push(None);
             }
+        } else {
+            catalog_credentials.push(None);
         }
         catalogs.push(catalog);
-        catalog_groups.push(catalog_group);
     }
 
-    let mut requests = FuturesUnordered::new();
-    for (group, (access, plan_type, account_id)) in model_tokens {
-        let request_state = state.clone();
-        requests.push(async move {
-            let snapshot = super::refresh_access_token_account(
-                &request_state,
-                &json!({
-                    "access_token": access,
-                    "source_type": "codex",
-                    "type": plan_type,
-                    "chatgpt_account_id": account_id,
-                }),
-                None,
-            )
-            .await
-            .ok();
-            (group, snapshot)
-        });
+    let mut fetched = Vec::<Option<Value>>::with_capacity(catalogs.len());
+    for credential in catalog_credentials {
+        let Some((access, plan_type, account_id)) = credential else {
+            fetched.push(None);
+            continue;
+        };
+        let snapshot = super::refresh_access_token_account(
+            state,
+            &json!({
+                "access_token": access,
+                "source_type": "codex",
+                "type": plan_type,
+                "chatgpt_account_id": account_id,
+            }),
+            None,
+        )
+        .await
+        .ok();
+        fetched.push(snapshot);
     }
-    let mut fetched = HashMap::<String, Option<Value>>::new();
-    while let Some((group, models)) = requests.next().await {
-        fetched.insert(group, models);
-    }
-    for (catalog_index, group) in catalog_groups.into_iter().enumerate() {
-        if let Some(group) = group
-            && let Some(Some(snapshot)) = fetched.get(&group)
-        {
-            let (models, sources) = merge_ccload_account_catalog(
-                catalogs[catalog_index].get("models"),
-                catalogs[catalog_index].get("model_sources"),
-                snapshot,
-            );
+    for (catalog_index, snapshot) in fetched.into_iter().enumerate() {
+        if let Some(snapshot) = snapshot {
+            let (models, sources) = merge_ccload_account_catalog(None, None, &snapshot);
             catalogs[catalog_index]["models"] = models;
             catalogs[catalog_index]["model_sources"] = sources;
             catalogs[catalog_index]["models_loaded"] = Value::Bool(true);
