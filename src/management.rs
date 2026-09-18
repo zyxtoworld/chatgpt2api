@@ -2246,44 +2246,14 @@ fn clean_ccload_channel_ids(
     Ok(selected)
 }
 
-fn normalized_ccload_credential(value: Option<&Value>) -> Option<HashMap<String, String>> {
-    let object = value?.as_object()?;
-    let mut credential = HashMap::new();
-    for name in [
-        "access_token",
-        "account_id",
-        "email",
-        "type",
-        "expired",
-        "plan_type",
-    ] {
-        let text = match object.get(name) {
-            None => String::new(),
-            Some(Value::String(text)) => text.trim().to_owned(),
-            Some(_) => return None,
-        };
-        credential.insert(name.to_owned(), text);
-    }
-    let account_type = credential
-        .get_mut("type")
-        .expect("credential type field")
-        .to_ascii_lowercase();
-    *credential.get_mut("type").expect("credential type field") = if account_type.is_empty() {
-        "codex".to_owned()
-    } else {
-        account_type
-    };
-    if credential.get("type").map(String::as_str) != Some("codex")
-        || credential
-            .get("access_token")
-            .is_none_or(|value| value.is_empty())
-        || credential
-            .get("expired")
-            .is_some_and(|value| !value.is_empty() && !valid_ccload_expired_text(value))
-    {
-        return None;
-    }
-    Some(credential)
+fn normalized_ccload_credential(value: Option<&Value>) -> Option<String> {
+    value?
+        .as_object()?
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty() && token.len() <= 16 * 1024)
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Clone)]
@@ -3203,11 +3173,10 @@ async fn load_ccload_channel_models(
 ) -> Result<Vec<Value>, ApiError> {
     let (base, token) = ccload_login(state, server).await?;
     let mut catalogs = Vec::with_capacity(ids.len());
-    let mut catalog_credentials =
-        Vec::<Option<(String, Option<String>, Option<String>)>>::with_capacity(ids.len());
+    let mut catalog_credentials = Vec::<Option<String>>::with_capacity(ids.len());
 
     for id in ids {
-        let mut catalog = json!({"id": id, "plan_type": "", "models": [], "models_loaded": false});
+        let catalog = json!({"id": id, "plan_type": "", "models": [], "models_loaded": false});
         let editor = remote_json(
             state,
             state
@@ -3227,42 +3196,13 @@ async fn load_ccload_channel_models(
                     .map(str::trim)
                     == Some("codex_oauth");
             if channel_matches {
-                if let Some(plan_type) = channel
-                    .and_then(|value| value.get("codex_plan_type"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| value.chars().count() <= 256)
-                {
-                    catalog["plan_type"] = Value::String(plan_type.to_owned());
-                }
                 let credential = normalized_ccload_credential(
                     editor
                         .get("data")
                         .and_then(|value| value.get("oauth_credential")),
                 );
-                if let Some(plan_type) = credential
-                    .as_ref()
-                    .and_then(|value| value.get("plan_type"))
-                    .filter(|value| value.chars().count() <= 256)
-                {
-                    catalog["plan_type"] = Value::String(plan_type.clone());
-                }
                 if let Some(credential) = credential {
-                    let plan_type = catalog
-                        .get("plan_type")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
-                    catalog_credentials.push(Some((
-                        credential
-                            .get("access_token")
-                            .cloned()
-                            .expect("validated ccLoad access token"),
-                        plan_type,
-                        credential
-                            .get("account_id")
-                            .filter(|value| !value.is_empty())
-                            .cloned(),
-                    )));
+                    catalog_credentials.push(Some(credential));
                 } else {
                     catalog_credentials.push(None);
                 }
@@ -3277,7 +3217,7 @@ async fn load_ccload_channel_models(
 
     let mut fetched = Vec::<Option<Value>>::with_capacity(catalogs.len());
     for credential in catalog_credentials {
-        let Some((access, plan_type, account_id)) = credential else {
+        let Some(access) = credential else {
             fetched.push(None);
             continue;
         };
@@ -3286,8 +3226,6 @@ async fn load_ccload_channel_models(
             &json!({
                 "access_token": access,
                 "source_type": "codex",
-                "type": plan_type,
-                "chatgpt_account_id": account_id,
             }),
             None,
         )
@@ -3422,31 +3360,10 @@ async fn execute_ccload_import(
                 if channel_matches
                     && let Some(credential) = normalized_ccload_credential(credential)
                 {
-                    let configured_entries =
-                        ccload_model_entries(channel.and_then(|item| item.get("models")));
-                    let mut candidate = json!({
-                        "access_token": credential
-                            .get("access_token")
-                            .expect("validated ccLoad access token"),
+                    candidates.push(json!({
+                        "access_token": credential,
                         "source_type": "codex",
-                        "type": "codex",
-                        "plan_type": credential
-                            .get("plan_type")
-                            .filter(|value| value.chars().count() <= 256)
-                            .cloned()
-                            .unwrap_or_default(),
-                    });
-                    if !configured_entries.is_empty() {
-                        let (models, sources) = ccload_model_payload(configured_entries);
-                        candidate["models"] = models;
-                        candidate["model_sources"] = sources;
-                    }
-                    for key in ["account_id", "email", "expired"] {
-                        if let Some(value) = credential.get(key).filter(|value| !value.is_empty()) {
-                            candidate[key] = Value::String(value.clone());
-                        }
-                    }
-                    candidates.push(candidate);
+                    }));
                     accepted = true;
                 }
                 if !accepted {
@@ -5740,14 +5657,7 @@ mod tests {
             "refresh_token": "discarded-refresh"
         })))
         .expect("access-token-only ccLoad credential");
-        assert_eq!(
-            credential.get("access_token").map(String::as_str),
-            Some("access-only")
-        );
-        assert_eq!(credential.get("type").map(String::as_str), Some("codex"));
-        assert!(!credential.contains_key("id_token"));
-        assert!(!credential.contains_key("refresh_token"));
-        assert!(credential.get("expired").is_some_and(String::is_empty));
+        assert_eq!(credential, "access-only");
     }
 
     #[test]

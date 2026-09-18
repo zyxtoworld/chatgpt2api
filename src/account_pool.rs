@@ -806,6 +806,12 @@ impl AccountStore {
                     && slot
                         .record
                         .raw
+                        .get("_verified_image_capability")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && slot
+                        .record
+                        .raw
                         .get("quota")
                         .is_some_and(|value| image_quota(Some(value)).is_some())
             })
@@ -820,6 +826,12 @@ impl AccountStore {
         let snapshot = self.snapshot.read().expect("account snapshot lock");
         for slot in snapshot.accounts.iter().filter(|slot| {
             slot.record.status == "正常"
+                && slot
+                    .record
+                    .raw
+                    .get("_verified_image_capability")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
                 && slot
                     .record
                     .raw

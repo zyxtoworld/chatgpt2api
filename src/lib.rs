@@ -997,10 +997,14 @@ fn read_account_document(
 }
 
 fn canonicalize_account_models(object: &mut Map<String, Value>) {
+    let source_version = object.get("_model_source_version").and_then(Value::as_u64)
+        == Some(ACCOUNT_MODEL_SOURCE_VERSION);
     let default = account_model_default_provenance_from_object(object);
     let entries = project_account_model_entries(object, default)
         .into_iter()
-        .filter(|(_, provenance)| !model_provenance_is_untrusted(*provenance))
+        .filter(|(_, provenance)| {
+            source_version && matches!(provenance, ModelProvenance::Web | ModelProvenance::Image)
+        })
         .take(MAX_MODELS)
         .collect::<Vec<_>>();
     if entries.is_empty() {
@@ -2414,6 +2418,9 @@ fn public_account(record: &AccountRecord) -> Value {
         "id_token",
         "proxy",
         "model_sources",
+        "_model_source_version",
+        "_verified_web_model_paths",
+        "_verified_image_capability",
     ] {
         object.remove(key);
     }
@@ -2444,7 +2451,9 @@ fn public_account(record: &AccountRecord) -> Value {
         .map(|object| {
             project_account_model_entries(object, account_model_default_provenance(&record.raw))
                 .into_iter()
-                .filter(|(_, provenance)| !model_provenance_is_untrusted(*provenance))
+                .filter(|(_, provenance)| {
+                    matches!(provenance, ModelProvenance::Web | ModelProvenance::Image)
+                })
                 .map(|(id, _)| Value::String(id))
                 .collect::<Vec<_>>()
         })
@@ -2481,13 +2490,13 @@ fn account_token(value: &Value) -> Option<String> {
 }
 
 fn account_model_default_provenance_from_object(_object: &Map<String, Value>) -> ModelProvenance {
-    ModelProvenance::Configured
+    ModelProvenance::Unknown
 }
 
 fn account_model_default_provenance(raw: &Value) -> ModelProvenance {
     raw.as_object()
         .map(account_model_default_provenance_from_object)
-        .unwrap_or(ModelProvenance::Configured)
+        .unwrap_or(ModelProvenance::Unknown)
 }
 
 fn merge_account_models(
@@ -2502,7 +2511,7 @@ fn merge_account_models(
         let value = value.trim();
         if value.is_empty()
             || value.chars().count() > MAX_MODEL_TEXT_LENGTH
-            || model_provenance_is_untrusted(provenance)
+            || !matches!(provenance, ModelProvenance::Web | ModelProvenance::Image)
         {
             return;
         }
@@ -2519,16 +2528,7 @@ fn merge_account_models(
         models.push(value.to_owned());
         provenances.push(provenance);
     };
-    if let Some(object) = raw.as_object() {
-        for (value, provenance) in
-            project_account_model_entries(object, account_model_default_provenance(raw))
-        {
-            if provenance == ModelProvenance::Image && !image_capable {
-                continue;
-            }
-            push(&value, provenance);
-        }
-    }
+    let _ = raw;
     if let Some(fetched) = fetched {
         for model in fetched {
             if model.provenance == ModelProvenance::Image && !image_capable {
@@ -2765,12 +2765,17 @@ async fn refresh_access_token_account(
     if let Some((model_items, model_sources)) = model_items {
         result["models"] = json!(model_items);
         result["model_sources"] = model_sources;
+        result["_verified_web_model_paths"] = json!(AUTHENTICATED_NATIVE_MODEL_PATHS);
     }
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
     }
     if image_quota_from_value(Some(&result["quota"])).is_some() {
         ensure_image_model_snapshot(&mut result);
+    }
+    result["_model_source_version"] = json!(ACCOUNT_MODEL_SOURCE_VERSION);
+    if quota > 0 {
+        result["_verified_image_capability"] = Value::Bool(true);
     }
     canonicalize_account_item(&result).map_err(|_| "invalid_account")
 }
@@ -10840,9 +10845,7 @@ const AUTHENTICATED_NATIVE_MODEL_PATHS: &[&str] = &[
     "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true",
     "/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true",
 ];
-const LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH: &str =
-    "/backend-api/models?history_and_training_disabled=false";
-const ANONYMOUS_NATIVE_MODEL_PATHS: &[&str] = &["/backend-anon/models?iim=false&is_gizmo=false"];
+const ACCOUNT_MODEL_SOURCE_VERSION: u64 = 1;
 
 struct NativeModelIdentity<'a> {
     token: &'a str,
@@ -10879,8 +10882,10 @@ async fn fetch_native_model_catalog_with_outcome(
     identity: NativeModelIdentity<'_>,
     deadline: Instant,
 ) -> NativeModelCatalogFetchOutcome {
-    let authenticated = !identity.token.is_empty();
-    if authenticated {
+    if identity.token.is_empty() {
+        return NativeModelCatalogFetchOutcome::PermanentUnavailable;
+    }
+    {
         let bootstrap = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             native_bootstrap(client, base_url, identity.token, context),
@@ -10898,21 +10903,11 @@ async fn fetch_native_model_catalog_with_outcome(
             Err(_) => return NativeModelCatalogFetchOutcome::RetryableUnavailable,
         }
     }
-    let mut paths = if authenticated {
-        AUTHENTICATED_NATIVE_MODEL_PATHS.to_vec()
-    } else {
-        ANONYMOUS_NATIVE_MODEL_PATHS.to_vec()
-    };
-    if authenticated {
-        paths.push(LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH);
-    }
+    let paths = AUTHENTICATED_NATIVE_MODEL_PATHS.to_vec();
     let mut indexes = HashMap::<String, usize>::new();
     let mut models: Vec<PublicModel> = Vec::new();
     let mut retryable_failure = false;
     for path in paths {
-        if path == LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH && !models.is_empty() {
-            break;
-        }
         if Instant::now() >= deadline {
             break;
         }
@@ -10923,11 +10918,9 @@ async fn fetch_native_model_catalog_with_outcome(
         )
         .header("X-OpenAI-Target-Path", target_path)
         .header("X-OpenAI-Target-Route", target_path);
-        if authenticated {
-            request = request.header(header::AUTHORIZATION, format!("Bearer {}", identity.token));
-            if let Some(account_id) = identity.account_id {
-                request = request.header("ChatGPT-Account-ID", account_id);
-            }
+        request = request.header(header::AUTHORIZATION, format!("Bearer {}", identity.token));
+        if let Some(account_id) = identity.account_id {
+            request = request.header("ChatGPT-Account-ID", account_id);
         }
         let response =
             match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
@@ -10965,16 +10958,12 @@ async fn fetch_native_model_catalog_with_outcome(
         let Ok(value) = serde_json::from_slice::<Value>(&body) else {
             continue;
         };
-        let provenance = if target_path == "/backend-api/codex/models" {
-            ModelProvenance::Codex
-        } else {
-            ModelProvenance::Web
-        };
+        let provenance = ModelProvenance::Web;
         for field in ["models", "data", "items"] {
             let Some(projected) = project_remote_model_list_with_provenance(
                 &value,
                 field,
-                !authenticated,
+                false,
                 identity.account_type,
                 true,
                 false,
@@ -19205,9 +19194,9 @@ mod tests {
                 }
             );
         }
-        assert_eq!(channel_models_body["channels"][0]["plan_type"], "pro");
-        assert_eq!(channel_models_body["channels"][1]["plan_type"], "PRO");
-        assert_eq!(channel_models_body["channels"][2]["plan_type"], "free");
+        assert_eq!(channel_models_body["channels"][0]["plan_type"], "");
+        assert_eq!(channel_models_body["channels"][1]["plan_type"], "");
+        assert_eq!(channel_models_body["channels"][2]["plan_type"], "");
 
         shutdown.send(()).expect("stub shutdown");
         stub_task.await.expect("stub join");
@@ -21629,7 +21618,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_refresh_model_merge_preserves_existing_catalog() {
+    fn imported_refresh_model_merge_ignores_existing_catalog() {
         let raw = json!({
             "models": [
                 "configured-model",
@@ -21638,10 +21627,7 @@ mod tests {
                 "configured-model"
             ]
         });
-        assert_eq!(
-            merge_account_models(&raw, None, false).map(|(models, _)| models),
-            Some(vec!["configured-model".to_owned(), "web-model".to_owned()])
-        );
+        assert_eq!(merge_account_models(&raw, None, false), None);
         assert_eq!(
             merge_account_models(
                 &raw,
@@ -21652,11 +21638,7 @@ mod tests {
                 false,
             )
             .map(|(models, _)| models),
-            Some(vec![
-                "configured-model".to_owned(),
-                "web-model".to_owned(),
-                "web-image-model".to_owned()
-            ])
+            Some(vec!["web-model".to_owned(), "web-image-model".to_owned()])
         );
         assert_eq!(merge_account_models(&json!({}), None, false), None);
     }
@@ -26429,7 +26411,7 @@ data: [DONE]
         let account_path = account_snapshot_path("public-model-provenance");
         fs::write(
             &account_path,
-            r#"[{"access_token":"image-account","status":"正常","type":"pro","quota":2,"models":["gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}}]"#,
+            r#"[{"access_token":"image-account","status":"正常","type":"pro","quota":2,"_model_source_version":1,"_verified_image_capability":true,"models":["gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}}]"#,
         )
         .expect("image-capable account snapshot");
         let state = AppState::new(AppConfig {
@@ -26489,6 +26471,8 @@ data: [DONE]
         let canonical = canonicalize_account_item(&json!({
             "access_token": "account-token",
             "source_type": "codex",
+            "_model_source_version": 1,
+            "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]],
             "models": [
                 {"model":"configured-model","source":"configured"},
                 {"model":"gpt-5-codex","source":"web"},
@@ -26496,17 +26480,13 @@ data: [DONE]
                 {"model":"unknown-channel-model","source":"unknown"},
                 "auto"
             ],
-            "model_sources": {"auto":"web"}
+            "model_sources": {"gpt-5-codex":"web","auto":"web"}
         }))
         .expect("canonical account");
-        assert_eq!(
-            canonical["models"],
-            json!(["configured-model", "gpt-5-codex", "auto"])
-        );
+        assert_eq!(canonical["models"], json!(["gpt-5-codex", "auto"]));
         assert_eq!(
             canonical["model_sources"],
             json!({
-                "configured-model": "configured",
                 "gpt-5-codex": "web",
                 "auto": "web"
             })
@@ -26522,7 +26502,11 @@ data: [DONE]
             "source_type": "codex",
             "type": "pro",
             "quota": "3",
+            "_model_source_version": 1,
+            "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]],
+            "_verified_image_capability": true,
             "models": ["gpt-5-5", "gpt-image-2", "gpt-image-2.5"]
+            ,"model_sources":{"gpt-5-5":"web","gpt-image-2":"image","gpt-image-2.5":"image"}
         });
         ensure_image_model_snapshot(&mut refreshed);
         let canonical = canonicalize_account_item(&refreshed).expect("canonical account");
@@ -26999,9 +26983,9 @@ data: [DONE]
         fs::write(
             &path,
             r#"{"items":[
-                {"access_token":"disabled-token","status":"禁用","models":["gpt-test"]},
-                {"access_token":"wrong-model-token","status":"正常","models":["other"]},
-                {"access_token":"account-token","status":"正常","models":["gpt-test"]}
+                {"access_token":"disabled-token","status":"禁用","_model_source_version":1,"_verified_web_model_paths":["/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true"],"models":["gpt-test"],"model_sources":{"gpt-test":"web"}},
+                {"access_token":"wrong-model-token","status":"正常","_model_source_version":1,"_verified_web_model_paths":["/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true"],"models":["other"],"model_sources":{"other":"web"}},
+                {"access_token":"account-token","status":"正常","_model_source_version":1,"_verified_web_model_paths":["/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true"],"models":["gpt-test"],"model_sources":{"gpt-test":"web"}}
             ]}"#
             .as_bytes(),
         )
@@ -27019,7 +27003,7 @@ data: [DONE]
         assert_eq!(old_lease.token(), "account-token");
         atomic_replace_checked_with_limit(
             &path,
-            r#"{"items":[{"access_token":"rotated-token","status":"正常","models":["gpt-test"]}]}"#
+            r#"{"items":[{"access_token":"rotated-token","status":"正常","_model_source_version":1,"_verified_web_model_paths":["/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true"],"models":["gpt-test"],"model_sources":{"gpt-test":"web"}}]}"#
                 .as_bytes(),
             MAX_ACCOUNT_SNAPSHOT_BYTES,
             false,
@@ -27033,7 +27017,7 @@ data: [DONE]
         drop(rotated_lease);
         atomic_replace_checked_with_limit(
             &path,
-            r#"{"items":[{"access_token":"rotated-token","status":"禁用","models":["gpt-test"]}]}"#
+            r#"{"items":[{"access_token":"rotated-token","status":"禁用","_model_source_version":1,"_verified_web_model_paths":["/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true"],"models":["gpt-test"],"model_sources":{"gpt-test":"web"}}]}"#
                 .as_bytes(),
             MAX_ACCOUNT_SNAPSHOT_BYTES,
             false,
@@ -27050,7 +27034,7 @@ data: [DONE]
         assert!(store.acquire("gpt-test").await.is_none());
         atomic_replace_checked_with_limit(
             &path,
-            r#"{"items":[{"access_token":"recovered-token","status":"正常","models":["gpt-test"]}]}"#
+            r#"{"items":[{"access_token":"recovered-token","status":"正常","_model_source_version":1,"_verified_web_model_paths":["/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true"],"models":["gpt-test"],"model_sources":{"gpt-test":"web"}}]}"#
                 .as_bytes(),
             MAX_ACCOUNT_SNAPSHOT_BYTES,
             false,
@@ -27068,9 +27052,9 @@ data: [DONE]
         fs::write(
             &path,
             r#"[
-                {"access_token":"image-token","status":"正常","type":"plus","quota":1,"models":["gpt-test"]},
+                {"access_token":"image-token","status":"正常","type":"plus","quota":1,"_model_source_version":1,"_verified_image_capability":true,"models":[],"model_sources":{}},
                 {"access_token":"zero-token","status":"正常","type":"pro","quota":0},
-                {"access_token":"string-token","status":"正常","type":"team","quota":"1"},
+                {"access_token":"string-token","status":"正常","type":"team","quota":"1","_verified_image_capability":true},
                 {"access_token":"limited-token","status":"限流","type":"enterprise","quota":5}
             ]"#
             .as_bytes(),
@@ -27100,9 +27084,9 @@ data: [DONE]
         atomic_replace_checked_with_limit(
             &path,
             r#"[
-                {"access_token":"image-token","status":"正常","type":"plus","quota":1,"models":["gpt-test"]},
+                {"access_token":"image-token","status":"正常","type":"plus","quota":1,"_model_source_version":1,"_verified_image_capability":true,"models":[],"model_sources":{}},
                 {"access_token":"zero-token","status":"正常","type":"pro","quota":0},
-                {"access_token":"string-token","status":"正常","type":"team","quota":"1"},
+                {"access_token":"string-token","status":"正常","type":"team","quota":"1","_verified_image_capability":true},
                 {"access_token":"limited-token","status":"限流","type":"enterprise","quota":5}
             ]"#
             .as_bytes(),
@@ -28799,8 +28783,7 @@ data: [DONE]
             post(|| async { Json(json!({"token":"anonymous-requirements-token"})) });
         let anonymous_models =
             get(|| async { Json(json!({"models": [{"slug":"catalog-model"}]})) });
-        let authenticated_models =
-            get(|| async { Json(json!({"models": [{"slug":"catalog-model"}]})) });
+        let authenticated_models = get(|| async { Json(json!({"models": [{"slug":"gpt-test"}]})) });
         let upstream_task = tokio::spawn(async move {
             axum::serve(
                 upstream_listener,
@@ -28865,7 +28848,7 @@ data: [DONE]
             )
             .await
             .expect("tool-call response");
-        assert_eq!(dropped_tool_call.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(dropped_tool_call.status(), StatusCode::BAD_REQUEST);
         assert_eq!(*call_log.lock().await, vec!["bootstrap"]);
         assert_eq!(state.account_store.inflight(), 0);
 
@@ -30868,8 +30851,7 @@ data: [DONE]
             post(|| async { Json(json!({"token":"anonymous-requirements-token"})) });
         let anonymous_models =
             get(|| async { Json(json!({"models": [{"slug":"catalog-model"}]})) });
-        let authenticated_models =
-            get(|| async { Json(json!({"models": [{"slug":"catalog-model"}]})) });
+        let authenticated_models = get(|| async { Json(json!({"models": [{"slug":"gpt-test"}]})) });
         let count_for_handler = conversation_count.clone();
         let tokens_for_handler = conversation_tokens.clone();
         let conversation = post(move |headers: HeaderMap, Json(_payload): Json<Value>| {
@@ -30933,8 +30915,8 @@ data: [DONE]
             &account_path,
             serde_json::to_vec(&json!({
                 "items": [
-                    {"access_token": "first-token", "status": "正常", "models": ["gpt-test"]},
-                    {"access_token": "second-token", "status": "正常", "models": [second_account_model]}
+                    {"access_token": "first-token", "status": "正常", "_model_source_version": 1, "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]], "models": ["gpt-test"], "model_sources": {"gpt-test": "web"}},
+                    {"access_token": "second-token", "status": "正常", "_model_source_version": 1, "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]], "models": [second_account_model], "model_sources": {second_account_model: "web"}}
                 ]
             }))
             .expect("accounts json"),
@@ -31066,8 +31048,7 @@ data: [DONE]
                     .into_response()
             }
         });
-        let authenticated_models =
-            get(|| async { Json(json!({"models": [{"slug":"catalog-model"}]})) });
+        let authenticated_models = get(|| async { Json(json!({"models": [{"slug":"gpt-test"}]})) });
         let anonymous_models =
             get(|| async { Json(json!({"models": [{"slug":"catalog-model"}]})) });
         let upstream_task = tokio::spawn(async move {
@@ -31102,8 +31083,8 @@ data: [DONE]
             &account_path,
             serde_json::to_vec(&json!({
                 "items": [
-                    {"access_token": "first-token", "status": "正常", "models": ["gpt-test"]},
-                    {"access_token": "second-token", "status": "正常", "models": ["gpt-test"]}
+                    {"access_token": "first-token", "status": "正常", "_model_source_version": 1, "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]], "models": ["gpt-test"], "model_sources": {"gpt-test": "web"}},
+                    {"access_token": "second-token", "status": "正常", "_model_source_version": 1, "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]], "models": ["gpt-test"], "model_sources": {"gpt-test": "web"}}
                 ]
             }))
             .expect("accounts json"),
@@ -31158,7 +31139,7 @@ data: [DONE]
         ));
         fs::write(
             &account_path,
-            r#"[{"access_token":"catalog-token","status":"正常","type":"free"}]"#,
+            r#"[{"access_token":"catalog-token","status":"正常","type":"free","_model_source_version":1,"_verified_web_model_paths":["/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true"],"models":["known-model"],"model_sources":{"known-model":"web"}}]"#,
         )
         .expect("account snapshot");
 
@@ -31227,7 +31208,7 @@ data: [DONE]
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = response
             .into_body()
             .collect()
@@ -31235,7 +31216,7 @@ data: [DONE]
             .expect("body")
             .to_bytes();
         let value: Value = serde_json::from_slice(&body).expect("error json");
-        assert_eq!(value["error"]["code"], "model_not_found");
+        assert_eq!(value["error"]["code"], "model_catalog_pending");
 
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -31603,9 +31584,13 @@ data: [DONE]
             .await
             .expect("body")
             .to_bytes();
-        assert_eq!(status, StatusCode::OK, "anonymous route body: {body:?}");
-        let value: Value = serde_json::from_slice(&body).expect("completion json");
-        assert_eq!(value["choices"][0]["message"]["content"], "anonymous ok");
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "anonymous model must not be sourced from an unauthenticated endpoint: {body:?}"
+        );
+        let value: Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(value["error"]["code"], "model_catalog_pending");
 
         let auto_response = tokio::time::timeout(
             Duration::from_secs(2),
@@ -31622,18 +31607,7 @@ data: [DONE]
         .await
         .expect("anonymous auto route must remain bounded")
         .expect("auto response");
-        assert_eq!(auto_response.status(), StatusCode::OK);
-        let auto_body = auto_response
-            .into_body()
-            .collect()
-            .await
-            .expect("auto body")
-            .to_bytes();
-        let auto_value: Value = serde_json::from_slice(&auto_body).expect("auto completion json");
-        assert_eq!(
-            auto_value["choices"][0]["message"]["content"],
-            "anonymous ok"
-        );
+        assert_eq!(auto_response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -32113,7 +32087,7 @@ data: [DONE]
             value["data"].as_array().expect("model data").len(),
             "model union must be globally deduplicated"
         );
-        assert!(ids.contains("native-anon-model"));
+        assert!(!ids.contains("native-anon-model"));
         assert!(ids.contains("collision-model"));
         assert!(ids.contains("plus-auth-model"));
         assert_eq!(
@@ -32251,14 +32225,10 @@ data: [DONE]
         assert_eq!(auth_model_calls.len(), 2);
         assert!(auth_model_calls.contains(&"Bearer codex-token".to_owned()));
         assert!(auth_model_calls.contains(&"Bearer codex-no-id".to_owned()));
-        assert!(paths.contains(&"/backend-anon/models?iim=false&is_gizmo=false".to_owned()));
-        assert_eq!(
-            paths
+        assert!(
+            !paths
                 .iter()
-                .filter(|path| path.starts_with("/backend-anon/models?"))
-                .count(),
-            1,
-            "anonymous catalog is fetched once per refresh"
+                .any(|path| path.starts_with("/backend-anon/models?"))
         );
         assert!(
             !paths
@@ -32654,7 +32624,7 @@ data: [DONE]
             .expect("same-type Web fallback");
         assert_eq!(result.1.candidates[0].token, "second");
         assert_eq!(result.0[0].id, "fallback-web-model");
-        assert_eq!(web_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 2);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -32816,7 +32786,7 @@ data: [DONE]
             .expect("second same-type candidate should be tried after invalid models");
         assert_eq!(result.1.candidates[0].token, "second");
         assert_eq!(result.0[0].id, "native-invalid-fallback-model");
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
@@ -32894,7 +32864,7 @@ data: [DONE]
             )
             .await;
         assert!(result.is_none());
-        assert_eq!(web_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 2);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -33378,17 +33348,15 @@ data: [DONE]
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if model_fetches.load(Ordering::Acquire) == 3 {
+                if model_fetches.load(Ordering::Acquire) == 2 {
                     break;
                 }
                 model_fetch_started.notified().await;
             }
         })
         .await
-        .expect(
-            "one native background owner should fetch anonymous plus one Web endpoint per type",
-        );
-        assert_eq!(model_fetches.load(Ordering::SeqCst), 3);
+        .expect("one native background owner should fetch one authenticated Web endpoint per type");
+        assert_eq!(model_fetches.load(Ordering::SeqCst), 2);
 
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -35668,9 +35636,9 @@ data: [DONE]
         let result =
             native_chat_failover_case(vec![StatusCode::BAD_GATEWAY, StatusCode::OK], "other-model")
                 .await;
-        assert_eq!(result.0, StatusCode::BAD_GATEWAY);
-        assert_eq!(result.1, 1);
-        assert_eq!(result.2, ["Bearer first-token"]);
+        assert_eq!(result.0, StatusCode::OK);
+        assert_eq!(result.1, 2);
+        assert_eq!(result.2, ["Bearer first-token", "Bearer second-token"]);
         assert_eq!(result.3, 0);
     }
 
@@ -36580,7 +36548,7 @@ data: [DONE]
             r#"[
                 {"access_token":"free-codex","status":"正常","source_type":"codex","type":"free","quota":1,"models":["gpt-5.5"]},
                 {"access_token":"plus-codex","status":"正常","source_type":"codex","type":"plus","quota":1,"models":["gpt-5.5"]},
-                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","quota":1,"models":["gpt-5.5"]},
+                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","quota":1,"_model_source_version":1,"_verified_image_capability":true,"models":["gpt-image-2"],"model_sources":{"gpt-image-2":"image"}},
                 {"access_token":"pro-codex","status":"正常","source_type":"codex","type":"pro","models":["gpt-5.5"]}
             ]"#,
         )
@@ -36664,7 +36632,7 @@ data: [DONE]
             r#"[
                 {"access_token":"free-codex","status":"正常","source_type":"codex","type":"free","models":["gpt-5.5"]},
                 {"access_token":"plus-codex","status":"正常","source_type":"codex","type":"plus","models":["gpt-5.5"]},
-                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","quota":1,"models":["gpt-5.5"]},
+                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","quota":1,"_verified_image_capability":true,"models":[],"model_sources":{}},
                 {"access_token":"pro-codex","status":"限流","source_type":"codex","type":"pro","models":["gpt-5.5"]}
             ]"#,
         )
@@ -36729,10 +36697,10 @@ data: [DONE]
             r#"[
                 {"access_token":"free-codex","status":"正常","source_type":"codex","type":"free","models":["gpt-5.5"]},
                 {"access_token":"plus-codex","status":"正常","source_type":"codex","type":"plus","models":["gpt-5.5"]},
-                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","quota":1,"models":["gpt-5.5"]},
+                {"access_token":"team-codex","status":"正常","source_type":"codex","type":"team","quota":1,"_verified_image_capability":true,"models":[],"model_sources":{}},
                 {"access_token":"pro-codex-limited","status":"限流","source_type":"codex","type":"pro","models":["gpt-5.5"]},
-                {"access_token":"free-web","status":"正常","source_type":"web","type":"free","quota":1,"models":["gpt-5.5","gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}},
-                {"access_token":"plus-web","status":"正常","source_type":"web","type":"plus","quota":1,"models":["gpt-5.5","gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}}
+                {"access_token":"free-web","status":"正常","source_type":"web","type":"free","quota":1,"_model_source_version":1,"_verified_image_capability":true,"models":["gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}},
+                {"access_token":"plus-web","status":"正常","source_type":"web","type":"plus","quota":1,"_model_source_version":1,"_verified_image_capability":true,"models":["gpt-image-2","gpt-image-2.5"],"model_sources":{"gpt-image-2":"image","gpt-image-2.5":"image"}}
             ]"#,
         )
         .expect("account snapshot");
