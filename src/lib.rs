@@ -998,10 +998,22 @@ fn read_account_document(
 
 fn canonicalize_account_models(object: &mut Map<String, Value>) {
     let default = account_model_default_provenance_from_object(object);
+    let verified_web_catalog = object
+        .get("_verified_web_model_catalog")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let imported_account = object
+        .get("source_type")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.eq_ignore_ascii_case("codex"));
     let entries = project_account_model_entries(object, default)
         .into_iter()
         .filter(|(id, provenance)| {
-            !model_provenance_is_untrusted(*provenance) && !is_codex_auto_review_model_id(id)
+            !model_provenance_is_untrusted(*provenance)
+                && !is_codex_auto_review_model_id(id)
+                && (!imported_account
+                    || *provenance == ModelProvenance::Image
+                    || (verified_web_catalog && *provenance == ModelProvenance::Web))
         })
         .take(MAX_MODELS)
         .collect::<Vec<_>>();
@@ -2505,6 +2517,7 @@ fn public_account(record: &AccountRecord) -> Value {
         "id_token",
         "proxy",
         "model_sources",
+        "_verified_web_model_catalog",
     ] {
         object.remove(key);
     }
@@ -2618,7 +2631,7 @@ fn merge_account_models(
         for (value, provenance) in
             project_account_model_entries(object, account_model_default_provenance(raw))
         {
-            if provenance == ModelProvenance::Image && !image_capable {
+            if provenance != ModelProvenance::Image || !image_capable {
                 continue;
             }
             push(&value, provenance);
@@ -2646,30 +2659,6 @@ fn merge_account_models(
         })
         .collect::<Map<_, _>>();
     Some((models, Value::Object(sources)))
-}
-
-fn account_web_catalog_models(raw: &Value) -> Vec<PublicModel> {
-    let Some(object) = raw.as_object() else {
-        return Vec::new();
-    };
-    project_account_model_entries(object, ModelProvenance::Unknown)
-        .into_iter()
-        .filter(|(id, provenance)| {
-            *provenance == ModelProvenance::Web
-                && !is_native_image_model_id(id)
-                && !is_codex_auto_review_model_id(id)
-        })
-        .filter_map(|(id, _)| {
-            ModelCatalog::project(&json!({
-                "id": id,
-                "provenance": "web"
-            }))
-        })
-        .map(|mut model| {
-            model.provenance = ModelProvenance::Web;
-            model
-        })
-        .collect()
 }
 
 fn account_request_payload_token(value: &Value) -> Option<String> {
@@ -2856,12 +2845,6 @@ async fn refresh_access_token_account(
         })
         .unwrap_or_default();
     let (quota, restore_at) = image_quota_from_limits_progress(init.get("limits_progress"));
-    let editor_web_models = account_web_catalog_models(raw);
-    if !editor_web_models.is_empty() {
-        state
-            .account_type_catalog
-            .persist_web_models_from_candidate(plan_type, raw, &editor_web_models);
-    }
     state
         .account_type_catalog
         .hydrate_current_persisted_web_catalog()
@@ -2915,6 +2898,9 @@ async fn refresh_access_token_account(
     if let Some(fetched_models) = fetched_models {
         fallback_web_models.extend(fetched_models);
     }
+    let verified_web_catalog = fallback_web_models
+        .iter()
+        .any(|model| model.provenance == ModelProvenance::Web);
     let model_items = merge_account_models(
         raw,
         (!fallback_web_models.is_empty()).then_some(fallback_web_models),
@@ -2935,6 +2921,9 @@ async fn refresh_access_token_account(
     if let Some((model_items, model_sources)) = model_items {
         result["models"] = json!(model_items);
         result["model_sources"] = model_sources;
+        if verified_web_catalog {
+            result["_verified_web_model_catalog"] = Value::Bool(true);
+        }
     }
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
@@ -11011,7 +11000,7 @@ const ACCOUNT_TYPE_MODEL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const ACCOUNT_TYPE_MODEL_REFRESH_DEADLINE: Duration = Duration::from_secs(90);
 const ACCOUNT_TYPE_REFRESH_CONCURRENCY: usize = 4;
 const PERSISTED_WEB_MODEL_CATALOG_FILE: &str = "web_model_catalog.json";
-const PERSISTED_WEB_MODEL_CATALOG_SCHEMA_VERSION: u64 = 1;
+const PERSISTED_WEB_MODEL_CATALOG_SCHEMA_VERSION: u64 = 2;
 const PERSISTED_WEB_MODEL_CATALOG_TTL_SECS: u64 = 24 * 60 * 60;
 const PERSISTED_WEB_MODEL_CATALOG_MAX_BYTES: u64 = 1024 * 1024;
 const CANONICAL_WEB_MODEL_PATHS: &[&str] = &[
@@ -20187,6 +20176,10 @@ mod tests {
                         "models":[
                             {"model":"configured-model","redirect_model":"configured-model","source":"configured"},
                             {"model":"plain-web-model","redirect_model":"plain-web-model"},
+                            {"model":"gpt-5.4-mini","redirect_model":"gpt-5.4-mini"},
+                            {"model":"gpt-5.5","redirect_model":"gpt-5.5"},
+                            {"model":"gpt-5.6-luna","redirect_model":"gpt-5.6-luna"},
+                            {"model":"gpt-5.6-terra","redirect_model":"gpt-5.6-terra"},
                             {"model":"web-page-model","redirect_model":"web-page-model","source":"web"},
                             {"model":"gpt-5-codex","redirect_model":"gpt-5-codex","source":"web"},
                             {"model":"auto","redirect_model":"auto","source":"web"},
@@ -20475,7 +20468,6 @@ mod tests {
             "web-page-model",
             "gpt-5-codex",
             "auto",
-            "plain-web-model",
             "web-tpp-model",
             "tpp-codex-named-model",
         ] {
@@ -20485,6 +20477,18 @@ mod tests {
             );
         }
         assert!(!channel_model_ids.contains(&"configured-model"));
+        for editor_only_model in [
+            "plain-web-model",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+        ] {
+            assert!(
+                !channel_model_ids.contains(&editor_only_model),
+                "unexpected editor-only channel model {editor_only_model}"
+            );
+        }
         assert!(channel_model_ids.contains(&"gpt-image-2"));
         assert!(
             !channel_model_ids.contains(&"codex-endpoint-model"),
@@ -20555,17 +20559,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing imported account {token}"));
             assert_eq!(item["type"], "pro");
             assert_eq!(item["source_type"], "codex");
-            assert!(item["models"].as_array().is_some_and(|models| {
-                models.iter().any(|model| model == "web-page-model")
-                    && models.iter().any(|model| model == "gpt-5-codex")
-                    && models.iter().any(|model| model == "auto")
-                    && models.iter().any(|model| model == "gpt-image-2")
-                    && models.iter().any(|model| model == "gpt-image-2.5")
-                    && models.iter().any(|model| model == "gpt-image-2.5-flare")
-                    && models.iter().any(|model| model == "web-tpp-model")
-                    && models.iter().any(|model| model == "tpp-codex-named-model")
-                    && models.iter().all(|model| model != "codex-endpoint-model")
-            }));
+            assert!(
+                item["models"].as_array().is_some_and(|models| {
+                    models.iter().any(|model| model == "web-page-model")
+                        && models.iter().any(|model| model == "gpt-5-codex")
+                        && models.iter().any(|model| model == "auto")
+                        && models.iter().any(|model| model == "gpt-image-2")
+                        && models.iter().any(|model| model == "gpt-image-2.5")
+                        && models.iter().any(|model| model == "gpt-image-2.5-flare")
+                        && models.iter().any(|model| model == "web-tpp-model")
+                        && models.iter().any(|model| model == "tpp-codex-named-model")
+                        && models.iter().all(|model| model != "codex-endpoint-model")
+                }),
+                "unexpected imported account models: {item}"
+            );
             for key in ["accessToken", "token", "refresh_token", "id_token"] {
                 assert!(item.get(key).is_none(), "account leaked {key}");
             }
@@ -20578,11 +20585,6 @@ mod tests {
             !ccload_item["models"]
                 .as_array()
                 .is_some_and(|models| models.iter().any(|model| model == "configured-model"))
-        );
-        assert!(
-            ccload_item["models"]
-                .as_array()
-                .is_some_and(|models| models.iter().any(|model| model == "plain-web-model"))
         );
         let cached_web_ids = {
             let cached_web_catalog = state
@@ -20601,26 +20603,20 @@ mod tests {
                 })
                 .unwrap_or_default()
         };
-        assert!(
-            cached_web_ids
-                .iter()
-                .any(|model| model == "plain-web-model"),
-            "cached Web ids: {cached_web_ids:?}"
-        );
-        let ccload_raw = state
-            .account_store
-            .raw_records()
-            .into_iter()
-            .find(|item| item["access_token"] == "cc-access-token")
-            .expect("raw ccLoad account after import");
-        let raw_web_ids = account_web_catalog_models(&ccload_raw)
-            .into_iter()
-            .map(|model| model.id)
-            .collect::<Vec<_>>();
-        assert!(
-            raw_web_ids.iter().any(|model| model == "plain-web-model"),
-            "raw Web ids: {raw_web_ids:?}"
-        );
+        for editor_only_model in [
+            "plain-web-model",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+        ] {
+            assert!(
+                !cached_web_ids
+                    .iter()
+                    .any(|model| model == editor_only_model),
+                "unexpected editor-only cached Web model {editor_only_model}: {cached_web_ids:?}"
+            );
+        }
 
         let models = management_request(&state, "GET", "/v1/models", None, Some("admin")).await;
         assert_eq!(models.status(), StatusCode::OK);
@@ -20631,10 +20627,22 @@ mod tests {
             .iter()
             .filter_map(|model| model["id"].as_str())
             .collect::<Vec<_>>();
-        for model in ["plain-web-model", "web-page-model", "gpt-image-2"] {
+        for model in ["web-page-model", "gpt-image-2"] {
             assert!(
                 model_ids.contains(&model),
                 "missing public model {model}: {models}"
+            );
+        }
+        for editor_only_model in [
+            "plain-web-model",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+        ] {
+            assert!(
+                !model_ids.contains(&editor_only_model),
+                "unexpected editor-only public model {editor_only_model}"
             );
         }
         for model in [
@@ -22510,7 +22518,7 @@ mod tests {
         });
         assert_eq!(
             merge_account_models(&raw, None, false).map(|(models, _)| models),
-            Some(vec!["configured-model".to_owned(), "web-model".to_owned()])
+            None
         );
         assert_eq!(
             merge_account_models(
@@ -22522,11 +22530,7 @@ mod tests {
                 false,
             )
             .map(|(models, _)| models),
-            Some(vec![
-                "configured-model".to_owned(),
-                "web-model".to_owned(),
-                "web-image-model".to_owned()
-            ])
+            Some(vec!["web-model".to_owned(), "web-image-model".to_owned()])
         );
         assert_eq!(merge_account_models(&json!({}), None, false), None);
     }
@@ -27387,20 +27391,24 @@ data: [DONE]
             "model_sources": {"auto":"web"}
         }))
         .expect("canonical account");
-        assert_eq!(
-            canonical["models"],
-            json!(["configured-model", "gpt-5-codex", "auto"])
-        );
-        assert_eq!(
-            canonical["model_sources"],
-            json!({
-                "configured-model": "configured",
-                "gpt-5-codex": "web",
-                "auto": "web"
-            })
-        );
+        assert!(canonical.get("models").is_none());
+        assert!(canonical.get("model_sources").is_none());
         assert!(!canonical.to_string().contains("codex-endpoint-model"));
         assert!(!canonical.to_string().contains("unknown-channel-model"));
+
+        let verified = canonicalize_account_item(&json!({
+            "access_token": "account-token",
+            "source_type": "codex",
+            "_verified_web_model_catalog": true,
+            "models": [
+                {"model":"gpt-5-codex","source":"web"},
+                {"model":"gpt-image-2","source":"image"}
+            ]
+        }))
+        .expect("verified canonical account");
+        assert_eq!(verified["models"], json!(["gpt-5-codex", "gpt-image-2"]));
+        assert_eq!(verified["model_sources"]["gpt-5-codex"], "web");
+        assert_eq!(verified["model_sources"]["gpt-image-2"], "image");
     }
 
     #[test]
@@ -27414,10 +27422,7 @@ data: [DONE]
         });
         ensure_image_model_snapshot(&mut refreshed);
         let canonical = canonicalize_account_item(&refreshed).expect("canonical account");
-        assert_eq!(
-            canonical["models"],
-            json!(["gpt-5-5", "gpt-image-2", "gpt-image-2.5"])
-        );
+        assert_eq!(canonical["models"], json!(["gpt-image-2", "gpt-image-2.5"]));
         assert_eq!(canonical["model_sources"]["gpt-image-2"], "image");
         assert_eq!(canonical["model_sources"]["gpt-image-2.5"], "image");
 
@@ -27673,6 +27678,15 @@ data: [DONE]
             .cloned()
             .expect("valid cache entry");
         assert_eq!(load_persisted_web_model_catalog(Some(&cache_path)).len(), 1);
+
+        let mut old_schema = valid_document.clone();
+        old_schema["schema_version"] = Value::from(1_u64);
+        fs::write(
+            &cache_path,
+            serde_json::to_vec(&old_schema).expect("old schema cache JSON"),
+        )
+        .expect("write old schema cache");
+        assert!(load_persisted_web_model_catalog(Some(&cache_path)).is_empty());
 
         fs::write(&cache_path, b"{broken").expect("corrupt cache");
         assert!(load_persisted_web_model_catalog(Some(&cache_path)).is_empty());
@@ -28227,13 +28241,20 @@ data: [DONE]
             assert_eq!(catalog["model_sources"].get("codex-auto-review"), None);
             assert_eq!(catalog["model_sources"].get("configured-model"), None);
         }
-        assert_eq!(first_channels[0]["model_sources"]["gpt-5.5"], "web");
-        for model in ["gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare"] {
-            assert_eq!(first_channels[0]["model_sources"][model], "image");
+        assert_eq!(first_channels[0]["model_sources"].get("gpt-5.5"), None);
+        assert_eq!(first_channels[0]["model_sources"]["gpt-image-2"], "image");
+        for editor_image_model in ["gpt-image-1.5", "gpt-image-2.5-flare"] {
+            assert_eq!(
+                first_channels[0]["model_sources"].get(editor_image_model),
+                None
+            );
         }
-        assert_eq!(first_channels[1]["model_sources"]["gpt-5.5"], "web");
-        for model in ["gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare"] {
-            assert_eq!(first_channels[1]["model_sources"].get(model), None);
+        assert_eq!(first_channels[1]["model_sources"].get("gpt-5.5"), None);
+        for editor_image_model in ["gpt-image-1.5", "gpt-image-2", "gpt-image-2.5-flare"] {
+            assert_eq!(
+                first_channels[1]["model_sources"].get(editor_image_model),
+                None
+            );
         }
         assert_eq!(first_channels[0]["model_sources"]["gpt-image-2"], "image");
         assert_eq!(first_channels[1]["model_sources"].get("gpt-image-2"), None);

@@ -32,10 +32,6 @@ use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
 use tokio::sync::Semaphore;
 
-use super::model_pool::{
-    ModelProvenance, model_provenance_from_value, model_provenance_label, model_provenance_rank,
-    project_imported_model_entries, project_imported_model_entries_with_sources,
-};
 use super::{
     ApiError, AppState, admin_authenticated, authenticated, config, data_file, image_content_type,
     image_root, read_image_tags, redact_config, safe_relative_path,
@@ -2288,232 +2284,6 @@ fn normalized_ccload_credential(value: Option<&Value>) -> Option<HashMap<String,
     Some(credential)
 }
 
-#[derive(Clone)]
-struct CcLoadModelEntry {
-    id: String,
-    provenance: ModelProvenance,
-}
-
-fn ccload_model_allowed(provenance: ModelProvenance) -> bool {
-    matches!(provenance, ModelProvenance::Web | ModelProvenance::Image)
-}
-
-fn ccload_model_entry_allowed(entry: &CcLoadModelEntry) -> bool {
-    ccload_model_allowed(entry.provenance) && !super::is_codex_auto_review_model_id(&entry.id)
-}
-
-fn ccload_model_entries(value: Option<&Value>) -> Vec<CcLoadModelEntry> {
-    // An authenticated ccLoad editor response is itself the catalog source;
-    // bare editor entries therefore represent Web models.
-    let mut explicit_provenance = HashMap::<String, ModelProvenance>::new();
-    for item in value.and_then(Value::as_array).into_iter().flatten() {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        let Some(id) = ["id", "model", "slug"]
-            .iter()
-            .find_map(|key| object.get(*key).and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        else {
-            continue;
-        };
-        let has_explicit_source = ["provenance", "source", "source_type", "endpoint"]
-            .iter()
-            .any(|key| {
-                object
-                    .get(*key)
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty())
-            });
-        if !has_explicit_source {
-            continue;
-        }
-        let provenance = model_provenance_from_value(Some(item), ModelProvenance::Unknown);
-        explicit_provenance
-            .entry(id.to_owned())
-            .and_modify(|current| {
-                if model_provenance_rank(provenance) > model_provenance_rank(*current) {
-                    *current = provenance;
-                }
-            })
-            .or_insert(provenance);
-    }
-    project_imported_model_entries(value, ModelProvenance::Web)
-        .into_iter()
-        .map(|(id, mut provenance)| {
-            if let Some(explicit) = explicit_provenance.get(&id) {
-                provenance = *explicit;
-            }
-            if provenance != ModelProvenance::Codex
-                && id.to_ascii_lowercase().starts_with("gpt-image-")
-            {
-                provenance = ModelProvenance::Image;
-            }
-            CcLoadModelEntry { id, provenance }
-        })
-        .collect()
-}
-
-fn ccload_model_ids(value: Option<&Value>) -> Vec<String> {
-    ccload_model_entries(value)
-        .into_iter()
-        .filter(ccload_model_entry_allowed)
-        .map(|entry| entry.id)
-        .collect()
-}
-
-fn ccload_model_payload(entries: Vec<CcLoadModelEntry>) -> (Value, Value) {
-    let models = entries
-        .iter()
-        .filter(|entry| ccload_model_entry_allowed(entry))
-        .map(|entry| Value::String(entry.id.clone()))
-        .collect::<Vec<_>>();
-    let sources = entries
-        .into_iter()
-        .filter(ccload_model_entry_allowed)
-        .map(|entry| {
-            (
-                entry.id,
-                Value::String(model_provenance_label(entry.provenance).to_owned()),
-            )
-        })
-        .collect::<Map<_, _>>();
-    (Value::Array(models), Value::Object(sources))
-}
-
-fn apply_ccload_image_capability(catalog: &mut Value, image_models: &[String]) {
-    let Some(object) = catalog.as_object_mut() else {
-        return;
-    };
-    let models = object
-        .entry("models".to_owned())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    if !models.is_array() {
-        *models = Value::Array(Vec::new());
-    }
-    let models = models.as_array_mut().expect("ccLoad models array");
-    models.retain(|model| {
-        !model
-            .as_str()
-            .is_some_and(|value| value.to_ascii_lowercase().starts_with("gpt-image-"))
-    });
-    for image_model in image_models {
-        if !models
-            .iter()
-            .any(|model| model.as_str() == Some(image_model))
-        {
-            models.push(Value::String(image_model.clone()));
-        }
-    }
-    if !image_models.is_empty() {
-        object.insert("models_loaded".to_owned(), Value::Bool(true));
-    }
-    let sources = object
-        .entry("model_sources".to_owned())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !sources.is_object() {
-        *sources = Value::Object(Map::new());
-    }
-    if let Some(sources) = sources.as_object_mut() {
-        sources.retain(|id, _| !id.to_ascii_lowercase().starts_with("gpt-image-"));
-        for image_model in image_models {
-            sources.insert(image_model.clone(), Value::String("image".to_owned()));
-        }
-    }
-}
-
-fn merge_ccload_model_catalog(
-    models: Option<&Value>,
-    sources: Option<&Value>,
-    fetched: Option<&[super::model_pool::PublicModel]>,
-) -> (Value, Value) {
-    let mut entries =
-        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Unknown)
-            .into_iter()
-            .filter(|(id, provenance)| {
-                ccload_model_allowed(*provenance) && !super::is_codex_auto_review_model_id(id)
-            })
-            .collect::<Vec<_>>();
-    let mut indexes = entries
-        .iter()
-        .enumerate()
-        .map(|(index, (id, _))| (id.clone(), index))
-        .collect::<HashMap<_, _>>();
-    if let Some(fetched) = fetched {
-        for model in fetched {
-            if !ccload_model_allowed(model.provenance)
-                || super::is_codex_auto_review_model_id(&model.id)
-            {
-                continue;
-            }
-            if let Some(index) = indexes.get(&model.id).copied() {
-                if model_provenance_rank(model.provenance) > model_provenance_rank(entries[index].1)
-                {
-                    entries[index].1 = model.provenance;
-                }
-            } else if entries.len() < super::MAX_MODELS {
-                indexes.insert(model.id.clone(), entries.len());
-                entries.push((model.id.clone(), model.provenance));
-            }
-        }
-    }
-    ccload_model_payload(
-        entries
-            .into_iter()
-            .map(|(id, provenance)| CcLoadModelEntry { id, provenance })
-            .collect(),
-    )
-}
-
-fn merge_ccload_account_catalog(
-    models: Option<&Value>,
-    sources: Option<&Value>,
-    image_capable: bool,
-    snapshot: &Value,
-) -> (Value, Value) {
-    let mut entries =
-        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Unknown)
-            .into_iter()
-            .filter(|(id, provenance)| {
-                ccload_model_allowed(*provenance)
-                    && !super::is_codex_auto_review_model_id(id)
-                    && (image_capable || *provenance != ModelProvenance::Image)
-            })
-            .collect::<Vec<_>>();
-    let mut indexes = entries
-        .iter()
-        .enumerate()
-        .map(|(index, (id, _))| (id.clone(), index))
-        .collect::<HashMap<_, _>>();
-    for (id, provenance) in project_imported_model_entries_with_sources(
-        snapshot.get("models"),
-        snapshot.get("model_sources"),
-        ModelProvenance::Unknown,
-    ) {
-        if !ccload_model_allowed(provenance)
-            || super::is_codex_auto_review_model_id(&id)
-            || (!image_capable && provenance == ModelProvenance::Image)
-        {
-            continue;
-        }
-        if let Some(index) = indexes.get(&id).copied() {
-            if model_provenance_rank(provenance) > model_provenance_rank(entries[index].1) {
-                entries[index].1 = provenance;
-            }
-        } else if entries.len() < super::MAX_MODELS {
-            indexes.insert(id.clone(), entries.len());
-            entries.push((id, provenance));
-        }
-    }
-    ccload_model_payload(
-        entries
-            .into_iter()
-            .map(|(id, provenance)| CcLoadModelEntry { id, provenance })
-            .collect(),
-    )
-}
-
 fn public_sub2api_item(value: &Value) -> Value {
     let object = value.as_object().cloned().unwrap_or_default();
     json!({
@@ -3372,10 +3142,7 @@ async fn load_ccload_channel_models(
             {
                 catalog["plan_type"] = Value::String(plan_type.clone());
             }
-            let (configured_models, configured_sources) = ccload_model_payload(
-                ccload_model_entries(channel.and_then(|value| value.get("models"))),
-            );
-            let mut account = json!({
+            let account = json!({
                 "access_token": credential
                     .get("access_token")
                     .expect("validated ccLoad access token"),
@@ -3383,13 +3150,6 @@ async fn load_ccload_channel_models(
                 "type": catalog.get("plan_type").cloned().unwrap_or(Value::Null),
                 "chatgpt_account_id": credential.get("account_id").cloned(),
             });
-            if configured_models
-                .as_array()
-                .is_some_and(|models| !models.is_empty())
-            {
-                account["models"] = configured_models.clone();
-                account["model_sources"] = configured_sources.clone();
-            }
             let snapshot = match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
                 super::refresh_access_token_account(&request_state, &account, None),
@@ -3398,24 +3158,8 @@ async fn load_ccload_channel_models(
             {
                 Ok(Ok(snapshot)) => snapshot,
                 Ok(Err(code)) => {
-                    let (models, sources) = merge_ccload_account_catalog(
-                        Some(&configured_models),
-                        Some(&configured_sources),
-                        false,
-                        &Value::Object(Map::new()),
-                    );
-                    let has_web = sources.as_object().is_some_and(|sources| {
-                        sources
-                            .values()
-                            .any(|source| source.as_str() == Some("web"))
-                    });
-                    catalog["models"] = models;
-                    catalog["model_sources"] = sources;
-                    catalog["models_loaded"] = Value::Bool(has_web);
                     catalog["model_load_status"] = Value::String(
-                        if has_web {
-                            "loaded"
-                        } else if code == "upstream_timeout" {
+                        if code == "upstream_timeout" {
                             "timeout"
                         } else {
                             "failed"
@@ -3425,34 +3169,18 @@ async fn load_ccload_channel_models(
                     return (index, catalog);
                 }
                 Err(_) => {
-                    let (models, sources) = merge_ccload_account_catalog(
-                        Some(&configured_models),
-                        Some(&configured_sources),
-                        false,
-                        &Value::Object(Map::new()),
-                    );
-                    let has_web = sources.as_object().is_some_and(|sources| {
-                        sources
-                            .values()
-                            .any(|source| source.as_str() == Some("web"))
-                    });
-                    catalog["models"] = models;
-                    catalog["model_sources"] = sources;
-                    catalog["models_loaded"] = Value::Bool(has_web);
                     catalog["model_load_status"] = Value::String("timeout".to_owned());
-                    if has_web {
-                        catalog["model_load_status"] = Value::String("loaded".to_owned());
-                    }
                     return (index, catalog);
                 }
             };
-            let image_capable = super::image_quota_from_value(snapshot.get("quota")).is_some();
-            let (models, sources) = merge_ccload_account_catalog(
-                Some(&configured_models),
-                Some(&configured_sources),
-                image_capable,
-                &snapshot,
-            );
+            let models = snapshot
+                .get("models")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            let sources = snapshot
+                .get("model_sources")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new()));
             let has_web = sources.as_object().is_some_and(|sources| {
                 sources
                     .values()
@@ -3606,8 +3334,6 @@ async fn execute_ccload_import(
                 if channel_matches
                     && let Some(credential) = normalized_ccload_credential(credential)
                 {
-                    let configured_entries =
-                        ccload_model_entries(channel.and_then(|item| item.get("models")));
                     let mut candidate = json!({
                         "access_token": credential
                             .get("access_token")
@@ -3620,11 +3346,6 @@ async fn execute_ccload_import(
                             .cloned()
                             .unwrap_or_default(),
                     });
-                    if !configured_entries.is_empty() {
-                        let (models, sources) = ccload_model_payload(configured_entries);
-                        candidate["models"] = models;
-                        candidate["model_sources"] = sources;
-                    }
                     for key in ["account_id", "email", "expired"] {
                         if let Some(value) = credential.get(key).filter(|value| !value.is_empty()) {
                             candidate[key] = Value::String(value.clone());
@@ -5820,11 +5541,8 @@ pub(super) async fn download_backup(
 mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
-        apply_ccload_image_capability, ccload_model_entries, ccload_model_ids,
-        ccload_model_payload, merge_ccload_account_catalog, normalized_ccload_credential,
-        parse_r2_list_xml, public_backup_error,
+        normalized_ccload_credential, parse_r2_list_xml, public_backup_error,
     };
-    use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
 
     #[test]
@@ -5933,136 +5651,5 @@ mod tests {
         assert!(!credential.contains_key("id_token"));
         assert!(!credential.contains_key("refresh_token"));
         assert!(credential.get("expired").is_some_and(String::is_empty));
-    }
-
-    #[test]
-    fn ccload_model_catalog_trusts_editor_models_and_filters_codex() {
-        let value = serde_json::json!([
-            {"model":"gpt-5-codex","source":"web"},
-            {"model":"auto","source":"web"},
-            {"model":"codex-endpoint-only","endpoint":"/backend-api/codex/models"},
-            {"model":"codex-source-only","source":"codex"},
-            {"model":"codex-source-only"},
-            {"model":"plain-web-model"},
-            {"model":"codex-auto-review"},
-            {"model":"unknown-source","source":"unknown"}
-        ]);
-        let entries = ccload_model_entries(Some(&value));
-        assert_eq!(entries.len(), 7);
-        assert_eq!(entries[0].id, "gpt-5-codex");
-        assert_eq!(entries[0].provenance, ModelProvenance::Web);
-        assert_eq!(entries[1].id, "auto");
-        assert_eq!(entries[1].provenance, ModelProvenance::Web);
-        assert_eq!(entries[2].id, "codex-endpoint-only");
-        assert_eq!(entries[2].provenance, ModelProvenance::Codex);
-        assert_eq!(entries[3].id, "codex-source-only");
-        assert_eq!(entries[3].provenance, ModelProvenance::Codex);
-        assert_eq!(entries[4].id, "plain-web-model");
-        assert_eq!(entries[4].provenance, ModelProvenance::Web);
-        assert_eq!(entries[5].id, "codex-auto-review");
-        assert_eq!(entries[5].provenance, ModelProvenance::Web);
-        assert_eq!(entries[6].id, "unknown-source");
-        assert_eq!(entries[6].provenance, ModelProvenance::Unknown);
-        assert_eq!(
-            ccload_model_ids(Some(&value)),
-            vec![
-                "gpt-5-codex".to_owned(),
-                "auto".to_owned(),
-                "plain-web-model".to_owned()
-            ]
-        );
-        let (models, sources) = ccload_model_payload(entries);
-        assert_eq!(
-            models,
-            serde_json::json!(["gpt-5-codex", "auto", "plain-web-model"])
-        );
-        assert_eq!(
-            sources,
-            serde_json::json!({
-                "gpt-5-codex": "web",
-                "auto": "web",
-                "plain-web-model": "web"
-            })
-        );
-    }
-
-    #[test]
-    fn ccload_editor_infers_image_provenance_from_model_id() {
-        let entries = ccload_model_entries(Some(&serde_json::json!([
-            {"model":"gpt-image-1.5"},
-            {"model":"gpt-image-2.5-flare"},
-            {"model":"regular-web-model"},
-            {"model":"gpt-image-codex","endpoint":"/backend-api/codex/models"}
-        ])));
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| (entry.id.as_str(), entry.provenance))
-                .collect::<Vec<_>>(),
-            vec![
-                ("gpt-image-1.5", ModelProvenance::Image),
-                ("gpt-image-2.5-flare", ModelProvenance::Image),
-                ("regular-web-model", ModelProvenance::Web),
-                ("gpt-image-codex", ModelProvenance::Codex),
-            ]
-        );
-        let (models, sources) = ccload_model_payload(entries);
-        assert_eq!(
-            models,
-            serde_json::json!(["gpt-image-1.5", "gpt-image-2.5-flare", "regular-web-model"])
-        );
-        assert_eq!(sources["gpt-image-1.5"], "image");
-        assert_eq!(sources.get("gpt-image-codex"), None);
-    }
-
-    #[test]
-    fn ccload_account_catalog_isolates_image_capability() {
-        let models = serde_json::json!(["web-model", "gpt-image-2"]);
-        let sources = serde_json::json!({"web-model":"web", "gpt-image-2":"image"});
-        let empty_snapshot = Value::Object(Map::new());
-        let (without_image, without_image_sources) =
-            merge_ccload_account_catalog(Some(&models), Some(&sources), false, &empty_snapshot);
-        assert_eq!(without_image, serde_json::json!(["web-model"]));
-        assert_eq!(
-            without_image_sources,
-            serde_json::json!({"web-model":"web"})
-        );
-        let (with_image, with_image_sources) =
-            merge_ccload_account_catalog(Some(&models), Some(&sources), true, &empty_snapshot);
-        assert_eq!(with_image, models);
-        assert_eq!(with_image_sources, sources);
-    }
-
-    #[test]
-    fn ccload_image_projection_requires_a_refreshed_positive_quota() {
-        let mut without_capability = serde_json::json!({
-            "models": ["web-model", "gpt-image-2"],
-            "model_sources": {"web-model":"web", "gpt-image-2":"web"}
-        });
-        apply_ccload_image_capability(&mut without_capability, &[]);
-        assert_eq!(
-            without_capability["models"],
-            serde_json::json!(["web-model"])
-        );
-        assert!(
-            without_capability["model_sources"]
-                .get("gpt-image-2")
-                .is_none()
-        );
-
-        let mut with_capability = serde_json::json!({
-            "models": ["web-model", "GPT-IMAGE-2", "gpt-image-2.5"],
-            "model_sources": {"web-model":"web", "GPT-IMAGE-2":"web", "gpt-image-2.5":"web"}
-        });
-        apply_ccload_image_capability(
-            &mut with_capability,
-            &["gpt-image-2".to_owned(), "gpt-image-2.5".to_owned()],
-        );
-        assert_eq!(
-            with_capability["models"],
-            serde_json::json!(["web-model", "gpt-image-2", "gpt-image-2.5"])
-        );
-        assert_eq!(with_capability["model_sources"]["gpt-image-2"], "image");
-        assert_eq!(with_capability["model_sources"]["gpt-image-2.5"], "image");
     }
 }
