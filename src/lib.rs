@@ -11014,13 +11014,19 @@ const PERSISTED_WEB_MODEL_CATALOG_FILE: &str = "web_model_catalog.json";
 const PERSISTED_WEB_MODEL_CATALOG_SCHEMA_VERSION: u64 = 1;
 const PERSISTED_WEB_MODEL_CATALOG_TTL_SECS: u64 = 24 * 60 * 60;
 const PERSISTED_WEB_MODEL_CATALOG_MAX_BYTES: u64 = 1024 * 1024;
-const AUTHENTICATED_NATIVE_MODEL_PATHS: &[&str] = &[
+const CANONICAL_WEB_MODEL_PATHS: &[&str] = &[
     "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true",
     "/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true",
 ];
-const LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH: &str =
-    "/backend-api/models?history_and_training_disabled=false";
 const ANONYMOUS_NATIVE_MODEL_PATHS: &[&str] = &["/backend-anon/models?iim=false&is_gizmo=false"];
+
+fn is_canonical_model_discovery_path(path: &str, authenticated: bool) -> bool {
+    if authenticated {
+        CANONICAL_WEB_MODEL_PATHS.contains(&path)
+    } else {
+        ANONYMOUS_NATIVE_MODEL_PATHS.contains(&path)
+    }
+}
 
 struct NativeModelIdentity<'a> {
     token: &'a str,
@@ -11076,25 +11082,22 @@ async fn fetch_native_model_catalog_with_outcome(
             Err(_) => return NativeModelCatalogFetchOutcome::RetryableUnavailable,
         }
     }
-    let mut paths = if authenticated {
-        AUTHENTICATED_NATIVE_MODEL_PATHS.to_vec()
+    let paths = if authenticated {
+        CANONICAL_WEB_MODEL_PATHS.to_vec()
     } else {
         ANONYMOUS_NATIVE_MODEL_PATHS.to_vec()
     };
-    if authenticated {
-        paths.push(LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH);
-    }
     let mut indexes = HashMap::<String, usize>::new();
     let mut models: Vec<PublicModel> = Vec::new();
     let mut retryable_failure = false;
     for path in paths {
-        if path == LEGACY_AUTHENTICATED_NATIVE_MODEL_PATH && !models.is_empty() {
-            break;
-        }
         if Instant::now() >= deadline {
             break;
         }
         let target_path = path.split('?').next().unwrap_or(path);
+        if !is_canonical_model_discovery_path(path, authenticated) {
+            return NativeModelCatalogFetchOutcome::PermanentUnavailable;
+        }
         let mut request = native_browser_headers(
             client.get(format!("{}{path}", base_url.trim_end_matches('/'))),
             context,
@@ -11143,11 +11146,9 @@ async fn fetch_native_model_catalog_with_outcome(
         let Ok(value) = serde_json::from_slice::<Value>(&body) else {
             continue;
         };
-        let provenance = if target_path == "/backend-api/codex/models" {
-            ModelProvenance::Codex
-        } else {
-            ModelProvenance::Web
-        };
+        // The request path is guarded by is_canonical_model_discovery_path;
+        // every authenticated catalog response is therefore Web provenance.
+        let provenance = ModelProvenance::Web;
         for field in ["models", "data", "items"] {
             let Some(projected) = project_remote_model_list_with_provenance(
                 &value,
@@ -27279,6 +27280,24 @@ data: [DONE]
                 .all(|model| model.provenance == ModelProvenance::Image)
         );
 
+        let mixed = project_remote_model_list_with_provenance(
+            &json!({
+                "models": [
+                    {"slug": "ordinary-looking-model", "source": "codex"},
+                    {"slug": "ordinary-web-model"}
+                ]
+            }),
+            "models",
+            false,
+            Some("pro"),
+            true,
+            false,
+            ModelProvenance::Web,
+        )
+        .expect("mixed provenance catalog");
+        assert_eq!(mixed[0].provenance, ModelProvenance::Codex);
+        assert_eq!(mixed[1].provenance, ModelProvenance::Web);
+
         let codex = project_remote_model_list_with_provenance(
             &json!({"models": [{"slug": "gpt-5-codex"}]}),
             "models",
@@ -34116,6 +34135,34 @@ data: [DONE]
         fs::remove_file(account_path).expect("cleanup");
     }
 
+    #[test]
+    fn native_model_discovery_allowlist_rejects_codex_and_legacy_paths() {
+        assert!(is_canonical_model_discovery_path(
+            CANONICAL_WEB_MODEL_PATHS[0],
+            true
+        ));
+        assert!(is_canonical_model_discovery_path(
+            CANONICAL_WEB_MODEL_PATHS[1],
+            true
+        ));
+        assert!(is_canonical_model_discovery_path(
+            ANONYMOUS_NATIVE_MODEL_PATHS[0],
+            false
+        ));
+        assert!(!is_canonical_model_discovery_path(
+            "/backend-api/codex/models",
+            true
+        ));
+        assert!(!is_canonical_model_discovery_path(
+            "/backend-api/models?history_and_training_disabled=false",
+            true
+        ));
+        assert!(!is_canonical_model_discovery_path(
+            "/backend-api/models",
+            false
+        ));
+    }
+
     #[tokio::test]
     async fn native_catalog_merges_web_and_tpp_model_endpoints_without_codex_request() {
         let web_calls = Arc::new(AtomicUsize::new(0));
@@ -34353,7 +34400,7 @@ data: [DONE]
             .expect("same-type Web fallback");
         assert_eq!(result.1.candidates[0].token, "second");
         assert_eq!(result.0[0].id, "fallback-web-model");
-        assert_eq!(web_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 2);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -34515,7 +34562,7 @@ data: [DONE]
             .expect("second same-type candidate should be tried after invalid models");
         assert_eq!(result.1.candidates[0].token, "second");
         assert_eq!(result.0[0].id, "native-invalid-fallback-model");
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
         let _ = upstream_task.await;
@@ -34593,7 +34640,7 @@ data: [DONE]
             )
             .await;
         assert!(result.is_none());
-        assert_eq!(web_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 2);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
