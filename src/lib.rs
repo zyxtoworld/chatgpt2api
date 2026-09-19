@@ -28072,6 +28072,30 @@ data: [DONE]
     }
 
     #[tokio::test]
+    async fn account_acquire_skips_deferred_invalid_accounts() {
+        let path = test_tmp_dir().join(format!(
+            "chatgpt2api-rust-deferred-invalid-{}-{}.json",
+            std::process::id(),
+            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &path,
+            r#"{"items":[
+                {"access_token":"deferred-invalid","status":"正常","models":["gpt-test"],"invalid_count":1},
+                {"access_token":"healthy","status":"正常","models":["gpt-test"]}
+            ]}"#,
+        )
+        .expect("deferred invalid fixture");
+        let store = AccountStore::load(Some(&path)).expect("account store");
+        for _ in 0..8 {
+            let lease = store.acquire("gpt-test").await.expect("healthy account");
+            assert_eq!(lease.token(), "healthy");
+            drop(lease);
+        }
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
     async fn account_snapshot_rejects_explicit_invalid_statuses_and_defaults_missing_status() {
         let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-accounts-status-{}-{}.json",

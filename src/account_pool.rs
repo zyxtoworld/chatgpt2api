@@ -33,6 +33,16 @@ fn is_request_eligible_status(status: &str) -> bool {
     !matches!(status, "禁用" | "限流" | "异常")
 }
 
+fn is_request_eligible_record(record: &AccountRecord) -> bool {
+    is_request_eligible_status(record.status.as_str())
+        && record
+            .raw
+            .get("invalid_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            == 0
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct AccountRecord {
     pub(super) token: String,
@@ -147,6 +157,7 @@ fn image_quota(value: Option<&serde_json::Value>) -> Option<u64> {
 
 fn has_verified_web_image_capability(record: &AccountRecord) -> bool {
     if record.status != "正常"
+        || !is_request_eligible_record(record)
         || record
             .raw
             .get("_verified_image_capability")
@@ -703,7 +714,7 @@ impl AccountStore {
                     };
                     !matches_capability
                 })
-                || !is_request_eligible_status(slot.record.status.as_str())
+                || !is_request_eligible_record(&slot.record)
             {
                 continue;
             }
@@ -748,7 +759,7 @@ impl AccountStore {
         }
         let mut groups = HashMap::<AccountModelGroup, Vec<CatalogAccountCandidate>>::new();
         for slot in snapshot.accounts.iter() {
-            if !is_request_eligible_status(slot.record.status.as_str()) {
+            if !is_request_eligible_record(&slot.record) {
                 continue;
             }
             groups
