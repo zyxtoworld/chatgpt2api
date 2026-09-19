@@ -11768,33 +11768,7 @@ impl AccountTypeCatalog {
         {
             return;
         }
-        let tokens = self
-            .account_store
-            .raw_records()
-            .into_iter()
-            .filter(|record| {
-                let status = record
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("正常");
-                if !matches!(status, "正常" | "限流") {
-                    return false;
-                }
-                let capability_verified = record
-                    .get("_verified_image_capability")
-                    .and_then(Value::as_bool)
-                    == Some(true)
-                    && image_quota_from_value(record.get("quota")).is_some();
-                let source_type = record
-                    .get("source_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("web");
-                let web_provenance_verified =
-                    record.as_object().is_some_and(account_model_source_proof);
-                !capability_verified || (source_type == "codex" && !web_provenance_verified)
-            })
-            .filter_map(|record| account_token(&record))
-            .collect::<Vec<_>>();
+        let tokens = image_quota_refresh_tokens(self.account_store.raw_records());
         if tokens.is_empty() {
             return;
         }
@@ -12868,6 +12842,54 @@ fn nonnegative_u64_from_value(value: Option<&Value>) -> Option<u64> {
 
 fn image_quota_from_value(value: Option<&Value>) -> Option<u64> {
     nonnegative_u64_from_value(value).filter(|value| *value > 0)
+}
+
+fn image_quota_refresh_tokens(records: Vec<Value>) -> Vec<String> {
+    let mut groups = HashSet::new();
+    records
+        .into_iter()
+        .filter(|record| {
+            let status = record
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("正常");
+            if !matches!(status, "正常" | "限流") {
+                return false;
+            }
+            let capability_verified = record
+                .get("_verified_image_capability")
+                .and_then(Value::as_bool)
+                == Some(true)
+                && image_quota_from_value(record.get("quota")).is_some();
+            let source_type = record
+                .get("source_type")
+                .and_then(Value::as_str)
+                .unwrap_or("web");
+            let web_provenance_verified =
+                record.as_object().is_some_and(account_model_source_proof);
+            !capability_verified || (source_type == "codex" && !web_provenance_verified)
+        })
+        .filter_map(|record| {
+            let account_type = record
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("free")
+                .to_ascii_lowercase();
+            let source_type = record
+                .get("source_type")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("web")
+                .to_ascii_lowercase();
+            groups
+                .insert(format!("{account_type}\0{source_type}"))
+                .then(|| account_token(&record))
+                .flatten()
+        })
+        .collect()
 }
 
 fn is_image_quota_feature(value: Option<&Value>) -> bool {
@@ -27082,6 +27104,26 @@ data: [DONE]
                 {"feature_name":"codex_models","remaining":99}
             ]))),
             (0, None)
+        );
+    }
+
+    #[test]
+    fn image_quota_refresh_uses_one_representative_per_account_group() {
+        let tokens = image_quota_refresh_tokens(vec![
+            json!({"access_token":"free-web-1","type":"free","source_type":"web","status":"正常"}),
+            json!({"access_token":"free-web-2","type":"FREE","source_type":"web","status":"正常"}),
+            json!({"access_token":"free-codex-1","type":"free","source_type":"codex","status":"正常"}),
+            json!({"access_token":"free-codex-2","type":"free","source_type":"codex","status":"正常"}),
+            json!({"access_token":"limited-pro","type":"pro","source_type":"web","status":"限流"}),
+            json!({"access_token":"disabled-pro","type":"pro","source_type":"web","status":"禁用"}),
+        ]);
+        assert_eq!(
+            tokens,
+            vec![
+                "free-web-1".to_owned(),
+                "free-codex-1".to_owned(),
+                "limited-pro".to_owned(),
+            ]
         );
     }
 
