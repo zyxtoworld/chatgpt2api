@@ -94,7 +94,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
-use base64::Engine as _;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use file_identity::{
     DirectoryHandle, FileVersion, Identity, create_regular_file_at, directory_identity_at,
     identity as kernel_identity, open_directory, open_or_create_directory, open_regular_file_at,
@@ -2569,6 +2569,61 @@ fn public_account(record: &AccountRecord) -> Value {
             .map(Value::String)
             .unwrap_or(Value::Null),
     );
+    if let Some(payload) = jwt_payload(record.token.as_str()) {
+        let profile = payload
+            .get("https://api.openai.com/profile")
+            .and_then(Value::as_object);
+        let auth = payload
+            .get("https://api.openai.com/auth")
+            .and_then(Value::as_object);
+        if object
+            .get("email")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            if let Some(email) = profile
+                .and_then(|value| value.get("email"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                object.insert("email".to_owned(), Value::String(email.to_owned()));
+            }
+        }
+        if object
+            .get("user_id")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            if let Some(user_id) = auth
+                .and_then(|value| value.get("user_id"))
+                .or_else(|| auth.and_then(|value| value.get("chatgpt_user_id")))
+                .or_else(|| payload.get("sub"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                object.insert("user_id".to_owned(), Value::String(user_id.to_owned()));
+            }
+        }
+        if record.chatgpt_account_id.is_none()
+            && let Some(account_id) = auth
+                .and_then(|value| value.get("chatgpt_account_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            object.insert(
+                "chatgpt_account_id".to_owned(),
+                Value::String(account_id.to_owned()),
+            );
+        }
+    }
+    for key in ["quota", "success", "fail"] {
+        if !object.get(key).is_some_and(Value::is_number) {
+            object.insert(key.to_owned(), Value::from(0));
+        }
+    }
     let models = record
         .raw
         .as_object()
@@ -2584,6 +2639,12 @@ fn public_account(record: &AccountRecord) -> Value {
         .unwrap_or_else(|| record.models.iter().cloned().map(Value::String).collect());
     object.insert("models".to_owned(), Value::Array(models));
     Value::Object(object)
+}
+
+fn jwt_payload(token: &str) -> Option<Value> {
+    let encoded = token.split('.').nth(1)?.trim();
+    let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn public_accounts(state: &AppState) -> Value {
@@ -3297,13 +3358,76 @@ async fn refresh_accounts_now(
     requested: &[String],
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
 ) -> Result<Value, ApiError> {
+    refresh_accounts_now_with_deadline(state, requested, batch, None).await
+}
+
+async fn persist_account_refresh_updates(
+    state: &AppState,
+    updated_records: &mut Vec<(String, Value)>,
+    invalid_tokens: &mut Vec<(String, &'static str)>,
+) -> Result<(), ApiError> {
+    if updated_records.is_empty() && invalid_tokens.is_empty() {
+        return Ok(());
+    }
+    state
+        .account_store
+        .mutate_raw(|current| {
+            for (old_token, updated) in updated_records.iter() {
+                let Some(target) = current
+                    .iter_mut()
+                    .find(|item| account_token(item).as_deref() == Some(old_token.as_str()))
+                else {
+                    continue;
+                };
+                let Some(target_object) = target.as_object_mut() else {
+                    continue;
+                };
+                if let Some(updated_object) = updated.as_object() {
+                    for (key, value) in updated_object {
+                        let useful = !value.is_null()
+                            && (!value.is_string()
+                                || !value.as_str().unwrap_or_default().trim().is_empty());
+                        if useful || !target_object.contains_key(key) {
+                            target_object.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            for (token, code) in invalid_tokens.iter() {
+                if let Some(target) = current
+                    .iter_mut()
+                    .find(|item| account_token(item).as_deref() == Some(token.as_str()))
+                    && let Some(object) = target.as_object_mut()
+                {
+                    object.insert("status".to_owned(), Value::String("异常".to_owned()));
+                    object.insert(
+                        "last_refresh_error".to_owned(),
+                        Value::String((*code).to_owned()),
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    updated_records.clear();
+    invalid_tokens.clear();
+    Ok(())
+}
+
+async fn refresh_accounts_now_with_deadline(
+    state: &AppState,
+    requested: &[String],
+    batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+    deadline: Option<Instant>,
+) -> Result<Value, ApiError> {
     // Refresh account metadata with the existing access token only. Never
     // exchange, rotate, read, or persist another token type.
     let mut errors = Vec::new();
     let mut refreshed = 0usize;
     let records = state.account_store.raw_records();
     let mut updated_records = Vec::<(String, Value)>::new();
-    let mut invalid_tokens = Vec::<(String, &str)>::new();
+    let mut invalid_tokens = Vec::<(String, &'static str)>::new();
+    let mut queued = VecDeque::<(String, Value)>::new();
     for token in requested {
         let Some(index) = records
             .iter()
@@ -3312,62 +3436,80 @@ async fn refresh_accounts_now(
             errors.push(json!({"token": public_token_ref(token), "code": "not_found"}));
             continue;
         };
-        match refresh_access_token_account(state, &records[index], batch.clone()).await {
+        queued.push_back((token.clone(), records[index].clone()));
+    }
+
+    let mut active: FuturesUnordered<
+        Pin<Box<dyn Future<Output = (String, Result<Value, &'static str>)> + Send>>,
+    > = FuturesUnordered::new();
+    let mut active_tokens = HashSet::new();
+    while active.len() < ACCOUNT_REFRESH_CONCURRENCY {
+        let Some((token, raw)) = queued.pop_front() else {
+            break;
+        };
+        active_tokens.insert(token.clone());
+        let request_state = state.clone();
+        let request_batch = batch.clone();
+        active.push(Box::pin(async move {
+            let result = refresh_access_token_account(&request_state, &raw, request_batch).await;
+            (token, result)
+        }));
+    }
+    let mut stopped_at_deadline = false;
+    while !active.is_empty() {
+        let next = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), active.next())
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            None => active.next().await,
+        };
+        let Some((token, result)) = next else {
+            stopped_at_deadline = deadline.is_some();
+            break;
+        };
+        active_tokens.remove(&token);
+        match result {
             Ok(updated) => {
                 updated_records.push((token.clone(), updated));
                 refreshed += 1;
             }
             Err(code) => {
-                errors.push(json!({"token": public_token_ref(token), "code": code}));
-                let _ = index;
+                errors.push(json!({"token": public_token_ref(&token), "code": code}));
                 if code == "invalid_token" {
                     invalid_tokens.push((token.clone(), code));
                 }
             }
         }
+        if updated_records.len() + invalid_tokens.len() >= ACCOUNT_REFRESH_PERSIST_BATCH {
+            persist_account_refresh_updates(state, &mut updated_records, &mut invalid_tokens)
+                .await?;
+        }
+        while active.len() < ACCOUNT_REFRESH_CONCURRENCY {
+            let Some((token, raw)) = queued.pop_front() else {
+                break;
+            };
+            active_tokens.insert(token.clone());
+            let request_state = state.clone();
+            let request_batch = batch.clone();
+            active.push(Box::pin(async move {
+                let result =
+                    refresh_access_token_account(&request_state, &raw, request_batch).await;
+                (token, result)
+            }));
+        }
     }
-    if !updated_records.is_empty() || !invalid_tokens.is_empty() {
-        state
-            .account_store
-            .mutate_raw(|current| {
-                for (old_token, updated) in &updated_records {
-                    let Some(target) = current
-                        .iter_mut()
-                        .find(|item| account_token(item).as_deref() == Some(old_token.as_str()))
-                    else {
-                        continue;
-                    };
-                    let Some(target_object) = target.as_object_mut() else {
-                        continue;
-                    };
-                    if let Some(updated_object) = updated.as_object() {
-                        for (key, value) in updated_object {
-                            let useful = !value.is_null()
-                                && (!value.is_string()
-                                    || !value.as_str().unwrap_or_default().trim().is_empty());
-                            if useful || !target_object.contains_key(key) {
-                                target_object.insert(key.clone(), value.clone());
-                            }
-                        }
-                    }
-                }
-                for (token, code) in &invalid_tokens {
-                    if let Some(target) = current
-                        .iter_mut()
-                        .find(|item| account_token(item).as_deref() == Some(token.as_str()))
-                        && let Some(object) = target.as_object_mut()
-                    {
-                        object.insert("status".to_owned(), Value::String("异常".to_owned()));
-                        object.insert(
-                            "last_refresh_error".to_owned(),
-                            Value::String((*code).to_owned()),
-                        );
-                    }
-                }
-                Ok(())
-            })
-            .await?;
+    if stopped_at_deadline {
+        for token in active_tokens
+            .into_iter()
+            .chain(queued.into_iter().map(|(token, _)| token))
+        {
+            errors.push(json!({"token": public_token_ref(&token), "code": "refresh_deadline"}));
+        }
     }
+    persist_account_refresh_updates(state, &mut updated_records, &mut invalid_tokens).await?;
     Ok(json!({
         "refreshed": refreshed,
         "errors": errors,
@@ -3409,6 +3551,22 @@ pub(crate) async fn refresh_imported_accounts_with_batch(
         .and_then(|result| result.get("refreshed").and_then(Value::as_u64))
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or_default()
+}
+
+pub(crate) async fn refresh_imported_accounts_with_batch_until(
+    state: &AppState,
+    tokens: &[String],
+    batch: Arc<ImportedModelCatalogBatchStats>,
+    deadline: Instant,
+) -> Value {
+    if tokens.is_empty() {
+        return json!({"refreshed": 0, "errors": [], "items": public_accounts(state)["items"]});
+    }
+    refresh_accounts_now_with_deadline(state, tokens, Some(batch), Some(deadline))
+        .await
+        .unwrap_or_else(
+            |_| json!({"refreshed": 0, "errors": [], "items": public_accounts(state)["items"]}),
+        )
 }
 
 #[allow(dead_code)]
@@ -11148,6 +11306,9 @@ const ACCOUNT_TYPE_MODEL_TTL: Duration = Duration::from_secs(300);
 const ACCOUNT_TYPE_MODEL_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 const ACCOUNT_TYPE_MODEL_REFRESH_DEADLINE: Duration = Duration::from_secs(90);
 const ACCOUNT_TYPE_REFRESH_CONCURRENCY: usize = 4;
+const ACCOUNT_REFRESH_CONCURRENCY: usize = 8;
+const ACCOUNT_REFRESH_PERSIST_BATCH: usize = 32;
+const PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE: Duration = Duration::from_secs(8);
 const AUTHENTICATED_NATIVE_MODEL_PATHS: &[&str] = &[
     "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true",
     "/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true",
@@ -11772,11 +11933,8 @@ impl AccountTypeCatalog {
         if tokens.is_empty() {
             return;
         }
-        let _ = tokio::time::timeout(
-            Duration::from_secs(25),
-            refresh_accounts_now(state, &tokens, None),
-        )
-        .await;
+        let deadline = Instant::now() + PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE;
+        let _ = refresh_accounts_now_with_deadline(state, &tokens, None, Some(deadline)).await;
         if let Ok(mut last) = self.image_quota_refreshed_at.lock() {
             *last = Some(Instant::now());
         }
