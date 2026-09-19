@@ -1962,6 +1962,7 @@ impl AppState {
     pub fn new(mut config: AppConfig) -> Result<Self, AppInitError> {
         let client = Client::builder()
             .emulation(wreq_util::Emulation::Chrome110)
+            .cookie_store(true)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()
@@ -2059,6 +2060,7 @@ impl AppState {
     ) -> Result<Self, AppInitError> {
         let client = Client::builder()
             .emulation(wreq_util::Emulation::Chrome110)
+            .cookie_store(true)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()
@@ -14278,8 +14280,8 @@ async fn native_chat_requirements_with_resources_for_route_context(
     } else {
         "/backend-anon"
     };
-    // Prepare and proof tokens must use one browser snapshot, matching the
-    // Python implementation's single build_pow_config call per handshake.
+    // The original web client builds a fresh PoW config for the prepare token
+    // and another one when producing the optional proof token.
     let pow_config = native_pow_config_runtime(NATIVE_USER_AGENT, resources);
     let p_token =
         native_requirements_token_from_config(&pow_config).map_err(|error| (error, false))?;
@@ -14315,10 +14317,14 @@ async fn native_chat_requirements_with_resources_for_route_context(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| (ApiError::upstream(), false))?;
-    let proof_token =
-        native_proof_token_with_config(prepare_value.get("proofofwork"), &pow_config, deadline)
-            .await
-            .map_err(|error| (error, false))?;
+    let proof_token = native_proof_token(
+        prepare_value.get("proofofwork"),
+        NATIVE_USER_AGENT,
+        resources,
+        deadline,
+    )
+    .await
+    .map_err(|error| (error, false))?;
     let turnstile_token =
         native_turnstile_token(prepare_value.get("turnstile"), &p_token, deadline)
             .await
