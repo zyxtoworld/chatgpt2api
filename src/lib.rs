@@ -1448,6 +1448,7 @@ const IMPORTED_MODEL_CATALOG_RETRY_BACKOFF: Duration = if cfg!(test) {
 };
 const IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS: usize = 2;
 const IMPORTED_MODEL_CATALOG_LAST_GOOD_REASON: &str = "last_good_web_catalog_unavailable";
+const IMPORTED_MODEL_CATALOG_IMAGE_ONLY_REASON: &str = "image_only_catalog_without_web_models";
 
 #[derive(Clone)]
 struct ImportedModelCatalogCache {
@@ -1513,6 +1514,12 @@ fn merge_public_model_catalog(
             base.push(model);
         }
     }
+}
+
+fn catalog_has_web_models(models: &[PublicModel]) -> bool {
+    models
+        .iter()
+        .any(|model| model.provenance == ModelProvenance::Web)
 }
 
 #[derive(Default)]
@@ -1721,7 +1728,8 @@ impl ImportedModelCatalogCache {
                 let mut state = entry.state.lock().await;
                 match &*state {
                     ImportedModelCatalogState::Ready { models, expires_at }
-                        if Instant::now() < *expires_at =>
+                        if Instant::now() < *expires_at
+                            && (allow_partial || catalog_has_web_models(models)) =>
                     {
                         if !counted_waiter_hit {
                             entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -1780,7 +1788,13 @@ impl ImportedModelCatalogCache {
                 }
                 let result = match fetch().await {
                     Some(ImportedModelCatalogFetch::Complete(models)) if !models.is_empty() => {
-                        Some((false, models, ""))
+                        if allow_partial || catalog_has_web_models(&models) {
+                            Some((false, models, ""))
+                        } else {
+                            let mut preserved = last_good_models.take().unwrap_or_default();
+                            merge_public_model_catalog(&mut preserved, models);
+                            Some((true, preserved, IMPORTED_MODEL_CATALOG_IMAGE_ONLY_REASON))
+                        }
                     }
                     Some(ImportedModelCatalogFetch::Partial {
                         models,
@@ -21832,6 +21846,33 @@ mod tests {
             .await
             .expect("image partial catalog");
         assert_eq!(partial.len(), 1);
+        let complete = cache
+            .fetch_or_reuse_complete_catalog("pro", None, || async {
+                Some(ImportedModelCatalogFetch::Complete(vec![
+                    test_public_model("web-model", ModelProvenance::Web),
+                ]))
+            })
+            .await
+            .expect("complete Web catalog");
+        assert_eq!(
+            complete
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web-model"]
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_catalog_request_does_not_accept_image_only_ready_cache() {
+        let cache = ImportedModelCatalogCache::new();
+        let image_only = cache
+            .fetch_or_reuse("pro", || async {
+                Some(vec![imported_image_capability_model()])
+            })
+            .await
+            .expect("image-only catalog");
+        assert_eq!(image_only.len(), 1);
         let complete = cache
             .fetch_or_reuse_complete_catalog("pro", None, || async {
                 Some(ImportedModelCatalogFetch::Complete(vec![
