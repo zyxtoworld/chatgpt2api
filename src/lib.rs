@@ -14266,8 +14266,8 @@ async fn native_chat_requirements_with_resources_for_route_context(
     // Prepare and proof tokens must use one browser snapshot, matching the
     // Python implementation's single build_pow_config call per handshake.
     let pow_config = native_pow_config_runtime(NATIVE_USER_AGENT, resources);
-    let p_token = native_requirements_token_from_config(&pow_config)
-        .map_err(|error| (error, false))?;
+    let p_token =
+        native_requirements_token_from_config(&pow_config).map_err(|error| (error, false))?;
     let prepare_path = format!("{route_base}/sentinel/chat-requirements/prepare");
     let mut prepare_request =
         native_browser_headers(client.post(format!("{base_url}{prepare_path}")), context)
@@ -14300,13 +14300,10 @@ async fn native_chat_requirements_with_resources_for_route_context(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| (ApiError::upstream(), false))?;
-    let proof_token = native_proof_token_with_config(
-        prepare_value.get("proofofwork"),
-        &pow_config,
-        deadline,
-    )
-    .await
-    .map_err(|error| (error, false))?;
+    let proof_token =
+        native_proof_token_with_config(prepare_value.get("proofofwork"), &pow_config, deadline)
+            .await
+            .map_err(|error| (error, false))?;
     let turnstile_token =
         native_turnstile_token(prepare_value.get("turnstile"), &p_token, deadline)
             .await

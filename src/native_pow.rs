@@ -109,8 +109,22 @@ fn random_uuid() -> String {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     )
 }
 
@@ -127,11 +141,7 @@ fn legacy_time() -> String {
 
 fn process_elapsed_ms() -> f64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_secs_f64()
-        * 1000.0
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
 pub(crate) fn native_pow_config_runtime(
@@ -181,15 +191,54 @@ pub(crate) fn native_pow_config_runtime(
         "hardwareConcurrency−32",
         "windowControlsOverlay−[object WindowControlsOverlay]",
     ];
-    const DOCUMENT_KEYS: &[&str] = &["__reactContainer$fzelfjyxej8", "_reactListening5dehydibo78", "location"];
+    const DOCUMENT_KEYS: &[&str] = &[
+        "__reactContainer$fzelfjyxej8",
+        "_reactListening5dehydibo78",
+        "location",
+    ];
     const WINDOW_KEYS: &[&str] = &[
-        "0", "window", "self", "document", "name", "location", "customElements", "history",
-        "navigation", "innerWidth", "innerHeight", "scrollX", "scrollY", "visualViewport",
-        "screenX", "screenY", "outerWidth", "outerHeight", "devicePixelRatio", "screen",
-        "navigator", "onresize", "performance", "crypto", "indexedDB", "sessionStorage",
-        "localStorage", "scheduler", "alert", "atob", "btoa", "fetch", "matchMedia",
-        "postMessage", "queueMicrotask", "requestAnimationFrame", "setInterval", "setTimeout",
-        "caches", "__NEXT_DATA__", "__BUILD_MANIFEST", "__NEXT_PRELOADREADY",
+        "0",
+        "window",
+        "self",
+        "document",
+        "name",
+        "location",
+        "customElements",
+        "history",
+        "navigation",
+        "innerWidth",
+        "innerHeight",
+        "scrollX",
+        "scrollY",
+        "visualViewport",
+        "screenX",
+        "screenY",
+        "outerWidth",
+        "outerHeight",
+        "devicePixelRatio",
+        "screen",
+        "navigator",
+        "onresize",
+        "performance",
+        "crypto",
+        "indexedDB",
+        "sessionStorage",
+        "localStorage",
+        "scheduler",
+        "alert",
+        "atob",
+        "btoa",
+        "fetch",
+        "matchMedia",
+        "postMessage",
+        "queueMicrotask",
+        "requestAnimationFrame",
+        "setInterval",
+        "setTimeout",
+        "caches",
+        "__NEXT_DATA__",
+        "__BUILD_MANIFEST",
+        "__NEXT_PRELOADREADY",
     ];
     let resolution = RESOLUTIONS[random_index(RESOLUTIONS.len())];
     let performance_ms = process_elapsed_ms();
