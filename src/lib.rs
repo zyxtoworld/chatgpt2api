@@ -14096,6 +14096,17 @@ async fn native_turnstile_token(
     if !native_optional_challenge_required(value)? {
         return Ok(String::new());
     }
+    // The Python implementation treats an unsupported Turnstile program as
+    // an empty token and still submits finalize. Preserve the hard failure
+    // only for a malformed required challenge with no executable payload.
+    let has_dx = value
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("dx"))
+        .and_then(Value::as_str)
+        .is_some_and(|dx| !dx.is_empty() && dx.chars().count() <= MAX_TURNSTILE_DX_CHARS);
+    if !has_dx {
+        return Err(ApiError::upstream());
+    }
     let permit = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
         NATIVE_POW_SEMAPHORE.clone().acquire_owned(),
@@ -14114,11 +14125,11 @@ async fn native_turnstile_token(
     });
     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut worker).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(ApiError::upstream()),
+        Ok(Err(_)) => Ok(String::new()),
         Err(_) => {
             cancel.store(true, Ordering::Release);
             let _ = worker.await;
-            Err(ApiError::upstream())
+            Ok(String::new())
         }
     }
 }
