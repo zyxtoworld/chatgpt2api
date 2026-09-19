@@ -3192,6 +3192,74 @@ fn terminal_ccload_channel_catalog(id: &str, status: &str) -> Value {
     })
 }
 
+fn normalize_ccload_catalogs_by_model_group(catalogs: &mut [Value]) {
+    let mut shared_web_models = HashMap::<String, HashSet<String>>::new();
+    for catalog in catalogs.iter() {
+        let Some(group) = catalog
+            .get("model_group")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        for (id, provenance) in project_imported_model_entries_with_sources(
+            catalog.get("models"),
+            catalog.get("model_sources"),
+            ModelProvenance::Unknown,
+        ) {
+            if provenance == ModelProvenance::Web {
+                shared_web_models
+                    .entry(group.to_ascii_lowercase())
+                    .or_default()
+                    .insert(id);
+            }
+        }
+    }
+    for catalog in catalogs.iter_mut() {
+        let Some(group) = catalog
+            .get("model_group")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase)
+        else {
+            continue;
+        };
+        let Some(shared_ids) = shared_web_models.get(&group) else {
+            continue;
+        };
+        if shared_ids.is_empty() {
+            continue;
+        }
+        let mut shared_ids = shared_ids.iter().cloned().collect::<Vec<_>>();
+        shared_ids.sort();
+        let shared_sources = shared_ids
+            .iter()
+            .map(|id| (id.clone(), Value::String("web".to_owned())))
+            .collect::<Map<_, _>>();
+        let shared_snapshot = json!({
+            "models": shared_ids,
+            "model_sources": shared_sources,
+        });
+        let (models, sources) = merge_ccload_account_catalog(
+            catalog.get("models"),
+            catalog.get("model_sources"),
+            &shared_snapshot,
+        );
+        catalog["models"] = models;
+        catalog["model_sources"] = sources;
+        catalog["models_loaded"] = Value::Bool(true);
+        let status = catalog
+            .get("model_load_status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(status, "loaded" | "fallback") {
+            catalog["model_load_status"] = Value::String("type_fallback".to_owned());
+        }
+    }
+}
+
 async fn load_ccload_channel_models(
     state: &AppState,
     _server_id: &str,
@@ -3292,6 +3360,9 @@ async fn load_ccload_channel_models(
                         .filter(|value| value.chars().count() <= 256)
                 })
                 .map(ToOwned::to_owned);
+            if let Some(group) = account_type.as_deref().map(str::to_ascii_lowercase) {
+                catalog["model_group"] = Value::String(group);
+            }
             let account_id = credential_value
                 .and_then(|value| value.get("account_id"))
                 .and_then(Value::as_str)
@@ -3320,7 +3391,7 @@ async fn load_ccload_channel_models(
                 .unwrap_or_else(|| (json!([]), json!({})));
             let account = json!({
                 "access_token": access,
-                "type": account_type,
+                "type": account_type.clone(),
                 "chatgpt_account_id": account_id,
             });
             let refresh = tokio::time::timeout_at(
@@ -3372,6 +3443,7 @@ async fn load_ccload_channel_models(
     while let Some((index, catalog)) = requests.next().await {
         catalogs[index] = catalog;
     }
+    normalize_ccload_catalogs_by_model_group(&mut catalogs);
     Ok(catalogs)
 }
 
@@ -5684,8 +5756,9 @@ mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
         apply_ccload_image_capability, ccload_model_entries, ccload_model_ids,
-        ccload_model_payload, merge_ccload_account_catalog, normalized_ccload_credential,
-        parse_r2_list_xml, public_backup_error,
+        ccload_model_payload, merge_ccload_account_catalog,
+        normalize_ccload_catalogs_by_model_group, normalized_ccload_credential, parse_r2_list_xml,
+        public_backup_error,
     };
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
@@ -5869,5 +5942,33 @@ mod tests {
             sources,
             serde_json::json!({"gpt-5-5":"web", "gpt-image-2":"image"})
         );
+    }
+
+    #[test]
+    fn ccload_same_model_group_shares_successful_web_catalog() {
+        let mut catalogs = vec![
+            serde_json::json!({
+                "model_group": "free",
+                "models": ["gpt-image-2"],
+                "model_sources": {"gpt-image-2":"image"},
+                "models_loaded": true,
+                "model_load_status": "partial"
+            }),
+            serde_json::json!({
+                "model_group": "free",
+                "models": ["gpt-5-5", "gpt-image-2"],
+                "model_sources": {"gpt-5-5":"web", "gpt-image-2":"image"},
+                "models_loaded": true,
+                "model_load_status": "loaded"
+            }),
+        ];
+        normalize_ccload_catalogs_by_model_group(&mut catalogs);
+        assert!(
+            catalogs[0]["models"]
+                .as_array()
+                .is_some_and(|models| models.iter().any(|model| model == "gpt-5-5"))
+        );
+        assert_eq!(catalogs[0]["model_sources"]["gpt-5-5"], "web");
+        assert_eq!(catalogs[0]["model_load_status"], "type_fallback");
     }
 }
