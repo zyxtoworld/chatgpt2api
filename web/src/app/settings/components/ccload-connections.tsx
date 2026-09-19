@@ -21,7 +21,6 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import {
   createCCLoadServer,
   deleteCCLoadServer,
-  fetchCCLoadChannelModels,
   fetchCCLoadChannels,
   fetchCCLoadServers,
   startCCLoadImport,
@@ -38,13 +37,9 @@ import {
   areAllCCLoadChannelsSelected,
   filterCCLoadChannels,
   getCCLoadPage,
-  getCCLoadModelErrorIds,
   getValidCCLoadSelectedIds,
   getSelectableCCLoadChannelIds,
-  getUnloadedCCLoadChannelIds,
-  mergeCCLoadChannelModels,
   normalizeCCLoadChannels,
-  resetCCLoadModelState,
   toggleAllCCLoadChannels,
 } from "@/lib/ccload-selection";
 
@@ -55,7 +50,6 @@ export function CCLoadConnections() {
   const deletingOwnerRef = useRef<{ epoch: number } | null>(null);
   const importingOwnerRef = useRef<{ epoch: number } | null>(null);
   const browsingOwnerRef = useRef<{ generation: number; mutationEpoch: number; allowed: boolean } | null>(null);
-  const modelOwnerRef = useRef<{ generation: number; mutationEpoch: number; allowed: boolean } | null>(null);
   const [servers, setServers] = useState<CCLoadServer[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -74,9 +68,6 @@ export function CCLoadConnections() {
   const [channelQuery, setChannelQuery] = useState("");
   const [channelPage, setChannelPage] = useState(1);
   const [channelPageSize, setChannelPageSize] = useState<PageSizeOption>("50");
-  const [loadingModelIds, setLoadingModelIds] = useState<string[]>([]);
-  const [modelLoadErrorIds, setModelLoadErrorIds] = useState<string[]>([]);
-  const [modelRetryGeneration, setModelRetryGeneration] = useState(0);
   const [isStartingImport, setIsStartingImport] = useState(false);
 
   const commitServers = (next: CCLoadServer[] | ((current: CCLoadServer[]) => CCLoadServer[])) => {
@@ -124,7 +115,6 @@ export function CCLoadConnections() {
       deletingOwnerRef.current = null;
       importingOwnerRef.current = null;
       browsingOwnerRef.current = null;
-      modelOwnerRef.current = null;
       gate.cancel();
     };
   }, [loadServers]);
@@ -239,11 +229,6 @@ export function CCLoadConnections() {
 
   const browseChannels = async (server: CCLoadServer) => {
     const gate = requestGateRef.current;
-    gate.invalidateQueries("channel-models");
-    modelOwnerRef.current = null;
-    const cleanModelState = resetCCLoadModelState();
-    setLoadingModelIds(cleanModelState.loadingModelIds);
-    setModelLoadErrorIds(cleanModelState.modelLoadErrorIds);
     const queryOwner = gate.beginQuery("channels");
     if (!queryOwner.allowed) return;
     browsingOwnerRef.current = queryOwner;
@@ -316,69 +301,10 @@ export function CCLoadConnections() {
     () => getCCLoadPage(filteredChannels, channelPage, Number(channelPageSize)),
     [channelPage, channelPageSize, filteredChannels],
   );
-  const unloadedPageModelIds = getUnloadedCCLoadChannelIds(channelPageResult.items).slice(0, 50);
-  const unloadedPageModelKey = unloadedPageModelIds.join(",");
-  const hasModelLoadErrors = channelPageResult.items.some((channel) => modelLoadErrorIds.includes(channel.id));
-
-  const retryChannelModels = () => {
-    if (!browserOpen || !browserServer || modelOwnerRef.current) return;
-    requestGateRef.current.invalidateQueries("channel-models");
-    setLoadingModelIds([]);
-    setModelLoadErrorIds([]);
-    setModelRetryGeneration((current) => current + 1);
-  };
-
-  useEffect(() => {
-    const gate = requestGateRef.current;
-    gate.invalidateQueries("channel-models");
-    modelOwnerRef.current = null;
-    if (!browserOpen || !browserServer || !unloadedPageModelKey) return;
-    const queryOwner = gate.beginQuery("channel-models");
-    if (!queryOwner.allowed) return;
-    const serverId = browserServer.id;
-    const channelIds = unloadedPageModelKey.split(",");
-    modelOwnerRef.current = queryOwner;
-    setLoadingModelIds(channelIds);
-    setModelLoadErrorIds((current) => current.filter((id) => !channelIds.includes(id)));
-    void fetchCCLoadChannelModels(serverId, channelIds)
-      .then((data) => {
-        if (!gate.acceptsQuery(queryOwner)) return;
-        const failedIds = new Set(getCCLoadModelErrorIds(data.channels, channelIds));
-        setModelLoadErrorIds((current) => [
-          ...current.filter((id) => !channelIds.includes(id)),
-          ...channelIds.filter((id) => failedIds.has(id)),
-        ]);
-        setChannels((current) => mergeCCLoadChannelModels(current, data.channels));
-      })
-      .catch((error: unknown) => {
-        if (gate.acceptsQuery(queryOwner)) {
-          setModelLoadErrorIds((current) => [...new Set([...current, ...channelIds])]);
-          toast.error(error instanceof Error ? error.message : "读取渠道模型失败");
-        }
-      })
-      .finally(() => {
-        if (modelOwnerRef.current === queryOwner) {
-          modelOwnerRef.current = null;
-          setLoadingModelIds([]);
-        }
-      });
-    return () => {
-      gate.invalidateQueries("channel-models");
-      if (modelOwnerRef.current === queryOwner) {
-        modelOwnerRef.current = null;
-        setLoadingModelIds([]);
-      }
-    };
-  }, [browserOpen, browserServer, unloadedPageModelKey, modelRetryGeneration]);
-
   const closeBrowser = () => {
     requestGateRef.current.invalidateQueries("channels");
     browsingOwnerRef.current = null;
     setLoadingChannelsId(null);
-    requestGateRef.current.invalidateQueries("channel-models");
-    modelOwnerRef.current = null;
-    setLoadingModelIds([]);
-    setModelLoadErrorIds([]);
     setBrowserOpen(false);
   };
   const selectableFilteredChannelIds = getSelectableCCLoadChannelIds(filteredChannels);
@@ -399,7 +325,7 @@ export function CCLoadConnections() {
               </div>
               <div>
                 <h2 className="text-lg font-semibold tracking-tight">ccLoad 连接管理</h2>
-                <p className="text-sm text-stone-500">配置 ccLoad 服务连接，读取渠道并使用 chatgpt2api 模型列表导入本地号池。</p>
+                <p className="text-sm text-stone-500">配置 ccLoad 服务连接，选择渠道后导入本地号池。</p>
               </div>
             </div>
             <div className="flex items-center gap-2">
@@ -522,8 +448,8 @@ export function CCLoadConnections() {
             <p className="font-medium text-stone-600">使用说明</p>
             <ul className="mt-1 list-inside list-disc space-y-0.5">
               <li>页面进入后先读取系统里已配置的 ccLoad 连接。</li>
-              <li>点击某个连接的「读取渠道」后，会读取 Codex OAuth 渠道和 chatgpt2api 模型列表。</li>
-              <li>确认选择后，后端后台获取对应凭据并导入本地号池。</li>
+              <li>点击某个连接的「读取渠道」后，只读取 Codex OAuth 渠道信息供选择。</li>
+              <li>确认选择后，后端后台获取 access_token 并按 CPA/Sub2API 逻辑统一刷新模型目录。</li>
               <li>管理员密码和 OAuth 凭据不会返回浏览器。</li>
             </ul>
           </div>
@@ -623,7 +549,7 @@ export function CCLoadConnections() {
                   setChannelQuery(event.target.value);
                   setChannelPage(1);
                 }}
-                placeholder="搜索渠道名称、ID或模型"
+                placeholder="搜索渠道名称、ID或套餐"
                 className="h-10 rounded-xl border-stone-200 bg-white pl-10"
                 disabled={hasMutation}
               />
@@ -654,16 +580,6 @@ export function CCLoadConnections() {
                 >
                   {allChannelsSelected ? "取消全选" : "全选筛选结果"}
                 </Button>
-                {hasModelLoadErrors ? (
-                  <Button
-                    variant="outline"
-                    className="h-10 rounded-xl border-rose-200 bg-white px-4 text-rose-600"
-                    onClick={retryChannelModels}
-                    disabled={hasMutation || loadingModelIds.length > 0}
-                  >
-                    重试读取模型
-                  </Button>
-                ) : null}
               </div>
           </div>
 
@@ -703,14 +619,9 @@ export function CCLoadConnections() {
                           <Badge className="rounded-md bg-stone-100 text-stone-600">{channel.plan_type || "unknown"}</Badge>
                           {!channel.enabled ? <Badge variant="info" className="rounded-md">已禁用</Badge> : null}
                         </div>
-                        <div className="mt-1 text-xs text-stone-400">
-                          模型：{channel.models_loaded
-                            ? channel.models.join(", ") || "暂无可用模型"
-                            : loadingModelIds.includes(channel.id)
-                              ? "读取中…"
-                              : modelLoadErrorIds.includes(channel.id) ? "读取失败，重试" : "等待读取"}
-                          {channel.subscription_active_until ? ` · 到期 ${channel.subscription_active_until}` : ""}
-                        </div>
+                        {channel.subscription_active_until ? (
+                          <div className="mt-1 text-xs text-stone-400">到期 {channel.subscription_active_until}</div>
+                        ) : null}
                       </div>
                     </label>
                   ))}
