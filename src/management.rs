@@ -1403,6 +1403,58 @@ fn registry_items(state: &AppState, kind: &str) -> Vec<Value> {
     super::read_server_registry(state, kind)
 }
 
+pub(crate) fn recover_unfinished_import_jobs(state: &AppState) {
+    for kind in ["cpa_pools", "sub2api", "ccload"] {
+        let values = super::read_server_registry(state, kind);
+        if !values.iter().any(import_job_is_unfinished) {
+            continue;
+        }
+        let _ = super::mutate_server_registry(state, kind, |items| {
+            for item in items {
+                let Some(job) = item.get_mut("import_job").and_then(Value::as_object_mut) else {
+                    continue;
+                };
+                if !matches!(
+                    job.get("status").and_then(Value::as_str),
+                    Some("pending" | "running")
+                ) {
+                    continue;
+                }
+                let total = job.get("total").and_then(Value::as_u64).unwrap_or_default();
+                let added = job.get("added").and_then(Value::as_u64).unwrap_or_default();
+                let skipped = job
+                    .get("skipped")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let failed = total.saturating_sub(added.saturating_add(skipped));
+                job.insert("status".to_owned(), Value::String("failed".to_owned()));
+                job.insert("completed".to_owned(), Value::from(total));
+                job.insert("failed".to_owned(), Value::from(failed));
+                job.insert(
+                    "updated_at".to_owned(),
+                    Value::String(iso_timestamp(SystemTime::now())),
+                );
+                job.insert(
+                    "errors".to_owned(),
+                    json!([{"name":"import","error":"导入任务在服务更新时中断"}]),
+                );
+            }
+            Ok(())
+        });
+    }
+}
+
+fn import_job_is_unfinished(value: &Value) -> bool {
+    matches!(
+        value
+            .get("import_job")
+            .and_then(Value::as_object)
+            .and_then(|job| job.get("status"))
+            .and_then(Value::as_str),
+        Some("pending" | "running")
+    )
+}
+
 fn registry_item(state: &AppState, kind: &str, id: &str) -> Option<Value> {
     registry_items(state, kind)
         .into_iter()
@@ -3686,13 +3738,6 @@ async fn execute_ccload_import(
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or_default();
-    let refresh_errors = refresh_result
-        .get("errors")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let refresh_failed = refresh_errors.len();
-    errors.extend(refresh_errors);
     publish_progress(
         ids.len(),
         added,
@@ -3703,7 +3748,7 @@ async fn execute_ccload_import(
         &errors,
     );
 
-    let failed = fetch_failed.saturating_add(refresh_failed).min(ids.len());
+    let failed = fetch_failed.min(ids.len());
     let status = if failed > 0 { "failed" } else { "completed" };
     let mut job = progress_job_with_created(
         &expected_job_id,

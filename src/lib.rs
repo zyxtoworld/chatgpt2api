@@ -2020,7 +2020,7 @@ impl AppState {
         };
         account_store.install_health_snapshot_sync(cache_sync.clone());
         auth_store.install_health_snapshot_sync(cache_sync);
-        Ok(Self {
+        let state = Self {
             config: Arc::new(config),
             config_path: Arc::new(config_path),
             data_dir: Arc::new(data_dir),
@@ -2042,7 +2042,9 @@ impl AppState {
             health_snapshot_publish_test_hook: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             health_refresh_coordinator_test_hook: Arc::new(RwLock::new(None)),
-        })
+        };
+        management::recover_unfinished_import_jobs(&state);
+        Ok(state)
     }
 
     pub(crate) async fn new_with_storage_backend(
@@ -2195,7 +2197,7 @@ impl AppState {
             config.upstream_protocol,
             codex_client_version(),
         );
-        Ok(Self {
+        let state = Self {
             config: Arc::new(config),
             config_path: Arc::new(config_path),
             data_dir: Arc::new(data_dir),
@@ -2217,7 +2219,9 @@ impl AppState {
             health_snapshot_publish_test_hook,
             #[cfg(test)]
             health_refresh_coordinator_test_hook,
-        })
+        };
+        management::recover_unfinished_import_jobs(&state);
+        Ok(state)
     }
 
     fn begin_http_shutdown(&self) {
@@ -2975,6 +2979,10 @@ async fn refresh_access_token_account(
         "restore_at": restore_at,
         "status": if quota == 0 { "限流" } else { "正常" },
         "chatgpt_account_id": default.get("account_id").cloned().unwrap_or(Value::Null),
+        "invalid_count": 0,
+        "last_invalid_at": Value::Null,
+        "last_refresh_error": Value::Null,
+        "last_refresh_error_at": Value::Null,
     });
     if let Some((model_items, model_sources)) = model_items {
         let has_web_models = model_sources.as_object().is_some_and(|sources| {
@@ -3365,6 +3373,11 @@ async fn persist_account_refresh_updates(
     if updated_records.is_empty() && invalid_tokens.is_empty() {
         return Ok(());
     }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
     state
         .account_store
         .mutate_raw(|current| {
@@ -3383,7 +3396,16 @@ async fn persist_account_refresh_updates(
                         let useful = !value.is_null()
                             && (!value.is_string()
                                 || !value.as_str().unwrap_or_default().trim().is_empty());
-                        if useful || !target_object.contains_key(key) {
+                        if useful
+                            || matches!(
+                                key.as_str(),
+                                "invalid_count"
+                                    | "last_invalid_at"
+                                    | "last_refresh_error"
+                                    | "last_refresh_error_at"
+                            )
+                            || !target_object.contains_key(key)
+                        {
                             target_object.insert(key.clone(), value.clone());
                         }
                     }
@@ -3395,11 +3417,24 @@ async fn persist_account_refresh_updates(
                     .find(|item| account_token(item).as_deref() == Some(token.as_str()))
                     && let Some(object) = target.as_object_mut()
                 {
-                    object.insert("status".to_owned(), Value::String("异常".to_owned()));
+                    let previous = object
+                        .get("invalid_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    let next = previous.saturating_add(1);
+                    object.insert("invalid_count".to_owned(), Value::from(next));
+                    object.insert("last_invalid_at".to_owned(), Value::String(now.clone()));
                     object.insert(
                         "last_refresh_error".to_owned(),
                         Value::String((*code).to_owned()),
                     );
+                    object.insert(
+                        "last_refresh_error_at".to_owned(),
+                        Value::String(now.clone()),
+                    );
+                    if invalid_token_should_mark_abnormal(previous) {
+                        object.insert("status".to_owned(), Value::String("异常".to_owned()));
+                    }
                 }
             }
             Ok(())
@@ -11303,8 +11338,13 @@ const ACCOUNT_TYPE_REFRESH_CONCURRENCY: usize = 4;
 const ACCOUNT_REFRESH_CONCURRENCY: usize = 8;
 const ACCOUNT_REFRESH_PERSIST_BATCH: usize = 32;
 const PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE: Duration = Duration::from_secs(8);
+const ACCOUNT_INVALID_CONFIRM_ATTEMPTS: u64 = 3;
 type AccountRefreshFuture =
     Pin<Box<dyn Future<Output = (String, Result<Value, &'static str>)> + Send>>;
+
+fn invalid_token_should_mark_abnormal(previous_count: u64) -> bool {
+    previous_count.saturating_add(1) >= ACCOUNT_INVALID_CONFIRM_ATTEMPTS
+}
 const AUTHENTICATED_NATIVE_MODEL_PATHS: &[&str] = &[
     "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true",
     "/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true",
@@ -27279,6 +27319,13 @@ data: [DONE]
                 "limited-pro".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn invalid_token_status_is_deferred_until_confirmed() {
+        assert!(!invalid_token_should_mark_abnormal(0));
+        assert!(!invalid_token_should_mark_abnormal(1));
+        assert!(invalid_token_should_mark_abnormal(2));
     }
 
     #[test]
