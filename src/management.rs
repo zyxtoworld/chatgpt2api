@@ -3560,38 +3560,38 @@ async fn execute_ccload_import(
                         .map(str::trim)
                         == Some("codex_oauth");
                 let mut accepted = false;
-                if channel_matches {
-                    if let Some(access_token) = normalized_ccload_credential(credential) {
-                        let mut candidate = json!({
+                if channel_matches
+                    && let Some(access_token) = normalized_ccload_credential(credential)
+                {
+                    let mut candidate = json!({
                             "access_token": access_token,
                             "source_type": "web",
+                    });
+                    let plan_type = credential
+                        .and_then(|value| value.get("plan_type"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .or_else(|| {
+                            channel
+                                .and_then(|value| value.get("codex_plan_type"))
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
                         });
-                        let plan_type = credential
-                            .and_then(|value| value.get("plan_type"))
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .or_else(|| {
-                                channel
-                                    .and_then(|value| value.get("codex_plan_type"))
-                                    .and_then(Value::as_str)
-                                    .map(str::trim)
-                                    .filter(|value| !value.is_empty())
-                            });
-                        if let Some(plan_type) = plan_type {
-                            candidate["type"] = Value::String(plan_type.to_owned());
-                        }
-                        if let Some(account_id) = credential
-                            .and_then(|value| value.get("account_id"))
-                            .and_then(Value::as_str)
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                        {
-                            candidate["chatgpt_account_id"] = Value::String(account_id.to_owned());
-                        }
-                        candidates.push(candidate);
-                        accepted = true;
+                    if let Some(plan_type) = plan_type {
+                        candidate["type"] = Value::String(plan_type.to_owned());
                     }
+                    if let Some(account_id) = credential
+                        .and_then(|value| value.get("account_id"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        candidate["chatgpt_account_id"] = Value::String(account_id.to_owned());
+                    }
+                    candidates.push(candidate);
+                    accepted = true;
                 }
                 if !accepted {
                     failed += 1;

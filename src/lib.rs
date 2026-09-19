@@ -2580,31 +2580,27 @@ fn public_account(record: &AccountRecord) -> Value {
             .get("email")
             .and_then(Value::as_str)
             .is_none_or(|value| value.trim().is_empty())
-        {
-            if let Some(email) = profile
+            && let Some(email) = profile
                 .and_then(|value| value.get("email"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-            {
-                object.insert("email".to_owned(), Value::String(email.to_owned()));
-            }
+        {
+            object.insert("email".to_owned(), Value::String(email.to_owned()));
         }
         if object
             .get("user_id")
             .and_then(Value::as_str)
             .is_none_or(|value| value.trim().is_empty())
-        {
-            if let Some(user_id) = auth
+            && let Some(user_id) = auth
                 .and_then(|value| value.get("user_id"))
                 .or_else(|| auth.and_then(|value| value.get("chatgpt_user_id")))
                 .or_else(|| payload.get("sub"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-            {
-                object.insert("user_id".to_owned(), Value::String(user_id.to_owned()));
-            }
+        {
+            object.insert("user_id".to_owned(), Value::String(user_id.to_owned()));
         }
         if record.chatgpt_account_id.is_none()
             && let Some(account_id) = auth
@@ -3439,9 +3435,7 @@ async fn refresh_accounts_now_with_deadline(
         queued.push_back((token.clone(), records[index].clone()));
     }
 
-    let mut active: FuturesUnordered<
-        Pin<Box<dyn Future<Output = (String, Result<Value, &'static str>)> + Send>>,
-    > = FuturesUnordered::new();
+    let mut active: FuturesUnordered<AccountRefreshFuture> = FuturesUnordered::new();
     let mut active_tokens = HashSet::new();
     while active.len() < ACCOUNT_REFRESH_CONCURRENCY {
         let Some((token, raw)) = queued.pop_front() else {
@@ -11309,6 +11303,8 @@ const ACCOUNT_TYPE_REFRESH_CONCURRENCY: usize = 4;
 const ACCOUNT_REFRESH_CONCURRENCY: usize = 8;
 const ACCOUNT_REFRESH_PERSIST_BATCH: usize = 32;
 const PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE: Duration = Duration::from_secs(8);
+type AccountRefreshFuture =
+    Pin<Box<dyn Future<Output = (String, Result<Value, &'static str>)> + Send>>;
 const AUTHENTICATED_NATIVE_MODEL_PATHS: &[&str] = &[
     "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true",
     "/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true",
