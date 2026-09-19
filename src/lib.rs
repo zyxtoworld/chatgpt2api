@@ -171,7 +171,7 @@ const NATIVE_SEARCH_MAX_FIELD_CHARS: usize = 4096;
 const NATIVE_SEARCH_MAX_SOURCES: usize = 100;
 const NATIVE_SEARCH_MODEL: &str = "gpt-5-5";
 const CODEX_RESPONSES_MODEL: &str = "gpt-5.5";
-const NATIVE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0";
+const NATIVE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 const NATIVE_ORIGIN: &str = "https://chatgpt.com";
 const NATIVE_CLIENT_VERSION: &str = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887";
 const NATIVE_CLIENT_BUILD_NUMBER: &str = "6708908";
@@ -1961,7 +1961,7 @@ impl AppState {
 
     pub fn new(mut config: AppConfig) -> Result<Self, AppInitError> {
         let client = Client::builder()
-            .emulation(wreq_util::Emulation::Edge143)
+            .emulation(wreq_util::Emulation::Chrome110)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()
@@ -2058,7 +2058,7 @@ impl AppState {
         data_dir: PathBuf,
     ) -> Result<Self, AppInitError> {
         let client = Client::builder()
-            .emulation(wreq_util::Emulation::Edge143)
+            .emulation(wreq_util::Emulation::Chrome110)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()
