@@ -35,6 +35,10 @@ RUN set -eux; \
             rust_target=x86_64-unknown-linux-gnu; \
             cargo_linker=x86_64-linux-gnu-gcc; \
             cargo_env=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER; \
+            export CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc; \
+            export CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++; \
+            export AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar; \
+            export RANLIB_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ranlib; \
             ;; \
         arm64) \
             apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross; \
@@ -42,6 +46,10 @@ RUN set -eux; \
             rust_target=aarch64-unknown-linux-gnu; \
             cargo_linker=aarch64-linux-gnu-gcc; \
             cargo_env=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER; \
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc; \
+            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++; \
+            export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar; \
+            export RANLIB_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ranlib; \
             ;; \
         *) \
             echo "unsupported TARGETARCH: $TARGETARCH" >&2; \
