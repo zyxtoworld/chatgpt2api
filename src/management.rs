@@ -4255,7 +4255,7 @@ impl R2Client {
             "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
             self.access_key_id
         );
-        let mut request = self.client.request(method, url);
+        let mut request = self.client.request(method, url.to_string());
         for (name, value) in headers {
             request = request.header(name, value);
         }
