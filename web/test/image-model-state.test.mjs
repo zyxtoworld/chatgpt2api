@@ -48,14 +48,26 @@ test("a failed model request leaves no fake model and blocks submit", () => {
   );
 });
 
-test("a ready model state only exposes the public web image model", () => {
+test("a ready model state only exposes public web image models", () => {
   const state = resolveImageModelLoadSuccess({
-    data: [{ id: "gpt-image-2" }, { id: "codex-gpt-image-2" }, { id: "gpt-5" }],
+    data: [
+      { id: "gpt-image-2" },
+      { id: "gpt-image-2.5" },
+      { id: "gpt-image-2.5-flare" },
+      { id: "gpt-image-2.5-sunburst" },
+      { id: "codex-gpt-image-2" },
+      { id: "gpt-5" },
+    ],
   });
 
   assert.deepEqual(state, {
     status: "ready",
-    models: ["gpt-image-2"],
+    models: [
+      "gpt-image-2",
+      "gpt-image-2.5",
+      "gpt-image-2.5-flare",
+      "gpt-image-2.5-sunburst",
+    ],
   });
   assert.equal(selectImageModel("missing-image-model", state.models), "gpt-image-2");
   assert.equal(
@@ -85,10 +97,14 @@ test("image model filtering does not stringify container ids", () => {
       { id: [canary] },
       { id: { secret: canary } },
       { id: "gpt-image-2" },
+      { id: "gpt-image-2.5" },
     ],
   });
 
-  assert.deepEqual(state, { status: "ready", models: ["gpt-image-2"] });
+  assert.deepEqual(state, {
+    status: "ready",
+    models: ["gpt-image-2", "gpt-image-2.5"],
+  });
   assert.equal(JSON.stringify(state).includes(canary), false);
 });
 

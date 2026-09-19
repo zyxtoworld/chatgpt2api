@@ -138,7 +138,7 @@ environment:
 - 支持通过 `n` 返回多张生成结果
 - 支持生成可编辑 PPT 文件
 - 支持生成可编辑 PSD 文件
-- 公开图片模型固定为 `gpt-image-2`；Rust-only 版本不会在 `/v1/models`、在线图片选择器或 API 文档中宣传 Codex 图片别名，也不会为公开模型目录请求 Codex 模型目录
+- 公开图片模型仅来自当前账号已验证的 Web image capability；当前允许的官方集合为 `gpt-image-2`、`gpt-image-2.5`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`，不会在 `/v1/models`、在线图片选择器或 API 文档中宣传 Codex 图片别名，也不会为公开模型目录请求 Codex 模型目录
 
 ### 在线画图功能
 

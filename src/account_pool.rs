@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 
 use file_identity::FileVersion;
 
+use super::model_pool::WEB_IMAGE_MODELS;
 use super::{
     AccountRevisionDecision, ApiError, AppInitError, HealthSnapshotSync, account_revision_decision,
     read_account_snapshot,
@@ -142,6 +143,24 @@ fn image_quota(value: Option<&serde_json::Value>) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+fn has_verified_web_image_capability(record: &AccountRecord) -> bool {
+    if record.status != "正常"
+        || record
+            .raw
+            .get("_verified_image_capability")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || image_quota(record.raw.get("quota")).is_none()
+    {
+        return false;
+    }
+    record.source_type != "codex"
+        || record
+            .raw
+            .as_object()
+            .is_some_and(super::account_model_source_proof)
 }
 
 pub(super) struct AccountLease {
@@ -586,7 +605,9 @@ impl AccountStore {
             let Some(quota) = image_quota(slot.record.raw.get("quota")) else {
                 continue;
             };
-            if excluded_tokens.contains(&slot.record.token) || slot.record.status != "正常" {
+            if excluded_tokens.contains(&slot.record.token)
+                || !has_verified_web_image_capability(&slot.record)
+            {
                 continue;
             }
             let reserved =
@@ -768,7 +789,13 @@ impl AccountStore {
             .accounts
             .iter()
             .find(|slot| {
-                slot.record.status == "正常"
+                has_verified_web_image_capability(&slot.record)
+                    && slot
+                        .record
+                        .raw
+                        .get("_verified_image_capability")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
                     && slot
                         .record
                         .raw
@@ -779,16 +806,7 @@ impl AccountStore {
                             slot.record.chatgpt_account_id.as_deref() == Some(value)
                         }))
             })
-            .map(|slot| {
-                super::model_pool::project_account_model_entries(
-                    slot.record.raw.as_object().expect("account object"),
-                    super::model_pool::ModelProvenance::Configured,
-                )
-                .into_iter()
-                .filter(|(_, provenance)| *provenance == super::model_pool::ModelProvenance::Image)
-                .map(|(id, _)| id)
-                .collect()
-            })
+            .map(|_| WEB_IMAGE_MODELS.iter().map(|id| (*id).to_owned()).collect())
             .unwrap_or_default()
     }
 
@@ -802,7 +820,7 @@ impl AccountStore {
             .accounts
             .iter()
             .filter(|slot| {
-                slot.record.status == "正常"
+                has_verified_web_image_capability(&slot.record)
                     && slot
                         .record
                         .raw
@@ -825,7 +843,7 @@ impl AccountStore {
         let mut result = HashMap::new();
         let snapshot = self.snapshot.read().expect("account snapshot lock");
         for slot in snapshot.accounts.iter().filter(|slot| {
-            slot.record.status == "正常"
+            has_verified_web_image_capability(&slot.record)
                 && slot
                     .record
                     .raw
@@ -838,23 +856,10 @@ impl AccountStore {
                     .get("quota")
                     .is_some_and(|value| image_quota(Some(value)).is_some())
         }) {
-            let Some(object) = slot.record.raw.as_object() else {
-                continue;
-            };
-            let models = super::model_pool::project_account_model_entries(
-                object,
-                super::model_pool::ModelProvenance::Configured,
-            )
-            .into_iter()
-            .filter(|(_, provenance)| *provenance == super::model_pool::ModelProvenance::Image)
-            .map(|(id, _)| id)
-            .collect::<HashSet<_>>();
-            if !models.is_empty() {
-                result
-                    .entry(slot.record.account_type.to_ascii_lowercase())
-                    .or_insert_with(HashSet::new)
-                    .extend(models);
-            }
+            result
+                .entry(slot.record.account_type.to_ascii_lowercase())
+                .or_insert_with(HashSet::new)
+                .extend(WEB_IMAGE_MODELS.iter().map(|id| (*id).to_owned()));
         }
         result
     }

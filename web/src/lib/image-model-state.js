@@ -1,11 +1,16 @@
-const PUBLIC_IMAGE_MODEL_ID = "gpt-image-2";
+const PUBLIC_IMAGE_MODEL_IDS = new Set([
+  "gpt-image-2",
+  "gpt-image-2.5",
+  "gpt-image-2.5-flare",
+  "gpt-image-2.5-sunburst",
+]);
 
 export function filterImageModels(items) {
   return (Array.isArray(items) ? items : [])
     .map((item) => (typeof item?.id === "string" ? item.id.trim() : ""))
     .filter(
       (id, index, list) =>
-        id === PUBLIC_IMAGE_MODEL_ID && list.indexOf(id) === index,
+        PUBLIC_IMAGE_MODEL_IDS.has(id) && list.indexOf(id) === index,
     );
 }
 

@@ -33,8 +33,8 @@ use tar::{Archive, Builder, Header};
 use tokio::sync::Semaphore;
 
 use super::model_pool::{
-    ModelProvenance, model_provenance_label, model_provenance_rank, project_imported_model_entries,
-    project_imported_model_entries_with_sources,
+    ModelProvenance, is_web_image_model_id, model_provenance_label, model_provenance_rank,
+    project_imported_model_entries, project_imported_model_entries_with_sources,
 };
 use super::{
     ApiError, AppState, admin_authenticated, authenticated, config, data_file, image_content_type,
@@ -2013,7 +2013,7 @@ async fn execute_cpa_import(
                 .ok_or_else(ApiError::upstream)
         }) {
             Ok(token) => {
-                imported.push(json!({"access_token": token, "source_type": "codex"}));
+                imported.push(json!({"access_token": token}));
                 successful += 1;
             }
             Err(_) => {
@@ -2304,6 +2304,10 @@ fn apply_ccload_image_capability(catalog: &mut Value, image_models: &[String]) {
     let Some(object) = catalog.as_object_mut() else {
         return;
     };
+    let image_models = image_models
+        .iter()
+        .filter(|id| is_web_image_model_id(id))
+        .collect::<Vec<_>>();
     let models = object
         .entry("models".to_owned())
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -2316,12 +2320,12 @@ fn apply_ccload_image_capability(catalog: &mut Value, image_models: &[String]) {
             .as_str()
             .is_some_and(|value| value.to_ascii_lowercase().starts_with("gpt-image-"))
     });
-    for image_model in image_models {
+    for image_model in &image_models {
         if !models
             .iter()
-            .any(|model| model.as_str() == Some(image_model))
+            .any(|model| model.as_str() == Some(image_model.as_str()))
         {
-            models.push(Value::String(image_model.clone()));
+            models.push(Value::String((*image_model).clone()));
         }
     }
     if !image_models.is_empty() {
@@ -2335,27 +2339,19 @@ fn apply_ccload_image_capability(catalog: &mut Value, image_models: &[String]) {
     }
     if let Some(sources) = sources.as_object_mut() {
         sources.retain(|id, _| !id.to_ascii_lowercase().starts_with("gpt-image-"));
-        for image_model in image_models {
-            sources.insert(image_model.clone(), Value::String("image".to_owned()));
+        for image_model in &image_models {
+            sources.insert((*image_model).clone(), Value::String("image".to_owned()));
         }
     }
 }
 
 fn merge_ccload_model_catalog(
-    models: Option<&Value>,
-    sources: Option<&Value>,
+    _models: Option<&Value>,
+    _sources: Option<&Value>,
     fetched: Option<&[super::model_pool::PublicModel]>,
 ) -> (Value, Value) {
-    let mut entries =
-        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Unknown)
-            .into_iter()
-            .filter(|(_, provenance)| ccload_model_allowed(*provenance))
-            .collect::<Vec<_>>();
-    let mut indexes = entries
-        .iter()
-        .enumerate()
-        .map(|(index, (id, _))| (id.clone(), index))
-        .collect::<HashMap<_, _>>();
+    let mut entries: Vec<(String, ModelProvenance)> = Vec::new();
+    let mut indexes: HashMap<String, usize> = HashMap::new();
     if let Some(fetched) = fetched {
         for model in fetched {
             if !ccload_model_allowed(model.provenance) {
@@ -2381,15 +2377,11 @@ fn merge_ccload_model_catalog(
 }
 
 fn merge_ccload_account_catalog(
-    models: Option<&Value>,
-    sources: Option<&Value>,
+    _models: Option<&Value>,
+    _sources: Option<&Value>,
     snapshot: &Value,
 ) -> (Value, Value) {
-    let mut entries =
-        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Unknown)
-            .into_iter()
-            .filter(|(_, provenance)| ccload_model_allowed(*provenance))
-            .collect::<Vec<_>>();
+    let mut entries: Vec<(String, ModelProvenance)> = Vec::new();
     let mut indexes = entries
         .iter()
         .enumerate()
@@ -2777,7 +2769,7 @@ async fn execute_sub2api_import(
                     .map(ToOwned::to_owned);
                 match token {
                     Some(token) => {
-                        imported.push(json!({"access_token": token, "source_type": "codex", "plan_type": bounded_public_text(credentials.get("plan_type"), 64)}));
+                        imported.push(json!({"access_token": token}));
                         successful += 1;
                     }
                     None => {
@@ -3225,7 +3217,6 @@ async fn load_ccload_channel_models(
             state,
             &json!({
                 "access_token": access,
-                "source_type": "codex",
             }),
             None,
         )
@@ -3362,7 +3353,6 @@ async fn execute_ccload_import(
                 {
                     candidates.push(json!({
                         "access_token": credential,
-                        "source_type": "codex",
                     }));
                     accepted = true;
                 }

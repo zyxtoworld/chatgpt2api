@@ -62,8 +62,8 @@ test("the account directory uses the authenticated non-paginated upstream model 
 });
 
 test("the public image contract does not advertise Codex image models", () => {
-  assert.match(apiDocsSource, /\[\"gpt-image-2\", \"auto\"/);
+  assert.match(apiDocsSource, /\[\"gpt-image-2\", \"gpt-image-2\.5\", \"gpt-image-2\.5-flare\", \"gpt-image-2\.5-sunburst\"/);
   assert.doesNotMatch(apiDocsSource, /codex-gpt-image-2/);
-  assert.match(readmeSource, /公开图片模型固定为 `gpt-image-2`/);
+  assert.match(readmeSource, /当前允许的官方集合为 `gpt-image-2`、`gpt-image-2\.5`/);
   assert.doesNotMatch(readmeSource, /模型别名为 `codex-gpt-image-2`/);
 });

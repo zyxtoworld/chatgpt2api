@@ -25,6 +25,19 @@ pub(super) enum ModelProvenance {
     Codex,
 }
 
+pub(super) const WEB_IMAGE_MODELS: &[&str] = &[
+    "gpt-image-2",
+    "gpt-image-2.5",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+];
+
+pub(super) fn is_web_image_model_id(id: &str) -> bool {
+    WEB_IMAGE_MODELS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(id.trim()))
+}
+
 fn model_provenance_from_object(
     object: &serde_json::Map<String, Value>,
     default: ModelProvenance,
@@ -434,9 +447,7 @@ pub(super) fn project_remote_model_list_with_provenance(
                 .map(|object| model_provenance_from_object(object, provenance))
                 .unwrap_or(provenance)
         };
-        if model.provenance == ModelProvenance::Web
-            && model.id.to_ascii_lowercase().starts_with("gpt-image-")
-        {
+        if model.provenance == ModelProvenance::Web && is_web_image_model_id(&model.id) {
             model.provenance = ModelProvenance::Image;
         }
         if let Some(index) = indexes.get(&model.id).copied() {

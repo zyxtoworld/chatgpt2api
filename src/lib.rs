@@ -39,9 +39,10 @@ use codex_upstream::{
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
 use model_pool::{
-    ModelCatalog, ModelProvenance, ModelStore, PublicModel, model_provenance_is_untrusted,
-    model_provenance_label, model_provenance_rank, project_account_model_entries,
-    project_remote_model_list, project_remote_model_list_with_provenance,
+    ModelCatalog, ModelProvenance, ModelStore, PublicModel, WEB_IMAGE_MODELS,
+    is_web_image_model_id, model_provenance_is_untrusted, model_provenance_label,
+    model_provenance_rank, project_account_model_entries, project_remote_model_list,
+    project_remote_model_list_with_provenance,
 };
 #[cfg(test)]
 use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
@@ -997,13 +998,15 @@ fn read_account_document(
 }
 
 fn canonicalize_account_models(object: &mut Map<String, Value>) {
-    let source_version = object.get("_model_source_version").and_then(Value::as_u64)
-        == Some(ACCOUNT_MODEL_SOURCE_VERSION);
+    let verified_web_catalog = account_model_source_proof(object);
+    let verified_image_capability = account_image_capability_proof(object);
     let default = account_model_default_provenance_from_object(object);
     let entries = project_account_model_entries(object, default)
         .into_iter()
-        .filter(|(_, provenance)| {
-            source_version && matches!(provenance, ModelProvenance::Web | ModelProvenance::Image)
+        .filter(|(id, provenance)| match provenance {
+            ModelProvenance::Web => verified_web_catalog && !is_native_image_model_id(id),
+            ModelProvenance::Image => verified_image_capability && is_web_image_model_id(id),
+            _ => false,
         })
         .take(MAX_MODELS)
         .collect::<Vec<_>>();
@@ -1444,6 +1447,7 @@ const IMPORTED_MODEL_CATALOG_RETRY_BACKOFF: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 const IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS: usize = 2;
+const IMPORTED_MODEL_CATALOG_LAST_GOOD_REASON: &str = "last_good_web_catalog_unavailable";
 
 #[derive(Clone)]
 struct ImportedModelCatalogCache {
@@ -1486,6 +1490,29 @@ struct ImportedModelCatalogEntry {
     attempt_count: AtomicUsize,
     cache_hit_count: AtomicUsize,
     retry_count: AtomicUsize,
+}
+
+fn merge_public_model_catalog(
+    base: &mut Vec<PublicModel>,
+    additions: impl IntoIterator<Item = PublicModel>,
+) {
+    let mut indexes = base
+        .iter()
+        .enumerate()
+        .map(|(index, model)| (model.id.clone(), index))
+        .collect::<HashMap<_, _>>();
+    for model in additions {
+        if let Some(index) = indexes.get(&model.id).copied() {
+            if model_provenance_rank(model.provenance)
+                > model_provenance_rank(base[index].provenance)
+            {
+                base[index] = model;
+            }
+        } else if base.len() < MAX_MODELS {
+            indexes.insert(model.id.clone(), base.len());
+            base.push(model);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1635,6 +1662,35 @@ impl ImportedModelCatalogCache {
         F: FnOnce() -> Fut,
         Fut: Future<Output = Option<ImportedModelCatalogFetch>>,
     {
+        self.fetch_or_reuse_with_catalog_batch_mode(key, batch, true, fetch)
+            .await
+    }
+
+    async fn fetch_or_reuse_complete_catalog<F, Fut>(
+        &self,
+        key: &str,
+        batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+        fetch: F,
+    ) -> Option<Vec<PublicModel>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<ImportedModelCatalogFetch>>,
+    {
+        self.fetch_or_reuse_with_catalog_batch_mode(key, batch, false, fetch)
+            .await
+    }
+
+    async fn fetch_or_reuse_with_catalog_batch_mode<F, Fut>(
+        &self,
+        key: &str,
+        batch: Option<Arc<ImportedModelCatalogBatchStats>>,
+        allow_partial: bool,
+        fetch: F,
+    ) -> Option<Vec<PublicModel>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Option<ImportedModelCatalogFetch>>,
+    {
         let entry = {
             let mut entries = self.entries.lock().await;
             entries
@@ -1658,15 +1714,15 @@ impl ImportedModelCatalogCache {
         };
 
         let mut counted_waiter_hit = false;
+        let mut last_good_models: Option<Vec<PublicModel>> = None;
         loop {
             let mut updates = entry.updates.subscribe();
             let owner = {
                 let mut state = entry.state.lock().await;
                 match &*state {
                     ImportedModelCatalogState::Ready { models, expires_at }
-                    | ImportedModelCatalogState::PartialReady {
-                        models, expires_at, ..
-                    } if Instant::now() < *expires_at => {
+                        if Instant::now() < *expires_at =>
+                    {
                         if !counted_waiter_hit {
                             entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
                             self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -1676,12 +1732,40 @@ impl ImportedModelCatalogCache {
                         }
                         return Some((**models).clone());
                     }
+                    ImportedModelCatalogState::PartialReady {
+                        models, expires_at, ..
+                    } if Instant::now() < *expires_at
+                        && (allow_partial
+                            || models
+                                .iter()
+                                .any(|model| model.provenance == ModelProvenance::Web)) =>
+                    {
+                        if !counted_waiter_hit {
+                            entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                            self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+                            if let Some(batch) = &batch {
+                                batch.record(key, 3);
+                            }
+                        }
+                        return Some((**models).clone());
+                    }
+                    ImportedModelCatalogState::PartialReady { models, .. } if !allow_partial => {
+                        last_good_models = Some((**models).clone());
+                        *state = ImportedModelCatalogState::InFlight;
+                        true
+                    }
                     ImportedModelCatalogState::Failed { retry_at }
                         if Instant::now() < *retry_at =>
                     {
                         return None;
                     }
                     ImportedModelCatalogState::InFlight => false,
+                    ImportedModelCatalogState::Ready { models, .. }
+                    | ImportedModelCatalogState::PartialReady { models, .. } => {
+                        last_good_models = Some((**models).clone());
+                        *state = ImportedModelCatalogState::InFlight;
+                        true
+                    }
                     _ => {
                         *state = ImportedModelCatalogState::InFlight;
                         true
@@ -1694,21 +1778,34 @@ impl ImportedModelCatalogCache {
                 if let Some(batch) = &batch {
                     batch.record(key, 2);
                 }
-                let result = fetch().await.and_then(|result| match result {
-                    ImportedModelCatalogFetch::Complete(models) if !models.is_empty() => {
+                let result = match fetch().await {
+                    Some(ImportedModelCatalogFetch::Complete(models)) if !models.is_empty() => {
                         Some((false, models, ""))
                     }
-                    ImportedModelCatalogFetch::Partial {
+                    Some(ImportedModelCatalogFetch::Partial {
                         models,
                         web_unavailable_reason,
-                    } if !models.is_empty() => Some((true, models, web_unavailable_reason)),
-                    _ => None,
-                });
+                    }) if !models.is_empty() => {
+                        let mut preserved = last_good_models.take().unwrap_or_default();
+                        merge_public_model_catalog(&mut preserved, models);
+                        Some((true, preserved, web_unavailable_reason))
+                    }
+                    _ => last_good_models
+                        .take()
+                        .map(|models| (true, models, IMPORTED_MODEL_CATALOG_LAST_GOOD_REASON)),
+                };
                 let next = match &result {
                     Some((true, models, web_unavailable_reason)) => {
                         ImportedModelCatalogState::PartialReady {
                             models: Arc::new(models.clone()),
-                            expires_at: Instant::now() + IMPORTED_MODEL_CATALOG_TTL,
+                            expires_at: Instant::now()
+                                + if *web_unavailable_reason
+                                    == IMPORTED_MODEL_CATALOG_LAST_GOOD_REASON
+                                {
+                                    IMPORTED_MODEL_CATALOG_RETRY_BACKOFF
+                                } else {
+                                    IMPORTED_MODEL_CATALOG_TTL
+                                },
                             web_unavailable_reason,
                         }
                     }
@@ -1722,7 +1819,18 @@ impl ImportedModelCatalogCache {
                 };
                 *entry.state.lock().await = next.clone();
                 let _ = entry.updates.send(next);
-                return result.map(|(_, models, _)| models);
+                return result.and_then(|(partial, models, _)| {
+                    if partial
+                        && !allow_partial
+                        && !models
+                            .iter()
+                            .any(|model| model.provenance == ModelProvenance::Web)
+                    {
+                        None
+                    } else {
+                        Some(models)
+                    }
+                });
             }
             if !counted_waiter_hit {
                 entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -1874,6 +1982,7 @@ impl AppState {
         let account_type_catalog = AccountTypeCatalog::new(
             account_store.clone(),
             client.clone(),
+            imported_model_catalog.clone(),
             config.upstream_base_url.clone(),
             config.accounts_path.is_some(),
             config.upstream_protocol,
@@ -2066,6 +2175,7 @@ impl AppState {
         let account_type_catalog = AccountTypeCatalog::new(
             account_store.clone(),
             client.clone(),
+            imported_model_catalog.clone(),
             config.upstream_base_url.clone(),
             true,
             config.upstream_protocol,
@@ -2499,6 +2609,31 @@ fn account_model_default_provenance(raw: &Value) -> ModelProvenance {
         .unwrap_or(ModelProvenance::Unknown)
 }
 
+fn account_model_source_proof(object: &Map<String, Value>) -> bool {
+    object.get("_model_source_version").and_then(Value::as_u64)
+        == Some(ACCOUNT_MODEL_SOURCE_VERSION)
+        && object
+            .get("_verified_web_model_paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| {
+                !paths.is_empty()
+                    && paths.iter().all(|path| {
+                        path.as_str()
+                            .is_some_and(|path| AUTHENTICATED_NATIVE_MODEL_PATHS.contains(&path))
+                    })
+            })
+}
+
+fn account_image_capability_proof(object: &Map<String, Value>) -> bool {
+    object.get("_model_source_version").and_then(Value::as_u64)
+        == Some(ACCOUNT_MODEL_SOURCE_VERSION)
+        && object
+            .get("_verified_image_capability")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && image_quota_from_value(object.get("quota")).is_some()
+}
+
 fn merge_account_models(
     raw: &Value,
     fetched: Option<Vec<PublicModel>>,
@@ -2512,6 +2647,10 @@ fn merge_account_models(
         if value.is_empty()
             || value.chars().count() > MAX_MODEL_TEXT_LENGTH
             || !matches!(provenance, ModelProvenance::Web | ModelProvenance::Image)
+            || (is_native_image_model_id(value)
+                && (provenance != ModelProvenance::Image || !is_web_image_model_id(value)))
+            || (provenance == ModelProvenance::Image
+                && (!image_capable || !is_web_image_model_id(value)))
         {
             return;
         }
@@ -2528,13 +2667,15 @@ fn merge_account_models(
         models.push(value.to_owned());
         provenances.push(provenance);
     };
-    let _ = raw;
     if let Some(fetched) = fetched {
         for model in fetched {
-            if model.provenance == ModelProvenance::Image && !image_capable {
-                continue;
-            }
             push(&model.id, model.provenance);
+        }
+    } else if let Some(object) = raw.as_object()
+        && account_model_source_proof(object)
+    {
+        for (id, provenance) in project_account_model_entries(object, ModelProvenance::Unknown) {
+            push(&id, provenance);
         }
     }
     if models.is_empty() {
@@ -2747,6 +2888,8 @@ async fn refresh_access_token_account(
         deadline: Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
         batch,
         image_capable: quota > 0,
+        retry: true,
+        require_web_catalog: true,
     });
     let fetched_models = fetched_models.await;
     let model_items = merge_account_models(raw, fetched_models, quota > 0);
@@ -2763,9 +2906,22 @@ async fn refresh_access_token_account(
         "chatgpt_account_id": default.get("account_id").cloned().unwrap_or(Value::Null),
     });
     if let Some((model_items, model_sources)) = model_items {
+        let has_web_models = model_sources.as_object().is_some_and(|sources| {
+            sources
+                .values()
+                .any(|source| source.as_str() == Some("web"))
+        });
         result["models"] = json!(model_items);
         result["model_sources"] = model_sources;
-        result["_verified_web_model_paths"] = json!(AUTHENTICATED_NATIVE_MODEL_PATHS);
+        result["_verified_web_model_paths"] = if has_web_models {
+            json!(AUTHENTICATED_NATIVE_MODEL_PATHS)
+        } else {
+            json!([])
+        };
+    } else {
+        result["models"] = json!([]);
+        result["model_sources"] = json!({});
+        result["_verified_web_model_paths"] = json!([]);
     }
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
@@ -2774,9 +2930,7 @@ async fn refresh_access_token_account(
         ensure_image_model_snapshot(&mut result);
     }
     result["_model_source_version"] = json!(ACCOUNT_MODEL_SOURCE_VERSION);
-    if quota > 0 {
-        result["_verified_image_capability"] = Value::Bool(true);
-    }
+    result["_verified_image_capability"] = Value::Bool(quota > 0);
     canonicalize_account_item(&result).map_err(|_| "invalid_account")
 }
 
@@ -4861,7 +5015,7 @@ fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<Str
         Some(Value::String(value)) => value.trim().to_ascii_lowercase(),
         Some(_) => return Err(ApiError::invalid_request()),
     };
-    if model.starts_with("gpt-image-") {
+    if is_web_image_model_id(&model) {
         return Ok((model, false, None));
     }
     if model == "codex-gpt-image-2" {
@@ -4888,7 +5042,7 @@ fn is_native_image_model_id(id: &str) -> bool {
 }
 
 fn is_public_chatgpt_image_model_id(id: &str) -> bool {
-    id.trim().to_ascii_lowercase().starts_with("gpt-image-")
+    is_web_image_model_id(id)
 }
 
 fn is_public_chatgpt_model(model: &PublicModel) -> bool {
@@ -6957,7 +7111,46 @@ async fn native_web_image_request_proxy(
         .acquire_image_lease(&HashSet::new())
         .await
         .ok_or_else(ApiError::unavailable)?;
-    let result = native_web_image_attempt(&state, &lease, &request, endpoint).await;
+    let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
+    let (configured, candidates) =
+        match resolve_web_image_upstream_models(&state, &lease, deadline).await {
+            Ok(value) => value,
+            Err(error) => {
+                let token = lease.token().to_owned();
+                if !state.account_store.mark_image_result(&token, false).await {
+                    AccountStore::note_usage_mark_failure();
+                }
+                drop(lease);
+                return Err(error);
+            }
+        };
+    let mut result = Err(ApiError::upstream());
+    for (index, candidate) in candidates.iter().enumerate() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let settings = RuntimeModelSettings {
+            upstream_model: candidate.clone(),
+            default_thinking_effort: configured.default_thinking_effort.clone(),
+        };
+        result =
+            native_web_image_attempt(&state, &lease, &request, endpoint, &settings, deadline).await;
+        if result.is_ok() {
+            log::info!(
+                "native Web image upstream model selected: requested={}, selected={}, candidate_index={}",
+                request.model,
+                candidate,
+                index,
+            );
+            break;
+        }
+        log::warn!(
+            "native Web image upstream model failed: requested={}, candidate={}, candidate_index={}",
+            request.model,
+            candidate,
+            index,
+        );
+    }
     let token = lease.token().to_owned();
     match result {
         Ok(data) => {
@@ -6977,11 +7170,113 @@ async fn native_web_image_request_proxy(
     }
 }
 
+fn web_model_quality_rank(id: &str) -> u8 {
+    let normalized = id.to_ascii_lowercase();
+    if normalized.contains("mini")
+        || normalized.contains("nano")
+        || normalized.contains("lite")
+        || normalized.contains("flash")
+    {
+        1
+    } else if normalized.contains("max")
+        || normalized.contains("thinking")
+        || normalized.contains("reasoning")
+        || normalized.contains("pro")
+        || normalized.contains("extended")
+    {
+        3
+    } else {
+        2
+    }
+}
+
+fn web_model_numeric_rank(id: &str) -> Vec<u64> {
+    id.split('-')
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn compare_web_model_priority(left: &str, right: &str) -> std::cmp::Ordering {
+    web_model_quality_rank(left)
+        .cmp(&web_model_quality_rank(right))
+        .then_with(|| web_model_numeric_rank(left).cmp(&web_model_numeric_rank(right)))
+        .then_with(|| left.cmp(right))
+}
+
+fn ordered_web_image_upstream_candidates(models: Vec<PublicModel>) -> Vec<String> {
+    let mut candidates = models
+        .into_iter()
+        .filter(|model| {
+            model.provenance == ModelProvenance::Web
+                && model.id != "auto"
+                && !is_native_image_model_id(&model.id)
+        })
+        .map(|model| model.id)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| compare_web_model_priority(right, left));
+    candidates.dedup();
+    candidates
+}
+
+async fn resolve_web_image_upstream_models(
+    state: &AppState,
+    lease: &AccountLease,
+    deadline: Instant,
+) -> Result<(RuntimeModelSettings, Vec<String>), ApiError> {
+    let configured = runtime_model_settings(state);
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(ApiError::unavailable)?;
+    let models = fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
+        cache: state.imported_model_catalog.clone(),
+        client: state.client.clone(),
+        base_url: base_url.to_owned(),
+        account_type: lease.account_type().to_owned(),
+        token: lease.token().to_owned(),
+        account_id: lease.chatgpt_account_id().map(ToOwned::to_owned),
+        deadline,
+        batch: None,
+        image_capable: false,
+        retry: true,
+        require_web_catalog: true,
+    })
+    .await
+    .ok_or_else(ApiError::unavailable)?;
+    let candidates = ordered_web_image_upstream_candidates(models);
+    if candidates.is_empty() {
+        return Err(ApiError::unavailable());
+    }
+    let fallback_reason = if candidates
+        .first()
+        .is_some_and(|model| model.eq_ignore_ascii_case(&configured.upstream_model))
+    {
+        "configured_model_is_current_catalog_leader"
+    } else if candidates
+        .iter()
+        .any(|model| model.eq_ignore_ascii_case(&configured.upstream_model))
+    {
+        "catalog_capability_order"
+    } else {
+        "configured_model_missing_from_current_catalog"
+    };
+    log::info!(
+        "native Web image upstream model candidates: requested={}, selected_candidate={}, fallback_reason={}",
+        configured.upstream_model,
+        candidates.first().map(String::as_str).unwrap_or_default(),
+        fallback_reason,
+    );
+    Ok((configured, candidates))
+}
+
 async fn native_web_image_attempt(
     state: &AppState,
     lease: &AccountLease,
     request: &NativeImageRequest,
     endpoint: &'static str,
+    model_settings: &RuntimeModelSettings,
+    deadline: Instant,
 ) -> Result<Response, ApiError> {
     let base_url = state
         .config
@@ -6989,7 +7284,6 @@ async fn native_web_image_attempt(
         .as_deref()
         .ok_or_else(ApiError::unavailable)?
         .trim_end_matches('/');
-    let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
     let context = NativeRequestContext::new();
     let mut uploads = Vec::new();
     for (index, image) in request.images.iter().enumerate() {
@@ -7015,8 +7309,7 @@ async fn native_web_image_attempt(
     )
     .await
     .map_err(|_| ApiError::upstream())?;
-    let model_settings = runtime_model_settings(state);
-    let upstream_model = model_settings.upstream_model;
+    let upstream_model = &model_settings.upstream_model;
     let prepare_path = "/backend-api/f/conversation/prepare";
     let mut prepare_payload = json!({
         "action": "next",
@@ -11016,6 +11309,8 @@ pub(crate) async fn fetch_imported_model_catalog(
         deadline,
         batch: None,
         image_capable: false,
+        retry: true,
+        require_web_catalog: true,
     })
     .await
 }
@@ -11030,6 +11325,8 @@ struct ImportedModelCatalogRequest {
     deadline: Instant,
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
     image_capable: bool,
+    retry: bool,
+    require_web_catalog: bool,
 }
 
 fn imported_image_capability_model() -> PublicModel {
@@ -11052,17 +11349,20 @@ async fn fetch_imported_model_catalog_request(
         deadline,
         batch,
         image_capable,
+        retry,
+        require_web_catalog,
     } = request;
     let key = account_type.to_ascii_lowercase();
     let retry_key = key.clone();
     let retry_cache = cache.clone();
-    cache
-        .fetch_or_reuse_with_catalog_batch(&key, batch.clone(), move || async move {
+    let retry_batch = batch.clone();
+    let fetch = move || async move {
+        let fetched = if retry {
             fetch_imported_native_model_catalog_with_retry(NativeModelCatalogRetryRequest {
                 cache: retry_cache,
                 key: retry_key,
                 deadline,
-                batch,
+                batch: retry_batch,
                 client,
                 base_url,
                 account_type,
@@ -11070,6 +11370,26 @@ async fn fetch_imported_model_catalog_request(
                 account_id,
             })
             .await
+        } else {
+            match fetch_native_model_catalog_with_outcome(
+                &client,
+                &base_url,
+                &NativeRequestContext::new(),
+                NativeModelIdentity {
+                    token: &token,
+                    account_type: Some(account_type.as_str()),
+                    account_id: account_id.as_deref(),
+                },
+                deadline,
+            )
+            .await
+            {
+                NativeModelCatalogFetchOutcome::Complete(models) => Some(models),
+                NativeModelCatalogFetchOutcome::RetryableUnavailable
+                | NativeModelCatalogFetchOutcome::PermanentUnavailable => None,
+            }
+        };
+        fetched
             .map(ImportedModelCatalogFetch::Complete)
             .or_else(|| {
                 image_capable.then(|| ImportedModelCatalogFetch::Partial {
@@ -11077,8 +11397,16 @@ async fn fetch_imported_model_catalog_request(
                     web_unavailable_reason: "canonical_web_catalog_unavailable",
                 })
             })
-        })
-        .await
+    };
+    if require_web_catalog {
+        cache
+            .fetch_or_reuse_complete_catalog(&key, batch.clone(), fetch)
+            .await
+    } else {
+        cache
+            .fetch_or_reuse_with_catalog_batch(&key, batch.clone(), fetch)
+            .await
+    }
 }
 
 struct NativeModelCatalogRetryRequest {
@@ -11311,6 +11639,7 @@ impl Default for AccountTypeCatalogSnapshot {
 struct AccountTypeCatalog {
     enabled: bool,
     protocol: UpstreamProtocol,
+    imported_model_catalog: ImportedModelCatalogCache,
     base_url: Option<String>,
     codex_client_version: Arc<RwLock<Option<String>>>,
     client: Client,
@@ -11347,6 +11676,7 @@ impl AccountTypeCatalog {
     fn new(
         account_store: Arc<AccountStore>,
         client: Client,
+        imported_model_catalog: ImportedModelCatalogCache,
         base_url: Option<String>,
         enabled: bool,
         protocol: UpstreamProtocol,
@@ -11356,6 +11686,7 @@ impl AccountTypeCatalog {
         Self {
             enabled,
             protocol,
+            imported_model_catalog,
             base_url,
             codex_client_version: Arc::new(RwLock::new(codex_client_version)),
             client,
@@ -11432,12 +11763,21 @@ impl AccountTypeCatalog {
                     .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or("正常");
-                matches!(status, "正常" | "限流")
-                    && record
-                        .get("quota")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default()
-                        == 0
+                if !matches!(status, "正常" | "限流") {
+                    return false;
+                }
+                let capability_verified = record
+                    .get("_verified_image_capability")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                    && image_quota_from_value(record.get("quota")).is_some();
+                let source_type = record
+                    .get("source_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("web");
+                let web_provenance_verified =
+                    record.as_object().is_some_and(account_model_source_proof);
+                !capability_verified || (source_type == "codex" && !web_provenance_verified)
             })
             .filter_map(|record| account_token(&record))
             .collect::<Vec<_>>();
@@ -11961,9 +12301,43 @@ impl AccountTypeCatalog {
             // Upstream model discovery has one authenticated Web catalog per
             // normalized account type.  source_type is only a later
             // conversation capability selector; it never selects another
-            // model-discovery endpoint.  Try the next same-type candidate
-            // only when this representative's Web request fails.
-            for candidate in candidate_accounts {
+            // model-discovery endpoint.  The shared imported catalog cache
+            // owns the representative fetch.  Only a failed representative
+            // may fall through to the next same-type token.
+            if let Some(candidate) = candidate_accounts.first() {
+                let base_url = self.base_url.as_deref()?;
+                if let Some(models) =
+                    fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
+                        cache: self.imported_model_catalog.clone(),
+                        client: self.client.clone(),
+                        base_url: base_url.to_owned(),
+                        account_type: account_group.clone(),
+                        token: candidate.token.clone(),
+                        account_id: candidate.chatgpt_account_id.clone(),
+                        deadline,
+                        batch: None,
+                        image_capable: false,
+                        retry: false,
+                        require_web_catalog: true,
+                    })
+                    .await
+                {
+                    let live_sources = candidate_accounts
+                        .iter()
+                        .map(|candidate| candidate.source_type.clone())
+                        .collect::<HashSet<_>>();
+                    let model_sources = models
+                        .iter()
+                        .map(|model| (model.id.clone(), live_sources.clone()))
+                        .collect();
+                    return Some((
+                        models,
+                        CatalogOwners::with_model_sources(vec![candidate.clone()], model_sources),
+                        true,
+                    ));
+                }
+            }
+            for candidate in candidate_accounts.iter().skip(1) {
                 if let Some(models) = self
                     .fetch_native_models(
                         &candidate.token,
@@ -12499,30 +12873,23 @@ fn ensure_image_model_snapshot(value: &mut Value) {
     if image_quota_from_value(object.get("quota")).is_none() {
         return;
     }
-    let mut image_models = object
-        .get("models")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flat_map(|models| models.iter())
-        .filter_map(Value::as_str)
-        .filter(|id| id.to_ascii_lowercase().starts_with("gpt-image-"))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if !image_models.iter().any(|id| id == "gpt-image-2") {
-        image_models.insert(0, "gpt-image-2".to_owned());
-    }
     let models = object
         .entry("models".to_owned())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !models.is_array() {
         *models = Value::Array(Vec::new());
     }
-    if let Some(models) = models.as_array_mut()
-        && !models
-            .iter()
-            .any(|model| model.as_str() == Some("gpt-image-2"))
-    {
-        models.push(Value::String("gpt-image-2".to_owned()));
+    if let Some(models) = models.as_array_mut() {
+        models.retain(|model| {
+            model
+                .as_str()
+                .is_none_or(|id| !is_native_image_model_id(id))
+        });
+        models.extend(
+            WEB_IMAGE_MODELS
+                .iter()
+                .map(|id| Value::String((*id).to_owned())),
+        );
     }
     let sources = object
         .entry("model_sources".to_owned())
@@ -12531,8 +12898,9 @@ fn ensure_image_model_snapshot(value: &mut Value) {
         *sources = Value::Object(Map::new());
     }
     if let Some(sources) = sources.as_object_mut() {
-        for image_model in image_models {
-            sources.insert(image_model, Value::String("image".to_owned()));
+        sources.retain(|id, _| !is_native_image_model_id(id));
+        for image_model in WEB_IMAGE_MODELS {
+            sources.insert((*image_model).to_owned(), Value::String("image".to_owned()));
         }
     }
 }
@@ -19188,9 +19556,24 @@ mod tests {
             assert_eq!(
                 channel_models_body["channels"][index]["models"],
                 if index == 2 {
-                    json!(["gpt-5-5", "gpt-5-6", "free-image-model", "gpt-image-2"])
+                    json!([
+                        "gpt-5-5",
+                        "gpt-5-6",
+                        "free-image-model",
+                        "gpt-image-2",
+                        "gpt-image-2.5",
+                        "gpt-image-2.5-flare",
+                        "gpt-image-2.5-sunburst"
+                    ])
                 } else {
-                    json!(["gpt-5-5", "gpt-5-6", "gpt-image-2"])
+                    json!([
+                        "gpt-5-5",
+                        "gpt-5-6",
+                        "gpt-image-2",
+                        "gpt-image-2.5",
+                        "gpt-image-2.5-flare",
+                        "gpt-image-2.5-sunburst"
+                    ])
                 }
             );
         }
@@ -19763,7 +20146,7 @@ mod tests {
                 .find(|item| item["access_token"] == token)
                 .unwrap_or_else(|| panic!("missing imported account {token}"));
             assert_eq!(item["type"], "pro");
-            assert_eq!(item["source_type"], "codex");
+            assert_eq!(item["source_type"], "web");
             assert!(item["models"].as_array().is_some_and(|models| {
                 models.iter().any(|model| model == "web-page-model")
                     && models.iter().any(|model| model == "gpt-5-codex")
@@ -19771,6 +20154,7 @@ mod tests {
                     && models.iter().any(|model| model == "gpt-image-2")
                     && models.iter().any(|model| model == "gpt-image-2.5")
                     && models.iter().any(|model| model == "gpt-image-2.5-flare")
+                    && models.iter().any(|model| model == "gpt-image-2.5-sunburst")
                     && models.iter().any(|model| model == "web-tpp-model")
                     && models.iter().any(|model| model == "tpp-codex-named-model")
                     && models.iter().all(|model| model != "codex-endpoint-model")
@@ -19817,6 +20201,7 @@ mod tests {
             assert_eq!(sources.get("gpt-image-2"), Some(&json!("image")));
             assert_eq!(sources.get("gpt-image-2.5"), Some(&json!("image")));
             assert_eq!(sources.get("gpt-image-2.5-flare"), Some(&json!("image")));
+            assert_eq!(sources.get("gpt-image-2.5-sunburst"), Some(&json!("image")));
         }
 
         assert!(state.account_type_catalog.enabled());
@@ -21388,6 +21773,80 @@ mod tests {
             Some(vec!["retry-model".to_owned()])
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn imported_partial_catalog_preserves_expired_last_good_web_models() {
+        let cache = ImportedModelCatalogCache::new();
+        let initial = cache
+            .fetch_or_reuse("pro", || async {
+                Some(vec![test_public_model("web-model", ModelProvenance::Web)])
+            })
+            .await;
+        assert_eq!(initial.as_ref().map(Vec::len), Some(1));
+        let entry = cache
+            .entries
+            .lock()
+            .await
+            .get("pro")
+            .cloned()
+            .expect("catalog entry");
+        *entry.state.lock().await = ImportedModelCatalogState::Ready {
+            models: Arc::new(vec![test_public_model("web-model", ModelProvenance::Web)]),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        let refreshed = cache
+            .fetch_or_reuse_with_catalog_batch("pro", None, || async {
+                Some(ImportedModelCatalogFetch::Partial {
+                    models: vec![imported_image_capability_model()],
+                    web_unavailable_reason: "test_web_unavailable",
+                })
+            })
+            .await
+            .expect("partial catalog");
+        let ids = refreshed
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"web-model"));
+        assert!(ids.contains(&"gpt-image-2"));
+        let reused = cache
+            .fetch_or_reuse_with_catalog_batch("pro", None, || async {
+                panic!("partial last-good catalog should be reused")
+            })
+            .await
+            .expect("reused partial catalog");
+        assert_eq!(reused.len(), refreshed.len());
+    }
+
+    #[tokio::test]
+    async fn complete_catalog_request_does_not_accept_image_only_partial_cache() {
+        let cache = ImportedModelCatalogCache::new();
+        let partial = cache
+            .fetch_or_reuse_with_catalog_batch("pro", None, || async {
+                Some(ImportedModelCatalogFetch::Partial {
+                    models: vec![imported_image_capability_model()],
+                    web_unavailable_reason: "test_web_unavailable",
+                })
+            })
+            .await
+            .expect("image partial catalog");
+        assert_eq!(partial.len(), 1);
+        let complete = cache
+            .fetch_or_reuse_complete_catalog("pro", None, || async {
+                Some(ImportedModelCatalogFetch::Complete(vec![
+                    test_public_model("web-model", ModelProvenance::Web),
+                ]))
+            })
+            .await
+            .expect("complete Web catalog");
+        assert_eq!(
+            complete
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["web-model"]
+        );
     }
 
     #[tokio::test]
@@ -26512,10 +26971,21 @@ data: [DONE]
         let canonical = canonicalize_account_item(&refreshed).expect("canonical account");
         assert_eq!(
             canonical["models"],
-            json!(["gpt-5-5", "gpt-image-2", "gpt-image-2.5"])
+            json!([
+                "gpt-5-5",
+                "gpt-image-2",
+                "gpt-image-2.5",
+                "gpt-image-2.5-flare",
+                "gpt-image-2.5-sunburst"
+            ])
         );
         assert_eq!(canonical["model_sources"]["gpt-image-2"], "image");
         assert_eq!(canonical["model_sources"]["gpt-image-2.5"], "image");
+        assert_eq!(canonical["model_sources"]["gpt-image-2.5-flare"], "image");
+        assert_eq!(
+            canonical["model_sources"]["gpt-image-2.5-sunburst"],
+            "image"
+        );
 
         let mut capability_only = json!({
             "access_token": "account-token",
@@ -26524,7 +26994,15 @@ data: [DONE]
             "quota": 3
         });
         ensure_image_model_snapshot(&mut capability_only);
-        assert_eq!(capability_only["models"], json!(["gpt-image-2"]));
+        assert_eq!(
+            capability_only["models"],
+            json!([
+                "gpt-image-2",
+                "gpt-image-2.5",
+                "gpt-image-2.5-flare",
+                "gpt-image-2.5-sunburst"
+            ])
+        );
         assert_eq!(capability_only["model_sources"]["gpt-image-2"], "image");
 
         let without_quota = canonicalize_account_item(&json!({
@@ -27124,8 +27602,8 @@ data: [DONE]
         fs::write(
             &path,
             r#"[
-                {"access_token":"success-token","status":"正常","type":"plus","quota":2},
-                {"access_token":"failure-token","status":"正常","type":"pro","quota":2}
+                {"access_token":"success-token","status":"正常","type":"plus","quota":2,"_verified_image_capability":true},
+                {"access_token":"failure-token","status":"正常","type":"pro","quota":2,"_verified_image_capability":true}
             ]"#
             .as_bytes(),
         )
@@ -29712,6 +30190,19 @@ data: [DONE]
             );
             assert_eq!(settings.default_thinking_effort, None);
         }
+    }
+
+    #[test]
+    fn web_image_upstream_fallback_uses_only_current_web_catalog_models() {
+        let candidates = ordered_web_image_upstream_candidates(vec![
+            test_public_model("gpt-5-3", ModelProvenance::Web),
+            test_public_model("gpt-5-6", ModelProvenance::Web),
+            test_public_model("gpt-5-6-mini", ModelProvenance::Web),
+            test_public_model("gpt-image-2", ModelProvenance::Image),
+            test_public_model("codex-fallback", ModelProvenance::Codex),
+        ]);
+        assert_eq!(candidates, vec!["gpt-5-6", "gpt-5-3", "gpt-5-6-mini"]);
+        assert!(!candidates.iter().any(|model| model.contains("codex")));
     }
 
     #[test]
@@ -33015,12 +33506,11 @@ data: [DONE]
                 .expect("recovered Codex lease");
         assert_eq!(codex_lease.source_type(), "codex");
         drop(codex_lease);
-        assert_eq!(web_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(web_calls.load(Ordering::SeqCst), 1);
         assert_eq!(codex_calls.load(Ordering::SeqCst), 0);
-        let recovered_is_codex = source_order[0] == "codex";
         assert_eq!(
             web_auth.lock().expect("web auth lock").clone(),
-            vec![(true, false), (!recovered_is_codex, recovered_is_codex)]
+            vec![(true, false)]
         );
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -36374,7 +36864,7 @@ data: [DONE]
         fs::write(
             &account_path,
             r#"[
-                {"access_token":"image-codex-token","status":"正常","source_type":"codex","type":"free"},
+                {"access_token":"image-codex-token","status":"正常","source_type":"web","type":"free"},
                 {"access_token":"image-web-token","status":"禁用","source_type":"web","type":"free","quota":1}
             ]"#,
         )
