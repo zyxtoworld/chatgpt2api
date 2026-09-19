@@ -23,7 +23,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use image::ImageReader;
 use reqwest::{Client, Method};
 use serde::Deserialize;
@@ -51,6 +51,8 @@ const MAX_BACKUP_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BACKUP_DETAIL_MEMBERS: usize = 5_000;
 const CCLOAD_CHANNEL_BROWSE_DEADLINE: Duration = Duration::from_secs(90);
 const CCLOAD_IMPORT_DEADLINE: Duration = Duration::from_secs(30 * 60);
+const CCLOAD_CHANNEL_MODEL_LOGIN_DEADLINE: Duration = Duration::from_secs(15);
+const CCLOAD_CHANNEL_MODEL_CONCURRENCY: usize = 8;
 const CCLOAD_MAX_CHANNELS: usize = 5_000;
 const CCLOAD_MAX_CHANNEL_PAGES: usize = 25;
 const MAX_R2_DOWNLOAD_BYTES: u64 = MAX_BACKUP_BYTES;
@@ -2377,8 +2379,8 @@ fn merge_ccload_model_catalog(
 }
 
 fn merge_ccload_account_catalog(
-    _models: Option<&Value>,
-    _sources: Option<&Value>,
+    models: Option<&Value>,
+    sources: Option<&Value>,
     snapshot: &Value,
 ) -> (Value, Value) {
     let mut entries: Vec<(String, ModelProvenance)> = Vec::new();
@@ -2387,6 +2389,21 @@ fn merge_ccload_account_catalog(
         .enumerate()
         .map(|(index, (id, _))| (id.clone(), index))
         .collect::<HashMap<_, _>>();
+    for (id, provenance) in
+        project_imported_model_entries_with_sources(models, sources, ModelProvenance::Unknown)
+    {
+        if !ccload_model_allowed(provenance) {
+            continue;
+        }
+        if let Some(index) = indexes.get(&id).copied() {
+            if model_provenance_rank(provenance) > model_provenance_rank(entries[index].1) {
+                entries[index].1 = provenance;
+            }
+        } else if entries.len() < super::MAX_MODELS {
+            indexes.insert(id.clone(), entries.len());
+            entries.push((id, provenance));
+        }
+    }
     for (id, provenance) in project_imported_model_entries_with_sources(
         snapshot.get("models"),
         snapshot.get("model_sources"),
@@ -3148,13 +3165,31 @@ pub(super) async fn ccload_channel_models(
     let server = registry_value(&state, "ccload", &server_id)?;
     let request = super::account_json_body(body).await?;
     let ids = clean_ccload_channel_ids(request.get("channel_ids"), 50)?;
-    let catalogs = tokio::time::timeout(
+    let requested_ids = ids.clone();
+    let catalogs = match tokio::time::timeout(
         CCLOAD_CHANNEL_MODEL_DEADLINE,
         load_ccload_channel_models(&state, &server_id, &server, ids),
     )
     .await
-    .map_err(|_| ApiError::upstream())??;
+    {
+        Ok(Ok(catalogs)) => catalogs,
+        Ok(Err(_)) | Err(_) => requested_ids
+            .iter()
+            .map(|id| terminal_ccload_channel_catalog(id, "failed"))
+            .collect(),
+    };
     Ok(Json(json!({"server_id": server_id, "channels": catalogs})))
+}
+
+fn terminal_ccload_channel_catalog(id: &str, status: &str) -> Value {
+    json!({
+        "id": id,
+        "plan_type": "",
+        "models": [],
+        "model_sources": {},
+        "models_loaded": false,
+        "model_load_status": status,
+    })
 }
 
 async fn load_ccload_channel_models(
@@ -3163,74 +3198,179 @@ async fn load_ccload_channel_models(
     server: &Map<String, Value>,
     ids: Vec<String>,
 ) -> Result<Vec<Value>, ApiError> {
-    let (base, token) = ccload_login(state, server).await?;
-    let mut catalogs = Vec::with_capacity(ids.len());
-    let mut catalog_credentials = Vec::<Option<String>>::with_capacity(ids.len());
+    let login_deadline = std::time::Instant::now() + CCLOAD_CHANNEL_MODEL_LOGIN_DEADLINE;
+    let (base, token) = ccload_login_until(state, server, login_deadline).await?;
+    let deadline = std::time::Instant::now() + CCLOAD_CHANNEL_MODEL_DEADLINE;
+    let existing_records = state.account_store.records();
+    let permits = Arc::new(Semaphore::new(CCLOAD_CHANNEL_MODEL_CONCURRENCY));
+    let catalog_count = ids.len();
+    let mut requests = FuturesUnordered::new();
 
-    for id in ids {
-        let catalog = json!({"id": id, "plan_type": "", "models": [], "models_loaded": false});
-        let editor = remote_json(
-            state,
-            state
-                .client
-                .get(format!("{base}/admin/channels/{id}/editor"))
-                .bearer_auth(&token),
-        )
-        .await;
-        if let Ok(editor) = editor {
+    for (index, id) in ids.into_iter().enumerate() {
+        let request_state = state.clone();
+        let request_client = state.client.clone();
+        let request_base = base.clone();
+        let request_token = token.clone();
+        let request_permits = permits.clone();
+        let request_records = existing_records.clone();
+        requests.push(async move {
+            let mut catalog = json!({
+                "id": id,
+                "plan_type": "",
+                "models": [],
+                "model_sources": {},
+                "models_loaded": false,
+                "model_load_status": "pending",
+            });
+            let _permit = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                request_permits.acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    catalog["model_load_status"] = Value::String("timeout".to_owned());
+                    return (index, catalog);
+                }
+            };
+            let editor = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                remote_json(
+                    &request_state,
+                    request_client
+                        .get(format!("{request_base}/admin/channels/{id}/editor"))
+                        .bearer_auth(&request_token),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(editor)) => editor,
+                Ok(Err(_)) => {
+                    catalog["model_load_status"] = Value::String("failed".to_owned());
+                    return (index, catalog);
+                }
+                Err(_) => {
+                    catalog["model_load_status"] = Value::String("timeout".to_owned());
+                    return (index, catalog);
+                }
+            };
             let channel = editor.get("data").and_then(|value| value.get("channel"));
             let channel_matches = channel
                 .and_then(|value| clean_ccload_channel_id(value.get("id")))
                 .is_some_and(|value| value == id)
                 && channel
+                    .and_then(|value| value.get("enabled"))
+                    .and_then(Value::as_bool)
+                    != Some(false)
+                && channel
                     .and_then(|value| value.get("auth_type"))
                     .and_then(Value::as_str)
                     .map(str::trim)
                     == Some("codex_oauth");
-            if channel_matches {
-                let credential = normalized_ccload_credential(
-                    editor
-                        .get("data")
-                        .and_then(|value| value.get("oauth_credential")),
-                );
-                if let Some(credential) = credential {
-                    catalog_credentials.push(Some(credential));
-                } else {
-                    catalog_credentials.push(None);
-                }
-            } else {
-                catalog_credentials.push(None);
+            if !channel_matches {
+                catalog["model_load_status"] = Value::String("failed".to_owned());
+                return (index, catalog);
             }
-        } else {
-            catalog_credentials.push(None);
-        }
-        catalogs.push(catalog);
+            let credential_value = editor
+                .get("data")
+                .and_then(|value| value.get("oauth_credential"));
+            let Some(access) = normalized_ccload_credential(credential_value) else {
+                catalog["model_load_status"] = Value::String("failed".to_owned());
+                return (index, catalog);
+            };
+            let account_type = credential_value
+                .and_then(|value| value.get("plan_type"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| value.chars().count() <= 256)
+                .or_else(|| {
+                    channel
+                        .and_then(|value| value.get("codex_plan_type"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| value.chars().count() <= 256)
+                })
+                .map(ToOwned::to_owned);
+            let account_id = credential_value
+                .and_then(|value| value.get("account_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty() && value.chars().count() <= 256)
+                .map(ToOwned::to_owned);
+            let fallback_raw = request_records
+                .iter()
+                .find(|record| {
+                    record.token == access
+                        || account_id.as_deref().is_some_and(|account_id| {
+                            record.chatgpt_account_id.as_deref() == Some(account_id)
+                        })
+                })
+                .map(|record| record.raw.clone());
+            let (fallback_models, fallback_sources) = fallback_raw
+                .as_ref()
+                .map(|raw| {
+                    (
+                        raw.get("models").cloned().unwrap_or_else(|| json!([])),
+                        raw.get("model_sources")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                    )
+                })
+                .unwrap_or_else(|| (json!([]), json!({})));
+            let account = json!({
+                "access_token": access,
+                "type": account_type,
+                "chatgpt_account_id": account_id,
+            });
+            let refresh = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                super::refresh_access_token_account(&request_state, &account, None),
+            )
+            .await;
+            let (snapshot, refresh_status) = match refresh {
+                Ok(Ok(snapshot)) => (Some(snapshot), "loaded"),
+                Ok(Err(_)) => (None, "failed"),
+                Err(_) => (None, "timeout"),
+            };
+            let empty_snapshot = Value::Object(Map::new());
+            let (models, sources) = merge_ccload_account_catalog(
+                Some(&fallback_models),
+                Some(&fallback_sources),
+                snapshot.as_ref().unwrap_or(&empty_snapshot),
+            );
+            let has_web = sources.as_object().is_some_and(|sources| {
+                sources
+                    .values()
+                    .any(|source| source.as_str() == Some("web"))
+            });
+            let has_image = sources.as_object().is_some_and(|sources| {
+                sources
+                    .values()
+                    .any(|source| source.as_str() == Some("image"))
+            });
+            catalog["models"] = models;
+            catalog["model_sources"] = sources;
+            catalog["models_loaded"] = Value::Bool(has_web || has_image);
+            catalog["model_load_status"] = Value::String(
+                if has_web && refresh_status == "failed" {
+                    "fallback"
+                } else if has_web {
+                    "loaded"
+                } else if has_image {
+                    "partial"
+                } else {
+                    refresh_status
+                }
+                .to_owned(),
+            );
+            (index, catalog)
+        });
     }
 
-    let mut fetched = Vec::<Option<Value>>::with_capacity(catalogs.len());
-    for credential in catalog_credentials {
-        let Some(access) = credential else {
-            fetched.push(None);
-            continue;
-        };
-        let snapshot = super::refresh_access_token_account(
-            state,
-            &json!({
-                "access_token": access,
-            }),
-            None,
-        )
-        .await
-        .ok();
-        fetched.push(snapshot);
-    }
-    for (catalog_index, snapshot) in fetched.into_iter().enumerate() {
-        if let Some(snapshot) = snapshot {
-            let (models, sources) = merge_ccload_account_catalog(None, None, &snapshot);
-            catalogs[catalog_index]["models"] = models;
-            catalogs[catalog_index]["model_sources"] = sources;
-            catalogs[catalog_index]["models_loaded"] = Value::Bool(true);
-        }
+    let mut catalogs = vec![Value::Null; catalog_count];
+    while let Some((index, catalog)) = requests.next().await {
+        catalogs[index] = catalog;
     }
     Ok(catalogs)
 }
@@ -5544,7 +5684,8 @@ mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
         apply_ccload_image_capability, ccload_model_entries, ccload_model_ids,
-        ccload_model_payload, normalized_ccload_credential, parse_r2_list_xml, public_backup_error,
+        ccload_model_payload, merge_ccload_account_catalog, normalized_ccload_credential,
+        parse_r2_list_xml, public_backup_error,
     };
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
@@ -5711,5 +5852,22 @@ mod tests {
         );
         assert_eq!(with_capability["model_sources"]["gpt-image-2"], "image");
         assert_eq!(with_capability["model_sources"]["gpt-image-2.5"], "image");
+    }
+
+    #[test]
+    fn ccload_channel_catalog_preserves_pool_web_models_when_refresh_is_image_only() {
+        let (models, sources) = merge_ccload_account_catalog(
+            Some(&serde_json::json!(["gpt-5-5"])),
+            Some(&serde_json::json!({"gpt-5-5":"web"})),
+            &serde_json::json!({
+                "models": ["gpt-image-2"],
+                "model_sources": {"gpt-image-2":"image"}
+            }),
+        );
+        assert_eq!(models, serde_json::json!(["gpt-5-5", "gpt-image-2"]));
+        assert_eq!(
+            sources,
+            serde_json::json!({"gpt-5-5":"web", "gpt-image-2":"image"})
+        );
     }
 }
