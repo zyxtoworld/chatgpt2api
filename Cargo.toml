@@ -24,7 +24,8 @@ httpdate = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 log = "0.4"
 percent-encoding = "2.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+wreq = { version = "6.0.0-rc.31", default-features = true, features = ["json", "stream", "socks"] }
+wreq-util = "3.0.0-rc.14"
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }

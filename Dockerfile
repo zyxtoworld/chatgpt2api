@@ -26,18 +26,18 @@ COPY Cargo.toml Cargo.lock ./
 COPY file_identity ./file_identity
 COPY src ./src
 RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends cmake clang; \
     case "$TARGETARCH" in \
         amd64) \
-            apt-get update; \
-            apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross; \
+            apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross; \
             rustup target add x86_64-unknown-linux-gnu; \
             rust_target=x86_64-unknown-linux-gnu; \
             cargo_linker=x86_64-linux-gnu-gcc; \
             cargo_env=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER; \
             ;; \
         arm64) \
-            apt-get update; \
-            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross; \
+            apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross; \
             rustup target add aarch64-unknown-linux-gnu; \
             rust_target=aarch64-unknown-linux-gnu; \
             cargo_linker=aarch64-linux-gnu-gcc; \

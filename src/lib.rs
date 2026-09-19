@@ -2,6 +2,8 @@
 #![recursion_limit = "256"]
 #![allow(dead_code)]
 
+extern crate wreq as reqwest;
+
 mod account_pool;
 mod account_snapshot;
 mod codex_sse;
@@ -1959,6 +1961,7 @@ impl AppState {
 
     pub fn new(mut config: AppConfig) -> Result<Self, AppInitError> {
         let client = Client::builder()
+            .emulation(wreq_util::Emulation::Edge143)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()
@@ -2055,6 +2058,7 @@ impl AppState {
         data_dir: PathBuf,
     ) -> Result<Self, AppInitError> {
         let client = Client::builder()
+            .emulation(wreq_util::Emulation::Edge143)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(120))
             .build()

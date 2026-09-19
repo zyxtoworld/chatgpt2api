@@ -25,10 +25,11 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use file_identity::{DirectoryHandle, open_directory, open_or_create_directory};
 use futures_util::StreamExt;
-use reqwest::{RequestBuilder, Url};
+use reqwest::RequestBuilder;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use url::Url;
 
 use super::{
     AccountLease, AccountModelGroup, AccountStore, ApiError, AppState,
