@@ -46,7 +46,9 @@ use model_pool::{
 };
 #[cfg(test)]
 use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
-use native_pow::{NativePowResources, native_pow_config, parse_native_pow_resources};
+use native_pow::{
+    NativePowResources, native_pow_config, native_pow_config_runtime, parse_native_pow_resources,
+};
 use protocol_anthropic::{
     anthropic_stream_responses_response, from_chat_response, from_responses_response,
     stream_body_response as anthropic_stream_body_response,
@@ -167,7 +169,7 @@ const NATIVE_SEARCH_MAX_FIELD_CHARS: usize = 4096;
 const NATIVE_SEARCH_MAX_SOURCES: usize = 100;
 const NATIVE_SEARCH_MODEL: &str = "gpt-5-5";
 const CODEX_RESPONSES_MODEL: &str = "gpt-5.5";
-const NATIVE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+const NATIVE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0";
 const NATIVE_ORIGIN: &str = "https://chatgpt.com";
 const NATIVE_CLIENT_VERSION: &str = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887";
 const NATIVE_CLIENT_BUILD_NUMBER: &str = "6708908";
@@ -13278,6 +13280,10 @@ fn native_requirements_token(
     resources: &NativePowResources,
 ) -> Result<String, ApiError> {
     let config = native_pow_config(user_agent, resources);
+    native_requirements_token_from_config(&config)
+}
+
+fn native_requirements_token_from_config(config: &[Value]) -> Result<String, ApiError> {
     let payload = serde_json::to_vec(&config).map_err(|_| ApiError::upstream())?;
     Ok(format!(
         "gAAAAAC{}",
@@ -13382,6 +13388,15 @@ async fn native_proof_token(
     resources: &NativePowResources,
     deadline: Instant,
 ) -> Result<String, ApiError> {
+    let config = native_pow_config(user_agent, resources);
+    native_proof_token_with_config(value, &config, deadline).await
+}
+
+async fn native_proof_token_with_config(
+    value: Option<&Value>,
+    config: &[Value],
+    deadline: Instant,
+) -> Result<String, ApiError> {
     if !native_optional_challenge_required(value)? {
         return Ok(String::new());
     }
@@ -13393,8 +13408,7 @@ async fn native_proof_token(
     .map_err(|_| ApiError::upstream())?
     .map_err(|_| ApiError::upstream())?;
     let value = value.cloned();
-    let user_agent = user_agent.to_owned();
-    let resources = resources.clone();
+    let config = config.to_owned();
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = cancel.clone();
     let _cancel_guard = NativePowCancelGuard(cancel.clone());
@@ -13402,13 +13416,7 @@ async fn native_proof_token(
         let _permit = permit;
         #[cfg(test)]
         let _worker_guard = NativePowWorkerGuard::for_value(value.as_ref());
-        native_proof_token_sync(
-            value.as_ref(),
-            &user_agent,
-            &resources,
-            &worker_cancel,
-            deadline,
-        )
+        native_proof_token_sync_for_config(value.as_ref(), &config, &worker_cancel, deadline)
     });
     let result =
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut worker).await;
@@ -14255,8 +14263,11 @@ async fn native_chat_requirements_with_resources_for_route_context(
     } else {
         "/backend-anon"
     };
-    let p_token =
-        native_requirements_token(NATIVE_USER_AGENT, resources).map_err(|error| (error, false))?;
+    // Prepare and proof tokens must use one browser snapshot, matching the
+    // Python implementation's single build_pow_config call per handshake.
+    let pow_config = native_pow_config_runtime(NATIVE_USER_AGENT, resources);
+    let p_token = native_requirements_token_from_config(&pow_config)
+        .map_err(|error| (error, false))?;
     let prepare_path = format!("{route_base}/sentinel/chat-requirements/prepare");
     let mut prepare_request =
         native_browser_headers(client.post(format!("{base_url}{prepare_path}")), context)
@@ -14289,10 +14300,9 @@ async fn native_chat_requirements_with_resources_for_route_context(
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| (ApiError::upstream(), false))?;
-    let proof_token = native_proof_token(
+    let proof_token = native_proof_token_with_config(
         prepare_value.get("proofofwork"),
-        NATIVE_USER_AGENT,
-        resources,
+        &pow_config,
         deadline,
     )
     .await
