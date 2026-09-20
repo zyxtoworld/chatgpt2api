@@ -9483,6 +9483,9 @@ async fn search_conversation_id_from_response(
             if conversation_id.is_none() {
                 conversation_id = search_find_string(&value, "conversation_id")
                     .filter(|id| valid_search_conversation_id(id));
+                if conversation_id.is_some() {
+                    return conversation_id.ok_or((ApiError::upstream(), false));
+                }
             }
         }
     }
@@ -9556,7 +9559,7 @@ fn extract_search_result(conversation_id: &str, conversation: &Value) -> Value {
         }
     }
     let message = selected;
-    let answer = message.map_or_else(String::new, search_message_text);
+    let answer = native_sanitize_text(&message.map_or_else(String::new, search_message_text));
     let status = message.and_then(search_message_status).unwrap_or_default();
     let mut sources = Vec::new();
     let mut seen = HashSet::new();
