@@ -8321,7 +8321,7 @@ async fn native_web_image_attempt(
     );
     let ids = native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline)
         .await
-        .map_err(|error| {
+        .inspect_err(|error| {
             eprintln!(
                 "native_web_image poll_failed model={} code={}",
                 request.model,
@@ -8337,7 +8337,7 @@ async fn native_web_image_attempt(
     let downloaded =
         native_download_image_files(state, lease, &context, &conversation_id, &ids, deadline)
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 eprintln!(
                     "native_web_image download_failed model={} code={}",
                     request.model,
