@@ -7850,17 +7850,32 @@ async fn native_download_image_files(
                 .map_err(|_| ApiError::upstream())?
                 .map_err(|_| ApiError::upstream())?;
         if !response.status().is_success() {
+            eprintln!(
+                "native_web_image download_meta_status={} id={}",
+                response.status(),
+                id
+            );
             return Err(ApiError::upstream());
         }
         let body = bounded_response_body(response).await?;
-        let meta: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+        let meta: Value = serde_json::from_slice(&body).map_err(|_| {
+            eprintln!(
+                "native_web_image download_meta_json_failed id={} bytes={}",
+                id,
+                body.len()
+            );
+            ApiError::upstream()
+        })?;
         let url = meta
             .get("download_url")
             .or_else(|| meta.get("url"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
-            .ok_or_else(ApiError::upstream)?;
+            .ok_or_else(|| {
+                eprintln!("native_web_image download_meta_url_missing id={}", id);
+                ApiError::upstream()
+            })?;
         let response = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
             state.client.get(url).send(),
@@ -7869,6 +7884,11 @@ async fn native_download_image_files(
         .map_err(|_| ApiError::upstream())?
         .map_err(|_| ApiError::upstream())?;
         if !response.status().is_success() {
+            eprintln!(
+                "native_web_image download_blob_status={} id={}",
+                response.status(),
+                id
+            );
             return Err(ApiError::upstream());
         }
         outputs.push(bounded_response_body(response).await?);
