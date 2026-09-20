@@ -10372,11 +10372,77 @@ fn read_tasks_unlocked(state: &AppState) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+fn image_task_retention_days(state: &AppState) -> f64 {
+    fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("image_retention_days")
+                .and_then(|value| match value {
+                    Value::Number(number) => number.as_f64(),
+                    Value::String(text) => text.trim().parse::<f64>().ok(),
+                    _ => None,
+                })
+        })
+        .filter(|days| days.is_finite() && *days >= 1.0)
+        .unwrap_or(30.0)
+}
+
+fn normalize_image_tasks_for_runtime(state: &AppState, tasks: &mut Vec<Value>) -> bool {
+    let (_, now) = image_task_now();
+    let retention_cutoff = now - image_task_retention_days(state) * 86_400.0;
+    let worker_pid = u64::from(std::process::id());
+    let (updated_at, updated_ts) = image_task_now();
+    let mut changed = false;
+    tasks.retain(|task| {
+        let terminal = matches!(
+            task.get("status").and_then(Value::as_str),
+            Some("success" | "error")
+        );
+        let expired = terminal
+            && task
+                .get("updated_ts")
+                .and_then(Value::as_f64)
+                .is_some_and(|timestamp| timestamp > 0.0 && timestamp < retention_cutoff);
+        if expired {
+            changed = true;
+        }
+        !expired
+    });
+    for task in tasks.iter_mut().filter_map(Value::as_object_mut) {
+        let unfinished = matches!(
+            task.get("status").and_then(Value::as_str),
+            Some("queued" | "running")
+        );
+        let owned_by_current_worker = task
+            .get("worker_pid")
+            .and_then(Value::as_u64)
+            .is_some_and(|pid| pid == worker_pid);
+        if unfinished && !owned_by_current_worker {
+            task.insert("status".to_owned(), Value::String("error".to_owned()));
+            task.insert(
+                "error".to_owned(),
+                Value::String("服务已重启，未完成的图片任务已中断".to_owned()),
+            );
+            task.insert("ended_ts".to_owned(), json!(updated_ts));
+            task.insert("updated_at".to_owned(), Value::String(updated_at.clone()));
+            task.insert("updated_ts".to_owned(), json!(updated_ts));
+            changed = true;
+        }
+    }
+    changed
+}
+
 async fn read_tasks(state: &AppState) -> Vec<Value> {
     let _guard = IMAGE_TASK_MUTATION_GATE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    read_tasks_unlocked(state)
+    let mut tasks = read_tasks_unlocked(state);
+    if normalize_image_tasks_for_runtime(state, &mut tasks) {
+        let _ = write_tasks_unlocked(state, &tasks);
+    }
+    tasks
 }
 
 fn write_tasks_unlocked(state: &AppState, tasks: &[Value]) -> Result<(), ApiError> {
@@ -10635,6 +10701,7 @@ async fn enqueue_image_task(
             "updated_at": created_at,
             "created_ts": created_ts,
             "updated_ts": created_ts,
+            "worker_pid": u64::from(std::process::id()),
         });
         let public = public_image_task(&task);
         tasks.push(task);
