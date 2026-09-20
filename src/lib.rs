@@ -3190,6 +3190,7 @@ async fn api_accounts_update(
                 "chatgpt_account_id",
                 "models",
                 "quota",
+                "proxy",
             ] {
                 if let Some(value) = object.get(key) {
                     target.insert(key.to_owned(), value.clone());
@@ -3632,7 +3633,13 @@ async fn api_users(
     if !state.auth_store.reload().await {
         return Err(ApiError::unavailable());
     }
-    Ok(Json(json!({"items": state.auth_store.public_records()})))
+    let items = state
+        .auth_store
+        .public_records()
+        .into_iter()
+        .filter(|record| record.get("role").and_then(Value::as_str) == Some("user"))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"items": items})))
 }
 
 fn public_auth_record(record: &Value) -> Value {
@@ -3741,6 +3748,7 @@ async fn api_users_update(
                     .get("id")
                     .and_then(Value::as_str)
                     .is_some_and(|value| value == key_id)
+                    && record.get("role").and_then(Value::as_str) == Some("user")
             }) else {
                 return Err(ApiError::not_found());
             };
@@ -3784,6 +3792,7 @@ async fn api_users_delete(
                     .get("id")
                     .and_then(Value::as_str)
                     .is_none_or(|value| value != key_id)
+                    || record.get("role").and_then(Value::as_str) != Some("user")
             });
             if records.len() == original_len {
                 return Err(ApiError::not_found());
@@ -3791,7 +3800,13 @@ async fn api_users_delete(
             Ok(())
         })
         .await?;
-    Ok(Json(json!({"items": state.auth_store.public_records()})))
+    let items = state
+        .auth_store
+        .public_records()
+        .into_iter()
+        .filter(|record| record.get("role").and_then(Value::as_str) == Some("user"))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"items": items})))
 }
 
 fn data_file(state: &AppState, name: &str) -> PathBuf {
@@ -21758,7 +21773,7 @@ mod tests {
                     .header(header::AUTHORIZATION, "Bearer secret")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"access_token":"token-one","status":"限流"}"#,
+                        r#"{"access_token":"token-one","status":"限流","proxy":"http://account-proxy.invalid:8080"}"#,
                     ))
                     .expect("request"),
             )
@@ -21769,6 +21784,10 @@ mod tests {
             .expect("updated json");
         assert_eq!(stored["cumulative_total"], 2);
         assert_eq!(stored["items"][0]["status"], "限流");
+        assert_eq!(
+            stored["items"][0]["proxy"],
+            "http://account-proxy.invalid:8080"
+        );
         assert!(stored["items"][0].get("refresh_token").is_none());
         assert!(stored["items"][0].get("id_token").is_none());
 
@@ -22365,6 +22384,12 @@ mod tests {
                     "role": "user",
                     "enabled": true,
                     "key_hash": auth_key_hash("old-key")
+                }, {
+                    "id": "admin-key",
+                    "name": "admin",
+                    "role": "admin",
+                    "enabled": true,
+                    "key_hash": auth_key_hash("admin")
                 }]
             }))
             .expect("auth snapshot"),
@@ -22382,6 +22407,25 @@ mod tests {
             upstream_protocol: UpstreamProtocol::ChatGpt,
         })
         .expect("state");
+        let listed = state
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/auth/users")
+                    .header(header::AUTHORIZATION, "Bearer admin")
+                    .body(Body::empty())
+                    .expect("list request"),
+            )
+            .await
+            .expect("list response");
+        let listed = json_response(listed).await;
+        assert!(
+            listed["items"]
+                .as_array()
+                .expect("listed users")
+                .iter()
+                .all(|item| item["role"] == "user")
+        );
         let create = state
             .router()
             .oneshot(
