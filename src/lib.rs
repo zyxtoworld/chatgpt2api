@@ -14337,14 +14337,14 @@ async fn native_chat_requirements_with_resources_for_route_context(
     if authenticated {
         prepare_request = prepare_request.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let prepare = prepare_request.send().await.map_err(|error| {
-        (
-            ApiError::upstream_message(format!("diagnostic prepare transport={error}")),
-            false,
-        )
-    });
+    let prepare = prepare_request.send();
     let prepare_body = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-        let prepare = prepare.await.map_err(|_| (ApiError::upstream(), false))?;
+        let prepare = prepare.await.map_err(|error| {
+            (
+                ApiError::upstream_message(format!("diagnostic prepare transport={error}")),
+                false,
+            )
+        })?;
         let status = prepare.status();
         if !status.is_success() {
             return Err((ApiError::upstream(), native_stage_retryable(status, true)));
@@ -14404,14 +14404,14 @@ async fn native_chat_requirements_with_resources_for_route_context(
         finalize_request =
             finalize_request.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let finalize = finalize_request.send().await.map_err(|error| {
-        (
-            ApiError::upstream_message(format!("diagnostic finalize transport={error}")),
-            false,
-        )
-    });
+    let finalize = finalize_request.send();
     let finalize_body = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-        let finalize = finalize.await.map_err(|_| (ApiError::upstream(), false))?;
+        let finalize = finalize.await.map_err(|error| {
+            (
+                ApiError::upstream_message(format!("diagnostic finalize transport={error}")),
+                false,
+            )
+        })?;
         let status = finalize.status();
         if !status.is_success() {
             return Err((ApiError::upstream(), native_stage_retryable(status, false)));
