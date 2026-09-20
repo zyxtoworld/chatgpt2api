@@ -14384,7 +14384,10 @@ async fn native_chat_requirements_with_resources_for_route_context(
             .map_err(|error| {
                 eprintln!("native sentinel turnstile failed: code={}", error.code());
                 (
-                    ApiError::upstream_message(format!("diagnostic turnstile code={}", error.code())),
+                    ApiError::upstream_message(format!(
+                        "diagnostic turnstile code={}",
+                        error.code()
+                    )),
                     false,
                 )
             })?;
