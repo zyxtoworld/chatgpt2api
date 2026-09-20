@@ -1,6 +1,9 @@
 use super::{DEFAULT_POW_SCRIPT, MAX_POW_SCRIPT_SOURCES, Value};
 use serde_json::json;
-use std::{fs, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{
+    fs,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use time::{OffsetDateTime, UtcOffset, format_description};
 
 #[derive(Clone, Default)]
