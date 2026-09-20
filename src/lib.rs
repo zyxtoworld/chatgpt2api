@@ -7322,7 +7322,7 @@ async fn native_web_image_request_proxy(
         .ok_or_else(ApiError::unavailable)?;
     let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
     let (configured, candidates) =
-        match resolve_web_image_upstream_models(&state, &lease, deadline).await {
+        match resolve_web_image_upstream_models(&state, &lease, &request.model, deadline).await {
             Ok(value) => value,
             Err(error) => {
                 let token = lease.token().to_owned();
@@ -7432,9 +7432,13 @@ fn ordered_web_image_upstream_candidates(models: Vec<PublicModel>) -> Vec<String
 async fn resolve_web_image_upstream_models(
     state: &AppState,
     lease: &AccountLease,
+    requested_model: &str,
     deadline: Instant,
 ) -> Result<(RuntimeModelSettings, Vec<String>), ApiError> {
     let configured = runtime_model_settings(state);
+    if requested_model != "gpt-image-2" {
+        return Ok((configured, vec!["auto".to_owned()]));
+    }
     let base_url = state
         .config
         .upstream_base_url
