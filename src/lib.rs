@@ -3638,9 +3638,16 @@ async fn api_users(
         .auth_store
         .public_records()
         .into_iter()
-        .filter(|record| record.get("role").and_then(Value::as_str) == Some("user"))
+        .filter(auth_record_is_user)
         .collect::<Vec<_>>();
     Ok(Json(json!({"items": items})))
+}
+
+fn auth_record_is_user(record: &Value) -> bool {
+    record
+        .get("role")
+        .and_then(Value::as_str)
+        .is_none_or(|role| role.eq_ignore_ascii_case("user"))
 }
 
 fn public_auth_record(record: &Value) -> Value {
@@ -3707,7 +3714,12 @@ async fn api_users_add(
     Ok(Json(json!({
         "item": public_auth_record(&created),
         "key": key,
-        "items": state.auth_store.public_records(),
+        "items": state
+            .auth_store
+            .public_records()
+            .into_iter()
+            .filter(auth_record_is_user)
+            .collect::<Vec<_>>(),
     })))
 }
 
@@ -3749,7 +3761,7 @@ async fn api_users_update(
                     .get("id")
                     .and_then(Value::as_str)
                     .is_some_and(|value| value == key_id)
-                    && record.get("role").and_then(Value::as_str) == Some("user")
+                    && auth_record_is_user(record)
             }) else {
                 return Err(ApiError::not_found());
             };
@@ -3770,7 +3782,12 @@ async fn api_users_update(
         .await?;
     let mut response = json!({
         "item": public_auth_record(&updated),
-        "items": state.auth_store.public_records(),
+        "items": state
+            .auth_store
+            .public_records()
+            .into_iter()
+            .filter(auth_record_is_user)
+            .collect::<Vec<_>>(),
     });
     if let Some(key) = replacement_key {
         response["key"] = Value::String(key);
@@ -3793,7 +3810,7 @@ async fn api_users_delete(
                     .get("id")
                     .and_then(Value::as_str)
                     .is_none_or(|value| value != key_id)
-                    || record.get("role").and_then(Value::as_str) != Some("user")
+                    || !auth_record_is_user(record)
             });
             if records.len() == original_len {
                 return Err(ApiError::not_found());
@@ -3805,7 +3822,7 @@ async fn api_users_delete(
         .auth_store
         .public_records()
         .into_iter()
-        .filter(|record| record.get("role").and_then(Value::as_str) == Some("user"))
+        .filter(auth_record_is_user)
         .collect::<Vec<_>>();
     Ok(Json(json!({"items": items})))
 }
