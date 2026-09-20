@@ -8327,7 +8327,6 @@ async fn native_web_image_attempt(
                 request.model,
                 error.code()
             );
-            error
         })?;
     eprintln!(
         "native_web_image poll_ok model={} ids={}",
@@ -8343,7 +8342,6 @@ async fn native_web_image_attempt(
                     request.model,
                     error.code()
                 );
-                error
             })?;
     eprintln!(
         "native_web_image download_ok model={} count={}",
