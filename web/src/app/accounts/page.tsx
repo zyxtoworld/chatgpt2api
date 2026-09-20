@@ -97,6 +97,10 @@ const metricCards = [
   { key: "quota", label: "剩余额度", color: "text-blue-500", icon: RefreshCw },
 ] as const;
 
+function hasWebModels(models: Model[]) {
+  return models.some((model) => !model.id.trim().toLowerCase().startsWith("gpt-image-"));
+}
+
 function formatQuota(account: Account) {
   return String(Math.max(0, account.quota));
 }
@@ -305,15 +309,22 @@ function AccountsPageContent() {
     const ownsModelRequest = () => modelAbortControllerRef.current === abortController;
     setIsLoadingModels(true);
     try {
-      const data = await fetchModels(abortController.signal);
-      if (!mountedRef.current || !ownsModelRequest()) {
-        return;
+      const maxWarmupAttempts = 20;
+      for (let attempt = 0; attempt < maxWarmupAttempts; attempt += 1) {
+        const data = await fetchModels(abortController.signal);
+        if (!mountedRef.current || !ownsModelRequest()) {
+          return;
+        }
+        const models = parseModelList(data);
+        if (models === null) {
+          throw new Error("模型列表响应格式无效");
+        }
+        setAvailableModels(models);
+        if (hasWebModels(models) || attempt === maxWarmupAttempts - 1) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-      const models = parseModelList(data);
-      if (models === null) {
-        throw new Error("模型列表响应格式无效");
-      }
-      setAvailableModels(models);
     } catch (error) {
       if (!mountedRef.current || !ownsModelRequest()) {
         return;
