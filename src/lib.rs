@@ -7800,6 +7800,28 @@ fn native_image_poll_shape(value: &Value) -> String {
             .and_then(Value::as_object)
             .map(|metadata| metadata.keys().cloned().collect::<Vec<_>>().join(","))
             .unwrap_or_default();
+        let metadata_status = message
+            .get("metadata")
+            .and_then(Value::as_object)
+            .map(|metadata| {
+                let finish = metadata
+                    .get("finish_details")
+                    .and_then(Value::as_object)
+                    .and_then(|finish| finish.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let complete = metadata
+                    .get("is_complete")
+                    .and_then(Value::as_bool)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default();
+                let message_type = metadata
+                    .get("message_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                format!("finish={finish} complete={complete} message_type={message_type}")
+            })
+            .unwrap_or_default();
         let content = message.get("content");
         let content_shape = match content {
             Some(Value::Object(content)) => {
@@ -7826,7 +7848,24 @@ fn native_image_poll_shape(value: &Value) -> String {
                             .join("|")
                     })
                     .unwrap_or_default();
-                format!("object keys=[{keys}] parts=[{parts}]")
+                let text_signals = ["text", "content"]
+                    .iter()
+                    .filter_map(|key| {
+                        content.get(*key).and_then(Value::as_str).map(|value| {
+                            format!(
+                                "{key}:len={} image={} file={} sediment={} json={}",
+                                value.len(),
+                                value.contains("image"),
+                                value.contains("file"),
+                                value.contains("sediment"),
+                                value.trim_start().starts_with('{')
+                                    || value.trim_start().starts_with('['),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                format!("object keys=[{keys}] parts=[{parts}] text=[{text_signals}]")
             }
             Some(Value::String(_)) => "string".to_owned(),
             Some(Value::Array(_)) => "array".to_owned(),
@@ -7836,7 +7875,7 @@ fn native_image_poll_shape(value: &Value) -> String {
             None => "missing".to_owned(),
         };
         messages.push(format!(
-            "role={role} metadata=[{metadata_keys}] content={content_shape}"
+            "role={role} {metadata_status} metadata=[{metadata_keys}] content={content_shape}"
         ));
     }
     messages.join(" || ")
