@@ -179,6 +179,18 @@ impl ApiError {
         }
     }
 
+    pub(super) fn upstream_message(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            kind: "server_error",
+            code: "upstream_error",
+            message: Cow::Owned(message.into()),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+
     pub(super) fn unavailable() -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,

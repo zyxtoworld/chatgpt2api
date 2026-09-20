@@ -15166,7 +15166,14 @@ async fn native_conversation_attempt(
 ) -> Result<reqwest::Response, (ApiError, bool)> {
     let authenticated = !token.is_empty();
     let context = NativeRequestContext::new();
-    let pow_resources = native_bootstrap(client, base_url, token, &context).await?;
+    let pow_resources = native_bootstrap(client, base_url, token, &context)
+        .await
+        .map_err(|(error, retryable)| {
+            (
+                ApiError::upstream_message(format!("diagnostic bootstrap code={}", error.code())),
+                retryable,
+            )
+        })?;
     let requirements = native_chat_requirements_with_resources_for_route_context(
         client,
         base_url,
@@ -15176,7 +15183,13 @@ async fn native_conversation_attempt(
         authenticated,
         &context,
     )
-    .await?;
+    .await
+    .map_err(|(error, retryable)| {
+        (
+            ApiError::upstream_message(format!("diagnostic requirements code={}", error.code())),
+            retryable,
+        )
+    })?;
     let route_base = if authenticated {
         "/backend-api/conversation"
     } else {
@@ -15206,9 +15219,20 @@ async fn native_conversation_attempt(
     }
     let upstream = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send())
         .await
-        .map_err(|_| (ApiError::upstream(), false))?
-        .map_err(|_| (ApiError::upstream(), false))?;
-    if !upstream.status().is_success() {
+        .map_err(|_| {
+            (
+                ApiError::upstream_message("diagnostic conversation timeout"),
+                false,
+            )
+        })?
+        .map_err(|error| {
+            (
+                ApiError::upstream_message(format!("diagnostic conversation transport={error}")),
+                false,
+            )
+        })?;
+    let status = upstream.status();
+    if !status.is_success() {
         let retryable = matches!(
             upstream.status(),
             StatusCode::TOO_MANY_REQUESTS
@@ -15217,7 +15241,10 @@ async fn native_conversation_attempt(
                 | StatusCode::SERVICE_UNAVAILABLE
                 | StatusCode::GATEWAY_TIMEOUT
         );
-        return Err((ApiError::upstream(), retryable));
+        return Err((
+            ApiError::upstream_message(format!("diagnostic conversation status={status}")),
+            retryable,
+        ));
     }
     if upstream_declares_oversize(&upstream) {
         return Err((ApiError::upstream(), false));
@@ -16090,7 +16117,12 @@ async fn chat_completions_with_timeout(
             drop(lease);
             return Ok(Json(chat).into_response());
         }
-        let text = native_completion_text(&body)?;
+        let text = native_completion_text(&body).map_err(|_| {
+            ApiError::upstream_message(format!(
+                "diagnostic sse parse body={}",
+                String::from_utf8_lossy(&body[..body.len().min(500)]),
+            ))
+        })?;
         let usage = native_usage(&object, &text)?;
         drop(lease);
         return Ok(Json(json!({
