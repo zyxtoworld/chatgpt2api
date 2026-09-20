@@ -14337,7 +14337,12 @@ async fn native_chat_requirements_with_resources_for_route_context(
     if authenticated {
         prepare_request = prepare_request.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let prepare = prepare_request.send();
+    let prepare = prepare_request.send().map_err(|error| {
+        (
+            ApiError::upstream_message(format!("diagnostic prepare transport={error}")),
+            false,
+        )
+    });
     let prepare_body = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
         let prepare = prepare.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = prepare.status();
@@ -14399,7 +14404,12 @@ async fn native_chat_requirements_with_resources_for_route_context(
         finalize_request =
             finalize_request.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let finalize = finalize_request.send();
+    let finalize = finalize_request.send().map_err(|error| {
+        (
+            ApiError::upstream_message(format!("diagnostic finalize transport={error}")),
+            false,
+        )
+    });
     let finalize_body = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
         let finalize = finalize.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = finalize.status();
@@ -15232,8 +15242,18 @@ async fn native_conversation_attempt(
     }
     let upstream = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send())
         .await
-        .map_err(|_| (ApiError::upstream(), false))?
-        .map_err(|_| (ApiError::upstream(), false))?;
+        .map_err(|_| {
+            (
+                ApiError::upstream_message("diagnostic conversation timeout"),
+                false,
+            )
+        })?
+        .map_err(|error| {
+            (
+                ApiError::upstream_message(format!("diagnostic conversation transport={error}")),
+                false,
+            )
+        })?;
     if !upstream.status().is_success() {
         let retryable = matches!(
             upstream.status(),
