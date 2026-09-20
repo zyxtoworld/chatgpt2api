@@ -15176,7 +15176,6 @@ async fn native_conversation_attempt(
         authenticated,
         &context,
     )
-    .await
     .await?;
     let route_base = if authenticated {
         "/backend-api/conversation"
