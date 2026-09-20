@@ -15203,27 +15203,11 @@ async fn native_work_mode_attempt(
 ) -> Result<reqwest::Response, (ApiError, bool)> {
     let context = NativeRequestContext::new();
     let base_url = base_url.trim_end_matches("/");
-    let resources = native_bootstrap(client, base_url, token, &context)
-        .await
-        .map_err(|(error, retryable)| {
-            (
-                ApiError::upstream_message(format!(
-                    "diagnostic wm bootstrap code={}",
-                    error.code()
-                )),
-                retryable,
-            )
-        })?;
+    let resources = native_bootstrap(client, base_url, token, &context).await?;
     let requirements = native_chat_requirements_with_resources_for_route_context(
         client, base_url, token, &resources, timeout, true, &context,
     )
-    .await
-    .map_err(|(error, retryable)| {
-        (
-            ApiError::upstream_message(format!("diagnostic wm requirements code={}", error.code())),
-            retryable,
-        )
-    })?;
+    .await?;
     let prepare_path = "/backend-api/f/conversation/prepare";
     let mut prepare =
         native_browser_headers(client.post(format!("{base_url}{prepare_path}")), &context)
@@ -15238,22 +15222,12 @@ async fn native_work_mode_attempt(
     }
     let prepare = tokio::time::timeout(timeout, prepare.send())
         .await
-        .map_err(|_| {
-            (
-                ApiError::upstream_message("diagnostic wm prepare timeout"),
-                false,
-            )
-        })?
-        .map_err(|error| {
-            (
-                ApiError::upstream_message(format!("diagnostic wm prepare transport={error}")),
-                true,
-            )
-        })?;
+        .map_err(|_| (ApiError::upstream(), false))?
+        .map_err(|_| (ApiError::upstream(), true))?;
     let prepare_status = prepare.status();
     if !prepare_status.is_success() {
         return Err((
-            ApiError::upstream_message(format!("diagnostic wm prepare status={prepare_status}")),
+            ApiError::upstream(),
             native_stage_retryable(prepare_status, true),
         ));
     }
@@ -15294,24 +15268,11 @@ async fn native_work_mode_attempt(
     }
     let response = tokio::time::timeout(timeout, run.send())
         .await
-        .map_err(|_| {
-            (
-                ApiError::upstream_message("diagnostic wm run timeout"),
-                false,
-            )
-        })?
-        .map_err(|error| {
-            (
-                ApiError::upstream_message(format!("diagnostic wm run transport={error}")),
-                true,
-            )
-        })?;
+        .map_err(|_| (ApiError::upstream(), false))?
+        .map_err(|_| (ApiError::upstream(), true))?;
     let status = response.status();
     if !status.is_success() {
-        return Err((
-            ApiError::upstream_message(format!("diagnostic wm run status={status}")),
-            native_stage_retryable(status, true),
-        ));
+        return Err((ApiError::upstream(), native_stage_retryable(status, true)));
     }
     if upstream_declares_oversize(&response) {
         return Err((ApiError::upstream(), false));
