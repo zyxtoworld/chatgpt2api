@@ -7419,6 +7419,8 @@ fn ordered_web_image_upstream_candidates(models: Vec<PublicModel>) -> Vec<String
             model.provenance == ModelProvenance::Web
                 && model.id != "auto"
                 && !is_native_image_model_id(&model.id)
+                && !model.id.to_ascii_lowercase().ends_with("-wm")
+                && !model.id.eq_ignore_ascii_case("research")
         })
         .map(|model| model.id)
         .collect::<Vec<_>>();
@@ -7453,7 +7455,14 @@ async fn resolve_web_image_upstream_models(
     })
     .await
     .ok_or_else(ApiError::unavailable)?;
-    let candidates = ordered_web_image_upstream_candidates(models);
+    let mut candidates = ordered_web_image_upstream_candidates(models);
+    if let Some(index) = candidates
+        .iter()
+        .position(|model| model.eq_ignore_ascii_case(&configured.upstream_model))
+    {
+        let configured_model = candidates.remove(index);
+        candidates.insert(0, configured_model);
+    }
     if candidates.is_empty() {
         return Err(ApiError::unavailable());
     }
