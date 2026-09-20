@@ -7625,6 +7625,7 @@ fn native_value_has_image_asset_pointer(value: &Value, depth: usize) -> bool {
         return false;
     }
     match value {
+        Value::String(value) => value.contains("file-service://") || value.contains("sediment://"),
         Value::Object(object) => {
             if object.get("content_type").and_then(Value::as_str) == Some("image_asset_pointer")
                 || object
@@ -7647,11 +7648,65 @@ fn native_value_has_image_asset_pointer(value: &Value, depth: usize) -> bool {
     }
 }
 
+fn native_collect_image_ids_from_text(value: &str, ids: &mut Vec<String>) {
+    for prefix in ["file-service://", "sediment://"] {
+        let mut offset = 0;
+        while let Some(index) = value[offset..].find(prefix) {
+            let start = offset + index + prefix.len();
+            let end = start
+                + value[start..]
+                    .char_indices()
+                    .find(|(_, character)| {
+                        !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(value.len() - start);
+            if start < end {
+                let candidate = &value[start..end];
+                let candidate = if prefix == "sediment://" {
+                    format!("sediment://{candidate}")
+                } else {
+                    candidate.to_owned()
+                };
+                if !ids.contains(&candidate) {
+                    ids.push(candidate);
+                }
+            }
+            offset = end.max(start.saturating_add(1));
+            if offset >= value.len() {
+                break;
+            }
+        }
+    }
+    let mut offset = 0;
+    while let Some(index) = value[offset..].find("file_") {
+        let start = offset + index;
+        let end = start
+            + value[start..]
+                .char_indices()
+                .find(|(_, character)| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+                })
+                .map(|(index, _)| index)
+                .unwrap_or(value.len() - start);
+        if let Some(candidate) = native_image_file_id(&value[start..end])
+            && !ids.contains(&candidate)
+        {
+            ids.push(candidate);
+        }
+        offset = end.max(start.saturating_add(1));
+        if offset >= value.len() {
+            break;
+        }
+    }
+}
+
 fn native_collect_image_ids_from_value(value: &Value, ids: &mut Vec<String>, depth: usize) {
     if depth > 16 || ids.len() >= 16 {
         return;
     }
     match value {
+        Value::String(value) => native_collect_image_ids_from_text(value, ids),
         Value::Object(object) => {
             for key in ["file_id", "fileId", "asset_pointer"] {
                 let Some(value) = object.get(key).and_then(Value::as_str) else {
@@ -7754,6 +7809,8 @@ async fn native_poll_image_file_ids(
             &referer,
         )
         .header(header::ACCEPT, "application/json")
+        .header("X-OpenAI-Target-Path", path.as_str())
+        .header("X-OpenAI-Target-Route", path.as_str())
         .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
         if let Some(account_id) = lease.chatgpt_account_id() {
             request = request.header("ChatGPT-Account-ID", account_id);
@@ -38223,6 +38280,29 @@ data: [DONE]
         upstream.abort();
         let _ = upstream.await;
         fs::remove_file(account_path).expect("cleanup");
+    }
+
+    #[test]
+    fn native_image_result_ids_include_embedded_asset_pointers() {
+        let mut ids = Vec::new();
+        native_collect_image_ids_from_value(
+            &json!({
+                "parts": [
+                    "generated file-service://file-result and sediment://file-sediment",
+                    "file_000000001234567890abcdef12345678",
+                ]
+            }),
+            &mut ids,
+            0,
+        );
+        assert_eq!(
+            ids,
+            [
+                "file-result",
+                "sediment://file-sediment",
+                "file_000000001234567890abcdef12345678",
+            ]
+        );
     }
 
     #[tokio::test]
