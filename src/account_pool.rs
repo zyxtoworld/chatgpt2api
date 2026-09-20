@@ -637,6 +637,18 @@ impl AccountStore {
         None
     }
 
+    pub(super) async fn image_token_is_eligible(&self, token: &str) -> bool {
+        if token.is_empty() || !self.reload().await {
+            return false;
+        }
+        let snapshot = self.snapshot.read().expect("account snapshot lock");
+        snapshot
+            .accounts
+            .iter()
+            .find(|slot| slot.record.token == token)
+            .is_some_and(|slot| has_verified_web_image_capability(&slot.record))
+    }
+
     /// Persist image quota accounting for the account that owned the lease.
     pub(super) async fn mark_image_result(&self, token: &str, success: bool) -> bool {
         if token.is_empty() {

@@ -8152,6 +8152,27 @@ async fn native_web_image_request_proxy(
         };
         let token = lease.token().to_owned();
         attempted_tokens.insert(token.clone());
+        let validation_deadline =
+            (Instant::now() + PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE).min(deadline);
+        let validated = refresh_accounts_now_with_deadline(
+            &state,
+            std::slice::from_ref(&token),
+            None,
+            Some(validation_deadline),
+        )
+        .await
+        .ok()
+        .and_then(|result| result.get("refreshed").and_then(Value::as_u64))
+        .is_some_and(|refreshed| refreshed == 1)
+            && state.account_store.image_token_is_eligible(&token).await;
+        if !validated {
+            log::debug!(
+                "native Web image account rejected by per-token capability refresh: attempt={}",
+                attempted_tokens.len()
+            );
+            drop(lease);
+            continue;
+        }
         let result = match resolve_web_image_upstream_models(&state, &request.model).await {
             Ok((configured, candidates)) => {
                 let mut result = Err(ApiError::upstream());
