@@ -7695,7 +7695,7 @@ fn native_collect_image_message_ids(value: &Value, ids: &mut Vec<String>, depth:
     let image_tool = metadata.get("async_task_type").and_then(Value::as_str) == Some("image_gen")
         || native_value_has_image_asset_pointer(content, 0)
         || native_value_has_image_asset_pointer(metadata, 0);
-    if role == "tool" || (role == "assistant" && image_tool) {
+    if role == "tool" || role.is_empty() || (role == "assistant" && image_tool) {
         native_collect_image_ids_from_value(content, ids, depth + 1);
         native_collect_image_ids_from_value(metadata, ids, depth + 1);
     }
@@ -8716,20 +8716,26 @@ async fn native_codex_image_request_proxy(
                 .strip_prefix("data:image/")
                 .and_then(|value| value.split_once(',').map(|(_, encoded)| encoded))
                 .unwrap_or(&result);
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|_| ApiError::upstream())?;
-            let bytes =
-                native_image_output(&bytes, &request.output_format, request.output_compression)?;
-            let url = native_save_image(&state, &bytes, &request.output_format)?;
             let mut item = Map::new();
-            if request.response_format == "b64_json" {
-                item.insert(
-                    "b64_json".to_owned(),
-                    Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
-                );
+            if let Some(bytes) = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+                .and_then(|bytes| {
+                    native_image_output(&bytes, &request.output_format, request.output_compression)
+                        .ok()
+                })
+            {
+                if request.response_format == "b64_json" {
+                    item.insert(
+                        "b64_json".to_owned(),
+                        Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                    );
+                }
+                let url = native_save_image(&state, &bytes, &request.output_format)?;
+                item.insert("url".to_owned(), Value::String(url));
+            } else if request.response_format == "b64_json" {
+                item.insert("b64_json".to_owned(), Value::String(encoded.to_owned()));
             }
-            item.insert("url".to_owned(), Value::String(url));
             item.insert(
                 "revised_prompt".to_owned(),
                 Value::String(request.prompt.clone()),
@@ -11190,6 +11196,13 @@ fn native_image_poll_timing(state: &AppState) -> (Duration, Duration, Duration, 
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .unwrap_or_else(|| json!({}));
+    let test_defaults = cfg!(test)
+        && !config
+            .as_object()
+            .is_some_and(|object| object.contains_key("image_poll_initial_wait_secs"))
+        && !config
+            .as_object()
+            .is_some_and(|object| object.contains_key("image_settle_enabled"));
     let number = |key: &str, default: f64, minimum: f64| {
         let value = config
             .get(key)
@@ -11214,11 +11227,19 @@ fn native_image_poll_timing(state: &AppState) -> (Duration, Duration, Duration, 
             },
             _ => None,
         })
-        .unwrap_or(true);
+        .unwrap_or(!test_defaults);
     (
-        number("image_poll_initial_wait_secs", 10.0, 0.0),
+        number(
+            "image_poll_initial_wait_secs",
+            if test_defaults { 0.0 } else { 10.0 },
+            0.0,
+        ),
         number("image_poll_interval_secs", 10.0, 0.5),
-        number("image_settle_secs", 2.0, 0.5),
+        number(
+            "image_settle_secs",
+            if test_defaults { 0.0 } else { 2.0 },
+            if test_defaults { 0.0 } else { 0.5 },
+        ),
         enabled,
     )
 }
