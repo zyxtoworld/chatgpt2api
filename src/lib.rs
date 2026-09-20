@@ -16117,12 +16117,7 @@ async fn chat_completions_with_timeout(
             drop(lease);
             return Ok(Json(chat).into_response());
         }
-        let text = native_completion_text(&body).map_err(|_| {
-            ApiError::upstream_message(format!(
-                "diagnostic sse parse body={}",
-                String::from_utf8_lossy(&body[..body.len().min(500)]),
-            ))
-        })?;
+        let text = native_completion_text(&body)?;
         let usage = native_usage(&object, &text)?;
         drop(lease);
         return Ok(Json(json!({
