@@ -8152,14 +8152,7 @@ async fn native_web_image_request_proxy(
         };
         let token = lease.token().to_owned();
         attempted_tokens.insert(token.clone());
-        let result = match resolve_web_image_upstream_models(
-            &state,
-            &lease,
-            &request.model,
-            deadline,
-        )
-        .await
-        {
+        let result = match resolve_web_image_upstream_models(&state, &request.model).await {
             Ok((configured, candidates)) => {
                 let mut result = Err(ApiError::upstream());
                 for (index, candidate) in candidates.iter().enumerate() {
@@ -8218,115 +8211,19 @@ async fn native_web_image_request_proxy(
     }
 }
 
-fn web_model_quality_rank(id: &str) -> u8 {
-    let normalized = id.to_ascii_lowercase();
-    if normalized.contains("mini")
-        || normalized.contains("nano")
-        || normalized.contains("lite")
-        || normalized.contains("flash")
-    {
-        1
-    } else if normalized.contains("max")
-        || normalized.contains("thinking")
-        || normalized.contains("reasoning")
-        || normalized.contains("pro")
-        || normalized.contains("extended")
-    {
-        3
-    } else {
-        2
-    }
-}
-
-fn web_model_numeric_rank(id: &str) -> Vec<u64> {
-    id.split('-')
-        .filter_map(|part| part.parse::<u64>().ok())
-        .collect()
-}
-
-fn compare_web_model_priority(left: &str, right: &str) -> std::cmp::Ordering {
-    web_model_quality_rank(left)
-        .cmp(&web_model_quality_rank(right))
-        .then_with(|| web_model_numeric_rank(left).cmp(&web_model_numeric_rank(right)))
-        .then_with(|| left.cmp(right))
-}
-
-fn ordered_web_image_upstream_candidates(models: Vec<PublicModel>) -> Vec<String> {
-    let mut candidates = models
-        .into_iter()
-        .filter(|model| {
-            model.provenance == ModelProvenance::Web
-                && model.id != "auto"
-                && !is_native_image_model_id(&model.id)
-                && !model.id.to_ascii_lowercase().ends_with("-wm")
-                && !model.id.eq_ignore_ascii_case("research")
-        })
-        .map(|model| model.id)
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| compare_web_model_priority(right, left));
-    candidates.dedup();
-    candidates
-}
-
 async fn resolve_web_image_upstream_models(
     state: &AppState,
-    lease: &AccountLease,
     requested_model: &str,
-    deadline: Instant,
 ) -> Result<(RuntimeModelSettings, Vec<String>), ApiError> {
     let configured = runtime_model_settings(state);
     if requested_model != "gpt-image-2" {
         return Ok((configured, vec!["auto".to_owned()]));
     }
-    let base_url = state
-        .config
-        .upstream_base_url
-        .as_deref()
-        .ok_or_else(ApiError::unavailable)?;
-    let models = fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
-        cache: state.imported_model_catalog.clone(),
-        client: state.client.clone(),
-        base_url: base_url.to_owned(),
-        account_type: lease.account_type().to_owned(),
-        token: lease.token().to_owned(),
-        account_id: lease.chatgpt_account_id().map(ToOwned::to_owned),
-        deadline,
-        batch: None,
-        image_capable: false,
-        retry: true,
-        require_web_catalog: true,
-    })
-    .await
-    .ok_or_else(ApiError::unavailable)?;
-    let mut candidates = ordered_web_image_upstream_candidates(models);
-    if let Some(index) = candidates
-        .iter()
-        .position(|model| model.eq_ignore_ascii_case(&configured.upstream_model))
-    {
-        let configured_model = candidates.remove(index);
-        candidates.insert(0, configured_model);
-    }
-    if candidates.is_empty() {
-        return Err(ApiError::unavailable());
-    }
-    let fallback_reason = if candidates
-        .first()
-        .is_some_and(|model| model.eq_ignore_ascii_case(&configured.upstream_model))
-    {
-        "configured_model_is_current_catalog_leader"
-    } else if candidates
-        .iter()
-        .any(|model| model.eq_ignore_ascii_case(&configured.upstream_model))
-    {
-        "catalog_capability_order"
-    } else {
-        "configured_model_missing_from_current_catalog"
-    };
+    let candidates = vec![configured.upstream_model.clone()];
     log::info!(
-        "native Web image upstream model candidates: requested={}, selected_candidate={}, fallback_reason={}",
+        "native Web image upstream model candidates: requested={}, selected_candidate={}, fallback_reason=configured_model",
         configured.upstream_model,
         candidates.first().map(String::as_str).unwrap_or_default(),
-        fallback_reason,
     );
     Ok((configured, candidates))
 }
@@ -31948,16 +31845,16 @@ data: [DONE]
     }
 
     #[test]
-    fn web_image_upstream_fallback_uses_only_current_web_catalog_models() {
-        let candidates = ordered_web_image_upstream_candidates(vec![
-            test_public_model("gpt-5-3", ModelProvenance::Web),
-            test_public_model("gpt-5-6", ModelProvenance::Web),
-            test_public_model("gpt-5-6-mini", ModelProvenance::Web),
-            test_public_model("gpt-image-2", ModelProvenance::Image),
-            test_public_model("codex-fallback", ModelProvenance::Codex),
-        ]);
-        assert_eq!(candidates, vec!["gpt-5-6", "gpt-5-3", "gpt-5-6-mini"]);
-        assert!(!candidates.iter().any(|model| model.contains("codex")));
+    fn web_image_uses_configured_upstream_model_without_catalog_replacement() {
+        let settings = runtime_model_settings_from_value(
+            &json!({
+                "default_upstream_model_name": "auto",
+                "default_thinking_effort": "auto"
+            }),
+            "gpt-fallback",
+        );
+        assert_eq!(settings.upstream_model, "auto");
+        assert_eq!(settings.default_thinking_effort, None);
     }
 
     #[test]
