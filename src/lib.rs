@@ -24,7 +24,7 @@ mod shutdown;
 mod storage;
 use account_pool::{
     AccountLease, AccountModelGroup, AccountRecord, AccountStore, CatalogAccountCandidate,
-    parse_backend_snapshot,
+    current_timestamp, parse_backend_snapshot,
 };
 #[cfg(test)]
 use codex_sse::native_codex_text;
@@ -197,6 +197,7 @@ static REGISTRY_MUTATION_GATES: LazyLock<StdMutex<HashMap<PathBuf, Arc<StdMutex<
 static IMAGE_TAGS_MUTATION_GATE: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 static BACKUP_OWNER_GATES: LazyLock<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
+static IMAGE_TASK_MUTATION_GATE: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -10347,20 +10348,45 @@ async fn download_editable_file(
     )
 }
 
-async fn read_tasks(state: &AppState) -> Vec<Value> {
+fn image_task_now() -> (String, f64) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    (current_timestamp(), now.as_secs_f64())
+}
+
+fn read_tasks_unlocked(state: &AppState) -> Vec<Value> {
     let path = data_file(state, "image_tasks.json");
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .and_then(|value: Value| value.as_array().cloned())
+        .and_then(|value: Value| {
+            value
+                .get("tasks")
+                .and_then(Value::as_array)
+                .cloned()
+                .or_else(|| value.as_array().cloned())
+        })
         .unwrap_or_default()
 }
 
-fn write_tasks(state: &AppState, tasks: &[Value]) -> Result<(), ApiError> {
+async fn read_tasks(state: &AppState) -> Vec<Value> {
+    let _guard = IMAGE_TASK_MUTATION_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    read_tasks_unlocked(state)
+}
+
+fn write_tasks_unlocked(state: &AppState, tasks: &[Value]) -> Result<(), ApiError> {
     fs::create_dir_all(state.data_dir.as_ref()).map_err(|_| ApiError::unavailable())?;
     let path = data_file(state, "image_tasks.json");
-    let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-    let bytes = serde_json::to_vec(tasks).map_err(|_| ApiError::unavailable())?;
+    let temp = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        AUTH_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let bytes =
+        serde_json::to_vec_pretty(&json!({"tasks": tasks})).map_err(|_| ApiError::unavailable())?;
     if fs::write(&temp, bytes).is_err() {
         let _ = fs::remove_file(&temp);
         return Err(ApiError::unavailable());
@@ -10371,12 +10397,301 @@ fn write_tasks(state: &AppState, tasks: &[Value]) -> Result<(), ApiError> {
     })
 }
 
+fn mutate_image_tasks<F, R>(state: &AppState, mutate: F) -> Result<R, ApiError>
+where
+    F: FnOnce(&mut Vec<Value>) -> Result<R, ApiError>,
+{
+    let _guard = IMAGE_TASK_MUTATION_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut tasks = read_tasks_unlocked(state);
+    let result = mutate(&mut tasks)?;
+    write_tasks_unlocked(state, &tasks)?;
+    Ok(result)
+}
+
+fn public_image_task(task: &Value) -> Value {
+    let Some(object) = task.as_object() else {
+        return json!({});
+    };
+    let mut public = Map::new();
+    for field in [
+        "id",
+        "status",
+        "mode",
+        "model",
+        "size",
+        "quality",
+        "created_at",
+        "updated_at",
+        "conversation_id",
+        "data",
+        "usage",
+        "error",
+        "progress",
+        "duration_ms",
+    ] {
+        if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
+            if field != "error" || value.as_str().is_none_or(|value| !value.is_empty()) {
+                public.insert(field.to_owned(), value.clone());
+            }
+        }
+    }
+    if matches!(
+        object.get("status").and_then(Value::as_str),
+        Some("queued" | "running")
+    ) {
+        let base = if object.get("status").and_then(Value::as_str) == Some("running") {
+            object.get("started_ts")
+        } else {
+            object
+                .get("created_ts")
+                .or_else(|| object.get("updated_ts"))
+        };
+        if let Some(base) = base.and_then(Value::as_f64) {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            public.insert("elapsed_secs".to_owned(), json!((now - base).max(0.0)));
+        }
+    }
+    Value::Object(public)
+}
+
+fn update_image_task(
+    state: &AppState,
+    owner: &str,
+    task_id: &str,
+    status: &str,
+    updates: Map<String, Value>,
+    error: Option<String>,
+    duration_ms: Option<u64>,
+) -> Result<(), ApiError> {
+    let (updated_at, updated_ts) = image_task_now();
+    mutate_image_tasks(state, |tasks| {
+        let task = tasks
+            .iter_mut()
+            .filter_map(Value::as_object_mut)
+            .find(|task| {
+                task.get("owner_id").and_then(Value::as_str) == Some(owner)
+                    && task.get("id").and_then(Value::as_str) == Some(task_id)
+            })
+            .ok_or_else(ApiError::unavailable)?;
+        task.insert("status".to_owned(), Value::String(status.to_owned()));
+        task.insert("updated_at".to_owned(), Value::String(updated_at));
+        task.insert("updated_ts".to_owned(), json!(updated_ts));
+        if status == "running" {
+            task.insert("started_ts".to_owned(), json!(updated_ts));
+            task.remove("ended_ts");
+        } else {
+            task.insert("ended_ts".to_owned(), json!(updated_ts));
+        }
+        if let Some(error) = error {
+            if error.is_empty() {
+                task.remove("error");
+            } else {
+                task.insert("error".to_owned(), Value::String(error));
+            }
+        }
+        if let Some(duration_ms) = duration_ms {
+            task.insert("duration_ms".to_owned(), json!(duration_ms));
+        }
+        for (key, value) in updates {
+            task.insert(key, value);
+        }
+        Ok(())
+    })
+}
+
+fn image_task_id(object: &Map<String, Value>) -> Result<String, ApiError> {
+    object
+        .get("client_task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty()
+                && value.chars().count() <= 256
+                && !value.contains([',', '/', '\\', ':'])
+                && !value.chars().any(char::is_control)
+        })
+        .map(ToOwned::to_owned)
+        .ok_or_else(ApiError::invalid_request)
+}
+
+async fn run_image_task(
+    state: AppState,
+    owner: String,
+    task_id: String,
+    mode: &'static str,
+    mut request: NativeImageRequest,
+) {
+    let _ = update_image_task(
+        &state,
+        &owner,
+        &task_id,
+        "running",
+        Map::new(),
+        Some(String::new()),
+        None,
+    );
+    let started = Instant::now();
+    let endpoint = if mode == "edit" {
+        "images/edits"
+    } else {
+        "images/generations"
+    };
+    let result = if request.codex {
+        native_codex_image_request_proxy(state.clone(), request, endpoint).await
+    } else {
+        native_web_image_request_proxy(state.clone(), request, endpoint).await
+    };
+    let result = match result {
+        Ok(response) => match bounded_response_body(response).await {
+            Ok(body) => serde_json::from_slice::<Value>(&body)
+                .map_err(|_| "image task returned invalid JSON".to_owned()),
+            Err(_) => Err("image task upstream response failed".to_owned()),
+        },
+        Err(_) => Err("image generation failed".to_owned()),
+    };
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    match result {
+        Ok(value) => {
+            let data = value
+                .get("data")
+                .and_then(Value::as_array)
+                .filter(|items| !items.is_empty())
+                .cloned();
+            if let Some(data) = data {
+                let mut updates = Map::new();
+                updates.insert("data".to_owned(), Value::Array(data));
+                if let Some(usage) = value.get("usage").filter(|usage| usage.is_object()) {
+                    updates.insert("usage".to_owned(), usage.clone());
+                }
+                let _ = update_image_task(
+                    &state,
+                    &owner,
+                    &task_id,
+                    "success",
+                    updates,
+                    Some(String::new()),
+                    Some(duration_ms),
+                );
+            } else {
+                let _ = update_image_task(
+                    &state,
+                    &owner,
+                    &task_id,
+                    "error",
+                    Map::new(),
+                    Some("号池中没有可用账号或图片结果为空".to_owned()),
+                    Some(duration_ms),
+                );
+            }
+        }
+        Err(error) => {
+            let _ = update_image_task(
+                &state,
+                &owner,
+                &task_id,
+                "error",
+                Map::new(),
+                Some(error),
+                Some(duration_ms),
+            );
+        }
+    }
+}
+
+async fn enqueue_image_task(
+    state: AppState,
+    owner: String,
+    task_id: String,
+    mode: &'static str,
+    request: NativeImageRequest,
+) -> Result<Json<Value>, ApiError> {
+    let (created_at, created_ts) = image_task_now();
+    let model = request.model.clone();
+    let size = request.size.clone().unwrap_or_default();
+    let quality = request.quality.clone();
+    let (public, created) = mutate_image_tasks(&state, |tasks| {
+        if let Some(existing) = tasks.iter().find(|task| {
+            task.get("owner_id").and_then(Value::as_str) == Some(owner.as_str())
+                && task.get("id").and_then(Value::as_str) == Some(task_id.as_str())
+        }) {
+            return Ok((public_image_task(existing), false));
+        }
+        let task = json!({
+            "id": task_id,
+            "owner_id": owner,
+            "status": "queued",
+            "mode": mode,
+            "model": model,
+            "size": size,
+            "quality": quality,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "created_ts": created_ts,
+            "updated_ts": created_ts,
+        });
+        let public = public_image_task(&task);
+        tasks.push(task);
+        Ok((public, true))
+    })?;
+    if created {
+        let worker_state = state.clone();
+        tokio::spawn(async move {
+            run_image_task(worker_state, owner, task_id, mode, request).await;
+        });
+    }
+    Ok(Json(public))
+}
+
 async fn image_tasks(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated(&headers, &state).await?;
-    Ok(Json(json!({"items": read_tasks(&state).await})))
+    let owner = authenticated_subject(&headers, &state).await?;
+    let requested = query
+        .get("ids")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let tasks = read_tasks(&state).await;
+    let mut items = Vec::new();
+    let mut found = HashSet::new();
+    for task in tasks {
+        if task.get("owner_id").and_then(Value::as_str) != Some(owner.as_str()) {
+            continue;
+        }
+        let Some(id) = task.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if requested.is_empty() || requested.iter().any(|value| value == id) {
+            found.insert(id.to_owned());
+            items.push(public_image_task(&task));
+        }
+    }
+    items.sort_by(|left, right| {
+        right["updated_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(left["updated_at"].as_str().unwrap_or_default())
+    });
+    let missing_ids = requested
+        .iter()
+        .filter(|id| !found.contains(id.as_str()))
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"items": items, "missing_ids": missing_ids})))
 }
 
 async fn image_task_generation(
@@ -10384,22 +10699,26 @@ async fn image_task_generation(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated(&headers, &state).await?;
+    let owner = authenticated_subject(&headers, &state).await?;
     let value = account_json_body(body).await?;
-    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
-    let task_id = object
-        .get("client_task_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty() && !value.contains(','))
-        .ok_or_else(ApiError::invalid_request)?
-        .to_owned();
-    let mut tasks = read_tasks(&state).await;
-    let task =
-        json!({"id": task_id, "client_task_id": task_id, "status": "queued", "request": value});
-    tasks.retain(|item| item.get("id") != Some(&Value::String(task_id.clone())));
-    tasks.push(task.clone());
-    write_tasks(&state, &tasks)?;
-    Ok(Json(task))
+    let object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(ApiError::invalid_request)?;
+    let task_id = image_task_id(&object)?;
+    let mut request_object = object;
+    request_object.remove("client_task_id");
+    request_object.insert("n".to_owned(), json!(1));
+    request_object.insert("response_format".to_owned(), json!("b64_json"));
+    request_object.insert("stream".to_owned(), json!(false));
+    let request = native_image_request_from_parts(
+        &request_object,
+        "images/generations",
+        Vec::new(),
+        None,
+        None,
+    )?;
+    enqueue_image_task(state, owner, task_id, "generate", request).await
 }
 
 async fn image_task_edit(
@@ -10407,7 +10726,62 @@ async fn image_task_edit(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
-    image_task_generation(State(state), headers, body).await
+    let owner = authenticated_subject(&headers, &state).await?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let mut request = if content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("multipart/form-data"))
+    {
+        let mut upstream_request = AxumRequest::builder()
+            .method(Method::POST)
+            .uri("/api/image-tasks/edits")
+            .body(body)
+            .map_err(|_| ApiError::invalid_request())?;
+        *upstream_request.headers_mut() = headers.clone();
+        DefaultBodyLimit::max(MAX_NATIVE_IMAGE_REQUEST_BYTES).apply(&mut upstream_request);
+        let multipart = Multipart::from_request(upstream_request, &state)
+            .await
+            .map_err(|_| ApiError::invalid_request())?;
+        native_parse_multipart_stream(multipart, "images/edits", &state.data_dir).await?
+    } else {
+        let value = account_json_body(body).await?;
+        let mut object = value
+            .as_object()
+            .cloned()
+            .ok_or_else(ApiError::invalid_request)?;
+        object.insert("n".to_owned(), json!(1));
+        object.insert("response_format".to_owned(), json!("b64_json"));
+        object.insert("stream".to_owned(), json!(false));
+        let images = ["images", "image", "image_url"]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .map(native_image_reference_sources)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let mask = object
+            .get("mask")
+            .filter(|value| !value.is_null())
+            .map(native_image_reference_sources)
+            .transpose()?
+            .and_then(|mut values| values.pop());
+        native_image_request_from_parts(&object, "images/edits", images, mask, None)?
+    };
+    let task_id = request
+        .client_task_id
+        .clone()
+        .ok_or_else(ApiError::invalid_request)?;
+    request.client_task_id = None;
+    request.response_format = "b64_json".to_owned();
+    request.stream = false;
+    request.n = 1;
+    enqueue_image_task(state, owner, task_id, "edit", request).await
 }
 
 async fn image_task_resume(
@@ -10415,12 +10789,15 @@ async fn image_task_resume(
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated(&headers, &state).await?;
+    let owner = authenticated_subject(&headers, &state).await?;
     read_tasks(&state)
         .await
         .into_iter()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(task_id.as_str()))
-        .map(Json)
+        .find(|item| {
+            item.get("owner_id").and_then(Value::as_str) == Some(owner.as_str())
+                && item.get("id").and_then(Value::as_str) == Some(task_id.as_str())
+        })
+        .map(|task| Json(public_image_task(&task)))
         .ok_or_else(ApiError::unavailable)
 }
 
