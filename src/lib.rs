@@ -7523,7 +7523,7 @@ async fn native_web_image_attempt(
     let mut prepare_payload = json!({
         "action": "next",
         "fork_from_shared_post": false,
-        "parent_message_id": "client-created-root",
+        "parent_message_id": native_message_id(),
         "model": upstream_model,
         "client_prepare_state": "success",
         "timezone_offset_min": -480,
@@ -7610,17 +7610,26 @@ async fn native_web_image_attempt(
                 })).collect::<Vec<_>>(),
             }
         }],
-        "parent_message_id": "client-created-root",
+        "parent_message_id": native_message_id(),
         "model": upstream_model,
         "client_prepare_state": "sent",
         "timezone_offset_min": -480,
         "timezone": "Asia/Shanghai",
         "conversation_mode": {"kind": "primary_assistant"},
         "enable_message_followups": true,
-        "system_hints": [],
+        "system_hints": ["picture_v2"],
         "supports_buffering": true,
         "supported_encodings": ["v1"],
-        "client_contextual_info": {"app_name": "chatgpt.com"},
+        "client_contextual_info": {
+            "is_dark_mode": false,
+            "time_since_loaded": 1200,
+            "page_height": 1072,
+            "page_width": 1724,
+            "pixel_ratio": 1.2,
+            "screen_height": 1440,
+            "screen_width": 2560,
+            "app_name": "chatgpt.com",
+        },
         "paragen_cot_summary_display_override": "allow",
         "force_parallel_switch": "auto",
     });
@@ -7630,6 +7639,7 @@ async fn native_web_image_attempt(
     let mut run =
         native_browser_headers(state.client.post(format!("{base_url}{run_path}")), &context)
             .header(header::ACCEPT, "text/event-stream")
+            .header("X-Oai-Turn-Trace-Id", native_message_id())
             .header("X-OpenAI-Target-Path", run_path)
             .header("X-OpenAI-Target-Route", run_path)
             .header("X-Conduit-Token", conduit)
