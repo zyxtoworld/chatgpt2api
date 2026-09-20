@@ -70,6 +70,10 @@ fn native_browser_headers_for_client(
     client_build_number: &str,
 ) -> RequestBuilder {
     request
+        // wreq's emulation profile installs browser headers as client defaults.
+        // Disable those defaults before adding the canonical web headers below;
+        // RequestBuilder::header appends and would otherwise send duplicates.
+        .default_headers(false)
         .header(header::USER_AGENT, NATIVE_USER_AGENT)
         .header("Origin", NATIVE_ORIGIN)
         .header(header::REFERER, referer)
