@@ -135,7 +135,7 @@ fn legacy_time() -> String {
     let offset = UtcOffset::from_hms(-5, 0, 0).expect("fixed Eastern offset");
     let now = OffsetDateTime::now_utc().to_offset(offset);
     let description = format_description::parse_borrowed::<2>(
-        "[weekday repr:short] [month repr:short] [day padding:space] [year] [hour repr:24]:[minute]:[second] GMT-0500 (Eastern Standard Time)",
+        "[weekday repr:short] [month repr:short] [day padding:zero] [year] [hour repr:24]:[minute]:[second] GMT-0500 (Eastern Standard Time)",
     )
     .expect("valid PoW time format");
     now.format(&description)
