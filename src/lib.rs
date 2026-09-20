@@ -7853,7 +7853,7 @@ fn native_image_poll_shape(value: &Value) -> String {
                     .filter_map(|key| {
                         content.get(*key).and_then(Value::as_str).map(|value| {
                             format!(
-                                "{key}:len={} image={} file={} sediment={} json={} result={} url={} b64={} data_uri={} http={} xml={} image_call={}",
+                                "{key}:len={} image={} file={} sediment={} json={} result={} url={} b64={} data_uri={} http={} xml={} image_call={} preview={}",
                                 value.len(),
                                 value.contains("image"),
                                 value.contains("file"),
@@ -7867,6 +7867,11 @@ fn native_image_poll_shape(value: &Value) -> String {
                                 value.contains("http://") || value.contains("https://"),
                                 value.trim_start().starts_with('<'),
                                 value.contains("image_generation_call"),
+                                value
+                                    .chars()
+                                    .take(96)
+                                    .collect::<String>()
+                                    .replace(['\n', '\r', '\t'], " "),
                             )
                         })
                     })
