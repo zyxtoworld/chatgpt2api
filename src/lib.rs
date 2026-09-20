@@ -60,7 +60,8 @@ use protocol_anthropic::{
 pub(crate) use protocol_chat::validate_chat_payload;
 use protocol_chat::{
     native_completion_text, native_conversation_payload, native_finish_frame, native_frame,
-    native_role_frame, native_usage, native_usage_for_prompt_tokens, native_usage_frame,
+    native_role_frame, native_sanitize_text, native_usage, native_usage_for_prompt_tokens,
+    native_usage_frame,
 };
 use protocol_codex_payload::native_codex_responses_payload;
 use protocol_responses::validate_responses_payload;
