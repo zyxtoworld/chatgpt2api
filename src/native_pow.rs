@@ -1,6 +1,6 @@
 use super::{DEFAULT_POW_SCRIPT, MAX_POW_SCRIPT_SOURCES, Value};
 use serde_json::json;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{fs, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use time::{OffsetDateTime, UtcOffset, format_description};
 
 #[derive(Clone, Default)]
@@ -140,6 +140,14 @@ fn legacy_time() -> String {
 }
 
 fn process_elapsed_ms() -> f64 {
+    // Python's time.perf_counter() is monotonic time since system boot, not
+    // process uptime. Linux exposes the same clock through /proc/uptime.
+    if let Ok(value) = fs::read_to_string("/proc/uptime")
+        && let Some(seconds) = value.split_whitespace().next()
+        && let Ok(seconds) = seconds.parse::<f64>()
+    {
+        return seconds * 1000.0;
+    }
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
