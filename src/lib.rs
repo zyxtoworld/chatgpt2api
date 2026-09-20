@@ -14342,11 +14342,7 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let prepare = prepare.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = prepare.status();
         if !status.is_success() {
-            eprintln!("native sentinel prepare failed: status={status}");
-            return Err((
-                ApiError::upstream_message(format!("diagnostic prepare status={status}")),
-                native_stage_retryable(status, true),
-            ));
+            return Err((ApiError::upstream(), native_stage_retryable(status, true)));
         }
         bounded_response_body(prepare)
             .await
@@ -14371,26 +14367,11 @@ async fn native_chat_requirements_with_resources_for_route_context(
         deadline,
     )
     .await
-    .map_err(|error| {
-        eprintln!("native sentinel proof failed: code={}", error.code());
-        (
-            ApiError::upstream_message(format!("diagnostic proof code={}", error.code())),
-            false,
-        )
-    })?;
+    .map_err(|error| (error, false))?;
     let turnstile_token =
         native_turnstile_token(prepare_value.get("turnstile"), &p_token, deadline)
             .await
-            .map_err(|error| {
-                eprintln!("native sentinel turnstile failed: code={}", error.code());
-                (
-                    ApiError::upstream_message(format!(
-                        "diagnostic turnstile code={}",
-                        error.code()
-                    )),
-                    false,
-                )
-            })?;
+            .map_err(|error| (error, false))?;
     let finalize_path = format!("{route_base}/sentinel/chat-requirements/finalize");
     let mut finalize_request =
         native_browser_headers(client.post(format!("{base_url}{finalize_path}")), context)
@@ -14410,7 +14391,6 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let finalize = finalize.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = finalize.status();
         if !status.is_success() {
-            eprintln!("native sentinel finalize failed: status={status}");
             return Err((ApiError::upstream(), native_stage_retryable(status, false)));
         }
         bounded_response_body(finalize)
@@ -15186,19 +15166,7 @@ async fn native_conversation_attempt(
 ) -> Result<reqwest::Response, (ApiError, bool)> {
     let authenticated = !token.is_empty();
     let context = NativeRequestContext::new();
-    let pow_resources = match native_bootstrap(client, base_url, token, &context).await {
-        Ok(resources) => resources,
-        Err((error, retryable)) => {
-            eprintln!(
-                "native conversation bootstrap failed: code={} retryable={retryable}",
-                error.code()
-            );
-            return Err((
-                ApiError::upstream_message(format!("diagnostic bootstrap code={}", error.code())),
-                retryable,
-            ));
-        }
-    };
+    let pow_resources = native_bootstrap(client, base_url, token, &context).await?;
     let requirements = native_chat_requirements_with_resources_for_route_context(
         client,
         base_url,
@@ -15209,16 +15177,7 @@ async fn native_conversation_attempt(
         &context,
     )
     .await
-    .map_err(|(error, retryable)| {
-        eprintln!(
-            "native conversation requirements failed: code={} retryable={retryable}",
-            error.code()
-        );
-        (
-            ApiError::upstream_message(format!("diagnostic requirements code={}", error.code())),
-            retryable,
-        )
-    })?;
+    .await?;
     let route_base = if authenticated {
         "/backend-api/conversation"
     } else {
@@ -15251,27 +15210,15 @@ async fn native_conversation_attempt(
         .map_err(|_| (ApiError::upstream(), false))?
         .map_err(|_| (ApiError::upstream(), false))?;
     if !upstream.status().is_success() {
-        let status = upstream.status();
-        let body = bounded_response_body(upstream).await.unwrap_or_default();
-        eprintln!(
-            "native conversation failed: status={status} body={}",
-            String::from_utf8_lossy(&body[..body.len().min(800)])
-        );
         let retryable = matches!(
-            status,
+            upstream.status(),
             StatusCode::TOO_MANY_REQUESTS
                 | StatusCode::INTERNAL_SERVER_ERROR
                 | StatusCode::BAD_GATEWAY
                 | StatusCode::SERVICE_UNAVAILABLE
                 | StatusCode::GATEWAY_TIMEOUT
         );
-        return Err((
-            ApiError::upstream_message(format!(
-                "diagnostic conversation status={status} body={}",
-                String::from_utf8_lossy(&body[..body.len().min(300)])
-            )),
-            retryable,
-        ));
+        return Err((ApiError::upstream(), retryable));
     }
     if upstream_declares_oversize(&upstream) {
         return Err((ApiError::upstream(), false));
