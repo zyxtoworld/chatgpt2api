@@ -14368,11 +14368,17 @@ async fn native_chat_requirements_with_resources_for_route_context(
         deadline,
     )
     .await
-    .map_err(|error| (error, false))?;
+    .map_err(|error| {
+        eprintln!("native sentinel proof failed: code={}", error.code());
+        (error, false)
+    })?;
     let turnstile_token =
         native_turnstile_token(prepare_value.get("turnstile"), &p_token, deadline)
             .await
-            .map_err(|error| (error, false))?;
+            .map_err(|error| {
+                eprintln!("native sentinel turnstile failed: code={}", error.code());
+                (error, false)
+            })?;
     let finalize_path = format!("{route_base}/sentinel/chat-requirements/finalize");
     let mut finalize_request =
         native_browser_headers(client.post(format!("{base_url}{finalize_path}")), context)
@@ -15168,7 +15174,13 @@ async fn native_conversation_attempt(
 ) -> Result<reqwest::Response, (ApiError, bool)> {
     let authenticated = !token.is_empty();
     let context = NativeRequestContext::new();
-    let pow_resources = native_bootstrap(client, base_url, token, &context).await?;
+    let pow_resources = match native_bootstrap(client, base_url, token, &context).await {
+        Ok(resources) => resources,
+        Err((error, retryable)) => {
+            eprintln!("native conversation bootstrap failed: code={} retryable={retryable}", error.code());
+            return Err((error, retryable));
+        }
+    };
     let requirements = native_chat_requirements_with_resources_for_route_context(
         client,
         base_url,
@@ -15178,7 +15190,11 @@ async fn native_conversation_attempt(
         authenticated,
         &context,
     )
-    .await?;
+    .await
+    .map_err(|(error, retryable)| {
+        eprintln!("native conversation requirements failed: code={} retryable={retryable}", error.code());
+        (error, retryable)
+    })?;
     let route_base = if authenticated {
         "/backend-api/conversation"
     } else {
