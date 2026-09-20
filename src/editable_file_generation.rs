@@ -1079,7 +1079,7 @@ async fn run_editable_conversation(
     if !response.status().is_success() {
         return Err(TaskFailure::Generic);
     }
-    search_conversation_id_from_response(response, deadline)
+    search_conversation_id_from_response(response, deadline, false)
         .await
         .map_err(|_| TaskFailure::Generic)
 }
