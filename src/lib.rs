@@ -14337,7 +14337,7 @@ async fn native_chat_requirements_with_resources_for_route_context(
     if authenticated {
         prepare_request = prepare_request.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let prepare = prepare_request.send().map_err(|error| {
+    let prepare = prepare_request.send().await.map_err(|error| {
         (
             ApiError::upstream_message(format!("diagnostic prepare transport={error}")),
             false,
@@ -14404,7 +14404,7 @@ async fn native_chat_requirements_with_resources_for_route_context(
         finalize_request =
             finalize_request.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
-    let finalize = finalize_request.send().map_err(|error| {
+    let finalize = finalize_request.send().await.map_err(|error| {
         (
             ApiError::upstream_message(format!("diagnostic finalize transport={error}")),
             false,
