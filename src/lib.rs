@@ -15217,7 +15217,13 @@ async fn native_conversation_attempt(
                 | StatusCode::SERVICE_UNAVAILABLE
                 | StatusCode::GATEWAY_TIMEOUT
         );
-        return Err((ApiError::upstream(), retryable));
+        return Err((
+            ApiError::upstream_message(format!(
+                "diagnostic conversation status={}",
+                upstream.status()
+            )),
+            retryable,
+        ));
     }
     if upstream_declares_oversize(&upstream) {
         return Err((ApiError::upstream(), false));
