@@ -165,6 +165,7 @@ const MAX_EDITABLE_TASKS: usize = 5_000;
 const PUBLIC_SERVER_ERROR: &str = "The upstream request failed. Please try again later.";
 const INVALID_AUTH: &str = "密钥无效或已失效，请重新登录";
 const NATIVE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+const NATIVE_IMAGE_DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 const NATIVE_SEARCH_TIMEOUT: Duration = Duration::from_secs(90);
 const NATIVE_SEARCH_POLL_INTERVAL: Duration = Duration::from_secs(3);
 const NATIVE_SEARCH_MAX_FIELD_CHARS: usize = 4096;
@@ -5250,6 +5251,460 @@ fn is_native_image_model_id(id: &str) -> bool {
             .any(|plan| id.eq_ignore_ascii_case(&format!("{plan}-codex-gpt-image-2")))
 }
 
+fn native_chat_modalities_include_image(object: &Map<String, Value>) -> bool {
+    object
+        .get("modalities")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+            })
+        })
+}
+
+fn native_chat_image_request(object: &Map<String, Value>) -> bool {
+    native_chat_modalities_include_image(object)
+        || object
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|model| is_web_image_model_id(model) || is_native_image_model_id(model))
+}
+
+fn native_chat_text_prompt(object: &Map<String, Value>) -> Result<String, ApiError> {
+    if let Some(prompt) = object
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(prompt.to_owned());
+    }
+    let mut prompts = Vec::new();
+    if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            let message = message.as_object().ok_or_else(ApiError::invalid_request)?;
+            if message.get("role").and_then(Value::as_str) != Some("user") {
+                continue;
+            }
+            match message.get("content") {
+                Some(Value::String(text)) if !text.trim().is_empty() => {
+                    prompts.push(text.trim().to_owned());
+                }
+                Some(Value::Array(parts)) => {
+                    for part in parts {
+                        let part = part.as_object().ok_or_else(ApiError::invalid_request)?;
+                        if matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("text" | "input_text" | "output_text")
+                        ) {
+                            let text = part
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(ApiError::invalid_request)?
+                                .trim();
+                            if !text.is_empty() {
+                                prompts.push(text.to_owned());
+                            }
+                        }
+                    }
+                }
+                Some(Value::Null) | None => {}
+                Some(_) => return Err(ApiError::invalid_request()),
+            }
+        }
+    }
+    let prompt = prompts.join("\n");
+    (!prompt.is_empty())
+        .then_some(prompt)
+        .ok_or_else(ApiError::invalid_request)
+}
+
+fn native_chat_image_values(object: &Map<String, Value>) -> Result<Vec<String>, ApiError> {
+    let Some(messages) = object.get("messages").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    for message in messages.iter().rev() {
+        let message = message.as_object().ok_or_else(ApiError::invalid_request)?;
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(parts) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        let mut values = Vec::new();
+        for part in parts {
+            let part = part.as_object().ok_or_else(ApiError::invalid_request)?;
+            let Some(kind) = part.get("type").and_then(Value::as_str) else {
+                return Err(ApiError::invalid_request());
+            };
+            if !matches!(kind, "image_url" | "input_image") {
+                continue;
+            }
+            let image = part
+                .get("image_url")
+                .and_then(|value| {
+                    value.as_str().map(ToOwned::to_owned).or_else(|| {
+                        value
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                })
+                .ok_or_else(ApiError::invalid_request)?;
+            values.push(image);
+        }
+        if !values.is_empty() {
+            return Ok(values);
+        }
+    }
+    Ok(Vec::new())
+}
+
+async fn native_chat_image_source(
+    state: &AppState,
+    value: String,
+) -> Result<NativeImageSource, ApiError> {
+    let value = value.trim().to_owned();
+    if value.starts_with("data:") {
+        native_image_input(&value)?;
+        return Ok(NativeImageSource::Text(value));
+    }
+    let parsed = url::Url::parse(&value).map_err(|_| ApiError::invalid_request())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(ApiError::invalid_request());
+    }
+    let response = tokio::time::timeout(
+        NATIVE_UPSTREAM_TIMEOUT,
+        state
+            .client
+            .get(value)
+            .header(header::ACCEPT, "image/*,*/*;q=0.8")
+            .send(),
+    )
+    .await
+    .map_err(|_| ApiError::invalid_request())?
+    .map_err(|_| ApiError::invalid_request())?;
+    if !response.status().is_success() || upstream_declares_oversize(&response) {
+        return Err(ApiError::invalid_request());
+    }
+    let mime = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| value.starts_with("image/"))
+        .unwrap_or("image/png")
+        .to_owned();
+    let bytes = bounded_response_body(response)
+        .await
+        .map_err(|_| ApiError::invalid_request())?;
+    if bytes.is_empty() || bytes.len() > MAX_NATIVE_IMAGE_BYTES {
+        return Err(ApiError::invalid_request());
+    }
+    let data_url = format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    );
+    native_image_input(&data_url)?;
+    Ok(NativeImageSource::Text(data_url))
+}
+
+async fn native_chat_image_request_from_object(
+    state: &AppState,
+    object: &Map<String, Value>,
+) -> Result<NativeImageRequest, ApiError> {
+    let model = match object.get("model") {
+        None | Some(Value::Null) => "gpt-image-2".to_owned(),
+        Some(Value::String(model)) => model.trim().to_ascii_lowercase(),
+        Some(_) => return Err(ApiError::invalid_request()),
+    };
+    let (model, codex, plan_type) = native_image_model(Some(&Value::String(model)))?;
+    let prompt = native_chat_text_prompt(object)?;
+    let n = object.get("n").and_then(Value::as_u64).unwrap_or(1);
+    let n = usize::try_from(n)
+        .ok()
+        .filter(|value| (1..=4).contains(value))
+        .ok_or_else(ApiError::invalid_request)?;
+    let mut images = Vec::new();
+    for value in native_chat_image_values(object)? {
+        images.push(native_chat_image_source(state, value).await?);
+    }
+    Ok(NativeImageRequest {
+        model,
+        client_task_id: None,
+        codex,
+        plan_type,
+        prompt,
+        n,
+        size: None,
+        quality: "auto".to_owned(),
+        response_format: "b64_json".to_owned(),
+        output_format: "png".to_owned(),
+        output_compression: None,
+        background: "auto".to_owned(),
+        stream: false,
+        images,
+        mask: None,
+        temp_guard: None,
+    })
+}
+
+fn native_response_image_tool(object: &Map<String, Value>) -> Option<Map<String, Value>> {
+    object
+        .get("tools")
+        .and_then(Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find_map(|tool| {
+                let tool = tool.as_object()?;
+                (tool.get("type").and_then(Value::as_str) == Some("image_generation"))
+                    .then(|| tool.clone())
+            })
+        })
+        .or_else(|| {
+            object
+                .get("tool_choice")
+                .and_then(Value::as_object)
+                .filter(|choice| {
+                    choice.get("type").and_then(Value::as_str) == Some("image_generation")
+                })
+                .cloned()
+        })
+}
+
+fn native_response_image_inputs(
+    value: &Value,
+    prompt: &mut Vec<String>,
+    images: &mut Vec<String>,
+) -> Result<(), ApiError> {
+    match value {
+        Value::String(text) => {
+            if !text.trim().is_empty() {
+                prompt.push(text.trim().to_owned());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                native_response_image_inputs(item, prompt, images)?;
+            }
+        }
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("input_text") => {
+                let text = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(ApiError::invalid_request)?;
+                if !text.trim().is_empty() {
+                    prompt.push(text.trim().to_owned());
+                }
+            }
+            Some("input_image") => {
+                let image = object
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(ApiError::invalid_request)?;
+                images.push(image.to_owned());
+            }
+            Some(_) => {}
+            None => {
+                if object
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_none_or(|role| role == "user")
+                {
+                    if let Some(content) = object.get("content") {
+                        native_response_image_inputs(content, prompt, images)?;
+                    }
+                }
+            }
+        },
+        _ => return Err(ApiError::invalid_request()),
+    }
+    Ok(())
+}
+
+async fn native_responses_image_request_from_object(
+    state: &AppState,
+    object: &Map<String, Value>,
+) -> Result<(NativeImageRequest, String), ApiError> {
+    let tool = native_response_image_tool(object).ok_or_else(ApiError::invalid_request)?;
+    let model = tool
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("gpt-image-2")
+        .to_owned();
+    let (model, codex, plan_type) = native_image_model(Some(&Value::String(model)))?;
+    let mut prompt = Vec::new();
+    let mut image_values = Vec::new();
+    native_response_image_inputs(
+        object.get("input").ok_or_else(ApiError::invalid_request)?,
+        &mut prompt,
+        &mut image_values,
+    )?;
+    let prompt = prompt.join("\n");
+    if prompt.trim().is_empty() {
+        return Err(ApiError::invalid_request());
+    }
+    let mut images = Vec::new();
+    for value in image_values {
+        images.push(native_chat_image_source(state, value).await?);
+    }
+    let endpoint = if images.is_empty() {
+        "images/generations"
+    } else {
+        "images/edits"
+    };
+    let quality = tool
+        .get("quality")
+        .and_then(Value::as_str)
+        .unwrap_or("auto")
+        .to_owned();
+    let background = tool
+        .get("background")
+        .and_then(Value::as_str)
+        .unwrap_or("auto")
+        .to_owned();
+    let output_format = tool
+        .get("output_format")
+        .and_then(Value::as_str)
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+    let output_compression = tool.get("output_compression").and_then(Value::as_u64);
+    let request = NativeImageRequest {
+        model,
+        client_task_id: None,
+        codex,
+        plan_type,
+        prompt: prompt.clone(),
+        n: 1,
+        size: tool
+            .get("size")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        quality,
+        response_format: "b64_json".to_owned(),
+        output_format,
+        output_compression,
+        background,
+        stream: false,
+        images,
+        mask: None,
+        temp_guard: None,
+    };
+    Ok((request, endpoint.to_owned()))
+}
+
+fn native_responses_image_items(prompt: &str, data: &[Value]) -> Vec<Value> {
+    data.iter()
+        .filter_map(|item| {
+            let encoded = item.get("b64_json").and_then(Value::as_str)?;
+            (!encoded.is_empty()).then(|| {
+                json!({
+                    "id": format!("ig_{}", native_message_id()),
+                    "type": "image_generation_call",
+                    "status": "completed",
+                    "result": encoded,
+                    "revised_prompt": item.get("revised_prompt").and_then(Value::as_str).unwrap_or(prompt),
+                })
+            })
+        })
+        .collect()
+}
+
+async fn native_responses_image_completion(
+    state: AppState,
+    object: Map<String, Value>,
+) -> Result<Response, ApiError> {
+    let (request, endpoint) = native_responses_image_request_from_object(&state, &object).await?;
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("auto")
+        .to_owned();
+    let image_response = if request.codex {
+        native_codex_image_request_proxy(state, request, &endpoint).await?
+    } else {
+        native_web_image_request_proxy(state, request, &endpoint).await?
+    };
+    let body = to_bytes(image_response.into_body(), MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::upstream())?;
+    let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+    let prompt = value
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .and_then(|item| item.get("revised_prompt"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let output = native_responses_image_items(
+        prompt,
+        value
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or_else(ApiError::upstream)?,
+    );
+    if output.is_empty() {
+        return Err(ApiError::upstream());
+    }
+    let response_id = format!("resp_{}", native_message_id());
+    let created = native_created();
+    let response = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created,
+        "status": "completed",
+        "error": Value::Null,
+        "incomplete_details": Value::Null,
+        "model": model,
+        "output": output,
+        "parallel_tool_calls": false,
+        "usage": native_image_usage(),
+    });
+    if !object
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(Json(response).into_response());
+    }
+    let output_items = response
+        .get("output")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut events = Vec::new();
+    events.push(json!({
+        "type": "response.created",
+        "response": {"id": response["id"], "object":"response", "created_at":created, "status":"in_progress", "model":response["model"], "output":[], "parallel_tool_calls":false}
+    }));
+    for (index, item) in output_items.iter().enumerate() {
+        events.push(json!({"type":"response.output_item.done","output_index":index,"item":item}));
+    }
+    events.push(json!({"type":"response.completed","response":response}));
+    let body = events
+        .into_iter()
+        .map(|event| {
+            format!(
+                "data: {}\n\n",
+                serde_json::to_string(&event).unwrap_or_default()
+            )
+        })
+        .collect::<String>();
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Ok(response)
+}
+
 fn is_public_chatgpt_image_model_id(id: &str) -> bool {
     is_web_image_model_id(id)
 }
@@ -7127,11 +7582,104 @@ fn native_image_file_id(value: &str) -> Option<String> {
         .unwrap_or(value)
         .trim();
     (!value.is_empty()
+        && value != "file_upload"
         && value.len() <= 256
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
     .then(|| value.to_owned())
+}
+
+fn native_image_sediment_id(value: &str) -> Option<String> {
+    let value = value.strip_prefix("sediment://")?.trim();
+    (!value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+    .then(|| format!("sediment://{value}"))
+}
+
+fn native_value_has_image_asset_pointer(value: &Value, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    match value {
+        Value::Object(object) => {
+            if object.get("content_type").and_then(Value::as_str) == Some("image_asset_pointer")
+                || object
+                    .get("asset_pointer")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| {
+                        value.starts_with("file-service://") || value.starts_with("sediment://")
+                    })
+            {
+                return true;
+            }
+            object
+                .values()
+                .any(|value| native_value_has_image_asset_pointer(value, depth + 1))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| native_value_has_image_asset_pointer(value, depth + 1)),
+        _ => false,
+    }
+}
+
+fn native_collect_image_ids_from_value(value: &Value, ids: &mut Vec<String>, depth: usize) {
+    if depth > 16 || ids.len() >= 16 {
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for key in ["file_id", "fileId", "asset_pointer"] {
+                let Some(value) = object.get(key).and_then(Value::as_str) else {
+                    continue;
+                };
+                let candidate =
+                    native_image_file_id(value).or_else(|| native_image_sediment_id(value));
+                if let Some(candidate) = candidate
+                    && !ids.contains(&candidate)
+                {
+                    ids.push(candidate);
+                }
+            }
+            for value in object.values() {
+                native_collect_image_ids_from_value(value, ids, depth + 1);
+            }
+        }
+        Value::Array(values) => {
+            for value in values.iter().take(128) {
+                native_collect_image_ids_from_value(value, ids, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn native_collect_image_message_ids(value: &Value, ids: &mut Vec<String>, depth: usize) {
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    let Some(message) = object.get("message").and_then(Value::as_object) else {
+        return;
+    };
+    let role = message
+        .get("author")
+        .and_then(Value::as_object)
+        .and_then(|author| author.get("role"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let metadata = message.get("metadata").unwrap_or(&Value::Null);
+    let content = message.get("content").unwrap_or(&Value::Null);
+    let image_tool = metadata.get("async_task_type").and_then(Value::as_str) == Some("image_gen")
+        || native_value_has_image_asset_pointer(content, 0)
+        || native_value_has_image_asset_pointer(metadata, 0);
+    if role == "tool" || (role == "assistant" && image_tool) {
+        native_collect_image_ids_from_value(content, ids, depth + 1);
+        native_collect_image_ids_from_value(metadata, ids, depth + 1);
+    }
 }
 
 fn native_collect_image_file_ids(value: &Value, ids: &mut Vec<String>, depth: usize) {
@@ -7140,44 +7688,18 @@ fn native_collect_image_file_ids(value: &Value, ids: &mut Vec<String>, depth: us
     }
     match value {
         Value::Object(object) => {
-            for key in ["file_id", "fileId", "asset_pointer"] {
-                if let Some(value) = object.get(key).and_then(Value::as_str)
-                    && let Some(value) = native_image_file_id(value)
-                    && !ids.contains(&value)
-                {
-                    ids.push(value);
+            if let Some(mapping) = object.get("mapping").and_then(Value::as_object) {
+                for node in mapping.values().take(128) {
+                    native_collect_image_message_ids(node, ids, depth + 1);
                 }
+                return;
             }
-            for key in [
-                "mapping",
-                "message",
-                "content",
-                "parts",
-                "metadata",
-                "attachments",
-                "output",
-                "item",
-                "data",
-                "result",
-            ] {
-                if let Some(value) = object.get(key) {
-                    if key == "mapping" {
-                        if let Some(mapping) = value.as_object() {
-                            for node in mapping.values().take(128) {
-                                native_collect_image_file_ids(node, ids, depth + 1);
-                            }
-                        }
-                    } else {
-                        native_collect_image_file_ids(value, ids, depth + 1);
-                    }
-                }
-            }
+            native_collect_image_message_ids(value, ids, depth + 1);
         }
-        Value::Array(values) => {
-            for value in values.iter().take(128) {
-                native_collect_image_file_ids(value, ids, depth + 1);
-            }
-        }
+        Value::Array(values) => values
+            .iter()
+            .take(128)
+            .for_each(|value| native_collect_image_file_ids(value, ids, depth + 1)),
         _ => {}
     }
 }
@@ -7195,6 +7717,13 @@ async fn native_poll_image_file_ids(
         .as_deref()
         .ok_or_else(ApiError::unavailable)?
         .trim_end_matches('/');
+    let (initial_wait, poll_interval, settle, settle_enabled) = native_image_poll_timing(state);
+    if !initial_wait.is_zero() {
+        if !sleep_search_poll_with_interval(deadline, initial_wait).await {
+            return Err(ApiError::upstream());
+        }
+    }
+    let mut last_ids: Option<Vec<String>> = None;
     loop {
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(ApiError::upstream());
@@ -7228,7 +7757,7 @@ async fn native_poll_image_file_ids(
                     | StatusCode::SERVICE_UNAVAILABLE
                     | StatusCode::GATEWAY_TIMEOUT
             ) {
-                if !sleep_search_poll_with_interval(deadline, Duration::from_secs(1)).await {
+                if !sleep_search_poll_with_interval(deadline, poll_interval).await {
                     return Err(ApiError::upstream());
                 }
                 continue;
@@ -7240,9 +7769,19 @@ async fn native_poll_image_file_ids(
         let mut ids = Vec::new();
         native_collect_image_file_ids(&value, &mut ids, 0);
         if !ids.is_empty() {
-            return Ok(ids);
+            if !settle_enabled {
+                return Ok(ids);
+            }
+            if last_ids.as_ref() == Some(&ids) {
+                return Ok(ids);
+            }
+            last_ids = Some(ids);
+            if !sleep_search_poll_with_interval(deadline, settle).await {
+                return Err(ApiError::upstream());
+            }
+            continue;
         }
-        if !sleep_search_poll_with_interval(deadline, Duration::from_secs(1)).await {
+        if !sleep_search_poll_with_interval(deadline, poll_interval).await {
             return Err(ApiError::upstream());
         }
     }
@@ -7252,6 +7791,7 @@ async fn native_download_image_files(
     state: &AppState,
     lease: &AccountLease,
     context: &NativeRequestContext,
+    conversation_id: &str,
     ids: &[String],
     deadline: Instant,
 ) -> Result<Vec<Vec<u8>>, ApiError> {
@@ -7263,11 +7803,23 @@ async fn native_download_image_files(
         .trim_end_matches('/');
     let mut outputs = Vec::new();
     for id in ids {
-        let path = format!("/backend-api/files/{id}/download");
+        let (path, referer) = if let Some(attachment_id) = id.strip_prefix("sediment://") {
+            (
+                format!(
+                    "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
+                ),
+                format!("{base_url}/c/{conversation_id}"),
+            )
+        } else {
+            (
+                format!("/backend-api/files/{id}/download"),
+                format!("{base_url}/"),
+            )
+        };
         let mut request = native_browser_headers_with_referer(
             state.client.get(format!("{base_url}{path}")),
             context,
-            &format!("{base_url}/"),
+            &referer,
         )
         .header(header::ACCEPT, "application/json")
         .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
@@ -7315,66 +7867,84 @@ async fn native_web_image_request_proxy(
         .account_type_catalog
         .refresh_image_quotas_for_public(&state)
         .await;
-    let lease = state
-        .account_store
-        .acquire_image_lease(&HashSet::new())
+    let deadline = Instant::now() + native_image_operation_timeout(&state);
+    let mut attempted_tokens = HashSet::new();
+    let mut last_error = None;
+    loop {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err(last_error.unwrap_or_else(ApiError::upstream));
+        }
+        let Some(lease) = state
+            .account_store
+            .acquire_image_lease(&attempted_tokens)
+            .await
+        else {
+            return Err(last_error.unwrap_or_else(ApiError::unavailable));
+        };
+        let token = lease.token().to_owned();
+        attempted_tokens.insert(token.clone());
+        let result = match resolve_web_image_upstream_models(
+            &state,
+            &lease,
+            &request.model,
+            deadline,
+        )
         .await
-        .ok_or_else(ApiError::unavailable)?;
-    let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
-    let (configured, candidates) =
-        match resolve_web_image_upstream_models(&state, &lease, &request.model, deadline).await {
-            Ok(value) => value,
+        {
+            Ok((configured, candidates)) => {
+                let mut result = Err(ApiError::upstream());
+                for (index, candidate) in candidates.iter().enumerate() {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    let settings = RuntimeModelSettings {
+                        upstream_model: candidate.clone(),
+                        default_thinking_effort: configured.default_thinking_effort.clone(),
+                    };
+                    result = native_web_image_attempt(
+                        &state, &lease, &request, endpoint, &settings, deadline,
+                    )
+                    .await;
+                    if result.is_ok() {
+                        log::info!(
+                            "native Web image upstream model selected: requested={}, selected={}, candidate_index={}, account_attempt={}",
+                            request.model,
+                            candidate,
+                            index,
+                            attempted_tokens.len(),
+                        );
+                        break;
+                    }
+                    log::warn!(
+                        "native Web image upstream model failed: requested={}, candidate={}, candidate_index={}, account_attempt={}",
+                        request.model,
+                        candidate,
+                        index,
+                        attempted_tokens.len(),
+                    );
+                }
+                result
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(data) => {
+                if !state.account_store.mark_image_result(&token, true).await {
+                    AccountStore::note_usage_mark_failure();
+                }
+                drop(lease);
+                return Ok(data);
+            }
             Err(error) => {
-                let token = lease.token().to_owned();
+                last_error = Some(error);
                 if !state.account_store.mark_image_result(&token, false).await {
                     AccountStore::note_usage_mark_failure();
                 }
                 drop(lease);
-                return Err(error);
+                if attempted_tokens.len() >= state.account_store.records().len() {
+                    return Err(last_error.expect("image failure recorded"));
+                }
             }
-        };
-    let mut result = Err(ApiError::upstream());
-    for (index, candidate) in candidates.iter().enumerate() {
-        if Instant::now() >= deadline {
-            break;
-        }
-        let settings = RuntimeModelSettings {
-            upstream_model: candidate.clone(),
-            default_thinking_effort: configured.default_thinking_effort.clone(),
-        };
-        result =
-            native_web_image_attempt(&state, &lease, &request, endpoint, &settings, deadline).await;
-        if result.is_ok() {
-            log::info!(
-                "native Web image upstream model selected: requested={}, selected={}, candidate_index={}",
-                request.model,
-                candidate,
-                index,
-            );
-            break;
-        }
-        log::warn!(
-            "native Web image upstream model failed: requested={}, candidate={}, candidate_index={}",
-            request.model,
-            candidate,
-            index,
-        );
-    }
-    let token = lease.token().to_owned();
-    match result {
-        Ok(data) => {
-            if !state.account_store.mark_image_result(&token, true).await {
-                AccountStore::note_usage_mark_failure();
-            }
-            drop(lease);
-            Ok(data)
-        }
-        Err(error) => {
-            if !state.account_store.mark_image_result(&token, false).await {
-                AccountStore::note_usage_mark_failure();
-            }
-            drop(lease);
-            Err(error)
         }
     }
 }
@@ -7686,7 +8256,9 @@ async fn native_web_image_attempt(
         .map_err(|_| ApiError::upstream())?;
     let ids =
         native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline).await?;
-    let downloaded = native_download_image_files(state, lease, &context, &ids, deadline).await?;
+    let downloaded =
+        native_download_image_files(state, lease, &context, &conversation_id, &ids, deadline)
+            .await?;
     let mut data = Vec::new();
     for bytes in downloaded {
         let bytes =
@@ -8064,7 +8636,7 @@ async fn native_codex_image_request_proxy(
         });
     let mut data = Vec::new();
     for _ in 0..request.n {
-        let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
+        let deadline = Instant::now() + native_image_operation_timeout(&state);
         let mut attempted_tokens = HashSet::new();
         let mut lease = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
@@ -8310,6 +8882,218 @@ async fn native_search_with_timeout(
             }
         }
     }
+}
+
+const NATIVE_CHAT_SEARCH_TOOL_TYPES: &[&str] = &[
+    "web_search",
+    "web_search_preview",
+    "web_search_preview_2025_03_11",
+];
+
+fn native_chat_search_requested(object: &Map<String, Value>) -> bool {
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let model_search = [
+        "gpt-4o-search-preview",
+        "gpt-4o-mini-search-preview",
+        "gpt-5-search-api",
+    ]
+    .iter()
+    .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")));
+    let options_search = object
+        .get("web_search_options")
+        .is_some_and(|value| !value.is_null());
+    let tool_search = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| NATIVE_CHAT_SEARCH_TOOL_TYPES.contains(&kind))
+            })
+        });
+    model_search || options_search || tool_search
+}
+
+fn native_chat_search_has_unsupported_tools(object: &Map<String, Value>) -> bool {
+    object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                let Some(kind) = tool.get("type").and_then(Value::as_str) else {
+                    return false;
+                };
+                !NATIVE_CHAT_SEARCH_TOOL_TYPES.contains(&kind)
+            })
+        })
+}
+
+fn native_chat_search_query(object: &Map<String, Value>) -> Result<String, ApiError> {
+    if let Some(prompt) = object
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(prompt.to_owned());
+    }
+    let messages = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(ApiError::invalid_request)?;
+    for message in messages.iter().rev() {
+        let message = message.as_object().ok_or_else(ApiError::invalid_request)?;
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let mut parts = Vec::new();
+        match message.get("content") {
+            Some(Value::String(text)) => parts.push(text.trim().to_owned()),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let item = item.as_object().ok_or_else(ApiError::invalid_request)?;
+                    if matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some("text" | "input_text" | "output_text")
+                    ) {
+                        parts.push(
+                            item.get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(ApiError::invalid_request)?
+                                .trim()
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+            Some(Value::Null) | None => {}
+            Some(_) => return Err(ApiError::invalid_request()),
+        }
+        let query = parts
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !query.is_empty() {
+            return Ok(query);
+        }
+    }
+    Err(ApiError::invalid_request())
+}
+
+fn native_chat_search_text(result: &Value) -> (String, Vec<Value>) {
+    let answer = result
+        .get("answer")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let sources = result
+        .get("sources")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let item = item.as_object()?;
+                    let url = item.get("url").and_then(Value::as_str)?.trim();
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        return None;
+                    }
+                    let title = item
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim();
+                    Some(json!({"url":url,"title":title}))
+                })
+                .take(NATIVE_SEARCH_MAX_SOURCES)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if sources.is_empty() {
+        return (answer, Vec::new());
+    }
+    let mut text = answer;
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    text.push_str("Sources:\n");
+    let mut annotations = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        let title = source["title"].as_str().unwrap_or_default();
+        let url = source["url"].as_str().unwrap_or_default();
+        let label = if title.is_empty() { url } else { title };
+        text.push_str(&format!("{}. ", index + 1));
+        text.push_str(label);
+        if !title.is_empty() {
+            text.push_str(" - ");
+        }
+        let start = text.len();
+        text.push_str(url);
+        annotations.push(json!({
+            "type":"url_citation",
+            "url_citation":{"start_index":start,"end_index":text.len(),"url":url,"title":label}
+        }));
+        text.push('\n');
+    }
+    (text.trim().to_owned(), annotations)
+}
+
+async fn native_chat_search_completion(
+    state: AppState,
+    object: Map<String, Value>,
+) -> Result<Response, ApiError> {
+    let query = native_chat_search_query(&object)?;
+    let result_response = native_search_with_timeout(state, query, NATIVE_SEARCH_TIMEOUT).await?;
+    let body = to_bytes(result_response.into_body(), MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::upstream())?;
+    let result: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+    let (content, annotations) = native_chat_search_text(&result);
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let response = json!({
+        "id": native_completion_id(),
+        "object": "chat.completion",
+        "created": native_created(),
+        "model": model,
+        "choices": [{"index":0,"message":{"role":"assistant","content":content,"annotations":annotations},"finish_reason":"stop"}],
+        "usage": native_usage(&object, &content)?,
+    });
+    if !object
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(Json(response).into_response());
+    }
+    let completion_id = response["id"].as_str().unwrap_or("chatcmpl-rust");
+    let created = response["created"].as_i64().unwrap_or_else(native_created);
+    let role = json!({"id":completion_id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{"role":"assistant","content":content},"finish_reason":null}]});
+    let finish = json!({"id":completion_id,"object":"chat.completion.chunk","created":created,"model":model,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&role).map_err(|_| ApiError::upstream())?,
+        serde_json::to_string(&finish).map_err(|_| ApiError::upstream())?,
+    );
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Ok(response)
 }
 
 async fn native_search_attempt(
@@ -10343,6 +11127,63 @@ fn runtime_model_settings(state: &AppState) -> RuntimeModelSettings {
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
     runtime_model_settings_from_value(&config, fallback_model)
+}
+
+fn native_image_operation_timeout(state: &AppState) -> Duration {
+    let configured_secs = fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("image_poll_timeout_secs")
+                .and_then(|value| match value {
+                    Value::Number(number) => number.as_u64(),
+                    Value::String(text) => text.trim().parse::<u64>().ok(),
+                    _ => None,
+                })
+        })
+        .unwrap_or(120)
+        .clamp(30, 3600);
+    Duration::from_secs(configured_secs.saturating_mul(2).saturating_add(30))
+        .max(NATIVE_IMAGE_DEFAULT_TIMEOUT)
+}
+
+fn native_image_poll_timing(state: &AppState) -> (Duration, Duration, Duration, bool) {
+    let config = fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    let number = |key: &str, default: f64, minimum: f64| {
+        let value = config
+            .get(key)
+            .and_then(|value| match value {
+                Value::Number(number) => number.as_f64(),
+                Value::String(text) => text.trim().parse::<f64>().ok(),
+                _ => None,
+            })
+            .filter(|value| value.is_finite())
+            .unwrap_or(default)
+            .max(minimum);
+        Duration::from_secs_f64(value)
+    };
+    let enabled = config
+        .get("image_settle_enabled")
+        .and_then(|value| match value {
+            Value::Bool(value) => Some(*value),
+            Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(true);
+    (
+        number("image_poll_initial_wait_secs", 10.0, 0.0),
+        number("image_poll_interval_secs", 10.0, 0.5),
+        number("image_settle_secs", 2.0, 0.5),
+        enabled,
+    )
 }
 
 fn apply_default_thinking_effort(
@@ -15287,10 +16128,20 @@ async fn messages_inner(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    let api_key = headers
-        .get("x-api-key")
+    let bearer = headers
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("Bearer {value}"))
+        })
         .ok_or_else(ApiError::unauthorized)?;
     if headers
         .get("anthropic-version")
@@ -15299,7 +16150,6 @@ async fn messages_inner(
     {
         return Err(ApiError::invalid_request());
     }
-    let bearer = format!("Bearer {api_key}");
     let mut auth_headers = headers.clone();
     auth_headers.insert(
         header::AUTHORIZATION,
@@ -15433,7 +16283,7 @@ async fn messages_inner(
     if let Some(auth) = state.config.upstream_auth.as_deref() {
         upstream_request = upstream_request.header(header::AUTHORIZATION, auth);
     }
-    let deadline = Instant::now() + NATIVE_UPSTREAM_TIMEOUT;
+    let deadline = Instant::now() + native_image_operation_timeout(&state);
     let upstream = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline),
         upstream_request.send(),
@@ -15711,6 +16561,9 @@ async fn responses_with_timeout(
         model_settings.default_thinking_effort.as_deref(),
     );
     if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
+        if native_response_image_tool(&object).is_some() {
+            return native_responses_image_completion(state, object).await;
+        }
         return native_responses_with_timeout(state, object, upstream_timeout).await;
     }
     if state.config.upstream_protocol != UpstreamProtocol::OpenAi {
@@ -15876,6 +16729,113 @@ async fn native_responses_with_timeout_and_groups(
         .into_response())
 }
 
+fn native_chat_image_content(data: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for (index, item) in data.iter().enumerate() {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        if let Some(encoded) = object
+            .get("b64_json")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!(
+                "![image_{}](data:image/png;base64,{encoded})",
+                index + 1
+            ));
+        } else if let Some(url) = object
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            parts.push(format!("![image_{}]({url})", index + 1));
+        }
+    }
+    if parts.is_empty() {
+        "Image generation completed.".to_owned()
+    } else {
+        parts.join("\n\n")
+    }
+}
+
+async fn native_chat_image_completion(
+    state: AppState,
+    object: Map<String, Value>,
+) -> Result<Response, ApiError> {
+    let requested_model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("gpt-image-2")
+        .to_owned();
+    let stream_requested = object
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let request = native_chat_image_request_from_object(&state, &object).await?;
+    let image_response = if request.codex {
+        native_codex_image_request_proxy(state, request, "images/generations").await?
+    } else {
+        native_web_image_request_proxy(state, request, "images/generations").await?
+    };
+    let body = to_bytes(image_response.into_body(), MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::upstream())?;
+    let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(ApiError::upstream)?;
+    let content = native_chat_image_content(data);
+    let response = json!({
+        "id": native_completion_id(),
+        "object": "chat.completion",
+        "created": native_created(),
+        "model": requested_model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
+        "usage": value.get("usage").cloned().unwrap_or_else(native_image_usage),
+    });
+    if !stream_requested {
+        return Ok(Json(response).into_response());
+    }
+    let completion_id = response["id"].as_str().unwrap_or("chatcmpl-rust");
+    let created = response["created"].as_i64().unwrap_or_else(native_created);
+    let model = response["model"].as_str().unwrap_or("gpt-image-2");
+    let role = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index":0,"delta":{"role":"assistant","content":content},"finish_reason":null}]
+    });
+    let finish = json!({
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index":0,"delta":{},"finish_reason":"stop"}]
+    });
+    let body = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(&role).map_err(|_| ApiError::upstream())?,
+        serde_json::to_string(&finish).map_err(|_| ApiError::upstream())?,
+    );
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    Ok(response)
+}
+
 async fn chat_completions_with_timeout(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15894,6 +16854,14 @@ async fn chat_completions_with_timeout(
         model_settings.default_thinking_effort.as_deref(),
     );
     if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
+        if native_chat_search_requested(&object)
+            && !native_chat_search_has_unsupported_tools(&object)
+        {
+            return native_chat_search_completion(state, object).await;
+        }
+        if native_chat_image_request(&object) {
+            return native_chat_image_completion(state, object).await;
+        }
         let chat_payload = native_conversation_payload(&object);
         let codex_payload = native_codex_response_payload(&object);
         let required_capability = match (chat_payload.is_ok(), codex_payload.is_ok()) {
@@ -28166,7 +29134,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn account_acquire_skips_deferred_invalid_accounts() {
+    async fn account_acquire_does_not_permanently_skip_deferred_invalid_accounts() {
         let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-deferred-invalid-{}-{}.json",
             std::process::id(),
@@ -28181,11 +29149,14 @@ data: [DONE]
         )
         .expect("deferred invalid fixture");
         let store = AccountStore::load(Some(&path)).expect("account store");
+        let mut tokens = HashSet::new();
         for _ in 0..8 {
-            let lease = store.acquire("gpt-test").await.expect("healthy account");
-            assert_eq!(lease.token(), "healthy");
+            let lease = store.acquire("gpt-test").await.expect("account");
+            tokens.insert(lease.token().to_owned());
             drop(lease);
         }
+        assert!(tokens.contains("deferred-invalid"));
+        assert!(tokens.contains("healthy"));
         fs::remove_file(path).expect("cleanup");
     }
 

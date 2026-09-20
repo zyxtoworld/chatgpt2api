@@ -857,7 +857,11 @@ fn validate_chat_options(object: &Map<String, Value>) -> Result<(), ApiError> {
         if items.iter().any(|item| !item.is_string()) {
             return Err(ApiError::validation());
         }
-        if !(items.len() == 1 && items[0].as_str() == Some("text")) {
+        if items.is_empty()
+            || items
+                .iter()
+                .any(|item| !matches!(item.as_str(), Some("text" | "image")))
+        {
             return Err(ApiError::invalid_request());
         }
     }
