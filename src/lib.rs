@@ -14214,7 +14214,15 @@ async fn native_bootstrap_with_timeout_context(
             client.get(format!("{}/", base_url.trim_end_matches('/'))),
             context,
         )
-        .header(header::ACCEPT, "text/html,application/xhtml+xml");
+        .header(
+            header::ACCEPT,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        )
+        .header("Sec-Fetch-Dest", "document")
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Site", "none")
+        .header("Sec-Fetch-User", "?1")
+        .header("Upgrade-Insecure-Requests", "1");
         if !token.is_empty() {
             request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
