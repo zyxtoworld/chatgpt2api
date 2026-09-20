@@ -7779,6 +7779,69 @@ fn native_collect_image_file_ids(value: &Value, ids: &mut Vec<String>, depth: us
     }
 }
 
+fn native_image_poll_shape(value: &Value) -> String {
+    let Some(mapping) = value.get("mapping").and_then(Value::as_object) else {
+        return "mapping=none".to_owned();
+    };
+    let mut messages = Vec::new();
+    for node in mapping.values().take(32) {
+        let Some(message) = node.get("message").and_then(Value::as_object) else {
+            messages.push("message=none".to_owned());
+            continue;
+        };
+        let role = message
+            .get("author")
+            .and_then(Value::as_object)
+            .and_then(|author| author.get("role"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let metadata_keys = message
+            .get("metadata")
+            .and_then(Value::as_object)
+            .map(|metadata| metadata.keys().cloned().collect::<Vec<_>>().join(","))
+            .unwrap_or_default();
+        let content = message.get("content");
+        let content_shape = match content {
+            Some(Value::Object(content)) => {
+                let keys = content.keys().cloned().collect::<Vec<_>>().join(",");
+                let parts = content
+                    .get("parts")
+                    .and_then(Value::as_array)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .take(16)
+                            .map(|part| match part {
+                                Value::String(_) => "string".to_owned(),
+                                Value::Object(object) => format!(
+                                    "object:{}",
+                                    object.keys().cloned().collect::<Vec<_>>().join(",")
+                                ),
+                                Value::Array(_) => "array".to_owned(),
+                                Value::Null => "null".to_owned(),
+                                Value::Bool(_) => "bool".to_owned(),
+                                Value::Number(_) => "number".to_owned(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    })
+                    .unwrap_or_default();
+                format!("object keys=[{keys}] parts=[{parts}]")
+            }
+            Some(Value::String(_)) => "string".to_owned(),
+            Some(Value::Array(_)) => "array".to_owned(),
+            Some(Value::Null) => "null".to_owned(),
+            Some(Value::Bool(_)) => "bool".to_owned(),
+            Some(Value::Number(_)) => "number".to_owned(),
+            None => "missing".to_owned(),
+        };
+        messages.push(format!(
+            "role={role} metadata=[{metadata_keys}] content={content_shape}"
+        ));
+    }
+    messages.join(" || ")
+}
+
 async fn native_poll_image_file_ids(
     state: &AppState,
     lease: &AccountLease,
@@ -7866,6 +7929,11 @@ async fn native_poll_image_file_ids(
             body_text.matches("image_gen").count(),
             ids.len(),
             conversation_id,
+        );
+        eprintln!(
+            "native_web_image poll_shape conversation_id={} {}",
+            conversation_id,
+            native_image_poll_shape(&value)
         );
         if !ids.is_empty() {
             if !settle_enabled {
