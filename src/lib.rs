@@ -7138,6 +7138,7 @@ async fn native_image_request_proxy(
         return Err(ApiError::invalid_request());
     };
     let request = native_apply_image_edit_mask(request)?;
+    reject_sensitive_words(&state, &Value::String(request.prompt.clone()))?;
     native_validate_image_sources(&request)?;
     if request.codex {
         native_codex_image_request_proxy(state, request, endpoint).await
@@ -8865,6 +8866,7 @@ async fn search(
         .await
         .map_err(|_| ApiError::invalid_request())?;
     let payload: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::invalid_request())?;
+    reject_sensitive_words(&state, &payload)?;
     let prompt = search_prompt(&payload)?;
     if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
         return native_search_with_timeout(state, prompt, NATIVE_SEARCH_TIMEOUT).await;
@@ -10524,7 +10526,7 @@ async fn run_image_task(
     owner: String,
     task_id: String,
     mode: &'static str,
-    mut request: NativeImageRequest,
+    request: NativeImageRequest,
 ) {
     let _ = update_image_task(
         &state,
@@ -10547,7 +10549,7 @@ async fn run_image_task(
         native_web_image_request_proxy(state.clone(), request, endpoint).await
     };
     let result = match result {
-        Ok(response) => match bounded_response_body(response).await {
+        Ok(response) => match to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES).await {
             Ok(body) => serde_json::from_slice::<Value>(&body)
                 .map_err(|_| "image task returned invalid JSON".to_owned()),
             Err(_) => Err("image task upstream response failed".to_owned()),
@@ -10701,6 +10703,7 @@ async fn image_task_generation(
 ) -> Result<Json<Value>, ApiError> {
     let owner = authenticated_subject(&headers, &state).await?;
     let value = account_json_body(body).await?;
+    reject_sensitive_words(&state, &value)?;
     let object = value
         .as_object()
         .cloned()
@@ -10777,6 +10780,7 @@ async fn image_task_edit(
         .client_task_id
         .clone()
         .ok_or_else(ApiError::invalid_request)?;
+    reject_sensitive_words(&state, &Value::String(request.prompt.clone()))?;
     request.client_task_id = None;
     request.response_format = "b64_json".to_owned();
     request.stream = false;
@@ -11580,6 +11584,118 @@ fn runtime_model_settings(state: &AppState) -> RuntimeModelSettings {
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
     runtime_model_settings_from_value(&config, fallback_model)
+}
+
+fn configured_global_system_prompt(state: &AppState) -> Option<String> {
+    fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value
+                .get("global_system_prompt")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn append_request_text(value: &Value, output: &mut String, depth: usize) {
+    if depth > 32 || output.len() >= 100_000 {
+        return;
+    }
+    match value {
+        Value::String(text) => {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(text);
+        }
+        Value::Array(items) => {
+            for item in items {
+                append_request_text(item, output, depth + 1);
+                if output.len() >= 100_000 {
+                    break;
+                }
+            }
+        }
+        Value::Object(object) => {
+            for key in [
+                "text",
+                "input_text",
+                "content",
+                "input",
+                "instructions",
+                "system",
+                "prompt",
+                "description",
+                "name",
+            ] {
+                if let Some(value) = object.get(key) {
+                    append_request_text(value, output, depth + 1);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn reject_sensitive_words(state: &AppState, value: &Value) -> Result<(), ApiError> {
+    let config = fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    let words = config
+        .get("sensitive_words")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return Ok(());
+    }
+    let mut text = String::new();
+    append_request_text(value, &mut text, 0);
+    if words.iter().any(|word| text.contains(word)) {
+        return Err(ApiError::invalid_request());
+    }
+    Ok(())
+}
+
+fn apply_global_system_prompt_to_chat(state: &AppState, object: &mut Map<String, Value>) {
+    let Some(prompt) = configured_global_system_prompt(state) else {
+        return;
+    };
+    let Some(messages) = object.get_mut("messages").and_then(Value::as_array_mut) else {
+        if let Some(Value::String(existing)) = object.get_mut("prompt") {
+            *existing = format!("{prompt}\n\n{existing}");
+        }
+        return;
+    };
+    if messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("system")
+            && message.get("content").and_then(Value::as_str) == Some(prompt.as_str())
+    }) {
+        return;
+    }
+    messages.insert(0, json!({"role": "system", "content": prompt}));
+}
+
+fn apply_global_system_prompt_to_responses(state: &AppState, object: &mut Map<String, Value>) {
+    let Some(prompt) = configured_global_system_prompt(state) else {
+        return;
+    };
+    match object.get_mut("instructions") {
+        Some(Value::String(existing)) if !existing.trim().is_empty() => {
+            *existing = format!("{prompt}\n\n{existing}");
+        }
+        _ => {
+            object.insert("instructions".to_owned(), Value::String(prompt));
+        }
+    }
 }
 
 fn native_image_operation_timeout(state: &AppState) -> Duration {
@@ -16630,6 +16746,7 @@ async fn messages_inner(
     let request = validate_message_request(
         serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?,
     )?;
+    reject_sensitive_words(&state, &Value::Object(request.clone()))?;
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -17023,6 +17140,8 @@ async fn responses_with_timeout(
         .map_err(|_| ApiError::validation())?;
     let payload: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?;
     let mut object = validate_responses_payload(payload)?;
+    reject_sensitive_words(&state, &Value::Object(object.clone()))?;
+    apply_global_system_prompt_to_responses(&state, &mut object);
     let model_settings = runtime_model_settings(&state);
     apply_default_thinking_effort(
         &mut object,
@@ -17316,6 +17435,8 @@ async fn chat_completions_with_timeout(
         .map_err(|_| ApiError::validation())?;
     let payload: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?;
     let mut object = validate_chat_payload(payload)?;
+    reject_sensitive_words(&state, &Value::Object(object.clone()))?;
+    apply_global_system_prompt_to_chat(&state, &mut object);
     let model_settings = runtime_model_settings(&state);
     apply_default_thinking_effort(
         &mut object,
