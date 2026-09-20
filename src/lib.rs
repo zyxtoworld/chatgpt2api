@@ -10433,10 +10433,10 @@ fn public_image_task(task: &Value) -> Value {
         "progress",
         "duration_ms",
     ] {
-        if let Some(value) = object.get(field).filter(|value| !value.is_null()) {
-            if field != "error" || value.as_str().is_none_or(|value| !value.is_empty()) {
-                public.insert(field.to_owned(), value.clone());
-            }
+        if let Some(value) = object.get(field).filter(|value| !value.is_null())
+            && (field != "error" || value.as_str().is_none_or(|value| !value.is_empty()))
+        {
+            public.insert(field.to_owned(), value.clone());
         }
     }
     if matches!(
