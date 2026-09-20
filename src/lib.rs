@@ -7489,6 +7489,12 @@ async fn native_upload_image(
         .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
         .ok_or_else(ApiError::upstream)?
         .to_owned();
+    let upstream_base = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .unwrap_or("https://chatgpt.com")
+        .trim_end_matches('/');
     let mut upload_request = state
         .client
         .put(upload_url)
@@ -7497,7 +7503,7 @@ async fn native_upload_image(
         .header("x-ms-blob-type", "BlockBlob")
         .header("x-ms-version", "2020-04-08")
         .header("Origin", NATIVE_ORIGIN)
-        .header("Referer", format!("{base_url}/"))
+        .header("Referer", format!("{upstream_base}/"))
         .header(header::USER_AGENT, NATIVE_USER_AGENT)
         .header(header::ACCEPT, "application/json, text/plain, */*");
     upload_request = match upload_body {
