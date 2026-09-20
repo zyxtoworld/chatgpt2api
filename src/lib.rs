@@ -7821,77 +7821,83 @@ async fn native_download_image_files(
         .trim_end_matches('/');
     let mut outputs = Vec::new();
     for id in ids {
-        let (path, referer) = if let Some(attachment_id) = id.strip_prefix("sediment://") {
-            (
-                format!(
-                    "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
+        let candidates = if let Some(attachment_id) = id.strip_prefix("sediment://") {
+            vec![
+                (
+                    format!(
+                        "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
+                    ),
+                    format!("{base_url}/c/{conversation_id}"),
+                    false,
                 ),
-                format!("{base_url}/c/{conversation_id}"),
-            )
+                (
+                    format!("/backend-api/files/download/{attachment_id}"),
+                    format!("{base_url}/"),
+                    true,
+                ),
+                (
+                    format!("/backend-api/files/{attachment_id}/download"),
+                    format!("{base_url}/"),
+                    false,
+                ),
+            ]
         } else {
-            (
+            vec![(
                 format!("/backend-api/files/{id}/download"),
                 format!("{base_url}/"),
-            )
+                false,
+            )]
         };
-        let mut request = native_browser_headers_with_referer(
-            state.client.get(format!("{base_url}{path}")),
-            context,
-            &referer,
-        )
-        .header(header::ACCEPT, "application/json")
-        .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
-        if let Some(account_id) = lease.chatgpt_account_id() {
-            request = request.header("ChatGPT-Account-ID", account_id);
+        let mut downloaded = None;
+        for (path, referer, with_file_query) in candidates {
+            let mut request = native_browser_headers_with_referer(
+                state.client.get(format!("{base_url}{path}")),
+                context,
+                &referer,
+            )
+            .header(header::ACCEPT, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
+            if with_file_query {
+                request = request.query(&[("post_id", ""), ("inline", "false")]);
+            }
+            if let Some(account_id) = lease.chatgpt_account_id() {
+                request = request.header("ChatGPT-Account-ID", account_id);
+            }
+            let response =
+                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
+                    .await
+                    .map_err(|_| ApiError::upstream())?
+                    .map_err(|_| ApiError::upstream())?;
+            if !response.status().is_success() {
+                continue;
+            }
+            let body = bounded_response_body(response).await?;
+            let Ok(meta) = serde_json::from_slice::<Value>(&body) else {
+                continue;
+            };
+            let Some(url) = meta
+                .get("download_url")
+                .or_else(|| meta.get("url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+            else {
+                continue;
+            };
+            let response = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                state.client.get(url).send(),
+            )
+            .await
+            .map_err(|_| ApiError::upstream())?
+            .map_err(|_| ApiError::upstream())?;
+            if !response.status().is_success() {
+                continue;
+            }
+            downloaded = Some(bounded_response_body(response).await?);
+            break;
         }
-        let response =
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
-                .await
-                .map_err(|_| ApiError::upstream())?
-                .map_err(|_| ApiError::upstream())?;
-        if !response.status().is_success() {
-            eprintln!(
-                "native_web_image download_meta_status={} id={}",
-                response.status(),
-                id
-            );
-            return Err(ApiError::upstream());
-        }
-        let body = bounded_response_body(response).await?;
-        let meta: Value = serde_json::from_slice(&body).map_err(|_| {
-            eprintln!(
-                "native_web_image download_meta_json_failed id={} bytes={}",
-                id,
-                body.len()
-            );
-            ApiError::upstream()
-        })?;
-        let url = meta
-            .get("download_url")
-            .or_else(|| meta.get("url"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
-            .ok_or_else(|| {
-                eprintln!("native_web_image download_meta_url_missing id={}", id);
-                ApiError::upstream()
-            })?;
-        let response = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            state.client.get(url).send(),
-        )
-        .await
-        .map_err(|_| ApiError::upstream())?
-        .map_err(|_| ApiError::upstream())?;
-        if !response.status().is_success() {
-            eprintln!(
-                "native_web_image download_blob_status={} id={}",
-                response.status(),
-                id
-            );
-            return Err(ApiError::upstream());
-        }
-        outputs.push(bounded_response_body(response).await?);
+        outputs.push(downloaded.ok_or_else(ApiError::upstream)?);
     }
     Ok(outputs)
 }
