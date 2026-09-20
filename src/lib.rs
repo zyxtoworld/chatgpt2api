@@ -2531,10 +2531,6 @@ async fn web_asset(
     State(_state): State<AppState>,
     AxumPath(web_path): AxumPath<String>,
 ) -> Result<Response, ApiError> {
-    eprintln!(
-        "native_web_image start model={} endpoint={}",
-        request.model, endpoint
-    );
     let path = match checked_web_asset(&web_path) {
         Some(path) => path,
         None if !web_path_disables_spa_fallback(&web_path) => {
@@ -8092,6 +8088,10 @@ async fn native_web_image_attempt(
     model_settings: &RuntimeModelSettings,
     deadline: Instant,
 ) -> Result<Response, ApiError> {
+    eprintln!(
+        "native_web_image start model={} endpoint={}",
+        request.model, endpoint
+    );
     let base_url = state
         .config
         .upstream_base_url
