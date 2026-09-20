@@ -2531,6 +2531,10 @@ async fn web_asset(
     State(_state): State<AppState>,
     AxumPath(web_path): AxumPath<String>,
 ) -> Result<Response, ApiError> {
+    eprintln!(
+        "native_web_image start model={} endpoint={}",
+        request.model, endpoint
+    );
     let path = match checked_web_asset(&web_path) {
         Some(path) => path,
         None if !web_path_disables_spa_fallback(&web_path) => {
@@ -8107,7 +8111,11 @@ async fn native_web_image_attempt(
         &context,
     )
     .await
-    .map_err(|_| ApiError::upstream())?;
+    .map_err(|_| {
+        eprintln!("native_web_image bootstrap_failed model={}", request.model);
+        ApiError::upstream()
+    })?;
+    eprintln!("native_web_image bootstrap_ok model={}", request.model);
     let requirements = native_chat_requirements_with_resources_for_route_context(
         &state.client,
         base_url,
@@ -8118,7 +8126,14 @@ async fn native_web_image_attempt(
         &context,
     )
     .await
-    .map_err(|_| ApiError::upstream())?;
+    .map_err(|_| {
+        eprintln!(
+            "native_web_image requirements_failed model={}",
+            request.model
+        );
+        ApiError::upstream()
+    })?;
+    eprintln!("native_web_image requirements_ok model={}", request.model);
     let upstream_model = &model_settings.upstream_model;
     let prepare_path = "/backend-api/f/conversation/prepare";
     let mut prepare_payload = json!({
@@ -8158,8 +8173,19 @@ async fn native_web_image_attempt(
     }
     let prepare = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), prepare.send())
         .await
-        .map_err(|_| ApiError::upstream())?
-        .map_err(|_| ApiError::upstream())?;
+        .map_err(|_| {
+            eprintln!("native_web_image prepare_timeout model={}", request.model);
+            ApiError::upstream()
+        })?
+        .map_err(|_| {
+            eprintln!("native_web_image prepare_network model={}", request.model);
+            ApiError::upstream()
+        })?;
+    eprintln!(
+        "native_web_image prepare_status={} model={}",
+        prepare.status(),
+        request.model
+    );
     if !prepare.status().is_success() {
         return Err(ApiError::upstream());
     }
@@ -8264,19 +8290,66 @@ async fn native_web_image_attempt(
     }
     let response = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), run.send())
         .await
-        .map_err(|_| ApiError::upstream())?
-        .map_err(|_| ApiError::upstream())?;
+        .map_err(|_| {
+            eprintln!("native_web_image run_timeout model={}", request.model);
+            ApiError::upstream()
+        })?
+        .map_err(|_| {
+            eprintln!("native_web_image run_network model={}", request.model);
+            ApiError::upstream()
+        })?;
+    eprintln!(
+        "native_web_image run_status={} model={}",
+        response.status(),
+        request.model
+    );
     if !response.status().is_success() {
         return Err(ApiError::upstream());
     }
     let conversation_id = search_conversation_id_from_response(response, deadline, true)
         .await
-        .map_err(|_| ApiError::upstream())?;
-    let ids =
-        native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline).await?;
+        .map_err(|_| {
+            eprintln!(
+                "native_web_image conversation_id_failed model={}",
+                request.model
+            );
+            ApiError::upstream()
+        })?;
+    eprintln!(
+        "native_web_image conversation_id_ok model={}",
+        request.model
+    );
+    let ids = native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline)
+        .await
+        .map_err(|error| {
+            eprintln!(
+                "native_web_image poll_failed model={} code={}",
+                request.model,
+                error.code()
+            );
+            error
+        })?;
+    eprintln!(
+        "native_web_image poll_ok model={} ids={}",
+        request.model,
+        ids.len()
+    );
     let downloaded =
         native_download_image_files(state, lease, &context, &conversation_id, &ids, deadline)
-            .await?;
+            .await
+            .map_err(|error| {
+                eprintln!(
+                    "native_web_image download_failed model={} code={}",
+                    request.model,
+                    error.code()
+                );
+                error
+            })?;
+    eprintln!(
+        "native_web_image download_ok model={} count={}",
+        request.model,
+        downloaded.len()
+    );
     let mut data = Vec::new();
     for bytes in downloaded {
         let bytes =
