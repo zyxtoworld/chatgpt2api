@@ -604,12 +604,7 @@ pub(crate) fn native_completion_text(body: &[u8]) -> Result<String, ApiError> {
         }
     }
     if !terminated {
-        return Err(ApiError::upstream_message(format!(
-            "diagnostic sse missing terminal events={} text={} tail={}",
-            event_index,
-            text,
-            String::from_utf8_lossy(&buffer[buffer.len().saturating_sub(700)..]),
-        )));
+        return Err(ApiError::upstream());
     }
     Ok(native_sanitize_text(&text))
 }
