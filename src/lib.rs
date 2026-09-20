@@ -14343,7 +14343,10 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let status = prepare.status();
         if !status.is_success() {
             eprintln!("native sentinel prepare failed: status={status}");
-            return Err((ApiError::upstream(), native_stage_retryable(status, true)));
+            return Err((
+                ApiError::upstream_message(format!("diagnostic prepare status={status}")),
+                native_stage_retryable(status, true),
+            ));
         }
         bounded_response_body(prepare)
             .await
@@ -14370,14 +14373,20 @@ async fn native_chat_requirements_with_resources_for_route_context(
     .await
     .map_err(|error| {
         eprintln!("native sentinel proof failed: code={}", error.code());
-        (error, false)
+        (
+            ApiError::upstream_message(format!("diagnostic proof code={}", error.code())),
+            false,
+        )
     })?;
     let turnstile_token =
         native_turnstile_token(prepare_value.get("turnstile"), &p_token, deadline)
             .await
             .map_err(|error| {
                 eprintln!("native sentinel turnstile failed: code={}", error.code());
-                (error, false)
+                (
+                    ApiError::upstream_message(format!("diagnostic turnstile code={}", error.code())),
+                    false,
+                )
             })?;
     let finalize_path = format!("{route_base}/sentinel/chat-requirements/finalize");
     let mut finalize_request =
@@ -15181,7 +15190,10 @@ async fn native_conversation_attempt(
                 "native conversation bootstrap failed: code={} retryable={retryable}",
                 error.code()
             );
-            return Err((error, retryable));
+            return Err((
+                ApiError::upstream_message(format!("diagnostic bootstrap code={}", error.code())),
+                retryable,
+            ));
         }
     };
     let requirements = native_chat_requirements_with_resources_for_route_context(
@@ -15199,7 +15211,10 @@ async fn native_conversation_attempt(
             "native conversation requirements failed: code={} retryable={retryable}",
             error.code()
         );
-        (error, retryable)
+        (
+            ApiError::upstream_message(format!("diagnostic requirements code={}", error.code())),
+            retryable,
+        )
     })?;
     let route_base = if authenticated {
         "/backend-api/conversation"
@@ -15247,7 +15262,13 @@ async fn native_conversation_attempt(
                 | StatusCode::SERVICE_UNAVAILABLE
                 | StatusCode::GATEWAY_TIMEOUT
         );
-        return Err((ApiError::upstream(), retryable));
+        return Err((
+            ApiError::upstream_message(format!(
+                "diagnostic conversation status={status} body={}",
+                String::from_utf8_lossy(&body[..body.len().min(300)])
+            )),
+            retryable,
+        ));
     }
     if upstream_declares_oversize(&upstream) {
         return Err((ApiError::upstream(), false));
