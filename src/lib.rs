@@ -15177,7 +15177,10 @@ async fn native_conversation_attempt(
     let pow_resources = match native_bootstrap(client, base_url, token, &context).await {
         Ok(resources) => resources,
         Err((error, retryable)) => {
-            eprintln!("native conversation bootstrap failed: code={} retryable={retryable}", error.code());
+            eprintln!(
+                "native conversation bootstrap failed: code={} retryable={retryable}",
+                error.code()
+            );
             return Err((error, retryable));
         }
     };
@@ -15192,7 +15195,10 @@ async fn native_conversation_attempt(
     )
     .await
     .map_err(|(error, retryable)| {
-        eprintln!("native conversation requirements failed: code={} retryable={retryable}", error.code());
+        eprintln!(
+            "native conversation requirements failed: code={} retryable={retryable}",
+            error.code()
+        );
         (error, retryable)
     })?;
     let route_base = if authenticated {
