@@ -14299,6 +14299,7 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let prepare = prepare.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = prepare.status();
         if !status.is_success() {
+            eprintln!("native sentinel prepare failed: status={status}");
             return Err((ApiError::upstream(), native_stage_retryable(status, true)));
         }
         bounded_response_body(prepare)
@@ -14348,6 +14349,7 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let finalize = finalize.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = finalize.status();
         if !status.is_success() {
+            eprintln!("native sentinel finalize failed: status={status}");
             return Err((ApiError::upstream(), native_stage_retryable(status, false)));
         }
         bounded_response_body(finalize)
@@ -15166,8 +15168,14 @@ async fn native_conversation_attempt(
         .map_err(|_| (ApiError::upstream(), false))?
         .map_err(|_| (ApiError::upstream(), false))?;
     if !upstream.status().is_success() {
+        let status = upstream.status();
+        let body = bounded_response_body(upstream).await.unwrap_or_default();
+        eprintln!(
+            "native conversation failed: status={status} body={}",
+            String::from_utf8_lossy(&body[..body.len().min(800)])
+        );
         let retryable = matches!(
-            upstream.status(),
+            status,
             StatusCode::TOO_MANY_REQUESTS
                 | StatusCode::INTERNAL_SERVER_ERROR
                 | StatusCode::BAD_GATEWAY
