@@ -2067,7 +2067,7 @@ async fn execute_cpa_import(
                 .ok_or_else(ApiError::upstream)
         }) {
             Ok(token) => {
-                imported.push(json!({"access_token": token}));
+                imported.push(json!({"access_token": token, "source_type": "codex"}));
                 successful += 1;
             }
             Err(_) => {
@@ -2838,7 +2838,7 @@ async fn execute_sub2api_import(
                     .map(ToOwned::to_owned);
                 match token {
                     Some(token) => {
-                        imported.push(json!({"access_token": token}));
+                        imported.push(json!({"access_token": token, "source_type": "codex"}));
                         successful += 1;
                     }
                     None => {
