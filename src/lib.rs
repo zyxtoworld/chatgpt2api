@@ -13285,7 +13285,11 @@ fn native_requirements_token(
     user_agent: &str,
     resources: &NativePowResources,
 ) -> Result<String, ApiError> {
-    let config = native_pow_config(user_agent, resources);
+    let config = if cfg!(test) {
+        native_pow_config(user_agent, resources)
+    } else {
+        native_pow_config_runtime(user_agent, resources)
+    };
     native_requirements_token_from_config(&config)
 }
 
@@ -13394,7 +13398,11 @@ async fn native_proof_token(
     resources: &NativePowResources,
     deadline: Instant,
 ) -> Result<String, ApiError> {
-    let config = native_pow_config(user_agent, resources);
+    let config = if cfg!(test) {
+        native_pow_config(user_agent, resources)
+    } else {
+        native_pow_config_runtime(user_agent, resources)
+    };
     native_proof_token_with_config(value, &config, deadline).await
 }
 
