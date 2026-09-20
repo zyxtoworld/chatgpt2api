@@ -282,6 +282,12 @@ fn native_text_candidate(value: &Value) -> Result<Option<String>, io::Error> {
         Some(Value::Object(content)) => content,
         Some(_) => return Err(io::Error::other("malformed upstream event")),
     };
+    if matches!(
+        content.get("content_type").and_then(Value::as_str),
+        Some("reasoning_recap" | "code" | "execution_output" | "system_error")
+    ) {
+        return Ok(None);
+    }
     if let Some(parts) = content.get("parts") {
         let parts = parts
             .as_array()
