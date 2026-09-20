@@ -7786,6 +7786,10 @@ async fn native_poll_image_file_ids(
     conversation_id: &str,
     deadline: Instant,
 ) -> Result<Vec<String>, ApiError> {
+    eprintln!(
+        "native_web_image poll_start conversation_id={}",
+        conversation_id
+    );
     let base_url = state
         .config
         .upstream_base_url
@@ -7820,7 +7824,12 @@ async fn native_poll_image_file_ids(
                 .await
                 .map_err(|_| ApiError::upstream())?
                 .map_err(|_| ApiError::upstream())?;
+        let response_status = response.status();
         if !response.status().is_success() {
+            eprintln!(
+                "native_web_image poll_status={} conversation_id={}",
+                response_status, conversation_id
+            );
             if matches!(
                 response.status(),
                 StatusCode::NOT_FOUND
@@ -7843,6 +7852,21 @@ async fn native_poll_image_file_ids(
         let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
         let mut ids = Vec::new();
         native_collect_image_file_ids(&value, &mut ids, 0);
+        let body_text = String::from_utf8_lossy(&body);
+        let mapping_len = value
+            .get("mapping")
+            .and_then(Value::as_object)
+            .map_or(0, Map::len);
+        eprintln!(
+            "native_web_image poll_response bytes={} mapping={} sediment_refs={} file_refs={} image_gen_refs={} ids={} conversation_id={}",
+            body.len(),
+            mapping_len,
+            body_text.matches("sediment://").count(),
+            body_text.matches("file-service://").count(),
+            body_text.matches("image_gen").count(),
+            ids.len(),
+            conversation_id,
+        );
         if !ids.is_empty() {
             if !settle_enabled {
                 return Ok(ids);
