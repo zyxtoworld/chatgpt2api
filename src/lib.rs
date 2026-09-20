@@ -14161,7 +14161,7 @@ async fn native_turnstile_token(
         native_turnstile_token_sync(value.as_ref(), &source_p, &worker_cancel, deadline)
     });
     match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), &mut worker).await {
-        Ok(Ok(result)) => result,
+        Ok(Ok(result)) => Ok(result.unwrap_or_default()),
         Ok(Err(_)) => Ok(String::new()),
         Err(_) => {
             cancel.store(true, Ordering::Release);
