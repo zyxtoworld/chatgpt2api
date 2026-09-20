@@ -8269,7 +8269,7 @@ async fn native_web_image_attempt(
     if !response.status().is_success() {
         return Err(ApiError::upstream());
     }
-    let conversation_id = search_conversation_id_from_response(response, deadline)
+    let conversation_id = search_conversation_id_from_response(response, deadline, true)
         .await
         .map_err(|_| ApiError::upstream())?;
     let ids =
@@ -9314,7 +9314,7 @@ async fn native_search_attempt(
     if upstream_declares_oversize(&run) {
         return Err((ApiError::upstream(), false));
     }
-    let conversation_id = search_conversation_id_from_response(run, deadline).await?;
+    let conversation_id = search_conversation_id_from_response(run, deadline, false).await?;
     native_search_poll(NativeSearchPollRequest {
         client: &state.client,
         base_url,
@@ -9450,6 +9450,7 @@ async fn native_search_poll(
 async fn search_conversation_id_from_response(
     response: reqwest::Response,
     deadline: Instant,
+    stop_after_id: bool,
 ) -> Result<String, (ApiError, bool)> {
     if upstream_declares_oversize(&response) {
         return Err((ApiError::upstream(), false));
@@ -9484,7 +9485,7 @@ async fn search_conversation_id_from_response(
             if conversation_id.is_none() {
                 conversation_id = search_find_string(&value, "conversation_id")
                     .filter(|id| valid_search_conversation_id(id));
-                if conversation_id.is_some() {
+                if stop_after_id && conversation_id.is_some() {
                     return conversation_id.ok_or((ApiError::upstream(), false));
                 }
             }
@@ -40865,9 +40866,10 @@ data: [DONE]
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        let result = search_conversation_id_from_response(response, Instant::now() + timeout)
-            .await
-            .map_err(|_| "invalid search SSE".to_owned());
+        let result =
+            search_conversation_id_from_response(response, Instant::now() + timeout, false)
+                .await
+                .map_err(|_| "invalid search SSE".to_owned());
         server.abort();
         let _ = server.await;
         result
