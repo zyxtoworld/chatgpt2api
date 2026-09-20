@@ -7779,120 +7779,6 @@ fn native_collect_image_file_ids(value: &Value, ids: &mut Vec<String>, depth: us
     }
 }
 
-fn native_image_poll_shape(value: &Value) -> String {
-    let Some(mapping) = value.get("mapping").and_then(Value::as_object) else {
-        return "mapping=none".to_owned();
-    };
-    let mut messages = Vec::new();
-    for node in mapping.values().take(32) {
-        let Some(message) = node.get("message").and_then(Value::as_object) else {
-            messages.push("message=none".to_owned());
-            continue;
-        };
-        let role = message
-            .get("author")
-            .and_then(Value::as_object)
-            .and_then(|author| author.get("role"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let metadata_keys = message
-            .get("metadata")
-            .and_then(Value::as_object)
-            .map(|metadata| metadata.keys().cloned().collect::<Vec<_>>().join(","))
-            .unwrap_or_default();
-        let metadata_status = message
-            .get("metadata")
-            .and_then(Value::as_object)
-            .map(|metadata| {
-                let finish = metadata
-                    .get("finish_details")
-                    .and_then(Value::as_object)
-                    .and_then(|finish| finish.get("type"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let complete = metadata
-                    .get("is_complete")
-                    .and_then(Value::as_bool)
-                    .map(|value| value.to_string())
-                    .unwrap_or_default();
-                let message_type = metadata
-                    .get("message_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                format!("finish={finish} complete={complete} message_type={message_type}")
-            })
-            .unwrap_or_default();
-        let content = message.get("content");
-        let content_shape = match content {
-            Some(Value::Object(content)) => {
-                let keys = content.keys().cloned().collect::<Vec<_>>().join(",");
-                let parts = content
-                    .get("parts")
-                    .and_then(Value::as_array)
-                    .map(|parts| {
-                        parts
-                            .iter()
-                            .take(16)
-                            .map(|part| match part {
-                                Value::String(_) => "string".to_owned(),
-                                Value::Object(object) => format!(
-                                    "object:{}",
-                                    object.keys().cloned().collect::<Vec<_>>().join(",")
-                                ),
-                                Value::Array(_) => "array".to_owned(),
-                                Value::Null => "null".to_owned(),
-                                Value::Bool(_) => "bool".to_owned(),
-                                Value::Number(_) => "number".to_owned(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("|")
-                    })
-                    .unwrap_or_default();
-                let text_signals = ["text", "content"]
-                    .iter()
-                    .filter_map(|key| {
-                        content.get(*key).and_then(Value::as_str).map(|value| {
-                            format!(
-                                "{key}:len={} image={} file={} sediment={} json={} result={} url={} b64={} data_uri={} http={} xml={} image_call={} preview={}",
-                                value.len(),
-                                value.contains("image"),
-                                value.contains("file"),
-                                value.contains("sediment"),
-                                value.trim_start().starts_with('{')
-                                    || value.trim_start().starts_with('['),
-                                value.contains("result"),
-                                value.contains("url"),
-                                value.contains("base64") || value.contains("b64"),
-                                value.contains("data:image"),
-                                value.contains("http://") || value.contains("https://"),
-                                value.trim_start().starts_with('<'),
-                                value.contains("image_generation_call"),
-                                value
-                                    .chars()
-                                    .take(96)
-                                    .collect::<String>()
-                                    .replace(['\n', '\r', '\t'], " "),
-                            )
-                        })
-                    })
-                    .collect::<Vec<_>>()
-                    .join("|");
-                format!("object keys=[{keys}] parts=[{parts}] text=[{text_signals}]")
-            }
-            Some(Value::String(_)) => "string".to_owned(),
-            Some(Value::Array(_)) => "array".to_owned(),
-            Some(Value::Null) => "null".to_owned(),
-            Some(Value::Bool(_)) => "bool".to_owned(),
-            Some(Value::Number(_)) => "number".to_owned(),
-            None => "missing".to_owned(),
-        };
-        messages.push(format!(
-            "role={role} {metadata_status} metadata=[{metadata_keys}] content={content_shape}"
-        ));
-    }
-    messages.join(" || ")
-}
-
 async fn native_poll_image_file_ids(
     state: &AppState,
     lease: &AccountLease,
@@ -7900,10 +7786,6 @@ async fn native_poll_image_file_ids(
     conversation_id: &str,
     deadline: Instant,
 ) -> Result<Vec<String>, ApiError> {
-    eprintln!(
-        "native_web_image poll_start conversation_id={}",
-        conversation_id
-    );
     let base_url = state
         .config
         .upstream_base_url
@@ -7938,12 +7820,7 @@ async fn native_poll_image_file_ids(
                 .await
                 .map_err(|_| ApiError::upstream())?
                 .map_err(|_| ApiError::upstream())?;
-        let response_status = response.status();
         if !response.status().is_success() {
-            eprintln!(
-                "native_web_image poll_status={} conversation_id={}",
-                response_status, conversation_id
-            );
             if matches!(
                 response.status(),
                 StatusCode::NOT_FOUND
@@ -7966,26 +7843,6 @@ async fn native_poll_image_file_ids(
         let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
         let mut ids = Vec::new();
         native_collect_image_file_ids(&value, &mut ids, 0);
-        let body_text = String::from_utf8_lossy(&body);
-        let mapping_len = value
-            .get("mapping")
-            .and_then(Value::as_object)
-            .map_or(0, Map::len);
-        eprintln!(
-            "native_web_image poll_response bytes={} mapping={} sediment_refs={} file_refs={} image_gen_refs={} ids={} conversation_id={}",
-            body.len(),
-            mapping_len,
-            body_text.matches("sediment://").count(),
-            body_text.matches("file-service://").count(),
-            body_text.matches("image_gen").count(),
-            ids.len(),
-            conversation_id,
-        );
-        eprintln!(
-            "native_web_image poll_shape conversation_id={} {}",
-            conversation_id,
-            native_image_poll_shape(&value)
-        );
         if !ids.is_empty() {
             if !settle_enabled {
                 return Ok(ids);
@@ -8071,16 +7928,10 @@ async fn native_download_image_files(
                     .map_err(|_| ApiError::upstream())?
                     .map_err(|_| ApiError::upstream())?;
             if !response.status().is_success() {
-                eprintln!(
-                    "native_web_image download_meta_status={} path={}",
-                    response.status(),
-                    path
-                );
                 continue;
             }
             let body = bounded_response_body(response).await?;
             let Ok(meta) = serde_json::from_slice::<Value>(&body) else {
-                eprintln!("native_web_image download_meta_json_failed path={}", path);
                 continue;
             };
             let Some(url) = meta
@@ -8090,7 +7941,6 @@ async fn native_download_image_files(
                 .map(str::trim)
                 .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
             else {
-                eprintln!("native_web_image download_meta_url_missing path={}", path);
                 continue;
             };
             let blob_referer = format!("{base_url}/c/{conversation_id}");
@@ -8111,14 +7961,8 @@ async fn native_download_image_files(
             .map_err(|_| ApiError::upstream())?
             .map_err(|_| ApiError::upstream())?;
             if !response.status().is_success() {
-                eprintln!(
-                    "native_web_image download_blob_status={} path={}",
-                    response.status(),
-                    path
-                );
                 continue;
             }
-            eprintln!("native_web_image download_candidate_ok path={}", path);
             downloaded = Some(bounded_response_body(response).await?);
             break;
         }
@@ -8257,10 +8101,6 @@ async fn native_web_image_attempt(
     model_settings: &RuntimeModelSettings,
     deadline: Instant,
 ) -> Result<Response, ApiError> {
-    eprintln!(
-        "native_web_image start model={} endpoint={}",
-        request.model, endpoint
-    );
     let base_url = state
         .config
         .upstream_base_url
@@ -8280,11 +8120,7 @@ async fn native_web_image_attempt(
         &context,
     )
     .await
-    .map_err(|_| {
-        eprintln!("native_web_image bootstrap_failed model={}", request.model);
-        ApiError::upstream()
-    })?;
-    eprintln!("native_web_image bootstrap_ok model={}", request.model);
+    .map_err(|_| ApiError::upstream())?;
     let requirements = native_chat_requirements_with_resources_for_route_context(
         &state.client,
         base_url,
@@ -8295,14 +8131,7 @@ async fn native_web_image_attempt(
         &context,
     )
     .await
-    .map_err(|_| {
-        eprintln!(
-            "native_web_image requirements_failed model={}",
-            request.model
-        );
-        ApiError::upstream()
-    })?;
-    eprintln!("native_web_image requirements_ok model={}", request.model);
+    .map_err(|_| ApiError::upstream())?;
     let upstream_model = &model_settings.upstream_model;
     let prepare_path = "/backend-api/f/conversation/prepare";
     let mut prepare_payload = json!({
@@ -8342,19 +8171,8 @@ async fn native_web_image_attempt(
     }
     let prepare = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), prepare.send())
         .await
-        .map_err(|_| {
-            eprintln!("native_web_image prepare_timeout model={}", request.model);
-            ApiError::upstream()
-        })?
-        .map_err(|_| {
-            eprintln!("native_web_image prepare_network model={}", request.model);
-            ApiError::upstream()
-        })?;
-    eprintln!(
-        "native_web_image prepare_status={} model={}",
-        prepare.status(),
-        request.model
-    );
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
     if !prepare.status().is_success() {
         return Err(ApiError::upstream());
     }
@@ -8459,64 +8277,19 @@ async fn native_web_image_attempt(
     }
     let response = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), run.send())
         .await
-        .map_err(|_| {
-            eprintln!("native_web_image run_timeout model={}", request.model);
-            ApiError::upstream()
-        })?
-        .map_err(|_| {
-            eprintln!("native_web_image run_network model={}", request.model);
-            ApiError::upstream()
-        })?;
-    eprintln!(
-        "native_web_image run_status={} model={}",
-        response.status(),
-        request.model
-    );
+        .map_err(|_| ApiError::upstream())?
+        .map_err(|_| ApiError::upstream())?;
     if !response.status().is_success() {
         return Err(ApiError::upstream());
     }
     let conversation_id = search_conversation_id_from_response(response, deadline, true)
         .await
-        .map_err(|_| {
-            eprintln!(
-                "native_web_image conversation_id_failed model={}",
-                request.model
-            );
-            ApiError::upstream()
-        })?;
-    eprintln!(
-        "native_web_image conversation_id_ok model={}",
-        request.model
-    );
-    let ids = native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline)
-        .await
-        .inspect_err(|error| {
-            eprintln!(
-                "native_web_image poll_failed model={} code={}",
-                request.model,
-                error.code()
-            );
-        })?;
-    eprintln!(
-        "native_web_image poll_ok model={} ids={}",
-        request.model,
-        ids.len()
-    );
+        .map_err(|_| ApiError::upstream())?;
+    let ids =
+        native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline).await?;
     let downloaded =
         native_download_image_files(state, lease, &context, &conversation_id, &ids, deadline)
-            .await
-            .inspect_err(|error| {
-                eprintln!(
-                    "native_web_image download_failed model={} code={}",
-                    request.model,
-                    error.code()
-                );
-            })?;
-    eprintln!(
-        "native_web_image download_ok model={} count={}",
-        request.model,
-        downloaded.len()
-    );
+            .await?;
     let mut data = Vec::new();
     for bytes in downloaded {
         let bytes =
