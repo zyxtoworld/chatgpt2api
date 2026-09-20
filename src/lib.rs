@@ -13247,6 +13247,33 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 static NATIVE_MESSAGE_ID: AtomicUsize = AtomicUsize::new(1);
 
 fn native_message_id() -> String {
+    #[cfg(not(test))]
+    {
+        let mut bytes = [0u8; 16];
+        if getrandom::getrandom(&mut bytes).is_ok() {
+            bytes[6] = (bytes[6] & 0x0f) | 0x40;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            return format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                bytes[0],
+                bytes[1],
+                bytes[2],
+                bytes[3],
+                bytes[4],
+                bytes[5],
+                bytes[6],
+                bytes[7],
+                bytes[8],
+                bytes[9],
+                bytes[10],
+                bytes[11],
+                bytes[12],
+                bytes[13],
+                bytes[14],
+                bytes[15],
+            );
+        }
+    }
     let id = NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
     format!("00000000-0000-4000-8000-{id:012x}")
 }
