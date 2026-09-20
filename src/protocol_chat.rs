@@ -299,7 +299,9 @@ fn native_text_candidate(value: &Value) -> Result<Option<String>, io::Error> {
                     .ok_or_else(|| io::Error::other("malformed upstream event"))?,
             );
         }
-        return Ok((!text.is_empty()).then_some(text));
+        if !text.is_empty() {
+            return Ok(Some(text));
+        }
     }
     if let Some(text) = content.get("text") {
         let text = text
