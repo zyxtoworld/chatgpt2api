@@ -7856,6 +7856,8 @@ async fn native_download_image_files(
                 &referer,
             )
             .header(header::ACCEPT, "application/json")
+            .header("X-OpenAI-Target-Path", path.as_str())
+            .header("X-OpenAI-Target-Route", path.as_str())
             .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
             if with_file_query {
                 request = request.query(&[("post_id", ""), ("inline", "false")]);
@@ -7869,10 +7871,16 @@ async fn native_download_image_files(
                     .map_err(|_| ApiError::upstream())?
                     .map_err(|_| ApiError::upstream())?;
             if !response.status().is_success() {
+                eprintln!(
+                    "native_web_image download_meta_status={} path={}",
+                    response.status(),
+                    path
+                );
                 continue;
             }
             let body = bounded_response_body(response).await?;
             let Ok(meta) = serde_json::from_slice::<Value>(&body) else {
+                eprintln!("native_web_image download_meta_json_failed path={}", path);
                 continue;
             };
             let Some(url) = meta
@@ -7882,18 +7890,35 @@ async fn native_download_image_files(
                 .map(str::trim)
                 .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
             else {
+                eprintln!("native_web_image download_meta_url_missing path={}", path);
                 continue;
             };
+            let blob_referer = format!("{base_url}/c/{conversation_id}");
+            let mut blob_request =
+                native_browser_headers_with_referer(state.client.get(url), context, &blob_referer);
+            if url.starts_with(base_url) {
+                blob_request =
+                    blob_request.header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
+                if let Some(account_id) = lease.chatgpt_account_id() {
+                    blob_request = blob_request.header("ChatGPT-Account-ID", account_id);
+                }
+            }
             let response = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
-                state.client.get(url).send(),
+                blob_request.send(),
             )
             .await
             .map_err(|_| ApiError::upstream())?
             .map_err(|_| ApiError::upstream())?;
             if !response.status().is_success() {
+                eprintln!(
+                    "native_web_image download_blob_status={} path={}",
+                    response.status(),
+                    path
+                );
                 continue;
             }
+            eprintln!("native_web_image download_candidate_ok path={}", path);
             downloaded = Some(bounded_response_body(response).await?);
             break;
         }
