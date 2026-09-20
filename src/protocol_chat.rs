@@ -573,13 +573,23 @@ pub(crate) fn native_usage_frame(
 pub(crate) fn native_completion_text(body: &[u8]) -> Result<String, ApiError> {
     let mut text = String::new();
     let mut terminated = false;
+    let mut event_index = 0usize;
     let mut buffer = body.to_vec();
     while let Some((position, delimiter_length)) = sse_delimiter(&buffer) {
         let event = buffer.drain(..position).collect::<Vec<_>>();
         buffer.drain(..delimiter_length);
+        event_index = event_index.saturating_add(1);
         if let Some(frame) =
-            native_frame(&event, &mut text, "chatcmpl-rust-canary", "auto", 0, false)
-                .map_err(|_| ApiError::upstream())?
+            native_frame(&event, &mut text, "chatcmpl-rust-canary", "auto", 0, false).map_err(
+                |error| {
+                    ApiError::upstream_message(format!(
+                        "diagnostic sse event={} error={} payload={}",
+                        event_index,
+                        error,
+                        String::from_utf8_lossy(&event[..event.len().min(700)]),
+                    ))
+                },
+            )?
             && frame == b"data: [DONE]\n\n"
         {
             terminated = true;
