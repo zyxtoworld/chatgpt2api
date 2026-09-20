@@ -5507,6 +5507,17 @@ fn native_response_image_inputs(
                     .ok_or_else(ApiError::invalid_request)?;
                 images.push(image.to_owned());
             }
+            Some("message") => {
+                if object
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .is_none_or(|role| role == "user")
+                {
+                    if let Some(content) = object.get("content") {
+                        native_response_image_inputs(content, prompt, images)?;
+                    }
+                }
+            }
             Some(_) => {}
             None => {
                 if object
@@ -7484,7 +7495,11 @@ async fn native_upload_image(
         .header(header::CONTENT_TYPE, &mime_type)
         .header(header::CONTENT_LENGTH, file_size)
         .header("x-ms-blob-type", "BlockBlob")
-        .header("x-ms-version", "2020-04-08");
+        .header("x-ms-version", "2020-04-08")
+        .header("Origin", NATIVE_ORIGIN)
+        .header("Referer", format!("{base_url}/"))
+        .header(header::USER_AGENT, NATIVE_USER_AGENT)
+        .header(header::ACCEPT, "application/json, text/plain, */*");
     upload_request = match upload_body {
         UploadBody::Bytes(bytes) => upload_request.body(bytes),
         UploadBody::File(source) => {
@@ -9055,11 +9070,11 @@ fn native_chat_search_text(result: &Value) -> (String, Vec<Value>) {
         if !title.is_empty() {
             text.push_str(" - ");
         }
-        let start = text.len();
+        let start = text.chars().count();
         text.push_str(url);
         annotations.push(json!({
             "type":"url_citation",
-            "url_citation":{"start_index":start,"end_index":text.len(),"url":url,"title":label}
+            "url_citation":{"start_index":start,"end_index":text.chars().count(),"url":url,"title":label}
         }));
         text.push('\n');
     }
