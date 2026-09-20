@@ -35,6 +35,12 @@ fn is_request_eligible_status(status: &str) -> bool {
 
 fn is_request_eligible_record(record: &AccountRecord) -> bool {
     is_request_eligible_status(record.status.as_str())
+        && record
+            .raw
+            .get("invalid_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default()
+            == 0
 }
 
 #[derive(Clone, Debug)]

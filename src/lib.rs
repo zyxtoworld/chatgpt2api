@@ -29192,7 +29192,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn account_acquire_does_not_permanently_skip_deferred_invalid_accounts() {
+    async fn account_acquire_skips_deferred_invalid_accounts() {
         let path = test_tmp_dir().join(format!(
             "chatgpt2api-rust-deferred-invalid-{}-{}.json",
             std::process::id(),
@@ -29207,14 +29207,11 @@ data: [DONE]
         )
         .expect("deferred invalid fixture");
         let store = AccountStore::load(Some(&path)).expect("account store");
-        let mut tokens = HashSet::new();
         for _ in 0..8 {
-            let lease = store.acquire("gpt-test").await.expect("account");
-            tokens.insert(lease.token().to_owned());
+            let lease = store.acquire("gpt-test").await.expect("healthy account");
+            assert_eq!(lease.token(), "healthy");
             drop(lease);
         }
-        assert!(tokens.contains("deferred-invalid"));
-        assert!(tokens.contains("healthy"));
         fs::remove_file(path).expect("cleanup");
     }
 
