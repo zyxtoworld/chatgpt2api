@@ -5528,7 +5528,7 @@ fn native_response_image_inputs(
 async fn native_responses_image_request_from_object(
     state: &AppState,
     object: &Map<String, Value>,
-) -> Result<(NativeImageRequest, String), ApiError> {
+) -> Result<NativeImageRequest, ApiError> {
     let tool = native_response_image_tool(object).ok_or_else(ApiError::invalid_request)?;
     let model = tool
         .get("model")
@@ -5552,11 +5552,6 @@ async fn native_responses_image_request_from_object(
     for value in image_values {
         images.push(native_chat_image_source(state, value).await?);
     }
-    let endpoint = if images.is_empty() {
-        "images/generations"
-    } else {
-        "images/edits"
-    };
     let quality = tool
         .get("quality")
         .and_then(Value::as_str)
@@ -5594,7 +5589,7 @@ async fn native_responses_image_request_from_object(
         mask: None,
         temp_guard: None,
     };
-    Ok((request, endpoint.to_owned()))
+    Ok(request)
 }
 
 fn native_responses_image_items(prompt: &str, data: &[Value]) -> Vec<Value> {
@@ -5618,7 +5613,12 @@ async fn native_responses_image_completion(
     state: AppState,
     object: Map<String, Value>,
 ) -> Result<Response, ApiError> {
-    let (request, endpoint) = native_responses_image_request_from_object(&state, &object).await?;
+    let request = native_responses_image_request_from_object(&state, &object).await?;
+    let endpoint = if request.images.is_empty() {
+        "images/generations"
+    } else {
+        "images/edits"
+    };
     let model = object
         .get("model")
         .and_then(Value::as_str)
@@ -8694,11 +8694,31 @@ async fn native_codex_image_request_proxy(
             AccountStore::note_usage_mark_failure();
         }
         drop(lease);
-        data.extend(
-            results
-                .into_iter()
-                .map(|result| json!({"b64_json": result, "revised_prompt": request.prompt})),
-        );
+        for result in results {
+            let encoded = result
+                .strip_prefix("data:image/")
+                .and_then(|value| value.split_once(',').map(|(_, encoded)| encoded))
+                .unwrap_or(&result);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| ApiError::upstream())?;
+            let bytes =
+                native_image_output(&bytes, &request.output_format, request.output_compression)?;
+            let url = native_save_image(&state, &bytes, &request.output_format)?;
+            let mut item = Map::new();
+            if request.response_format == "b64_json" {
+                item.insert(
+                    "b64_json".to_owned(),
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                );
+            }
+            item.insert("url".to_owned(), Value::String(url));
+            item.insert(
+                "revised_prompt".to_owned(),
+                Value::String(request.prompt.clone()),
+            );
+            data.push(Value::Object(item));
+        }
     }
     if data.is_empty() {
         return Err(ApiError::upstream());
