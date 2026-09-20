@@ -451,6 +451,16 @@ pub(crate) fn native_frame(
     }
     let value: Value =
         serde_json::from_str(&data).map_err(|_| io::Error::other("malformed upstream event"))?;
+    // ChatGPT emits lifecycle metadata before and between visible messages
+    // (for example resume_conversation_token). Python skips those frames;
+    // they are not malformed assistant content.
+    if value.get("type").and_then(Value::as_str).is_some()
+        && value.get("message").is_none()
+        && value.get("p").is_none()
+        && value.get("v").is_none()
+    {
+        return Ok(None);
+    }
     let candidate = native_text_candidate(&value)?;
     let candidate = candidate.or(native_patch_candidate(&value, current_text, 0)?);
     let Some(candidate) = candidate else {
