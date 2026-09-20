@@ -5512,10 +5512,9 @@ fn native_response_image_inputs(
                     .get("role")
                     .and_then(Value::as_str)
                     .is_none_or(|role| role == "user")
+                    && let Some(content) = object.get("content")
                 {
-                    if let Some(content) = object.get("content") {
-                        native_response_image_inputs(content, prompt, images)?;
-                    }
+                    native_response_image_inputs(content, prompt, images)?;
                 }
             }
             Some(_) => {}
@@ -5524,10 +5523,9 @@ fn native_response_image_inputs(
                     .get("role")
                     .and_then(Value::as_str)
                     .is_none_or(|role| role == "user")
+                    && let Some(content) = object.get("content")
                 {
-                    if let Some(content) = object.get("content") {
-                        native_response_image_inputs(content, prompt, images)?;
-                    }
+                    native_response_image_inputs(content, prompt, images)?;
                 }
             }
         },
@@ -5636,9 +5634,9 @@ async fn native_responses_image_completion(
         .unwrap_or("auto")
         .to_owned();
     let image_response = if request.codex {
-        native_codex_image_request_proxy(state, request, &endpoint).await?
+        native_codex_image_request_proxy(state, request, endpoint).await?
     } else {
-        native_web_image_request_proxy(state, request, &endpoint).await?
+        native_web_image_request_proxy(state, request, endpoint).await?
     };
     let body = to_bytes(image_response.into_body(), MAX_REQUEST_BODY_BYTES)
         .await
@@ -7739,10 +7737,8 @@ async fn native_poll_image_file_ids(
         .ok_or_else(ApiError::unavailable)?
         .trim_end_matches('/');
     let (initial_wait, poll_interval, settle, settle_enabled) = native_image_poll_timing(state);
-    if !initial_wait.is_zero() {
-        if !sleep_search_poll_with_interval(deadline, initial_wait).await {
-            return Err(ApiError::upstream());
-        }
+    if !initial_wait.is_zero() && !sleep_search_poll_with_interval(deadline, initial_wait).await {
+        return Err(ApiError::upstream());
     }
     let mut last_ids: Option<Vec<String>> = None;
     loop {
