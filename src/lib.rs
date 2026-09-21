@@ -25474,10 +25474,13 @@ mod tests {
             })
             .cloned()
             .collect::<Vec<_>>();
-        without_quota.dedup();
         assert_eq!(
             without_quota,
-            vec![json!("configured-model"), json!("web-model")]
+            vec![
+                json!("configured-model"),
+                json!("web-model"),
+                json!("configured-model")
+            ]
         );
     }
 
