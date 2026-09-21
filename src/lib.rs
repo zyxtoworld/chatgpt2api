@@ -8687,13 +8687,22 @@ async fn native_web_image_attempt(
     if let Some(effort) = model_settings.default_thinking_effort.as_deref() {
         prepare_payload["thinking_effort"] = Value::String(effort.to_owned());
     }
-    let mut prepare =
-        native_browser_headers(client.post(format!("{base_url}{prepare_path}")), &context)
-            .header(header::ACCEPT, "*/*")
-            .header("X-OpenAI-Target-Path", prepare_path)
-            .header("X-OpenAI-Target-Route", prepare_path)
-            .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
-            .json(&prepare_payload);
+    let mut prepare = native_browser_headers_with_clearance(
+        client.post(format!("{base_url}{prepare_path}")),
+        &context,
+        &format!("{base_url}/"),
+        Some(&state.clearance_store),
+        Some(&proxy_runtime_value(state)),
+        lease.proxy_url().unwrap_or_default(),
+        base_url,
+        None,
+    )
+    .await
+    .header(header::ACCEPT, "*/*")
+    .header("X-OpenAI-Target-Path", prepare_path)
+    .header("X-OpenAI-Target-Route", prepare_path)
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .json(&prepare_payload);
     if let Some(account_id) = lease.chatgpt_account_id() {
         prepare = prepare.header("ChatGPT-Account-ID", account_id);
     }
@@ -8781,18 +8790,28 @@ async fn native_web_image_attempt(
     if let Some(effort) = model_settings.default_thinking_effort.as_deref() {
         run_payload["thinking_effort"] = Value::String(effort.to_owned());
     }
-    let mut run = native_browser_headers(client.post(format!("{base_url}{run_path}")), &context)
-        .header(header::ACCEPT, "text/event-stream")
-        .header("X-Oai-Turn-Trace-Id", native_message_id())
-        .header("X-OpenAI-Target-Path", run_path)
-        .header("X-OpenAI-Target-Route", run_path)
-        .header("X-Conduit-Token", conduit)
-        .header(
-            "OpenAI-Sentinel-Chat-Requirements-Token",
-            requirements.token,
-        )
-        .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
-        .json(&run_payload);
+    let mut run = native_browser_headers_with_clearance(
+        client.post(format!("{base_url}{run_path}")),
+        &context,
+        &format!("{base_url}/c/"),
+        Some(&state.clearance_store),
+        Some(&proxy_runtime_value(state)),
+        lease.proxy_url().unwrap_or_default(),
+        base_url,
+        None,
+    )
+    .await
+    .header(header::ACCEPT, "text/event-stream")
+    .header("X-Oai-Turn-Trace-Id", native_message_id())
+    .header("X-OpenAI-Target-Path", run_path)
+    .header("X-OpenAI-Target-Route", run_path)
+    .header("X-Conduit-Token", conduit)
+    .header(
+        "OpenAI-Sentinel-Chat-Requirements-Token",
+        requirements.token,
+    )
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .json(&run_payload);
     if let Some(account_id) = lease.chatgpt_account_id() {
         run = run.header("ChatGPT-Account-ID", account_id);
     }
