@@ -19,6 +19,7 @@ mod protocol_anthropic;
 mod protocol_chat;
 mod protocol_codex_payload;
 mod protocol_responses;
+mod proxy_service;
 mod responses_websocket;
 mod shutdown;
 mod storage;
