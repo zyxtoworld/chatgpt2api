@@ -9941,7 +9941,7 @@ async fn native_search_attempt(
     }
     let conversation_id = search_conversation_id_from_response(run, deadline, false).await?;
     native_search_poll(NativeSearchPollRequest {
-        state: &state,
+        state: Some(&state),
         client: &client,
         base_url,
         token: lease.token(),
@@ -9955,7 +9955,7 @@ async fn native_search_attempt(
 }
 
 struct NativeSearchPollRequest<'a> {
-    state: &'a AppState,
+    state: Option<&'a AppState>,
     client: &'a Client,
     base_url: &'a str,
     token: &'a str,
@@ -9992,8 +9992,8 @@ async fn native_search_poll(
             client.get(format!("{base_url}{poll_path}")),
             context,
             &referer,
-            Some(&state.clearance_store),
-            Some(&proxy_runtime_value(state)),
+            state.map(|state| &state.clearance_store),
+            state.map(proxy_runtime_value).as_ref(),
             "",
             base_url,
             None,
@@ -42850,7 +42850,7 @@ data: [DONE]
             .expect("poll server readiness");
         assert_eq!(ready.status(), StatusCode::NO_CONTENT);
         let result = native_search_poll(NativeSearchPollRequest {
-            state: &state,
+            state: None,
             client: &client,
             base_url: &base_url,
             token: "search-token",
@@ -42920,7 +42920,7 @@ data: [DONE]
             .expect("poll server readiness");
         assert_eq!(ready.status(), StatusCode::NO_CONTENT);
         let result = native_search_poll(NativeSearchPollRequest {
-            state: &state,
+            state: None,
             client: &client,
             base_url: &base_url,
             token: "search-token",
