@@ -3136,11 +3136,11 @@ async fn refresh_access_token_account(
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
     }
+    result["_model_source_version"] = json!(ACCOUNT_MODEL_SOURCE_VERSION);
+    result["_verified_image_capability"] = Value::Bool(quota > 0);
     if image_quota_from_value(Some(&result["quota"])).is_some() {
         ensure_image_model_snapshot(&mut result);
     }
-    result["_model_source_version"] = json!(ACCOUNT_MODEL_SOURCE_VERSION);
-    result["_verified_image_capability"] = Value::Bool(quota > 0);
     canonicalize_account_item(&result).map_err(|_| "invalid_account")
 }
 
