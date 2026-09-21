@@ -9941,7 +9941,7 @@ async fn native_search_attempt(
     }
     let conversation_id = search_conversation_id_from_response(run, deadline, false).await?;
     native_search_poll(NativeSearchPollRequest {
-        state: Some(&state),
+        state,
         client: &client,
         base_url,
         token: lease.token(),
