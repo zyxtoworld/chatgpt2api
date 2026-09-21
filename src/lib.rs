@@ -203,6 +203,19 @@ fn upstream_client_for_profile(profile: &ProxyProfile) -> Result<Client, ()> {
     let _ = profile.skip_ssl_verify;
     builder.build().map_err(|_| ())
 }
+
+fn upstream_client_for_lease(state: &AppState, lease: &AccountLease, resource: bool) -> Client {
+    let runtime = proxy_runtime_value(state);
+    let profile = proxy_service::profile_from_runtime(
+        &runtime,
+        lease.proxy_url(),
+        None,
+        None,
+        resource,
+        true,
+    );
+    upstream_client_for_profile(&profile).unwrap_or_else(|_| state.client.clone())
+}
 type HealthSnapshotSync = Arc<dyn Fn() + Send + Sync>;
 static NATIVE_POW_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(NATIVE_POW_MAX_CONCURRENCY)));
@@ -7669,8 +7682,9 @@ async fn native_upload_image(
     };
     let file_name = format!("image-{index}.{extension}");
     let path = "/backend-api/files";
+    let client = upstream_client_for_lease(state, lease, true);
     let mut request = native_browser_headers(
-        state.client.post(format!(
+        client.post(format!(
             "{}{path}",
             state
                 .config
@@ -7789,7 +7803,7 @@ async fn native_upload_image(
     }
     let uploaded_path = format!("/backend-api/files/{file_id}/uploaded");
     let mut confirm = native_browser_headers(
-        state.client.post(format!(
+        client.post(format!(
             "{}{uploaded_path}",
             state
                 .config
@@ -8136,8 +8150,9 @@ async fn native_download_image_files(
         };
         let mut downloaded = None;
         for (path, referer, with_file_query) in candidates {
+            let client = upstream_client_for_lease(state, lease, true);
             let mut request = native_browser_headers_with_referer(
-                state.client.get(format!("{base_url}{path}")),
+                client.get(format!("{base_url}{path}")),
                 context,
                 &referer,
             )
@@ -8173,8 +8188,12 @@ async fn native_download_image_files(
                 continue;
             };
             let blob_referer = format!("{base_url}/c/{conversation_id}");
-            let mut blob_request =
-                native_browser_headers_with_referer(state.client.get(url), context, &blob_referer);
+            let resource_client = upstream_client_for_lease(state, lease, true);
+            let mut blob_request = native_browser_headers_with_referer(
+                resource_client.get(url),
+                context,
+                &blob_referer,
+            );
             if url.starts_with(base_url) {
                 blob_request =
                     blob_request.header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
