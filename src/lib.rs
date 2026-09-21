@@ -217,9 +217,35 @@ fn chat_cache_config(state: &AppState) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-fn chat_cache_key(object: &Map<String, Value>) -> Option<String> {
+fn normalize_cached_messages(state: &AppState, value: &Value) -> Value {
+    let config = chat_cache_config(state);
+    if !settings_bool(config.get("normalize_messages"), true) {
+        return value.clone();
+    }
+    let Some(messages) = value.as_array() else {
+        return value.clone();
+    };
+    let drop_assistant = settings_bool(config.get("drop_assistant_history"), false);
+    let drop_duplicates = settings_bool(config.get("drop_adjacent_duplicates"), true);
+    let mut normalized = Vec::new();
+    let mut previous = None;
+    for message in messages {
+        if drop_assistant && message.get("role").and_then(Value::as_str) == Some("assistant") {
+            continue;
+        }
+        let signature = serde_json::to_string(message).unwrap_or_default();
+        if drop_duplicates && previous.as_deref() == Some(signature.as_str()) {
+            continue;
+        }
+        previous = Some(signature);
+        normalized.push(message.clone());
+    }
+    Value::Array(normalized)
+}
+
+fn chat_cache_key(state: &AppState, object: &Map<String, Value>, stream: bool) -> Option<String> {
     let model = object.get("model").and_then(Value::as_str)?;
-    let messages = object.get("messages")?;
+    let messages = normalize_cached_messages(state, object.get("messages")?);
     let mut canonical = Map::new();
     for key in [
         "frequency_penalty",
@@ -246,18 +272,30 @@ fn chat_cache_key(object: &Map<String, Value>) -> Option<String> {
     }
     canonical.insert("model".to_owned(), Value::String(model.to_owned()));
     canonical.insert("messages".to_owned(), messages.clone());
-    canonical.insert("stream".to_owned(), Value::Bool(false));
+    canonical.insert("stream".to_owned(), Value::Bool(stream));
     let bytes = serde_json::to_vec(&canonical).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn chat_cache_read(state: &AppState, key: &str) -> Option<Value> {
+fn chat_cache_enabled(state: &AppState, stream: bool) -> Option<(u64, usize, bool)> {
     let config = chat_cache_config(state);
     if !settings_bool(config.get("enabled"), true)
-        || settings_u64(config.get("ttl_seconds"), 60, 0) == 0
+        || (stream && !settings_bool(config.get("stream_cache"), true))
     {
         return None;
     }
+    let ttl = settings_u64(config.get("ttl_seconds"), 60, 0);
+    (ttl > 0).then(|| {
+        (
+            ttl,
+            settings_u64(config.get("max_entries"), 256, 1) as usize,
+            settings_bool(config.get("dedupe_inflight"), true),
+        )
+    })
+}
+
+fn chat_cache_read(state: &AppState, key: &str) -> Option<Value> {
+    chat_cache_enabled(state, false)?;
     let mut cache = state.chat_cache.lock().ok()?;
     let entry = cache.entries.get(key)?;
     if SystemTime::now() >= entry.expires_at {
@@ -268,15 +306,9 @@ fn chat_cache_read(state: &AppState, key: &str) -> Option<Value> {
 }
 
 fn chat_cache_write(state: &AppState, key: String, value: Value) {
-    let config = chat_cache_config(state);
-    if !settings_bool(config.get("enabled"), true) {
+    let Some((ttl, max_entries, _)) = chat_cache_enabled(state, false) else {
         return;
-    }
-    let ttl = settings_u64(config.get("ttl_seconds"), 60, 0);
-    if ttl == 0 {
-        return;
-    }
-    let max_entries = settings_u64(config.get("max_entries"), 256, 1) as usize;
+    };
     if let Ok(mut cache) = state.chat_cache.lock() {
         let now = SystemTime::now();
         cache.entries.retain(|_, item| now < item.expires_at);
@@ -298,6 +330,45 @@ fn chat_cache_write(state: &AppState, key: String, value: Value) {
             } else {
                 break;
             }
+        }
+    }
+}
+
+fn chat_cache_read_stream(state: &AppState, key: &str) -> Option<Value> {
+    chat_cache_enabled(state, true)?;
+    let mut cache = state.chat_cache.lock().ok()?;
+    let entry = cache.entries.get(key)?;
+    if SystemTime::now() >= entry.expires_at {
+        cache.entries.remove(key);
+        return None;
+    }
+    Some(entry.value.clone())
+}
+
+fn chat_cache_write_stream(state: &AppState, key: String, value: Value) {
+    let Some((ttl, max_entries, _)) = chat_cache_enabled(state, true) else {
+        return;
+    };
+    if let Ok(mut cache) = state.chat_cache.lock() {
+        let now = SystemTime::now();
+        cache.entries.retain(|_, item| now < item.expires_at);
+        cache.entries.insert(
+            key,
+            ChatCacheEntry {
+                expires_at: now + Duration::from_secs(ttl),
+                value,
+            },
+        );
+        while cache.entries.len() > max_entries {
+            let Some(oldest) = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, item)| item.expires_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            cache.entries.remove(&oldest);
         }
     }
 }
@@ -1565,7 +1636,6 @@ const IMPORTED_MODEL_CATALOG_RETRY_BACKOFF: Duration = if cfg!(test) {
 };
 const IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS: usize = 2;
 const IMPORTED_MODEL_CATALOG_LAST_GOOD_REASON: &str = "last_good_web_catalog_unavailable";
-const IMPORTED_MODEL_CATALOG_IMAGE_ONLY_REASON: &str = "image_only_catalog_without_web_models";
 
 #[derive(Clone)]
 struct ImportedModelCatalogCache {
@@ -1595,10 +1665,6 @@ enum ImportedModelCatalogState {
 
 enum ImportedModelCatalogFetch {
     Complete(Vec<PublicModel>),
-    Partial {
-        models: Vec<PublicModel>,
-        web_unavailable_reason: &'static str,
-    },
 }
 
 struct ImportedModelCatalogEntry {
@@ -1608,35 +1674,6 @@ struct ImportedModelCatalogEntry {
     attempt_count: AtomicUsize,
     cache_hit_count: AtomicUsize,
     retry_count: AtomicUsize,
-}
-
-fn merge_public_model_catalog(
-    base: &mut Vec<PublicModel>,
-    additions: impl IntoIterator<Item = PublicModel>,
-) {
-    let mut indexes = base
-        .iter()
-        .enumerate()
-        .map(|(index, model)| (model.id.clone(), index))
-        .collect::<HashMap<_, _>>();
-    for model in additions {
-        if let Some(index) = indexes.get(&model.id).copied() {
-            if model_provenance_rank(model.provenance)
-                > model_provenance_rank(base[index].provenance)
-            {
-                base[index] = model;
-            }
-        } else if base.len() < MAX_MODELS {
-            indexes.insert(model.id.clone(), base.len());
-            base.push(model);
-        }
-    }
-}
-
-fn catalog_has_web_models(models: &[PublicModel]) -> bool {
-    models
-        .iter()
-        .any(|model| model.provenance == ModelProvenance::Web)
 }
 
 #[derive(Default)]
@@ -1845,8 +1882,7 @@ impl ImportedModelCatalogCache {
                 let mut state = entry.state.lock().await;
                 match &*state {
                     ImportedModelCatalogState::Ready { models, expires_at }
-                        if Instant::now() < *expires_at
-                            && (allow_partial || catalog_has_web_models(models)) =>
+                        if Instant::now() < *expires_at =>
                     {
                         if !counted_waiter_hit {
                             entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -1859,12 +1895,7 @@ impl ImportedModelCatalogCache {
                     }
                     ImportedModelCatalogState::PartialReady {
                         models, expires_at, ..
-                    } if Instant::now() < *expires_at
-                        && (allow_partial
-                            || models
-                                .iter()
-                                .any(|model| model.provenance == ModelProvenance::Web)) =>
-                    {
+                    } if Instant::now() < *expires_at && allow_partial => {
                         if !counted_waiter_hit {
                             entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
                             self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -1905,21 +1936,7 @@ impl ImportedModelCatalogCache {
                 }
                 let result = match fetch().await {
                     Some(ImportedModelCatalogFetch::Complete(models)) if !models.is_empty() => {
-                        if allow_partial || catalog_has_web_models(&models) {
-                            Some((false, models, ""))
-                        } else {
-                            let mut preserved = last_good_models.take().unwrap_or_default();
-                            merge_public_model_catalog(&mut preserved, models);
-                            Some((true, preserved, IMPORTED_MODEL_CATALOG_IMAGE_ONLY_REASON))
-                        }
-                    }
-                    Some(ImportedModelCatalogFetch::Partial {
-                        models,
-                        web_unavailable_reason,
-                    }) if !models.is_empty() => {
-                        let mut preserved = last_good_models.take().unwrap_or_default();
-                        merge_public_model_catalog(&mut preserved, models);
-                        Some((true, preserved, web_unavailable_reason))
+                        Some((false, models, ""))
                     }
                     _ => last_good_models
                         .take()
@@ -1950,18 +1967,7 @@ impl ImportedModelCatalogCache {
                 };
                 *entry.state.lock().await = next.clone();
                 let _ = entry.updates.send(next);
-                return result.and_then(|(partial, models, _)| {
-                    if partial
-                        && !allow_partial
-                        && !models
-                            .iter()
-                            .any(|model| model.provenance == ModelProvenance::Web)
-                    {
-                        None
-                    } else {
-                        Some(models)
-                    }
-                });
+                return result.map(|(_, models, _)| models);
             }
             if !counted_waiter_hit {
                 entry.cache_hit_count.fetch_add(1, Ordering::Relaxed);
@@ -3087,7 +3093,6 @@ async fn refresh_access_token_account(
         account_id: account_id.map(ToOwned::to_owned),
         deadline: Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
         batch,
-        image_capable: quota > 0,
         retry: true,
         require_web_catalog: true,
     });
@@ -8119,6 +8124,52 @@ async fn native_download_image_files(
     Ok(outputs)
 }
 
+fn native_image_cleanup_flags(state: &AppState) -> (bool, bool) {
+    let config = fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    (
+        settings_bool(config.get("image_remove_conversation_always"), false),
+        settings_bool(config.get("image_remove_conversation_after_result"), false),
+    )
+}
+
+fn native_spawn_image_cleanup(
+    state: &AppState,
+    lease: &AccountLease,
+    context: &NativeRequestContext,
+    conversation_id: &str,
+) {
+    if conversation_id.trim().is_empty() {
+        return;
+    }
+    let client = state.client.clone();
+    let base_url = state.config.upstream_base_url.clone().unwrap_or_default();
+    let token = lease.token().to_owned();
+    let account_id = lease.chatgpt_account_id().map(ToOwned::to_owned);
+    let context = context.clone();
+    let conversation_id = conversation_id.to_owned();
+    tokio::spawn(async move {
+        let base_url = base_url.trim_end_matches('/');
+        let path = format!("/backend-api/conversation/{conversation_id}");
+        let mut request = native_browser_headers_with_referer(
+            client.patch(format!("{base_url}{path}")),
+            &context,
+            &format!("{base_url}/c/{conversation_id}"),
+        )
+        .header(header::ACCEPT, "*/*")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("X-OpenAI-Target-Path", path.as_str())
+        .header("X-OpenAI-Target-Route", path.as_str())
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .json(&json!({"is_visible": false}));
+        if let Some(account_id) = account_id {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
+        let _ = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send()).await;
+    });
+}
 async fn native_web_image_request_proxy(
     state: AppState,
     request: NativeImageRequest,
@@ -8432,11 +8483,30 @@ async fn native_web_image_attempt(
     let conversation_id = search_conversation_id_from_response(response, deadline, true)
         .await
         .map_err(|_| ApiError::upstream())?;
-    let ids =
-        native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline).await?;
+    let (remove_always, remove_after_result) = native_image_cleanup_flags(state);
+    let ids = match native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline)
+        .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            if remove_always {
+                native_spawn_image_cleanup(state, lease, &context, &conversation_id);
+            }
+            return Err(error);
+        }
+    };
     let downloaded =
-        native_download_image_files(state, lease, &context, &conversation_id, &ids, deadline)
-            .await?;
+        match native_download_image_files(state, lease, &context, &conversation_id, &ids, deadline)
+            .await
+        {
+            Ok(downloaded) => downloaded,
+            Err(error) => {
+                if remove_always {
+                    native_spawn_image_cleanup(state, lease, &context, &conversation_id);
+                }
+                return Err(error);
+            }
+        };
     let mut data = Vec::new();
     for bytes in downloaded {
         let bytes =
@@ -8457,7 +8527,13 @@ async fn native_web_image_attempt(
         data.push(Value::Object(item));
     }
     if data.is_empty() {
+        if remove_always {
+            native_spawn_image_cleanup(state, lease, &context, &conversation_id);
+        }
         return Err(ApiError::upstream());
+    }
+    if remove_after_result || remove_always {
+        native_spawn_image_cleanup(state, lease, &context, &conversation_id);
     }
     let event_type = if endpoint == "images/edits" {
         "image_edit.completed"
@@ -13179,7 +13255,6 @@ pub(crate) async fn fetch_imported_model_catalog(
         account_id: account_id.map(ToOwned::to_owned),
         deadline,
         batch: None,
-        image_capable: false,
         retry: true,
         require_web_catalog: true,
     })
@@ -13195,16 +13270,8 @@ struct ImportedModelCatalogRequest {
     account_id: Option<String>,
     deadline: Instant,
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
-    image_capable: bool,
     retry: bool,
     require_web_catalog: bool,
-}
-
-fn imported_image_capability_model() -> PublicModel {
-    let mut model = ModelCatalog::project(&json!({"id": "gpt-image-2"}))
-        .expect("canonical image capability model");
-    model.provenance = ModelProvenance::Image;
-    model
 }
 
 async fn fetch_imported_model_catalog_request(
@@ -13219,11 +13286,10 @@ async fn fetch_imported_model_catalog_request(
         account_id,
         deadline,
         batch,
-        image_capable,
         retry,
         require_web_catalog,
     } = request;
-    let key = account_type.to_ascii_lowercase();
+    let key = format!("{}:{}", account_type.to_ascii_lowercase(), token);
     let retry_key = key.clone();
     let retry_cache = cache.clone();
     let retry_batch = batch.clone();
@@ -13260,14 +13326,7 @@ async fn fetch_imported_model_catalog_request(
                 | NativeModelCatalogFetchOutcome::PermanentUnavailable => None,
             }
         };
-        fetched
-            .map(ImportedModelCatalogFetch::Complete)
-            .or_else(|| {
-                image_capable.then(|| ImportedModelCatalogFetch::Partial {
-                    models: vec![imported_image_capability_model()],
-                    web_unavailable_reason: "canonical_web_catalog_unavailable",
-                })
-            })
+        fetched.map(ImportedModelCatalogFetch::Complete)
     };
     if require_web_catalog {
         cache
@@ -14157,7 +14216,6 @@ impl AccountTypeCatalog {
                         account_id: candidate.chatgpt_account_id.clone(),
                         deadline,
                         batch: None,
-                        image_capable: false,
                         retry: false,
                         require_web_catalog: true,
                     })
@@ -18065,11 +18123,16 @@ async fn chat_completions_with_timeout(
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or("auto");
+        let stream_requested = object
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let cache_key =
             (required_capability.is_none() && chat_payload.is_ok() && codex_payload.is_err())
-                .then(|| chat_cache_key(&object))
+                .then(|| chat_cache_key(&state, &object, stream_requested))
                 .flatten();
         if let Some(key) = cache_key.as_deref()
+            && !stream_requested
             && let Some(cached) = chat_cache_read(&state, key)
         {
             return Ok(Json(cached).into_response());
@@ -24293,106 +24356,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn imported_partial_catalog_preserves_expired_last_good_web_models() {
-        let cache = ImportedModelCatalogCache::new();
-        let initial = cache
-            .fetch_or_reuse("pro", || async {
-                Some(vec![test_public_model("web-model", ModelProvenance::Web)])
-            })
-            .await;
-        assert_eq!(initial.as_ref().map(Vec::len), Some(1));
-        let entry = cache
-            .entries
-            .lock()
-            .await
-            .get("pro")
-            .cloned()
-            .expect("catalog entry");
-        *entry.state.lock().await = ImportedModelCatalogState::Ready {
-            models: Arc::new(vec![test_public_model("web-model", ModelProvenance::Web)]),
-            expires_at: Instant::now() - Duration::from_secs(1),
-        };
-        let refreshed = cache
-            .fetch_or_reuse_with_catalog_batch("pro", None, || async {
-                Some(ImportedModelCatalogFetch::Partial {
-                    models: vec![imported_image_capability_model()],
-                    web_unavailable_reason: "test_web_unavailable",
-                })
-            })
-            .await
-            .expect("partial catalog");
-        let ids = refreshed
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect::<Vec<_>>();
-        assert!(ids.contains(&"web-model"));
-        assert!(ids.contains(&"gpt-image-2"));
-        let reused = cache
-            .fetch_or_reuse_with_catalog_batch("pro", None, || async {
-                panic!("partial last-good catalog should be reused")
-            })
-            .await
-            .expect("reused partial catalog");
-        assert_eq!(reused.len(), refreshed.len());
-    }
-
-    #[tokio::test]
-    async fn complete_catalog_request_does_not_accept_image_only_partial_cache() {
-        let cache = ImportedModelCatalogCache::new();
-        let partial = cache
-            .fetch_or_reuse_with_catalog_batch("pro", None, || async {
-                Some(ImportedModelCatalogFetch::Partial {
-                    models: vec![imported_image_capability_model()],
-                    web_unavailable_reason: "test_web_unavailable",
-                })
-            })
-            .await
-            .expect("image partial catalog");
-        assert_eq!(partial.len(), 1);
-        let complete = cache
-            .fetch_or_reuse_complete_catalog("pro", None, || async {
-                Some(ImportedModelCatalogFetch::Complete(vec![
-                    test_public_model("web-model", ModelProvenance::Web),
-                ]))
-            })
-            .await
-            .expect("complete Web catalog");
-        assert_eq!(
-            complete
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["web-model"]
-        );
-    }
-
-    #[tokio::test]
-    async fn complete_catalog_request_does_not_accept_image_only_ready_cache() {
-        let cache = ImportedModelCatalogCache::new();
-        let image_only = cache
-            .fetch_or_reuse("pro", || async {
-                Some(vec![imported_image_capability_model()])
-            })
-            .await
-            .expect("image-only catalog");
-        assert_eq!(image_only.len(), 1);
-        let complete = cache
-            .fetch_or_reuse_complete_catalog("pro", None, || async {
-                Some(ImportedModelCatalogFetch::Complete(vec![
-                    test_public_model("web-model", ModelProvenance::Web),
-                ]))
-            })
-            .await
-            .expect("complete Web catalog");
-        assert_eq!(
-            complete
-                .iter()
-                .map(|model| model.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["web-model"]
-        );
-    }
-
     #[tokio::test]
     async fn imported_model_catalog_does_not_retry_permanent_bootstrap_forbidden() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -24513,38 +24476,12 @@ mod tests {
         assert_eq!(stats.retries, 0);
     }
 
-    #[tokio::test]
-    async fn imported_partial_ready_reuses_image_capability_without_refetching_web_catalog() {
-        let cache = ImportedModelCatalogCache::new();
-        let first_batch = Arc::new(ImportedModelCatalogBatchStats::default());
-        let second_batch = Arc::new(ImportedModelCatalogBatchStats::default());
-        let image = imported_image_capability_model();
-        let first = cache
-            .fetch_or_reuse_with_catalog_batch("pro", Some(first_batch.clone()), || async {
-                Some(ImportedModelCatalogFetch::Partial {
-                    models: vec![image.clone()],
-                    web_unavailable_reason: "test_web_unavailable",
-                })
-            })
-            .await;
-        let second = cache
-            .fetch_or_reuse_with_catalog_batch("pro", Some(second_batch.clone()), || async {
-                panic!("partial-ready catalog must not refetch web models")
-            })
-            .await;
-        assert_eq!(first.as_ref().map(Vec::len), Some(1));
-        assert_eq!(second.as_ref().map(Vec::len), Some(1));
-        let first_stats = first_batch.snapshot();
-        assert_eq!(first_stats.fetches, 1);
-        assert_eq!(first_stats.cache_hits, 0);
-        let second_stats = second_batch.snapshot();
-        assert_eq!(second_stats.fetches, 0);
-        assert_eq!(second_stats.cache_hits, 1);
-    }
-
     #[test]
     fn imported_image_catalog_isolated_by_account_capability() {
-        let fetched = Some(vec![imported_image_capability_model()]);
+        let fetched = Some(vec![test_public_model(
+            "gpt-image-2",
+            ModelProvenance::Image,
+        )]);
         let without_capability = merge_account_models(&json!({}), fetched.clone(), false);
         assert!(without_capability.is_none());
         let with_capability = merge_account_models(&json!({}), fetched, true)

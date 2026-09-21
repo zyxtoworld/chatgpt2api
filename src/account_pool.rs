@@ -735,7 +735,6 @@ impl AccountStore {
                     continue;
                 }
             } else if model != "auto"
-                && !slot.record.models.is_empty()
                 && !slot
                     .record
                     .models
