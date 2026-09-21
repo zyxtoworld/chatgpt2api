@@ -3566,7 +3566,13 @@ async fn api_accounts_refresh(
                 item["status"] = Value::String("running".to_owned());
             }
         }
-        let result = refresh_accounts_now(&task_state, &requested, None).await;
+        let sink = AccountRefreshProgressSink {
+            progress: task_state.account_progress.clone(),
+            progress_id: task_progress_id.clone(),
+        };
+        let result =
+            refresh_accounts_now_with_deadline(&task_state, &requested, None, None, Some(sink))
+                .await;
         let mut progress = task_state.account_progress.lock().await;
         if let Some(item) = progress.get_mut(&task_progress_id) {
             match result {
@@ -3598,7 +3604,7 @@ async fn refresh_accounts_now(
     requested: &[String],
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
 ) -> Result<Value, ApiError> {
-    refresh_accounts_now_with_deadline(state, requested, batch, None).await
+    refresh_accounts_now_with_deadline(state, requested, batch, None, None).await
 }
 
 async fn persist_account_refresh_updates(
@@ -3686,6 +3692,7 @@ async fn refresh_accounts_now_with_deadline(
     requested: &[String],
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
     deadline: Option<Instant>,
+    progress_sink: Option<AccountRefreshProgressSink>,
 ) -> Result<Value, ApiError> {
     // Refresh account metadata with the existing access token only. Never
     // exchange, rotate, read, or persist another token type.
@@ -3736,6 +3743,9 @@ async fn refresh_accounts_now_with_deadline(
             break;
         };
         active_tokens.remove(&token);
+        if let Some(sink) = &progress_sink {
+            sink.record(&token, &result).await;
+        }
         match result {
             Ok(updated) => {
                 updated_records.push((token.clone(), updated));
@@ -3827,7 +3837,7 @@ pub(crate) async fn refresh_imported_accounts_with_batch_until(
     if tokens.is_empty() {
         return json!({"refreshed": 0, "errors": [], "items": public_accounts(state)["items"]});
     }
-    refresh_accounts_now_with_deadline(state, tokens, Some(batch), Some(deadline))
+    refresh_accounts_now_with_deadline(state, tokens, Some(batch), Some(deadline), None)
         .await
         .unwrap_or_else(
             |_| json!({"refreshed": 0, "errors": [], "items": public_accounts(state)["items"]}),
@@ -8313,6 +8323,7 @@ async fn native_web_image_request_proxy(
             std::slice::from_ref(&token),
             None,
             Some(validation_deadline),
+            None,
         )
         .await
         .ok()
@@ -13187,6 +13198,64 @@ const ACCOUNT_INVALID_CONFIRM_ATTEMPTS: u64 = 3;
 type AccountRefreshFuture =
     Pin<Box<dyn Future<Output = (String, Result<Value, &'static str>)> + Send>>;
 
+#[derive(Clone)]
+struct AccountRefreshProgressSink {
+    progress: Arc<Mutex<HashMap<String, Value>>>,
+    progress_id: String,
+}
+
+impl AccountRefreshProgressSink {
+    async fn record(&self, token: &str, result: &Result<Value, &'static str>) {
+        let mut progress = self.progress.lock().await;
+        let Some(item) = progress.get_mut(&self.progress_id) else {
+            return;
+        };
+        item["processed"] = Value::from(
+            item["processed"]
+                .as_u64()
+                .unwrap_or_default()
+                .saturating_add(1),
+        );
+        if result.is_ok() {
+            item["refreshed"] = Value::from(
+                item["refreshed"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .saturating_add(1),
+            );
+        } else if let Err(code) = result {
+            let errors = item["errors"].as_array_mut();
+            if let Some(errors) = errors {
+                errors.push(json!({"token": public_token_ref(token), "code": code}));
+            }
+        }
+        if let Some(updated) = result.as_ref().ok()
+            && let Some(status) = updated.get("status").and_then(Value::as_str)
+        {
+            let counts = item["status_counts"].as_object_mut();
+            if let Some(counts) = counts {
+                let next = counts
+                    .get(status)
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default()
+                    .saturating_add(1);
+                counts.insert(status.to_owned(), Value::from(next));
+            }
+            item["total_quota"] = Value::from(
+                item["total_quota"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .saturating_add(
+                        updated
+                            .get("quota")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    ),
+            );
+        }
+    }
+}
+
 fn invalid_token_should_mark_abnormal(previous_count: u64) -> bool {
     previous_count.saturating_add(1) >= ACCOUNT_INVALID_CONFIRM_ATTEMPTS
 }
@@ -13798,7 +13867,8 @@ impl AccountTypeCatalog {
             return;
         }
         let deadline = Instant::now() + PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE;
-        let _ = refresh_accounts_now_with_deadline(state, &tokens, None, Some(deadline)).await;
+        let _ =
+            refresh_accounts_now_with_deadline(state, &tokens, None, Some(deadline), None).await;
         if let Ok(mut last) = self.image_quota_refreshed_at.lock() {
             *last = Some(Instant::now());
         }
