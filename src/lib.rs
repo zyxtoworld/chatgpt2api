@@ -11555,21 +11555,170 @@ async fn image_task_edit(
     enqueue_image_task(state, owner, task_id, "edit", request).await
 }
 
+async fn run_resumed_image_task(
+    state: AppState,
+    owner: String,
+    task_id: String,
+    conversation_id: String,
+    model: String,
+) {
+    let started = Instant::now();
+    let _ = update_image_task(
+        &state,
+        &owner,
+        &task_id,
+        "running",
+        Map::new(),
+        Some(String::new()),
+        None,
+    );
+    let Some(lease) = state
+        .account_store
+        .acquire_image_lease(&HashSet::new())
+        .await
+    else {
+        let _ = update_image_task(
+            &state,
+            &owner,
+            &task_id,
+            "error",
+            Map::new(),
+            Some("号池中没有可用图片账号".to_owned()),
+            Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+        );
+        return;
+    };
+    let context = NativeRequestContext::new();
+    let deadline = Instant::now() + native_image_operation_timeout(&state);
+    let ids =
+        native_poll_image_file_ids(&state, &lease, &context, &conversation_id, deadline).await;
+    let result = match ids {
+        Ok(ids) => {
+            native_download_image_files(&state, &lease, &context, &conversation_id, &ids, deadline)
+                .await
+        }
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(downloaded) if !downloaded.is_empty() => {
+            let mut data = Vec::new();
+            for bytes in downloaded {
+                let bytes = match native_image_output(&bytes, "png", None) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let _ = update_image_task(
+                            &state,
+                            &owner,
+                            &task_id,
+                            "error",
+                            Map::new(),
+                            Some(error.to_string()),
+                            Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                        );
+                        return;
+                    }
+                };
+                data.push(
+                    json!({"b64_json": base64::engine::general_purpose::STANDARD.encode(bytes)}),
+                );
+            }
+            let mut updates = Map::new();
+            updates.insert("data".to_owned(), Value::Array(data));
+            updates.insert("conversation_id".to_owned(), Value::String(conversation_id));
+            updates.insert("model".to_owned(), Value::String(model));
+            let _ = update_image_task(
+                &state,
+                &owner,
+                &task_id,
+                "success",
+                updates,
+                Some(String::new()),
+                Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            );
+        }
+        _ => {
+            let _ = update_image_task(
+                &state,
+                &owner,
+                &task_id,
+                "error",
+                Map::new(),
+                Some("继续等待后仍未找到图片结果".to_owned()),
+                Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            );
+        }
+    }
+}
+
 async fn image_task_resume(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     let owner = authenticated_subject(&headers, &state).await?;
-    read_tasks(&state)
+    let task = read_tasks(&state)
         .await
         .into_iter()
         .find(|item| {
             item.get("owner_id").and_then(Value::as_str) == Some(owner.as_str())
                 && item.get("id").and_then(Value::as_str) == Some(task_id.as_str())
         })
-        .map(|task| Json(public_image_task(&task)))
-        .ok_or_else(ApiError::unavailable)
+        .ok_or_else(ApiError::unavailable)?;
+    let object = task.as_object().ok_or_else(ApiError::unavailable)?;
+    if object.get("status").and_then(Value::as_str) != Some("error") {
+        return Err(ApiError::invalid_request());
+    }
+    let error = object
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let conversation_id = object
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ApiError::invalid_request)?;
+    if !error.contains("超时")
+        && !error.contains("等待")
+        && !error.to_ascii_lowercase().contains("timeout")
+    {
+        return Err(ApiError::invalid_request());
+    }
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("gpt-image-2")
+        .to_owned();
+    mutate_image_tasks(&state, |tasks| {
+        let task = tasks
+            .iter_mut()
+            .filter_map(Value::as_object_mut)
+            .find(|item| {
+                item.get("owner_id").and_then(Value::as_str) == Some(owner.as_str())
+                    && item.get("id").and_then(Value::as_str) == Some(task_id.as_str())
+            })
+            .ok_or_else(ApiError::unavailable)?;
+        task.insert("status".to_owned(), Value::String("running".to_owned()));
+        task.remove("error");
+        Ok(())
+    })?;
+    let worker_state = state.clone();
+    let worker_owner = owner.clone();
+    let worker_task = task_id.clone();
+    let worker_conversation = conversation_id.to_owned();
+    tokio::spawn(async move {
+        run_resumed_image_task(
+            worker_state,
+            worker_owner,
+            worker_task,
+            worker_conversation,
+            model,
+        )
+        .await;
+    });
+    Ok(Json(public_image_task(
+        &json!({"id": task_id, "status": "running", "conversation_id": conversation_id}),
+    )))
 }
 
 async fn api_settings(
