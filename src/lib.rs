@@ -12271,6 +12271,175 @@ fn reject_sensitive_words(state: &AppState, value: &Value) -> Result<(), ApiErro
     Ok(())
 }
 
+fn review_text_value(value: &Value, output: &mut String, depth: usize) {
+    if depth > 32 || output.len() >= 100_000 {
+        return;
+    }
+    match value {
+        Value::String(text) => {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(text);
+        }
+        Value::Array(items) => {
+            for item in items {
+                review_text_value(item, output, depth + 1);
+                if output.len() >= 100_000 {
+                    break;
+                }
+            }
+        }
+        Value::Object(object) => {
+            for key in [
+                "text",
+                "input_text",
+                "content",
+                "input",
+                "instructions",
+                "system",
+                "prompt",
+            ] {
+                if let Some(value) = object.get(key) {
+                    review_text_value(value, output, depth + 1);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn sanitize_review_text(text: &str) -> String {
+    let mut output = String::with_capacity(text.len().min(100_000));
+    let mut remaining = text;
+    while let Some(start) = remaining.find("data:") {
+        output.push_str(&remaining[..start]);
+        let Some(end) = remaining[start..].find(|character: char| character.is_whitespace()) else {
+            output.push_str("[image]");
+            remaining = "";
+            break;
+        };
+        let token = &remaining[start..start + end];
+        if token.contains(";base64,") {
+            output.push_str("[image]");
+        } else {
+            output.push_str(token);
+        }
+        remaining = &remaining[start + end..];
+    }
+    output.push_str(remaining);
+    if output.len() <= 100_000 {
+        return output;
+    }
+    let marker = "\n…[truncated]…\n";
+    let half = (100_000 - marker.len()) / 2;
+    format!(
+        "{}{}{}",
+        &output[..half],
+        marker,
+        &output[output.len() - half..]
+    )
+}
+
+async fn review_request_content(state: &AppState, value: &Value) -> Result<(), ApiError> {
+    let config = fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    let review = config.get("ai_review").and_then(Value::as_object);
+    if review
+        .and_then(|object| object.get("enabled"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Ok(());
+    }
+    let base_url = review
+        .and_then(|object| object.get("base_url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::invalid_request())?
+        .trim_end_matches('/');
+    let api_key = review
+        .and_then(|object| object.get("api_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::invalid_request())?;
+    let model = review
+        .and_then(|object| object.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::invalid_request())?;
+    let mut text = String::new();
+    review_text_value(value, &mut text, 0);
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let prompt = review
+        .and_then(|object| object.get("prompt"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("判断用户请求是否允许。只回答 ALLOW 或 REJECT。");
+    let body = json!({
+        "model": model,
+        "messages": [{"role":"user","content":format!("{}\n\n用户请求:\n{}\n\n只回答 ALLOW 或 REJECT。", prompt, sanitize_review_text(&text))}],
+        "temperature": 0
+    });
+    let response = tokio::time::timeout(
+        Duration::from_secs(60),
+        state
+            .client
+            .post(format!("{base_url}/v1/chat/completions"))
+            .header(header::AUTHORIZATION, format!("Bearer {api_key}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| ApiError::content_review_unavailable())?
+    .map_err(|_| ApiError::content_review_unavailable())?;
+    let value: Value = response
+        .json()
+        .await
+        .map_err(|_| ApiError::content_review_unavailable())?;
+    let decision = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .ok_or_else(ApiError::content_review_unavailable)?;
+    if decision.starts_with("allow")
+        || decision.starts_with("pass")
+        || decision.starts_with("true")
+        || decision.starts_with("yes")
+        || decision.starts_with("通过")
+        || decision.starts_with("允许")
+        || decision.starts_with("安全")
+    {
+        return Ok(());
+    }
+    if decision.starts_with("reject")
+        || decision.starts_with("deny")
+        || decision.starts_with("block")
+        || decision.starts_with("false")
+        || decision.starts_with("no")
+        || decision.starts_with("拒绝")
+        || decision.starts_with("不允许")
+        || decision.starts_with("违规")
+        || decision.starts_with("禁止")
+    {
+        return Err(ApiError::content_policy("AI 审核未通过，拒绝本次任务"));
+    }
+    Err(ApiError::content_review_unavailable())
+}
+
 fn apply_global_system_prompt_to_chat(state: &AppState, object: &mut Map<String, Value>) {
     let Some(prompt) = configured_global_system_prompt(state) else {
         return;
@@ -17847,6 +18016,7 @@ async fn messages_inner(
         serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?,
     )?;
     reject_sensitive_words(&state, &Value::Object(request.clone()))?;
+    review_request_content(&state, &Value::Object(request.clone())).await?;
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -18241,6 +18411,7 @@ async fn responses_with_timeout(
     let payload: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?;
     let mut object = validate_responses_payload(payload)?;
     reject_sensitive_words(&state, &Value::Object(object.clone()))?;
+    review_request_content(&state, &Value::Object(object.clone())).await?;
     apply_global_system_prompt_to_responses(&state, &mut object);
     let model_settings = runtime_model_settings(&state);
     apply_default_thinking_effort(
@@ -18564,6 +18735,7 @@ async fn chat_completions_with_timeout(
     let payload: Value = serde_json::from_slice(&bytes).map_err(|_| ApiError::validation())?;
     let mut object = validate_chat_payload(payload)?;
     reject_sensitive_words(&state, &Value::Object(object.clone()))?;
+    review_request_content(&state, &Value::Object(object.clone())).await?;
     apply_global_system_prompt_to_chat(&state, &mut object);
     let model_settings = runtime_model_settings(&state);
     apply_default_thinking_effort(

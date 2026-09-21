@@ -86,6 +86,30 @@ impl ApiError {
             detail_status: None,
         }
     }
+
+    pub(super) fn content_policy(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "content_policy_violation",
+            message: Cow::Borrowed(message),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn content_review_unavailable() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            code: "content_review_unavailable",
+            message: Cow::Borrowed("AI 审核服务暂时不可用，请稍后重试"),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
     pub(super) fn not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
