@@ -3448,12 +3448,12 @@ async fn api_accounts_add(
         return Err(ApiError::invalid_request());
     }
     let (added, skipped) = state.account_store.merge_import_records(additions).await?;
-    let refresh_result = refresh_accounts_now(&state, &requested_tokens, None).await?;
+    let refreshed = refresh_imported_accounts(&state, &requested_tokens).await;
     Ok(Json(json!({
         "added": added,
         "skipped": skipped,
-        "refreshed": refresh_result["refreshed"].clone(),
-        "errors": refresh_result["errors"].clone(),
+        "refreshed": refreshed,
+        "errors": [],
         "items": public_accounts(&state)["items"].clone(),
     })))
 }
