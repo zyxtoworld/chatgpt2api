@@ -24356,7 +24356,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[tokio::test]
     async fn imported_model_catalog_does_not_retry_permanent_bootstrap_forbidden() {
         let calls = Arc::new(AtomicUsize::new(0));
         let route_calls = calls.clone();
