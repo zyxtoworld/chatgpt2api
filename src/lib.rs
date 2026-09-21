@@ -16833,6 +16833,22 @@ async fn native_conversation_attempt(
             .ok()
             .map(|body| String::from_utf8_lossy(&body[..body.len().min(512)]).to_string())
             .unwrap_or_default();
+        if let Ok(mut file) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/chatgpt2api-native-upstream.log")
+        {
+            let _ = writeln!(
+                file,
+                "model={} status={} body={}",
+                payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                status,
+                preview
+            );
+        }
         log::warn!(
             "native conversation upstream failed: model={} token_len={} status={} body={}",
             payload
