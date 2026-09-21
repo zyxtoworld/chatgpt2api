@@ -3141,7 +3141,7 @@ async fn account_upstream_json_with_proxy(
         .ok_or("upstream_unavailable")?
         .trim_end_matches('/');
     account_upstream_json_at_with_proxy(
-        state,
+        state: Some(state),
         base_url,
         context,
         token,
