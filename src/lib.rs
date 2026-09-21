@@ -3059,6 +3059,7 @@ async fn account_upstream_json_at_with_proxy(
         &profile.proxy_url,
         base_url,
     )
+    .await
     .header(header::AUTHORIZATION, format!("Bearer {token}"))
     .header(header::ACCEPT, "application/json")
     .header("Sec-Fetch-Dest", "empty")
