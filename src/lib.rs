@@ -508,6 +508,44 @@ fn chat_cache_finish_stream(
     inflight.notify.notify_waiters();
 }
 
+fn response_from_cached_stream_frames(frames: Vec<Vec<u8>>) -> Response {
+    let stream = stream::iter(frames.into_iter().map(Ok::<Bytes, io::Error>));
+    let mut output = Response::new(Body::from_stream(stream));
+    output.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    output
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    output
+}
+
+struct StreamCacheOutput {
+    state: AppState,
+    key: String,
+    inflight: Arc<ChatCacheInflight>,
+    frames: Vec<Vec<u8>>,
+    finished: bool,
+}
+
+impl StreamCacheOutput {
+    fn finish(&mut self, result: Result<Vec<Vec<u8>>, String>) {
+        if !self.finished {
+            self.finished = true;
+            chat_cache_finish_stream(&self.state, &self.key, &self.inflight, result);
+        }
+    }
+}
+
+impl Drop for StreamCacheOutput {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(Err("stream consumer dropped".to_owned()));
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 struct HealthBlockingTestHook {
@@ -16431,16 +16469,25 @@ async fn native_chat_requirements_with_resources_for_route_context(
 }
 
 fn native_stream_response(
+    state: AppState,
     response: reqwest::Response,
     lease: Option<AccountLease>,
     model: String,
     include_usage: bool,
     prompt_tokens: usize,
+    stream_cache: Option<(String, Arc<ChatCacheInflight>)>,
 ) -> Response {
     type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
     let input: UpstreamStream = Box::pin(response.bytes_stream());
     let completion_id = native_completion_id();
     let created = native_created();
+    let cache_state = stream_cache.map(|(key, inflight)| StreamCacheOutput {
+        state: state.clone(),
+        key,
+        inflight,
+        frames: Vec::new(),
+        finished: false,
+    });
     let stream = stream::unfold(
         (
             input,
@@ -16456,6 +16503,7 @@ fn native_stream_response(
             created,
             include_usage,
             prompt_tokens,
+            cache_state,
         ),
         |(
             mut input,
@@ -16471,9 +16519,13 @@ fn native_stream_response(
             created,
             include_usage,
             prompt_tokens,
+            mut cache_state,
         )| async move {
             loop {
                 if let Some(frame) = pending.pop_front() {
+                    if let Some(cache) = cache_state.as_mut() {
+                        cache.frames.push(frame.clone());
+                    }
                     return Some((
                         Ok(Bytes::from(frame)),
                         (
@@ -16490,10 +16542,14 @@ fn native_stream_response(
                             created,
                             include_usage,
                             prompt_tokens,
+                            cache_state,
                         ),
                     ));
                 }
                 if finished {
+                    if let Some(cache) = cache_state.as_mut() {
+                        cache.finish(Ok(cache.frames.clone()));
+                    }
                     drop(lease.take());
                     return None;
                 }
@@ -16501,6 +16557,9 @@ fn native_stream_response(
                 let chunk = match next {
                     Ok(Some(Ok(chunk))) => chunk,
                     Ok(Some(Err(_))) | Err(_) => {
+                        if let Some(cache) = cache_state.as_mut() {
+                            cache.finish(Err("upstream stream failed".to_owned()));
+                        }
                         drop(lease.take());
                         return Some((
                             Err(io::Error::other("upstream stream failed")),
@@ -16518,10 +16577,16 @@ fn native_stream_response(
                                 created,
                                 include_usage,
                                 prompt_tokens,
+                                cache_state,
                             ),
                         ));
                     }
                     Ok(None) => {
+                        if let Some(cache) = cache_state.as_mut() {
+                            cache.finish(Err(
+                                "upstream stream ended without terminal event".to_owned()
+                            ));
+                        }
                         drop(lease.take());
                         return Some((
                             Err(io::Error::other(
@@ -16541,6 +16606,7 @@ fn native_stream_response(
                                 created,
                                 include_usage,
                                 prompt_tokens,
+                                cache_state,
                             ),
                         ));
                     }
@@ -16548,6 +16614,9 @@ fn native_stream_response(
                 total = match total.checked_add(chunk.len()) {
                     Some(total) if total <= MAX_UPSTREAM_BODY_BYTES => total,
                     _ => {
+                        if let Some(cache) = cache_state.as_mut() {
+                            cache.finish(Err("upstream body exceeded limit".to_owned()));
+                        }
                         drop(lease.take());
                         return Some((
                             Err(io::Error::other("upstream body exceeded limit")),
@@ -16565,6 +16634,7 @@ fn native_stream_response(
                                 created,
                                 include_usage,
                                 prompt_tokens,
+                                cache_state,
                             ),
                         ));
                     }
@@ -16612,6 +16682,11 @@ fn native_stream_response(
                                             usage,
                                         )),
                                         Err(_) => {
+                                            if let Some(cache) = cache_state.as_mut() {
+                                                cache.finish(Err(
+                                                    "upstream usage calculation failed".to_owned(),
+                                                ));
+                                            }
                                             drop(lease.take());
                                             return Some((
                                                 Err(io::Error::other(
@@ -16631,6 +16706,7 @@ fn native_stream_response(
                                                     created,
                                                     include_usage,
                                                     prompt_tokens,
+                                                    cache_state,
                                                 ),
                                             ));
                                         }
@@ -16652,6 +16728,9 @@ fn native_stream_response(
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            if let Some(cache) = cache_state.as_mut() {
+                                cache.finish(Err(error.to_string()));
+                            }
                             drop(lease.take());
                             return Some((
                                 Err(error),
@@ -16669,6 +16748,7 @@ fn native_stream_response(
                                     created,
                                     include_usage,
                                     prompt_tokens,
+                                    cache_state,
                                 ),
                             ));
                         }
@@ -18425,6 +18505,20 @@ async fn chat_completions_with_timeout(
         {
             return Ok(Json(cached).into_response());
         }
+        let mut stream_cache_owner = None;
+        if stream_requested && let Some(key) = cache_key.as_deref() {
+            if let Some(frames) = chat_cache_read_stream_frames(&state, key) {
+                return Ok(response_from_cached_stream_frames(frames));
+            }
+            if let Some((inflight, owner)) = chat_cache_begin_stream(&state, key) {
+                if owner {
+                    stream_cache_owner = Some((key.to_owned(), inflight));
+                } else {
+                    let frames = chat_cache_wait_stream(&inflight).await?;
+                    return Ok(response_from_cached_stream_frames(frames));
+                }
+            }
+        }
         let base_url = state
             .config
             .upstream_base_url
@@ -18613,11 +18707,13 @@ async fn chat_completions_with_timeout(
                 )
             } else {
                 native_stream_response(
+                    state.clone(),
                     upstream,
                     lease,
                     model.to_owned(),
                     include_usage,
                     prompt_tokens,
+                    stream_cache_owner,
                 )
             });
         }
