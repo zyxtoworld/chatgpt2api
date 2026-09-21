@@ -9781,14 +9781,23 @@ async fn native_search_attempt(
         "client_contextual_info": {"app_name": "chatgpt.com"}
     });
     let client = upstream_client_for_lease(state, lease, false);
-    let mut request =
-        native_browser_headers(client.post(format!("{base_url}{prepare_path}")), &context)
-            .header(header::ACCEPT, "*/*")
-            .header("X-Conduit-Token", "no-token")
-            .header("X-OpenAI-Target-Path", prepare_path)
-            .header("X-OpenAI-Target-Route", prepare_path)
-            .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
-            .json(&prepare_payload);
+    let mut request = native_browser_headers_with_clearance(
+        client.post(format!("{base_url}{prepare_path}")),
+        &context,
+        &format!("{base_url}/"),
+        Some(&state.clearance_store),
+        Some(&proxy_runtime_value(state)),
+        lease.proxy_url().unwrap_or_default(),
+        base_url,
+        None,
+    )
+    .await
+    .header(header::ACCEPT, "*/*")
+    .header("X-Conduit-Token", "no-token")
+    .header("X-OpenAI-Target-Path", prepare_path)
+    .header("X-OpenAI-Target-Route", prepare_path)
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .json(&prepare_payload);
     if let Some(account_id) = lease.chatgpt_account_id() {
         request = request.header("ChatGPT-Account-ID", account_id);
     }
@@ -9883,18 +9892,27 @@ async fn native_search_attempt(
         "paragen_cot_summary_display_override": "allow",
         "force_parallel_switch": "auto"
     });
-    let mut request =
-        native_browser_headers(client.post(format!("{base_url}{run_path}")), &context)
-            .header(header::ACCEPT, "text/event-stream")
-            .header("X-OpenAI-Target-Path", run_path)
-            .header("X-OpenAI-Target-Route", run_path)
-            .header("X-Conduit-Token", conduit_token)
-            .header(
-                "OpenAI-Sentinel-Chat-Requirements-Token",
-                requirements.token,
-            )
-            .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
-            .json(&run_payload);
+    let mut request = native_browser_headers_with_clearance(
+        client.post(format!("{base_url}{run_path}")),
+        &context,
+        &format!("{base_url}/"),
+        Some(&state.clearance_store),
+        Some(&proxy_runtime_value(state)),
+        lease.proxy_url().unwrap_or_default(),
+        base_url,
+        None,
+    )
+    .await
+    .header(header::ACCEPT, "text/event-stream")
+    .header("X-OpenAI-Target-Path", run_path)
+    .header("X-OpenAI-Target-Route", run_path)
+    .header("X-Conduit-Token", conduit_token)
+    .header(
+        "OpenAI-Sentinel-Chat-Requirements-Token",
+        requirements.token,
+    )
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .json(&run_payload);
     if let Some(account_id) = lease.chatgpt_account_id() {
         request = request.header("ChatGPT-Account-ID", account_id);
     }
@@ -9923,6 +9941,7 @@ async fn native_search_attempt(
     }
     let conversation_id = search_conversation_id_from_response(run, deadline, false).await?;
     native_search_poll(NativeSearchPollRequest {
+        state: &state,
         client: &client,
         base_url,
         token: lease.token(),
@@ -9936,6 +9955,7 @@ async fn native_search_attempt(
 }
 
 struct NativeSearchPollRequest<'a> {
+    state: &'a AppState,
     client: &'a Client,
     base_url: &'a str,
     token: &'a str,
@@ -9951,6 +9971,7 @@ async fn native_search_poll(
 ) -> Result<Value, (ApiError, bool)> {
     let NativeSearchPollRequest {
         client,
+        state,
         base_url,
         token,
         account_id,
@@ -9967,11 +9988,17 @@ async fn native_search_poll(
         }
         let poll_path = format!("/backend-api/conversation/{conversation_id}");
         let referer = format!("{base_url}/c/{conversation_id}");
-        let mut request = native_browser_headers_with_referer(
+        let mut request = native_browser_headers_with_clearance(
             client.get(format!("{base_url}{poll_path}")),
             context,
             &referer,
+            Some(&state.clearance_store),
+            Some(&proxy_runtime_value(state)),
+            "",
+            base_url,
+            None,
         )
+        .await
         .header(header::ACCEPT, "*/*")
         .header("X-OpenAI-Target-Path", poll_path.as_str())
         .header("X-OpenAI-Target-Route", poll_path.as_str())
