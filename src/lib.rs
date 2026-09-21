@@ -9163,6 +9163,9 @@ async fn native_codex_image_attempt(
         .map_err(|_| (ApiError::upstream(), false))?
         .map_err(|_| (ApiError::upstream(), false))?;
     if !response.status().is_success() {
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err((ApiError::unauthorized(), false));
+        }
         let retryable = matches!(
             response.status(),
             StatusCode::TOO_MANY_REQUESTS
@@ -9241,6 +9244,19 @@ async fn native_codex_image_request_proxy(
                     };
                 }
                 Err((error, false)) => {
+                    if error.code() == "invalid_api_key" {
+                        let token = lease.token().to_owned();
+                        let config = fs::read(state.config_path.as_ref())
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            .unwrap_or_else(|| json!({}));
+                        let remove =
+                            settings_bool(config.get("auto_remove_invalid_accounts"), false);
+                        let _ = state
+                            .account_store
+                            .record_invalid_token(&token, "invalid_token", remove)
+                            .await;
+                    }
                     drop(lease);
                     return Err(error);
                 }
@@ -17287,6 +17303,9 @@ async fn native_codex_response_attempt(
         .map_err(|_| (ApiError::upstream(), false))?
         .map_err(|_| (ApiError::upstream(), false))?;
     if !response.status().is_success() {
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err((ApiError::unauthorized(), false));
+        }
         let retryable = matches!(
             response.status(),
             StatusCode::TOO_MANY_REQUESTS
@@ -18377,6 +18396,18 @@ async fn native_responses_with_timeout_and_groups(
                 };
             }
             Err((error, _)) => {
+                if error.code() == "invalid_api_key" {
+                    let token = lease.token().to_owned();
+                    let config = fs::read(state.config_path.as_ref())
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .unwrap_or_else(|| json!({}));
+                    let remove = settings_bool(config.get("auto_remove_invalid_accounts"), false);
+                    let _ = state
+                        .account_store
+                        .record_invalid_token(&token, "invalid_token", remove)
+                        .await;
+                }
                 drop(lease);
                 return Err(error);
             }
@@ -30791,6 +30822,52 @@ data: [DONE]
             assert_eq!(lease.token(), "healthy");
             drop(lease);
         }
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn account_invalid_token_confirmation_marks_or_removes_after_third_failure() {
+        let path = account_snapshot_path("invalid-token-confirmation");
+        fs::write(
+            &path,
+            r#"[{"access_token":"keep-token","status":"正常"},{"access_token":"remove-token","status":"正常"}]"#,
+        )
+        .expect("accounts snapshot");
+        let store = AccountStore::load(Some(&path)).expect("account store");
+        for _ in 0..2 {
+            assert!(
+                store
+                    .record_invalid_token("keep-token", "invalid_token", false)
+                    .await
+                    .expect("record")
+            );
+            assert!(
+                store
+                    .record_invalid_token("remove-token", "invalid_token", true)
+                    .await
+                    .expect("record")
+            );
+        }
+        assert_eq!(store.records().len(), 2);
+        assert!(
+            store
+                .record_invalid_token("keep-token", "invalid_token", false)
+                .await
+                .expect("record")
+        );
+        assert!(
+            store
+                .record_invalid_token("remove-token", "invalid_token", true)
+                .await
+                .expect("record")
+        );
+        let records = store.records();
+        let kept = records
+            .iter()
+            .find(|record| record.token == "keep-token")
+            .expect("kept account");
+        assert_eq!(kept.status, "异常");
+        assert!(records.iter().all(|record| record.token != "remove-token"));
         fs::remove_file(path).expect("cleanup");
     }
 

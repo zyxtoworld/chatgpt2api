@@ -1126,6 +1126,61 @@ impl AccountStore {
         .await
     }
 
+    pub(super) async fn record_invalid_token(
+        &self,
+        token: &str,
+        error: &str,
+        remove_invalid: bool,
+    ) -> Result<bool, ApiError> {
+        if token.is_empty() {
+            return Ok(false);
+        }
+        self.mutate_raw(|records| {
+            let Some(index) = records
+                .iter()
+                .position(|item| account_payload_token(item).as_deref() == Some(token))
+            else {
+                return Ok(false);
+            };
+            let should_remove = {
+                let object = records[index]
+                    .as_object_mut()
+                    .ok_or_else(ApiError::unavailable)?;
+                let previous = object
+                    .get("invalid_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let next = previous.saturating_add(1);
+                object.insert("invalid_count".to_owned(), serde_json::json!(next));
+                object.insert(
+                    "last_invalid_at".to_owned(),
+                    serde_json::Value::String(current_timestamp()),
+                );
+                object.insert(
+                    "last_refresh_error".to_owned(),
+                    serde_json::Value::String(error.to_owned()),
+                );
+                object.insert(
+                    "last_refresh_error_at".to_owned(),
+                    serde_json::Value::String(current_timestamp()),
+                );
+                let confirmed = next >= 3;
+                if confirmed && !remove_invalid {
+                    object.insert(
+                        "status".to_owned(),
+                        serde_json::Value::String("异常".to_owned()),
+                    );
+                }
+                confirmed && remove_invalid
+            };
+            if should_remove {
+                records.remove(index);
+            }
+            Ok(true)
+        })
+        .await
+    }
+
     async fn replace_raw_locked(
         &self,
         value: serde_json::Value,
