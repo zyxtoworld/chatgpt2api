@@ -2995,6 +2995,7 @@ pub(crate) async fn account_upstream_json_at(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn account_upstream_json_at_with_proxy(
     state: &AppState,
     base_url: &str,
@@ -3052,7 +3053,7 @@ fn proxy_runtime_value(state: &AppState) -> Value {
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| value.get("proxy_runtime").cloned())
-        .unwrap_or_else(|| config::proxy_runtime_defaults_from_environment())
+        .unwrap_or_else(config::proxy_runtime_defaults_from_environment)
 }
 
 async fn refresh_access_token_account(
