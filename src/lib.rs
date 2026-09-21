@@ -15850,6 +15850,13 @@ async fn native_bootstrap_with_timeout_context(
             .map_err(|_| (ApiError::upstream(), false))?;
         let status = response.status();
         if !status.is_success() {
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/chatgpt2api-native-upstream.log")
+            {
+                let _ = writeln!(file, "bootstrap status={status}");
+            }
             return Err((ApiError::upstream(), native_stage_retryable(status, false)));
         }
         let body = bounded_response_body(response)
@@ -15960,6 +15967,13 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let prepare = prepare.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = prepare.status();
         if !status.is_success() {
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/chatgpt2api-native-upstream.log")
+            {
+                let _ = writeln!(file, "requirements_prepare status={status}");
+            }
             return Err((ApiError::upstream(), native_stage_retryable(status, true)));
         }
         bounded_response_body(prepare)
@@ -16009,6 +16023,13 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let finalize = finalize.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = finalize.status();
         if !status.is_success() {
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/chatgpt2api-native-upstream.log")
+            {
+                let _ = writeln!(file, "requirements_finalize status={status}");
+            }
             return Err((ApiError::upstream(), native_stage_retryable(status, false)));
         }
         bounded_response_body(finalize)
