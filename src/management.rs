@@ -2048,6 +2048,8 @@ async fn execute_cpa_import(
     let mut successful = 0usize;
     let mut failed = 0usize;
     let mut imported = Vec::new();
+    let requested_ids = ids.iter().cloned().collect::<HashSet<_>>();
+    let mut returned_ids = HashSet::new();
     for name in &names {
         let value = remote_json(
             &state,
@@ -2806,6 +2808,13 @@ async fn execute_sub2api_import(
             };
             for account in accounts {
                 let object = account.as_object().cloned().unwrap_or_default();
+                let account_id = bounded_public_text(object.get("id"), 128);
+                if account_id.is_empty() || !requested_ids.contains(&account_id) {
+                    continue;
+                }
+                if !returned_ids.insert(account_id.clone()) {
+                    continue;
+                }
                 let credentials = object
                     .get("credentials")
                     .and_then(Value::as_object)
@@ -2824,9 +2833,13 @@ async fn execute_sub2api_import(
                     }
                     None => {
                         failed += 1;
-                        errors.push(json!({"name": bounded_public_text(object.get("id"), 128), "error": "missing access_token"}));
+                        errors.push(json!({"name": account_id, "error": "missing access_token"}));
                     }
                 }
+            }
+            for missing in requested_ids.difference(&returned_ids) {
+                failed += 1;
+                errors.push(json!({"name": missing, "error": "account not returned"}));
             }
         }
         Err(_) => {
@@ -3365,7 +3378,7 @@ async fn load_ccload_channel_models(
             });
             catalog["models"] = models;
             catalog["model_sources"] = sources;
-            catalog["models_loaded"] = Value::Bool(has_web || has_image);
+            catalog["models_loaded"] = Value::Bool(has_web);
             catalog["model_load_status"] = Value::String(
                 if has_web {
                     "loaded"
