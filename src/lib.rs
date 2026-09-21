@@ -308,6 +308,22 @@ fn normalize_cached_messages(state: &AppState, value: &Value) -> Value {
     Value::Array(normalized)
 }
 
+fn canonicalize_cache_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            let mut sorted = Map::new();
+            for (key, value) in entries {
+                sorted.insert(key.clone(), canonicalize_cache_value(value));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonicalize_cache_value).collect()),
+        _ => value.clone(),
+    }
+}
+
 fn chat_cache_key(state: &AppState, object: &Map<String, Value>, stream: bool) -> Option<String> {
     let model = object.get("model").and_then(Value::as_str)?;
     let messages = normalize_cached_messages(state, object.get("messages")?);
@@ -338,7 +354,7 @@ fn chat_cache_key(state: &AppState, object: &Map<String, Value>, stream: bool) -
     canonical.insert("model".to_owned(), Value::String(model.to_owned()));
     canonical.insert("messages".to_owned(), messages.clone());
     canonical.insert("stream".to_owned(), Value::Bool(stream));
-    let bytes = serde_json::to_vec(&canonical).ok()?;
+    let bytes = serde_json::to_vec(&canonicalize_cache_value(&Value::Object(canonical))).ok()?;
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -33207,6 +33223,17 @@ data: [DONE]
         state.account_type_catalog.shutdown().await;
         fs::remove_file(account_path).expect("cleanup");
         upstream_task.abort();
+    }
+
+    #[test]
+    fn cache_canonicalizer_sorts_nested_object_keys_like_python() {
+        let first = json!({"z":1,"a":{"y":2,"b":3}});
+        let second = json!({"a":{"b":3,"y":2},"z":1});
+        let first_bytes =
+            serde_json::to_vec(&canonicalize_cache_value(&first)).expect("first JSON");
+        let second_bytes =
+            serde_json::to_vec(&canonicalize_cache_value(&second)).expect("second JSON");
+        assert_eq!(first_bytes, second_bytes);
     }
 
     #[test]
