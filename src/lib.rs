@@ -512,7 +512,11 @@ fn chat_cache_finish_stream(
 }
 
 fn response_from_cached_stream_frames(frames: Vec<Vec<u8>>) -> Response {
-    let stream = stream::iter(frames.into_iter().map(Ok::<Bytes, io::Error>));
+    let stream = stream::iter(
+        frames
+            .into_iter()
+            .map(|frame| Ok::<Bytes, io::Error>(Bytes::from(frame))),
+    );
     let mut output = Response::new(Body::from_stream(stream));
     output.headers_mut().insert(
         header::CONTENT_TYPE,
