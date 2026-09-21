@@ -12359,20 +12359,20 @@ async fn review_request_content(state: &AppState, value: &Value) -> Result<(), A
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::invalid_request())?
+        .ok_or_else(ApiError::invalid_request)?
         .trim_end_matches('/');
     let api_key = review
         .and_then(|object| object.get("api_key"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::invalid_request())?;
+        .ok_or_else(ApiError::invalid_request)?;
     let model = review
         .and_then(|object| object.get("model"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::invalid_request())?;
+        .ok_or_else(ApiError::invalid_request)?;
     let mut text = String::new();
     review_text_value(value, &mut text, 0);
     if text.trim().is_empty() {
