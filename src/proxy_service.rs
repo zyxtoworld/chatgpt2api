@@ -21,6 +21,92 @@ pub(crate) struct ClearanceBundle {
     pub(crate) user_agent: String,
 }
 
+pub(crate) fn profile_from_runtime(
+    runtime: &Value,
+    account_proxy: Option<&str>,
+    explicit_proxy: Option<&str>,
+    legacy_proxy: Option<&str>,
+    resource: bool,
+    upstream: bool,
+) -> ProxyProfile {
+    let object = runtime.as_object();
+    let enabled = object
+        .and_then(|value| value.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let egress_mode = object
+        .and_then(|value| value.get("egress_mode"))
+        .and_then(Value::as_str)
+        .filter(|value| *value == "single_proxy")
+        .unwrap_or("direct")
+        .to_owned();
+    let runtime_proxy = if upstream && enabled && egress_mode == "single_proxy" {
+        let key = if resource {
+            "resource_proxy_url"
+        } else {
+            "proxy_url"
+        };
+        object
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                object
+                    .and_then(|value| value.get("proxy_url"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+            })
+    } else {
+        None
+    };
+    let (proxy_url, proxy_source) = [
+        (account_proxy, "account"),
+        (
+            runtime_proxy,
+            if resource {
+                "runtime_resource"
+            } else {
+                "runtime"
+            },
+        ),
+        (explicit_proxy, "explicit"),
+        (legacy_proxy, "global"),
+    ]
+    .into_iter()
+    .find_map(|(value, source)| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| (normalize_proxy_url(value), source.to_owned()))
+    })
+    .unwrap_or_else(|| (String::new(), "direct".to_owned()));
+    let reset_session_status_codes = object
+        .and_then(|value| value.get("reset_session_status_codes"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_u64().and_then(|value| u16::try_from(value).ok()))
+        .filter(|value| (100..=599).contains(value))
+        .collect::<Vec<_>>();
+    ProxyProfile {
+        proxy_url,
+        proxy_source,
+        resource,
+        runtime_enabled: enabled,
+        egress_mode,
+        skip_ssl_verify: enabled
+            && object
+                .and_then(|value| value.get("skip_ssl_verify"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        reset_session_status_codes: if reset_session_status_codes.is_empty() {
+            vec![403]
+        } else {
+            reset_session_status_codes
+        },
+    }
+}
+
 pub(crate) fn normalize_proxy_url(raw: &str) -> String {
     let value = raw.trim();
     if value.len() >= 8 && value[..8].eq_ignore_ascii_case("socks://") {
@@ -169,5 +255,41 @@ mod tests {
         .expect("bundle");
         assert!(bundle.cookies.contains_key("ok"));
         assert!(!bundle.cookies.contains_key("bad"));
+    }
+
+    #[test]
+    fn profile_priority_matches_python_proxy_service() {
+        let profile = profile_from_runtime(
+            &json!({
+                "enabled": true,
+                "egress_mode": "single_proxy",
+                "proxy_url": "http://runtime:1",
+                "resource_proxy_url": "http://resource:2",
+                "skip_ssl_verify": true
+            }),
+            Some("socks5://account:3"),
+            Some("http://explicit:4"),
+            Some("http://global:5"),
+            true,
+            true,
+        );
+        assert_eq!(profile.proxy_source, "account");
+        assert_eq!(profile.proxy_url, "socks5h://account:3");
+        assert!(profile.skip_ssl_verify);
+        let runtime = profile_from_runtime(
+            &json!({
+                "enabled": true,
+                "egress_mode": "single_proxy",
+                "proxy_url": "http://runtime:1",
+                "resource_proxy_url": "http://resource:2"
+            }),
+            None,
+            None,
+            None,
+            true,
+            true,
+        );
+        assert_eq!(runtime.proxy_source, "runtime_resource");
+        assert_eq!(runtime.proxy_url, "http://resource:2");
     }
 }
