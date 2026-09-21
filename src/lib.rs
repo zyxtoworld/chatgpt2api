@@ -2951,13 +2951,35 @@ pub(crate) async fn account_upstream_json(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, &'static str> {
+    account_upstream_json_with_proxy(state, context, token, None, method, path, body).await
+}
+
+async fn account_upstream_json_with_proxy(
+    state: &AppState,
+    context: &NativeRequestContext,
+    token: &str,
+    account_proxy: Option<&str>,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, &'static str> {
     let base_url = state
         .config
         .upstream_base_url
         .as_deref()
         .ok_or("upstream_unavailable")?
         .trim_end_matches('/');
-    account_upstream_json_at(state, base_url, context, token, method, path, body).await
+    account_upstream_json_at_with_proxy(
+        state,
+        base_url,
+        context,
+        token,
+        account_proxy,
+        method,
+        path,
+        body,
+    )
+    .await
 }
 
 pub(crate) async fn account_upstream_json_at(
@@ -2969,19 +2991,40 @@ pub(crate) async fn account_upstream_json_at(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, &'static str> {
+    account_upstream_json_at_with_proxy(state, base_url, context, token, None, method, path, body)
+        .await
+}
+
+async fn account_upstream_json_at_with_proxy(
+    state: &AppState,
+    base_url: &str,
+    context: &NativeRequestContext,
+    token: &str,
+    account_proxy: Option<&str>,
+    method: Method,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, &'static str> {
     let base_url = base_url.trim_end_matches('/');
     let target_path = path.split('?').next().unwrap_or(path);
-    let mut request = native_browser_headers(
-        state.client.request(method, format!("{base_url}{path}")),
-        context,
-    )
-    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-    .header(header::ACCEPT, "application/json")
-    .header("Sec-Fetch-Dest", "empty")
-    .header("Sec-Fetch-Mode", "cors")
-    .header("Sec-Fetch-Site", "same-origin")
-    .header("X-OpenAI-Target-Path", target_path)
-    .header("X-OpenAI-Target-Route", target_path);
+    let profile = proxy_service::profile_from_runtime(
+        &proxy_runtime_value(state),
+        account_proxy,
+        None,
+        None,
+        false,
+        true,
+    );
+    let client = upstream_client_for_profile(&profile).unwrap_or_else(|_| state.client.clone());
+    let mut request =
+        native_browser_headers(client.request(method, format!("{base_url}{path}")), context)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::ACCEPT, "application/json")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("X-OpenAI-Target-Path", target_path)
+            .header("X-OpenAI-Target-Route", target_path);
     if let Some(body) = body {
         request = request
             .header(header::CONTENT_TYPE, "application/json")
@@ -3004,31 +3047,46 @@ pub(crate) async fn account_upstream_json_at(
     serde_json::from_slice(&bytes).map_err(|_| "upstream_error")
 }
 
+fn proxy_runtime_value(state: &AppState) -> Value {
+    fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("proxy_runtime").cloned())
+        .unwrap_or_else(|| config::proxy_runtime_defaults_from_environment())
+}
+
 async fn refresh_access_token_account(
     state: &AppState,
     raw: &Value,
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
 ) -> Result<Value, &'static str> {
     let token = account_token(raw).ok_or("invalid_account")?;
+    let account_proxy = raw
+        .get("proxy")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let context = NativeRequestContext::new();
     let base_url = state
         .config
         .upstream_base_url
         .as_deref()
         .ok_or("upstream_unavailable")?;
-    let me = account_upstream_json(
+    let me = account_upstream_json_with_proxy(
         state,
         &context,
         &token,
+        account_proxy,
         Method::GET,
         "/backend-api/me",
         None,
     )
     .await?;
-    let init = account_upstream_json(
+    let init = account_upstream_json_with_proxy(
         state,
         &context,
         &token,
+        account_proxy,
         Method::POST,
         "/backend-api/conversation/init",
         Some(json!({
@@ -3039,10 +3097,11 @@ async fn refresh_access_token_account(
         })),
     )
     .await?;
-    let account_check = account_upstream_json(
+    let account_check = account_upstream_json_with_proxy(
         state,
         &context,
         &token,
+        account_proxy,
         Method::GET,
         "/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-480",
         None,
