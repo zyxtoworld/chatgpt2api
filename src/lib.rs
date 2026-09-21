@@ -37,8 +37,7 @@ use codex_sse::{
 use codex_upstream::parse_codex_client_version;
 use codex_upstream::{
     NativeRequestContext, codex_client_version, codex_request_headers, native_browser_headers,
-    native_browser_headers_with_clearance, native_browser_headers_with_referer,
-    native_codex_response_payload,
+    native_browser_headers_with_clearance, native_codex_response_payload,
 };
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
