@@ -2048,8 +2048,6 @@ async fn execute_cpa_import(
     let mut successful = 0usize;
     let mut failed = 0usize;
     let mut imported = Vec::new();
-    let requested_ids = ids.iter().cloned().collect::<HashSet<_>>();
-    let mut returned_ids = HashSet::new();
     for name in &names {
         let value = remote_json(
             &state,
@@ -2797,6 +2795,8 @@ async fn execute_sub2api_import(
     let mut successful = 0usize;
     let mut failed = 0usize;
     let mut imported = Vec::new();
+    let requested_ids = ids.iter().cloned().collect::<HashSet<_>>();
+    let mut returned_ids = HashSet::new();
     match result {
         Ok(value) => {
             let Some(accounts) = remote_array(&value, &["accounts", "data"]) else {
