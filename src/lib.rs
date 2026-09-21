@@ -3406,9 +3406,48 @@ async fn refresh_access_token_account(
             json!([])
         };
     } else {
-        result["models"] = json!([]);
-        result["model_sources"] = json!({});
-        result["_verified_web_model_paths"] = json!([]);
+        // A transient catalog failure must not erase the last known account
+        // catalog. The original account service merges refresh fields and
+        // leaves unrelated persisted fields intact.
+        let preserved = raw
+            .as_object()
+            .and_then(|object| object.get("models"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let preserved_sources = raw
+            .as_object()
+            .and_then(|object| object.get("model_sources"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        result["models"] = if quota > 0 {
+            preserved
+        } else {
+            Value::Array(
+                preserved
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|model| {
+                        model
+                            .as_str()
+                            .is_none_or(|id| !is_native_image_model_id(id))
+                    })
+                    .cloned()
+                    .collect(),
+            )
+        };
+        result["model_sources"] = if quota > 0 {
+            preserved_sources
+        } else {
+            let mut sources = preserved_sources.as_object().cloned().unwrap_or_default();
+            sources.retain(|id, _| !is_native_image_model_id(id));
+            Value::Object(sources)
+        };
+        result["_verified_web_model_paths"] = raw
+            .as_object()
+            .and_then(|object| object.get("_verified_web_model_paths"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
     }
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
@@ -25410,29 +25449,39 @@ mod tests {
     }
 
     #[test]
-    fn imported_refresh_model_merge_ignores_existing_catalog() {
+    fn imported_refresh_model_merge_preserves_existing_catalog_when_fetch_fails() {
         let raw = json!({
             "models": [
                 "configured-model",
                 {"model":"web-model","source":"web"},
-                {"model":"codex-endpoint-model","source":"codex"},
+                {"model":"gpt-image-2","source":"image"},
                 "configured-model"
-            ]
+            ],
+            "model_sources": {"web-model":"web", "gpt-image-2":"image"},
+            "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]]
         });
         assert_eq!(merge_account_models(&raw, None, false), None);
+        let preserved = raw["models"].clone();
+        assert_eq!(preserved.as_array().map(Vec::len), Some(4));
+        let mut without_quota = preserved
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|model| {
+                model
+                    .as_str()
+                    .is_none_or(|id| !is_native_image_model_id(id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        without_quota.dedup();
         assert_eq!(
-            merge_account_models(
-                &raw,
-                Some(vec![
-                    test_public_model("web-model", ModelProvenance::Web),
-                    test_public_model("web-image-model", ModelProvenance::Web),
-                ]),
-                false,
-            )
-            .map(|(models, _)| models),
-            Some(vec!["web-model".to_owned(), "web-image-model".to_owned()])
+            without_quota,
+            vec![
+                json!("configured-model"),
+                json!({"model":"web-model","source":"web"})
+            ]
         );
-        assert_eq!(merge_account_models(&json!({}), None, false), None);
     }
 
     #[tokio::test]
