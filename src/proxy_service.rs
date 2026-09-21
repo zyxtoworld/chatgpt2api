@@ -8,6 +8,9 @@ use tokio::sync::Mutex;
 
 use serde_json::{Value, json};
 
+type ClearanceKey = (String, String);
+type ClearanceFlight = Arc<tokio::sync::Notify>;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProxyProfile {
     pub(crate) proxy_url: String,
@@ -30,8 +33,8 @@ pub(crate) struct ClearanceBundle {
 
 #[derive(Clone, Default)]
 pub(crate) struct ClearanceStore {
-    entries: Arc<Mutex<HashMap<(String, String), ClearanceBundle>>>,
-    flights: Arc<Mutex<HashMap<(String, String), Arc<tokio::sync::Notify>>>>,
+    entries: Arc<Mutex<HashMap<ClearanceKey, ClearanceBundle>>>,
+    flights: Arc<Mutex<HashMap<ClearanceKey, ClearanceFlight>>>,
 }
 
 impl ClearanceStore {
