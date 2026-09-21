@@ -479,7 +479,7 @@ fn chat_cache_finish_stream(
     if let Ok(mut cache) = state.chat_cache.lock() {
         cache.inflight.remove(key);
     }
-    if let Ok(Ok(frames)) = &result {
+    if let Ok(frames) = &result {
         chat_cache_write_stream(
             state,
             key.to_owned(),
