@@ -17521,6 +17521,7 @@ fn native_codex_stream_response(
 }
 
 async fn native_codex_response_attempt(
+    state: &AppState,
     client: &Client,
     lease: &AccountLease,
     base_url: &str,
@@ -17533,7 +17534,17 @@ async fn native_codex_response_attempt(
         base_url.trim_end_matches('/')
     );
     let request = codex_request_headers(
-        client.post(url),
+        native_browser_headers_with_clearance(
+            client.post(url),
+            &NativeRequestContext::new(),
+            &format!("{base_url}/"),
+            Some(&state.clearance_store),
+            Some(&proxy_runtime_value(state)),
+            lease.proxy_url().unwrap_or_default(),
+            base_url,
+            None,
+        )
+        .await,
         lease.token(),
         lease.chatgpt_account_id().map(ToOwned::to_owned),
         version,
@@ -18608,6 +18619,7 @@ async fn native_responses_with_timeout_and_groups(
         attempted_tokens.insert(lease.token().to_owned());
         let client = upstream_client_for_lease(&state, &lease, false);
         match native_codex_response_attempt(
+            &state,
             &client,
             &lease,
             base_url,
@@ -18967,6 +18979,7 @@ async fn chat_completions_with_timeout(
                 let payload = native_codex_response_payload(&object)?;
                 let client = upstream_client_for_lease(&state, current, false);
                 native_codex_response_attempt(
+                    &state,
                     &client,
                     current,
                     base_url,
