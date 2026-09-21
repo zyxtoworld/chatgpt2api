@@ -3196,7 +3196,6 @@ async fn refresh_access_token_account(
         account_type: plan_type.to_owned(),
         token: token.clone(),
         account_id: account_id.map(ToOwned::to_owned),
-        cache_key: Some(format!("{}:{}", plan_type.to_ascii_lowercase(), token)),
         deadline: Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
         batch,
         retry: true,
@@ -13363,7 +13362,6 @@ pub(crate) async fn fetch_imported_model_catalog(
         account_type: account_type.to_owned(),
         token: token.to_owned(),
         account_id: account_id.map(ToOwned::to_owned),
-        cache_key: None,
         deadline,
         batch: None,
         retry: true,
@@ -13379,7 +13377,6 @@ struct ImportedModelCatalogRequest {
     account_type: String,
     token: String,
     account_id: Option<String>,
-    cache_key: Option<String>,
     deadline: Instant,
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
     retry: bool,
@@ -13396,13 +13393,12 @@ async fn fetch_imported_model_catalog_request(
         account_type,
         token,
         account_id,
-        cache_key,
         deadline,
         batch,
         retry,
         require_web_catalog,
     } = request;
-    let key = cache_key.unwrap_or_else(|| account_type.to_ascii_lowercase());
+    let key = account_type.to_ascii_lowercase();
     let retry_key = key.clone();
     let retry_cache = cache.clone();
     let retry_batch = batch.clone();
@@ -14327,7 +14323,6 @@ impl AccountTypeCatalog {
                         account_type: account_group.clone(),
                         token: candidate.token.clone(),
                         account_id: candidate.chatgpt_account_id.clone(),
-                        cache_key: None,
                         deadline,
                         batch: None,
                         retry: false,
