@@ -13289,7 +13289,7 @@ async fn fetch_imported_model_catalog_request(
         retry,
         require_web_catalog,
     } = request;
-    let key = format!("{}:{}", account_type.to_ascii_lowercase(), token);
+    let key = account_type.to_ascii_lowercase();
     let retry_key = key.clone();
     let retry_cache = cache.clone();
     let retry_batch = batch.clone();

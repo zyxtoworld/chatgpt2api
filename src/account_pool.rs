@@ -735,6 +735,7 @@ impl AccountStore {
                     continue;
                 }
             } else if model != "auto"
+                && slot.record.raw.get("models").is_some()
                 && !slot
                     .record
                     .models
