@@ -37,7 +37,8 @@ use codex_sse::{
 use codex_upstream::parse_codex_client_version;
 use codex_upstream::{
     NativeRequestContext, codex_client_version, codex_request_headers, native_browser_headers,
-    native_browser_headers_with_referer, native_codex_response_payload,
+    native_browser_headers_with_clearance, native_browser_headers_with_referer,
+    native_codex_response_payload,
 };
 pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
@@ -66,6 +67,7 @@ use protocol_chat::{
 };
 use protocol_codex_payload::native_codex_responses_payload;
 use protocol_responses::{native_responses_text_input, validate_responses_payload};
+use proxy_service::ClearanceStore;
 use proxy_service::ProxyProfile;
 pub use shutdown::run;
 #[cfg(test)]
@@ -2047,6 +2049,7 @@ pub struct AppState {
     health_storage_semaphore: Arc<Semaphore>,
     health_accounts_semaphore: Arc<Semaphore>,
     chat_cache: Arc<StdMutex<ChatCacheState>>,
+    clearance_store: ClearanceStore,
     client: Client,
     #[cfg(test)]
     health_snapshot_publish_test_hook: Arc<RwLock<Option<HealthSnapshotPublishTestHook>>>,
@@ -2209,6 +2212,7 @@ impl AppState {
             health_storage_semaphore: Arc::new(Semaphore::new(1)),
             health_accounts_semaphore: Arc::new(Semaphore::new(1)),
             chat_cache: Arc::new(StdMutex::new(ChatCacheState::default())),
+            clearance_store: ClearanceStore::default(),
             client,
             #[cfg(test)]
             health_snapshot_publish_test_hook: Arc::new(RwLock::new(None)),
@@ -2389,6 +2393,7 @@ impl AppState {
             health_storage_semaphore: Arc::new(Semaphore::new(1)),
             health_accounts_semaphore: Arc::new(Semaphore::new(1)),
             chat_cache: Arc::new(StdMutex::new(ChatCacheState::default())),
+            clearance_store: ClearanceStore::default(),
             client,
             #[cfg(test)]
             health_snapshot_publish_test_hook,
@@ -3046,15 +3051,21 @@ async fn account_upstream_json_at_with_proxy(
         true,
     );
     let client = upstream_client_for_profile(&profile).unwrap_or_else(|_| state.client.clone());
-    let mut request =
-        native_browser_headers(client.request(method, format!("{base_url}{path}")), context)
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .header(header::ACCEPT, "application/json")
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "same-origin")
-            .header("X-OpenAI-Target-Path", target_path)
-            .header("X-OpenAI-Target-Route", target_path);
+    let mut request = native_browser_headers_with_clearance(
+        client.request(method, format!("{base_url}{path}")),
+        context,
+        &format!("{base_url}/"),
+        Some(&state.clearance_store),
+        &profile.proxy_url,
+        base_url,
+    )
+    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+    .header(header::ACCEPT, "application/json")
+    .header("Sec-Fetch-Dest", "empty")
+    .header("Sec-Fetch-Mode", "cors")
+    .header("Sec-Fetch-Site", "same-origin")
+    .header("X-OpenAI-Target-Path", target_path)
+    .header("X-OpenAI-Target-Route", target_path);
     if let Some(body) = body {
         request = request
             .header(header::CONTENT_TYPE, "application/json")

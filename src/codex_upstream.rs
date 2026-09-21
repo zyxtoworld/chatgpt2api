@@ -64,6 +64,28 @@ pub(crate) fn native_browser_headers_with_referer(
     )
 }
 
+pub(crate) async fn native_browser_headers_with_clearance(
+    request: RequestBuilder,
+    context: &NativeRequestContext,
+    referer: &str,
+    store: Option<&crate::proxy_service::ClearanceStore>,
+    proxy_url: &str,
+    target_url: &str,
+) -> RequestBuilder {
+    let mut request = native_browser_headers_with_referer(request, context, referer);
+    if let Some(store) = store
+        && let Some(bundle) = store.get(proxy_url, target_url).await
+    {
+        if !bundle.user_agent.is_empty() {
+            request = request.header(header::USER_AGENT, bundle.user_agent);
+        }
+        if !bundle.cookies.is_empty() {
+            request = request.header(header::COOKIE, cookie_header(&bundle.cookies));
+        }
+    }
+    request
+}
+
 fn native_browser_headers_for_client(
     request: RequestBuilder,
     context: &NativeRequestContext,

@@ -1396,6 +1396,32 @@ pub(super) async fn test_clearance(
             .get("user_agent")
             .and_then(Value::as_str)
             .unwrap_or("");
+        let mut cookies_map = super::proxy_service::parse_cookie_header(cookies);
+        if !cf_clearance.trim().is_empty() {
+            cookies_map
+                .entry("cf_clearance".to_owned())
+                .or_insert_with(|| cf_clearance.trim().to_owned());
+        }
+        if !cookies_map.is_empty() || !user_agent.trim().is_empty() {
+            state
+                .clearance_store
+                .put(
+                    proxy_url,
+                    target_url,
+                    super::proxy_service::ClearanceBundle {
+                        target_host: super::proxy_service::normalize_host(target_url),
+                        proxy_url: super::proxy_service::normalize_proxy_url(proxy_url),
+                        cookies: cookies_map,
+                        user_agent: user_agent.trim().to_owned(),
+                        expires_at: None,
+                    },
+                    clearance
+                        .get("refresh_interval")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(3600),
+                )
+                .await;
+        }
         json!({
             "ok": !cookies.trim().is_empty() || !cf_clearance.trim().is_empty() || !user_agent.trim().is_empty(),
             "status": "ok",
@@ -1432,6 +1458,18 @@ pub(super) async fn test_clearance(
             Ok(response) if response.status().is_success() => {
                 let payload = response.json::<Value>().await.unwrap_or(Value::Null);
                 if let Some(bundle) = parse_flaresolverr_bundle(&payload, target_url, proxy_url) {
+                    state
+                        .clearance_store
+                        .put(
+                            proxy_url,
+                            target_url,
+                            bundle.clone(),
+                            clearance
+                                .get("refresh_interval")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(3600),
+                        )
+                        .await;
                     json!({
                         "ok": true, "status": "ok", "latency_ms": latency_ms,
                         "has_cookies": !bundle.cookies.is_empty(),

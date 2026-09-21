@@ -1,4 +1,10 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use tokio::sync::Mutex;
 
 use serde_json::{Value, json};
 
@@ -19,6 +25,65 @@ pub(crate) struct ClearanceBundle {
     pub(crate) proxy_url: String,
     pub(crate) cookies: HashMap<String, String>,
     pub(crate) user_agent: String,
+    pub(crate) expires_at: Option<Instant>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ClearanceStore {
+    entries: Arc<Mutex<HashMap<(String, String), ClearanceBundle>>>,
+}
+
+impl ClearanceStore {
+    pub(crate) async fn get(&self, proxy_url: &str, target_url: &str) -> Option<ClearanceBundle> {
+        let key = (normalize_proxy_url(proxy_url), normalize_host(target_url));
+        let mut entries = self.entries.lock().await;
+        let bundle = entries.get(&key).cloned();
+        if bundle.as_ref().is_some_and(|item| {
+            item.expires_at
+                .is_some_and(|expires_at| Instant::now() >= expires_at)
+        }) {
+            entries.remove(&key);
+            return None;
+        }
+        bundle
+    }
+
+    pub(crate) async fn put(
+        &self,
+        proxy_url: &str,
+        target_url: &str,
+        mut bundle: ClearanceBundle,
+        refresh_interval: u64,
+    ) {
+        bundle.target_host = normalize_host(target_url);
+        bundle.proxy_url = normalize_proxy_url(proxy_url);
+        bundle.expires_at =
+            (refresh_interval > 0).then(|| Instant::now() + Duration::from_secs(refresh_interval));
+        self.entries.lock().await.insert(
+            (bundle.proxy_url.clone(), bundle.target_host.clone()),
+            bundle,
+        );
+    }
+
+    pub(crate) async fn invalidate(&self, proxy_url: &str, target_url: &str) {
+        self.entries
+            .lock()
+            .await
+            .remove(&(normalize_proxy_url(proxy_url), normalize_host(target_url)));
+    }
+
+    pub(crate) async fn hosts(&self) -> Vec<String> {
+        let mut hosts = self
+            .entries
+            .lock()
+            .await
+            .values()
+            .map(|bundle| bundle.target_host.clone())
+            .collect::<Vec<_>>();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
 }
 
 pub(crate) fn profile_from_runtime(
@@ -214,6 +279,7 @@ pub(crate) fn parse_flaresolverr_bundle(
         proxy_url: normalize_proxy_url(proxy_url),
         cookies,
         user_agent,
+        expires_at: None,
     })
 }
 
