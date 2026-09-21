@@ -42850,6 +42850,7 @@ data: [DONE]
             .expect("poll server readiness");
         assert_eq!(ready.status(), StatusCode::NO_CONTENT);
         let result = native_search_poll(NativeSearchPollRequest {
+            state: &state,
             client: &client,
             base_url: &base_url,
             token: "search-token",
@@ -42919,6 +42920,7 @@ data: [DONE]
             .expect("poll server readiness");
         assert_eq!(ready.status(), StatusCode::NO_CONTENT);
         let result = native_search_poll(NativeSearchPollRequest {
+            state: &state,
             client: &client,
             base_url: &base_url,
             token: "search-token",
