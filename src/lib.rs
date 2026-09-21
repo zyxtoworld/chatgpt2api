@@ -9194,7 +9194,17 @@ async fn native_codex_image_attempt(
     );
     let body = reqwest::Body::wrap_stream(native_codex_image_body_stream(request, action));
     let request = codex_request_headers(
-        state.client.post(url),
+        native_browser_headers_with_clearance(
+            state.client.post(url),
+            &NativeRequestContext::new(),
+            &format!("{base_url}/"),
+            Some(&state.clearance_store),
+            Some(&proxy_runtime_value(state)),
+            lease.proxy_url().unwrap_or_default(),
+            base_url,
+            None,
+        )
+        .await,
         lease.token(),
         lease.chatgpt_account_id().map(ToOwned::to_owned),
         state.account_type_catalog.codex_client_version().as_deref(),
