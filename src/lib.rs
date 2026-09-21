@@ -200,9 +200,7 @@ fn upstream_client_for_profile(profile: &ProxyProfile) -> Result<Client, ()> {
         let proxy = reqwest::Proxy::all(&profile.proxy_url).map_err(|_| ())?;
         builder = builder.proxy(proxy);
     }
-    if profile.skip_ssl_verify {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
+    let _ = profile.skip_ssl_verify;
     builder.build().map_err(|_| ())
 }
 type HealthSnapshotSync = Arc<dyn Fn() + Send + Sync>;
