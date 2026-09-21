@@ -66,6 +66,7 @@ use protocol_chat::{
 };
 use protocol_codex_payload::native_codex_responses_payload;
 use protocol_responses::{native_responses_text_input, validate_responses_payload};
+use proxy_service::ProxyProfile;
 pub use shutdown::run;
 #[cfg(test)]
 use shutdown::{serve_state_with_bounded_shutdown, serve_with_bounded_shutdown};
@@ -188,6 +189,22 @@ const NATIVE_POW_MAX_CONCURRENCY: usize = 4;
 const MAX_TURNSTILE_DX_CHARS: usize = 2 * 1024 * 1024;
 const MAX_TURNSTILE_INSTRUCTIONS: usize = 100_000;
 const MAX_TURNSTILE_VALUE_STRING_CHARS: usize = 64 * 1024;
+
+fn upstream_client_for_profile(profile: &ProxyProfile) -> Result<Client, ()> {
+    let mut builder = Client::builder()
+        .emulation(wreq_util::Emulation::Chrome110)
+        .cookie_store(true)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120));
+    if !profile.proxy_url.is_empty() {
+        let proxy = reqwest::Proxy::all(&profile.proxy_url).map_err(|_| ())?;
+        builder = builder.proxy(proxy);
+    }
+    if profile.skip_ssl_verify {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().map_err(|_| ())
+}
 type HealthSnapshotSync = Arc<dyn Fn() + Send + Sync>;
 static NATIVE_POW_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(NATIVE_POW_MAX_CONCURRENCY)));
