@@ -25463,7 +25463,7 @@ mod tests {
         assert_eq!(merge_account_models(&raw, None, false), None);
         let preserved = raw["models"].clone();
         assert_eq!(preserved.as_array().map(Vec::len), Some(4));
-        let mut without_quota = preserved
+        let without_quota = preserved
             .as_array()
             .into_iter()
             .flatten()
