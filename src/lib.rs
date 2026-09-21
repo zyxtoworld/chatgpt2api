@@ -64,7 +64,7 @@ use protocol_chat::{
     native_usage_frame,
 };
 use protocol_codex_payload::native_codex_responses_payload;
-use protocol_responses::validate_responses_payload;
+use protocol_responses::{native_responses_text_input, validate_responses_payload};
 pub use shutdown::run;
 #[cfg(test)]
 use shutdown::{serve_state_with_bounded_shutdown, serve_with_bounded_shutdown};
@@ -16870,6 +16870,375 @@ async fn responses_websocket_upgrade(
         .into_response())
 }
 
+fn responses_text_to_chat_object(
+    object: &Map<String, Value>,
+) -> Result<Map<String, Value>, ApiError> {
+    let input = object.get("input").ok_or_else(ApiError::invalid_request)?;
+    let normalized = native_responses_text_input(input)?;
+    let items = normalized
+        .as_array()
+        .ok_or_else(ApiError::invalid_request)?;
+    let mut messages = Vec::new();
+    if let Some(instructions) = object
+        .get("instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(json!({"role": "system", "content": instructions}));
+    }
+    for item in items {
+        let item = item.as_object().ok_or_else(ApiError::invalid_request)?;
+        let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+        let role = if matches!(role, "developer" | "system") {
+            "system"
+        } else {
+            role
+        };
+        let content = item.get("content").ok_or_else(ApiError::invalid_request)?;
+        let mut text = String::new();
+        match content {
+            Value::String(value) => text.push_str(value),
+            Value::Array(parts) => {
+                for part in parts {
+                    let part = part.as_object().ok_or_else(ApiError::invalid_request)?;
+                    match part.get("type").and_then(Value::as_str) {
+                        Some("input_text" | "output_text") => text.push_str(
+                            part.get("text")
+                                .and_then(Value::as_str)
+                                .ok_or_else(ApiError::invalid_request)?,
+                        ),
+                        Some("input_image") => return Err(ApiError::unsupported_capability()),
+                        _ => return Err(ApiError::invalid_request()),
+                    }
+                }
+            }
+            _ => return Err(ApiError::invalid_request()),
+        }
+        messages.push(json!({"role": role, "content": text}));
+    }
+    if messages.is_empty() {
+        return Err(ApiError::invalid_request());
+    }
+    let mut chat = Map::new();
+    chat.insert(
+        "model".to_owned(),
+        object
+            .get("model")
+            .cloned()
+            .ok_or_else(ApiError::invalid_request)?,
+    );
+    chat.insert("messages".to_owned(), Value::Array(messages));
+    chat.insert(
+        "stream".to_owned(),
+        object
+            .get("stream")
+            .cloned()
+            .unwrap_or_else(|| json!(false)),
+    );
+    if let Some(reasoning) = object.get("reasoning").filter(|value| !value.is_null()) {
+        chat.insert("reasoning".to_owned(), reasoning.clone());
+    }
+    Ok(chat)
+}
+
+fn response_from_chat_value(value: &Value, model: &str) -> Result<Value, ApiError> {
+    let choice = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(Value::as_object)
+        .ok_or_else(ApiError::upstream)?;
+    let message = choice
+        .get("message")
+        .and_then(Value::as_object)
+        .ok_or_else(ApiError::upstream)?;
+    let text = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let response_id = format!("resp_{}", native_message_id());
+    let item_id = format!("msg_{}", native_message_id());
+    let item = json!({
+        "id": item_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    });
+    let mut response = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": native_created(),
+        "status": "completed",
+        "error": Value::Null,
+        "incomplete_details": Value::Null,
+        "model": model,
+        "output": [item],
+        "parallel_tool_calls": false,
+    });
+    if let Some(usage) = value.get("usage").and_then(Value::as_object) {
+        let input_tokens = usage
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let output_tokens = usage
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        response["usage"] = json!({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens.saturating_add(output_tokens),
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        });
+    }
+    Ok(response)
+}
+
+type ChatResponseInputStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send + 'static>>;
+
+fn response_stream_from_chat(response: Response, model: String, deadline: Instant) -> Response {
+    let input = response
+        .into_body()
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(|_| io::Error::other("chat response stream failed")));
+    struct StreamState {
+        input: ChatResponseInputStream,
+        buffer: Vec<u8>,
+        pending: VecDeque<Bytes>,
+        model: String,
+        response_id: String,
+        item_id: String,
+        created: i64,
+        text: String,
+        terminal: bool,
+        total: usize,
+    }
+    let response_id = format!("resp_{}", native_message_id());
+    let item_id = format!("msg_{}", native_message_id());
+    let created = native_created();
+    let mut pending = VecDeque::new();
+    pending.push_back(Bytes::from(format!(
+        "data: {}\n\n",
+        serde_json::to_string(&json!({
+            "type": "response.created",
+            "response": {
+                "id": response_id.clone(),
+                "object": "response",
+                "created_at": created,
+                "status": "in_progress",
+                "error": Value::Null,
+                "incomplete_details": Value::Null,
+                "model": model.clone(),
+                "output": [],
+                "parallel_tool_calls": false
+            }
+        }))
+        .unwrap_or_default()
+    )));
+    pending.push_back(Bytes::from(format!(
+        "data: {}\n\n",
+        serde_json::to_string(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": item_id.clone(),
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "", "annotations": []}]
+            }
+        }))
+        .unwrap_or_default()
+    )));
+    let state = StreamState {
+        input: Box::pin(input),
+        buffer: Vec::new(),
+        pending,
+        model,
+        response_id,
+        item_id,
+        created,
+        text: String::new(),
+        terminal: false,
+        total: 0,
+    };
+    let stream = stream::unfold(state, move |mut state| async move {
+        loop {
+            if let Some(frame) = state.pending.pop_front() {
+                return Some((Ok(frame), state));
+            }
+            if state.terminal {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                state.terminal = true;
+                return Some((Err(io::Error::other("response stream timed out")), state));
+            }
+            let next = tokio::time::timeout(remaining, state.input.next()).await;
+            let chunk = match next {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(error))) | Err(_) => {
+                    state.terminal = true;
+                    return Some((Err(io::Error::other(error.to_string())), state));
+                }
+                Ok(None) => {
+                    let item = json!({
+                        "id": state.item_id.clone(),
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": state.text.clone(), "annotations": []}]
+                    });
+                    state.pending.push_back(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "response.output_text.done",
+                            "item_id": state.item_id.clone(),
+                            "output_index": 0,
+                            "content_index": 0,
+                            "text": state.text.clone(),
+                        }))
+                        .unwrap_or_default()
+                    )));
+                    state.pending.push_back(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "response.output_item.done",
+                            "output_index": 0,
+                            "item": item,
+                        }))
+                        .unwrap_or_default()
+                    )));
+                    state.pending.push_back(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "response.completed",
+                            "response": {
+                                "id": state.response_id.clone(),
+                                "object": "response",
+                                "created_at": state.created,
+                                "status": "completed",
+                                "error": Value::Null,
+                                "incomplete_details": Value::Null,
+                                "model": state.model.clone(),
+                                "output": [item],
+                                "parallel_tool_calls": false
+                            }
+                        }))
+                        .unwrap_or_default()
+                    )));
+                    state.terminal = true;
+                    continue;
+                }
+            };
+            state.total = state.total.saturating_add(chunk.len());
+            if state.total > MAX_UPSTREAM_BODY_BYTES {
+                state.terminal = true;
+                return Some((
+                    Err(io::Error::other("response stream exceeded limit")),
+                    state,
+                ));
+            }
+            state.buffer.extend_from_slice(&chunk);
+            while let Some((position, delimiter_length)) = sse_delimiter(&state.buffer) {
+                let event = state.buffer.drain(..position).collect::<Vec<_>>();
+                state.buffer.drain(..delimiter_length);
+                let data = match codex_sse_data(&event) {
+                    Ok(Some(data)) => data,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        state.terminal = true;
+                        return Some((Err(error), state));
+                    }
+                };
+                if data == "[DONE]" {
+                    state.input = Box::pin(stream::empty());
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(&data) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let delta = value
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .and_then(|choices| choices.first())
+                    .and_then(Value::as_object)
+                    .and_then(|choice| choice.get("delta"))
+                    .and_then(Value::as_object)
+                    .and_then(|delta| delta.get("content"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !delta.is_empty() {
+                    state.text.push_str(delta);
+                    state.pending.push_back(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&json!({
+                            "type": "response.output_text.delta",
+                            "item_id": state.item_id.clone(),
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": delta,
+                        }))
+                        .unwrap_or_default()
+                    )));
+                }
+            }
+            if !state.pending.is_empty() {
+                continue;
+            }
+        }
+    });
+    let mut output = Response::new(Body::from_stream(stream));
+    output.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    output
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    output
+}
+
+async fn native_responses_via_web_chat(
+    state: AppState,
+    headers: HeaderMap,
+    object: Map<String, Value>,
+    timeout: Duration,
+) -> Result<Response, ApiError> {
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(ApiError::invalid_request)?
+        .to_owned();
+    let chat_object = responses_text_to_chat_object(&object)?;
+    let body =
+        serde_json::to_vec(&Value::Object(chat_object)).map_err(|_| ApiError::invalid_request())?;
+    let routed =
+        chat_completions_with_timeout(State(state), headers, Body::from(body), timeout).await?;
+    if object
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(response_stream_from_chat(
+            routed,
+            model,
+            Instant::now() + timeout,
+        ));
+    }
+    let body = to_bytes(routed.into_body(), MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::upstream())?;
+    let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+    Ok(Json(response_from_chat_value(&value, &model)?).into_response())
+}
+
 async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
     match messages_inner(State(state), headers, body).await {
         Ok(response) => response,
@@ -17320,6 +17689,18 @@ async fn responses_with_timeout(
     if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
         if native_response_image_tool(&object).is_some() {
             return native_responses_image_completion(state, object).await;
+        }
+        let has_web_search_tool =
+            object
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| {
+                    tools.iter().any(|tool| {
+                        tool.get("type").and_then(Value::as_str) == Some("web_search_preview")
+                    })
+                });
+        if !has_web_search_tool {
+            return native_responses_via_web_chat(state, headers, object, upstream_timeout).await;
         }
         return native_responses_with_timeout(state, object, upstream_timeout).await;
     }
