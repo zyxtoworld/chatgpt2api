@@ -7580,6 +7580,7 @@ async fn native_image_request_proxy(
     };
     let request = native_apply_image_edit_mask(request)?;
     reject_sensitive_words(&state, &Value::String(request.prompt.clone()))?;
+    review_request_content(&state, &Value::String(request.prompt.clone())).await?;
     native_validate_image_sources(&request)?;
     if request.codex {
         native_codex_image_request_proxy(state, request, endpoint).await
@@ -11320,6 +11321,7 @@ async fn image_task_generation(
         None,
         None,
     )?;
+    review_request_content(&state, &Value::String(request.prompt.clone())).await?;
     enqueue_image_task(state, owner, task_id, "generate", request).await
 }
 
@@ -11380,6 +11382,7 @@ async fn image_task_edit(
         .clone()
         .ok_or_else(ApiError::invalid_request)?;
     reject_sensitive_words(&state, &Value::String(request.prompt.clone()))?;
+    review_request_content(&state, &Value::String(request.prompt.clone())).await?;
     request.client_task_id = None;
     request.response_format = "b64_json".to_owned();
     request.stream = false;
