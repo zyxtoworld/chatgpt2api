@@ -3144,6 +3144,7 @@ async fn account_upstream_json_at_with_proxy(
         context,
         &format!("{base_url}/"),
         Some(&state.clearance_store),
+        Some(&proxy_runtime_value(state)),
         &profile.proxy_url,
         base_url,
     )
@@ -3183,6 +3184,13 @@ fn proxy_runtime_value(state: &AppState) -> Value {
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| value.get("proxy_runtime").cloned())
         .unwrap_or_else(config::proxy_runtime_defaults_from_environment)
+}
+
+pub(crate) fn clearance_client_for_headers() -> Client {
+    Client::builder()
+        .timeout(Duration::from_secs(75))
+        .build()
+        .unwrap_or_else(|_| Client::new())
 }
 
 async fn refresh_access_token_account(

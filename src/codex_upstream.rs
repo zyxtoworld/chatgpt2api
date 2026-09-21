@@ -69,13 +69,52 @@ pub(crate) async fn native_browser_headers_with_clearance(
     context: &NativeRequestContext,
     referer: &str,
     store: Option<&crate::proxy_service::ClearanceStore>,
+    runtime: Option<&Value>,
     proxy_url: &str,
     target_url: &str,
 ) -> RequestBuilder {
     let mut request = native_browser_headers_with_referer(request, context, referer);
-    if let Some(store) = store
-        && let Some(bundle) = store.get(proxy_url, target_url).await
-    {
+    let bundle = if let Some(store) = store {
+        let runtime = runtime.cloned().unwrap_or(Value::Null);
+        let clearance = runtime.get("clearance").and_then(Value::as_object);
+        let enabled = runtime.get("enabled").and_then(Value::as_bool) == Some(true)
+            && clearance
+                .and_then(|value| value.get("enabled"))
+                .and_then(Value::as_bool)
+                == Some(true);
+        let mode = clearance
+            .and_then(|value| value.get("mode"))
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let cached = store.get(proxy_url, target_url).await;
+        if cached.is_some() || !enabled || mode != "flaresolverr" {
+            cached
+        } else {
+            let client = crate::clearance_client_for_headers();
+            store
+                .refresh_flaresolverr(
+                    &client,
+                    clearance
+                        .and_then(|value| value.get("flaresolverr_url"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    target_url,
+                    proxy_url,
+                    clearance
+                        .and_then(|value| value.get("timeout_sec"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(60),
+                    clearance
+                        .and_then(|value| value.get("refresh_interval"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(3600),
+                )
+                .await
+        }
+    } else {
+        None
+    };
+    if let Some(bundle) = bundle {
         if !bundle.user_agent.is_empty() {
             request = request.header(header::USER_AGENT, bundle.user_agent);
         }

@@ -31,6 +31,7 @@ pub(crate) struct ClearanceBundle {
 #[derive(Clone, Default)]
 pub(crate) struct ClearanceStore {
     entries: Arc<Mutex<HashMap<(String, String), ClearanceBundle>>>,
+    flights: Arc<Mutex<HashMap<(String, String), Arc<tokio::sync::Notify>>>>,
 }
 
 impl ClearanceStore {
@@ -70,6 +71,59 @@ impl ClearanceStore {
             .lock()
             .await
             .remove(&(normalize_proxy_url(proxy_url), normalize_host(target_url)));
+    }
+
+    pub(crate) async fn refresh_flaresolverr(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        target_url: &str,
+        proxy_url: &str,
+        timeout_sec: u64,
+        refresh_interval: u64,
+    ) -> Option<ClearanceBundle> {
+        let key = (normalize_proxy_url(proxy_url), normalize_host(target_url));
+        if let Some(bundle) = self.get(proxy_url, target_url).await {
+            return Some(bundle);
+        }
+        let (notify, owner) = {
+            let mut flights = self.flights.lock().await;
+            if let Some(notify) = flights.get(&key) {
+                (notify.clone(), false)
+            } else {
+                let notify = Arc::new(tokio::sync::Notify::new());
+                flights.insert(key.clone(), notify.clone());
+                (notify, true)
+            }
+        };
+        if !owner {
+            notify.notified().await;
+            return self.get(proxy_url, target_url).await;
+        }
+        let result = async {
+            let endpoint = endpoint.trim_end_matches('/');
+            if endpoint.is_empty() {
+                return None;
+            }
+            let response = client
+                .post(format!("{endpoint}/v1"))
+                .json(&flaresolverr_payload(target_url, proxy_url, timeout_sec))
+                .send()
+                .await
+                .ok()?;
+            if !response.status().is_success() {
+                return None;
+            }
+            let value = response.json::<Value>().await.ok()?;
+            let bundle = parse_flaresolverr_bundle(&value, target_url, proxy_url)?;
+            self.put(proxy_url, target_url, bundle, refresh_interval)
+                .await;
+            self.get(proxy_url, target_url).await
+        }
+        .await;
+        self.flights.lock().await.remove(&key);
+        notify.notify_waiters();
+        result
     }
 
     pub(crate) async fn hosts(&self) -> Vec<String> {
