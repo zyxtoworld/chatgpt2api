@@ -6,6 +6,7 @@ use std::env;
 use std::fs;
 
 use super::protocol_codex_payload::native_codex_tool;
+use super::proxy_service::{cookie_header, parse_cookie_header};
 use super::{
     ApiError, CODEX_RESPONSES_MODEL, NATIVE_CLIENT_BUILD_NUMBER, NATIVE_CLIENT_VERSION,
     NATIVE_ORIGIN, NATIVE_SEC_CH_UA, NATIVE_USER_AGENT, is_semver, native_message_id,
@@ -115,20 +116,27 @@ fn native_browser_headers_for_client(
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
         {
-            request = request.header(header::USER_AGENT, user_agent);
+            request = request.header(header::USER_AGENT, user_agent.trim());
         }
-        if let Some(cookies) = clearance
+        let mut additions = clearance
             .get("cf_cookies")
             .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            request = request.header(header::COOKIE, cookies);
-        } else if let Some(clearance) = clearance
+            .map(parse_cookie_header)
+            .unwrap_or_default();
+        if let Some(clearance) = clearance
             .get("cf_clearance")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
         {
-            request = request.header(header::COOKIE, format!("cf_clearance={clearance}"));
+            additions
+                .entry("cf_clearance".to_owned())
+                .or_insert_with(|| clearance.trim().to_owned());
+        }
+        if !additions.is_empty() {
+            let merged = cookie_header(&additions);
+            if !merged.is_empty() {
+                request = request.header(header::COOKIE, merged);
+            }
         }
     }
     request

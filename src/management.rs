@@ -36,6 +36,7 @@ use super::model_pool::{
     ModelProvenance, is_web_image_model_id, model_provenance_label, model_provenance_rank,
     project_account_model_entries, project_imported_model_entries,
 };
+use super::proxy_service::{flaresolverr_payload, parse_flaresolverr_bundle};
 use super::{
     ApiError, AppState, admin_authenticated, authenticated, config, data_file, image_content_type,
     image_root, read_image_tags, redact_config, safe_relative_path,
@@ -1349,24 +1350,113 @@ pub(super) async fn test_clearance(
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
-    let _ = super::account_json_body(body).await?;
+    let request = super::account_json_body(body).await?;
     let runtime = runtime_status(&state);
     let enabled = runtime
         .get("clearance_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let target_url = request
+        .get("target_url")
+        .and_then(Value::as_str)
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+        .unwrap_or("https://chatgpt.com/");
+    let config = runtime_value(&state);
+    let clearance = config.get("clearance").unwrap_or(&Value::Null);
+    let mode = clearance
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let proxy_url = config
+        .get("proxy_url")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let timeout_sec = clearance
+        .get("timeout_sec")
+        .and_then(Value::as_u64)
+        .unwrap_or(60)
+        .clamp(1, 300);
+    let started = std::time::Instant::now();
     let result = if !enabled {
         json!({
             "ok": false, "status": "disabled", "latency_ms": 0,
             "has_cookies": false, "user_agent": "", "error": "clearance is disabled",
             "runtime": runtime,
         })
-    } else {
+    } else if mode == "manual" {
+        let cookies = clearance
+            .get("cf_cookies")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let cf_clearance = clearance
+            .get("cf_clearance")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let user_agent = clearance
+            .get("user_agent")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         json!({
-            "ok": false, "status": "failed", "latency_ms": 0,
-            "has_cookies": false, "user_agent": "", "error": "clearance refresh returned no bundle",
+            "ok": !cookies.trim().is_empty() || !cf_clearance.trim().is_empty() || !user_agent.trim().is_empty(),
+            "status": "ok",
+            "latency_ms": started.elapsed().as_millis(),
+            "has_cookies": !cookies.trim().is_empty() || !cf_clearance.trim().is_empty(),
+            "user_agent": user_agent,
+            "error": Value::Null,
             "runtime": runtime,
         })
+    } else {
+        let flaresolverr_url = clearance
+            .get("flaresolverr_url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim_end_matches('/');
+        if flaresolverr_url.is_empty() {
+            return Ok(Json(json!({"result": {
+                "ok": false, "status": "failed", "latency_ms": 0,
+                "has_cookies": false, "user_agent": "",
+                "error": "FlareSolverr URL is not configured", "runtime": runtime,
+            }})));
+        }
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_sec + 5))
+            .build()
+            .map_err(|_| ApiError::unavailable())?;
+        let response = client
+            .post(format!("{flaresolverr_url}/v1"))
+            .json(&flaresolverr_payload(target_url, proxy_url, timeout_sec))
+            .send()
+            .await;
+        let latency_ms = started.elapsed().as_millis();
+        match response {
+            Ok(response) if response.status().is_success() => {
+                let payload = response.json::<Value>().await.unwrap_or(Value::Null);
+                if let Some(bundle) = parse_flaresolverr_bundle(&payload, target_url, proxy_url) {
+                    json!({
+                        "ok": true, "status": "ok", "latency_ms": latency_ms,
+                        "has_cookies": !bundle.cookies.is_empty(),
+                        "user_agent": bundle.user_agent, "error": Value::Null,
+                        "runtime": runtime,
+                    })
+                } else {
+                    json!({
+                        "ok": false, "status": "failed", "latency_ms": latency_ms,
+                        "has_cookies": false, "user_agent": "",
+                        "error": "FlareSolverr returned no clearance bundle", "runtime": runtime,
+                    })
+                }
+            }
+            Ok(response) => json!({
+                "ok": false, "status": "failed", "latency_ms": latency_ms,
+                "has_cookies": false, "user_agent": "",
+                "error": format!("FlareSolverr HTTP {}", response.status()), "runtime": runtime,
+            }),
+            Err(error) => json!({
+                "ok": false, "status": "error", "latency_ms": latency_ms,
+                "has_cookies": false, "user_agent": "",
+                "error": error.to_string(), "runtime": runtime,
+            }),
+        }
     };
     Ok(Json(json!({"result": result})))
 }
