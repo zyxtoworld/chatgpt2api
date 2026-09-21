@@ -3261,7 +3261,7 @@ async fn refresh_access_token_account(
         .as_deref()
         .ok_or("upstream_unavailable")?;
     let me = account_upstream_json_with_proxy(
-        state: Some(state),
+        state,
         &context,
         &token,
         account_proxy,
@@ -9941,7 +9941,7 @@ async fn native_search_attempt(
     }
     let conversation_id = search_conversation_id_from_response(run, deadline, false).await?;
     native_search_poll(NativeSearchPollRequest {
-        state,
+        state: Some(state),
         client: &client,
         base_url,
         token: lease.token(),
