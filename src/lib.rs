@@ -13761,14 +13761,18 @@ enum NativeModelCatalogFetchOutcome {
 }
 
 async fn fetch_native_model_catalog(
+    state: Option<&AppState>,
     client: &Client,
     base_url: &str,
     context: &NativeRequestContext,
     identity: NativeModelIdentity<'_>,
+    proxy_url: &str,
     deadline: Instant,
 ) -> Option<Vec<PublicModel>> {
-    match fetch_native_model_catalog_with_outcome(client, base_url, context, identity, deadline)
-        .await
+    match fetch_native_model_catalog_with_outcome(
+        state, client, base_url, context, identity, proxy_url, deadline,
+    )
+    .await
     {
         NativeModelCatalogFetchOutcome::Complete(models) => Some(models),
         NativeModelCatalogFetchOutcome::RetryableUnavailable
@@ -13777,10 +13781,12 @@ async fn fetch_native_model_catalog(
 }
 
 async fn fetch_native_model_catalog_with_outcome(
+    state: Option<&AppState>,
     client: &Client,
     base_url: &str,
     context: &NativeRequestContext,
     identity: NativeModelIdentity<'_>,
+    proxy_url: &str,
     deadline: Instant,
 ) -> NativeModelCatalogFetchOutcome {
     if identity.token.is_empty() {
@@ -13813,10 +13819,24 @@ async fn fetch_native_model_catalog_with_outcome(
             break;
         }
         let target_path = path.split('?').next().unwrap_or(path);
-        let mut request = native_browser_headers(
-            client.get(format!("{}{path}", base_url.trim_end_matches('/'))),
-            context,
-        )
+        let mut request = if let Some(state) = state {
+            native_browser_headers_with_clearance(
+                client.get(format!("{}{path}", base_url.trim_end_matches('/'))),
+                context,
+                &format!("{}/", base_url.trim_end_matches('/')),
+                Some(&state.clearance_store),
+                Some(&proxy_runtime_value(state)),
+                proxy_url,
+                base_url,
+                None,
+            )
+            .await
+        } else {
+            native_browser_headers(
+                client.get(format!("{}{path}", base_url.trim_end_matches('/'))),
+                context,
+            )
+        }
         .header("X-OpenAI-Target-Path", target_path)
         .header("X-OpenAI-Target-Route", target_path);
         request = request.header(header::AUTHORIZATION, format!("Bearer {}", identity.token));
@@ -13970,6 +13990,7 @@ async fn fetch_imported_model_catalog_request(
             .await
         } else {
             match fetch_native_model_catalog_with_outcome(
+                None,
                 &client,
                 &base_url,
                 &NativeRequestContext::new(),
@@ -13978,6 +13999,7 @@ async fn fetch_imported_model_catalog_request(
                     account_type: Some(account_type.as_str()),
                     account_id: account_id.as_deref(),
                 },
+                "",
                 deadline,
             )
             .await
@@ -14032,6 +14054,7 @@ async fn fetch_imported_native_model_catalog_with_retry(
             batch.record(&key, 0);
         }
         let result = fetch_native_model_catalog_with_outcome(
+            None,
             &client,
             &base_url,
             &NativeRequestContext::new(),
@@ -14040,6 +14063,7 @@ async fn fetch_imported_native_model_catalog_with_retry(
                 account_type: Some(account_type.as_str()),
                 account_id: account_id.as_deref(),
             },
+            "",
             deadline,
         )
         .await;
@@ -14991,6 +15015,7 @@ impl AccountTypeCatalog {
     ) -> Option<Vec<PublicModel>> {
         let base_url = self.base_url.as_deref()?;
         fetch_native_model_catalog(
+            None,
             &self.client,
             base_url,
             &NativeRequestContext::new(),
@@ -14999,6 +15024,7 @@ impl AccountTypeCatalog {
                 account_type,
                 account_id,
             },
+            "",
             deadline,
         )
         .await
@@ -17586,7 +17612,9 @@ async fn native_codex_response_attempt(
 }
 
 async fn native_conversation_attempt(
+    state: &AppState,
     client: &Client,
+    lease: Option<&AccountLease>,
     base_url: &str,
     token: &str,
     payload: &Value,
@@ -17617,15 +17645,29 @@ async fn native_conversation_attempt(
         "/backend-anon/conversation"
     };
     let url = format!("{}{route_base}", base_url.trim_end_matches('/'));
-    let mut request = native_browser_headers(client.post(url), &context)
-        .header(header::ACCEPT, "text/event-stream")
-        .header("X-OpenAI-Target-Path", route_base)
-        .header("X-OpenAI-Target-Route", route_base)
-        .header(
-            "OpenAI-Sentinel-Chat-Requirements-Token",
-            requirements.token,
+    let mut request = if let Some(lease) = lease {
+        native_browser_headers_with_clearance(
+            client.post(url),
+            &context,
+            &format!("{base_url}/"),
+            Some(&state.clearance_store),
+            Some(&proxy_runtime_value(state)),
+            lease.proxy_url().unwrap_or_default(),
+            base_url,
+            None,
         )
-        .json(payload);
+        .await
+    } else {
+        native_browser_headers(client.post(url), &context)
+    }
+    .header(header::ACCEPT, "text/event-stream")
+    .header("X-OpenAI-Target-Path", route_base)
+    .header("X-OpenAI-Target-Route", route_base)
+    .header(
+        "OpenAI-Sentinel-Chat-Requirements-Token",
+        requirements.token,
+    )
+    .json(payload);
     if authenticated {
         request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
     }
@@ -19004,7 +19046,15 @@ async fn chat_completions_with_timeout(
                     .as_ref()
                     .map(|current| upstream_client_for_lease(&state, current, false))
                     .unwrap_or_else(|| state.client.clone());
-                native_conversation_attempt(&client, base_url, token, &payload).await
+                native_conversation_attempt(
+                    &state,
+                    &client,
+                    lease.as_ref(),
+                    base_url,
+                    token,
+                    &payload,
+                )
+                .await
             };
             match attempt {
                 Ok(upstream) => break upstream,
