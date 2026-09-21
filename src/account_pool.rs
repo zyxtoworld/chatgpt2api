@@ -696,7 +696,7 @@ impl AccountStore {
 
     async fn acquire_filtered(
         &self,
-        _model: &str,
+        model: &str,
         excluded_tokens: &HashSet<String>,
         allowed_groups: Option<&HashSet<AccountModelGroup>>,
         required_source_type: Option<&str>,
@@ -732,6 +732,15 @@ impl AccountStore {
             }
             if let Some(allowed_groups) = allowed_groups
                 && !allowed_groups.contains(&slot.record.account_type)
+            {
+                continue;
+            } else if model != "auto"
+                && !slot.record.models.is_empty()
+                && !slot
+                    .record
+                    .models
+                    .iter()
+                    .any(|candidate| candidate == model)
             {
                 continue;
             }
