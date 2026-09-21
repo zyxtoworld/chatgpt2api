@@ -1217,8 +1217,12 @@ pub(super) async fn proxy_runtime(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
+    let mut status = runtime_status(&state);
+    let cached_hosts = state.clearance_store.hosts().await;
+    status["has_clearance_bundle"] = Value::Bool(!cached_hosts.is_empty());
+    status["cached_clearance_hosts"] = json!(cached_hosts);
     Ok(Json(
-        json!({"runtime": runtime_value(&state), "status": runtime_status(&state)}),
+        json!({"runtime": runtime_value(&state), "status": status}),
     ))
 }
 
