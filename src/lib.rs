@@ -16827,8 +16827,24 @@ async fn native_conversation_attempt(
         .map_err(|_| (ApiError::upstream(), false))?
         .map_err(|_| (ApiError::upstream(), false))?;
     if !upstream.status().is_success() {
+        let status = upstream.status();
+        let preview = bounded_response_body(upstream)
+            .await
+            .ok()
+            .map(|body| String::from_utf8_lossy(&body[..body.len().min(512)]).to_string())
+            .unwrap_or_default();
+        log::warn!(
+            "native conversation upstream failed: model={} token_len={} status={} body={}",
+            payload
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            token.len(),
+            status,
+            preview
+        );
         let retryable = matches!(
-            upstream.status(),
+            status,
             StatusCode::TOO_MANY_REQUESTS
                 | StatusCode::INTERNAL_SERVER_ERROR
                 | StatusCode::BAD_GATEWAY
