@@ -735,16 +735,6 @@ impl AccountStore {
             {
                 continue;
             }
-            if model != "auto"
-                && !slot.record.models.is_empty()
-                && !slot
-                    .record
-                    .models
-                    .iter()
-                    .any(|candidate| candidate == model)
-            {
-                continue;
-            }
             slot.inflight.fetch_add(1, Ordering::AcqRel);
             return Some(AccountLease::new(slot, false));
         }

@@ -15850,13 +15850,6 @@ async fn native_bootstrap_with_timeout_context(
             .map_err(|_| (ApiError::upstream(), false))?;
         let status = response.status();
         if !status.is_success() {
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/chatgpt2api-native-upstream.log")
-            {
-                let _ = writeln!(file, "bootstrap status={status}");
-            }
             return Err((ApiError::upstream(), native_stage_retryable(status, false)));
         }
         let body = bounded_response_body(response)
@@ -15967,13 +15960,6 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let prepare = prepare.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = prepare.status();
         if !status.is_success() {
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/chatgpt2api-native-upstream.log")
-            {
-                let _ = writeln!(file, "requirements_prepare status={status}");
-            }
             return Err((ApiError::upstream(), native_stage_retryable(status, true)));
         }
         bounded_response_body(prepare)
@@ -16023,13 +16009,6 @@ async fn native_chat_requirements_with_resources_for_route_context(
         let finalize = finalize.await.map_err(|_| (ApiError::upstream(), false))?;
         let status = finalize.status();
         if !status.is_success() {
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/chatgpt2api-native-upstream.log")
-            {
-                let _ = writeln!(file, "requirements_finalize status={status}");
-            }
             return Err((ApiError::upstream(), native_stage_retryable(status, false)));
         }
         bounded_response_body(finalize)
@@ -16807,16 +16786,7 @@ async fn native_conversation_attempt(
     let context = NativeRequestContext::new();
     let pow_resources = match native_bootstrap(client, base_url, token, &context).await {
         Ok(resources) => resources,
-        Err((error, retryable)) => {
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/chatgpt2api-native-upstream.log")
-            {
-                let _ = writeln!(file, "bootstrap_error retryable={retryable}");
-            }
-            return Err((error, retryable));
-        }
+        Err(error) => return Err(error),
     };
     let requirements = match native_chat_requirements_with_resources_for_route_context(
         client,
@@ -16830,16 +16800,7 @@ async fn native_conversation_attempt(
     .await
     {
         Ok(requirements) => requirements,
-        Err((error, retryable)) => {
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/chatgpt2api-native-upstream.log")
-            {
-                let _ = writeln!(file, "requirements_error retryable={retryable}");
-            }
-            return Err((error, retryable));
-        }
+        Err(error) => return Err(error),
     };
     let route_base = if authenticated {
         "/backend-api/conversation"
@@ -16868,62 +16829,12 @@ async fn native_conversation_attempt(
     if let Some(value) = requirements.turnstile_token {
         request = request.header("OpenAI-Sentinel-Turnstile-Token", value);
     }
-    let upstream = match tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send()).await {
-        Ok(Ok(response)) => response,
-        Ok(Err(_)) => {
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/chatgpt2api-native-upstream.log")
-            {
-                let _ = writeln!(file, "conversation_send_error");
-            }
-            return Err((ApiError::upstream(), false));
-        }
-        Err(_) => {
-            if let Ok(mut file) = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/chatgpt2api-native-upstream.log")
-            {
-                let _ = writeln!(file, "conversation_timeout");
-            }
-            return Err((ApiError::upstream(), false));
-        }
-    };
+    let upstream = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send())
+        .await
+        .map_err(|_| (ApiError::upstream(), false))?
+        .map_err(|_| (ApiError::upstream(), false))?;
     if !upstream.status().is_success() {
         let status = upstream.status();
-        let preview = bounded_response_body(upstream)
-            .await
-            .ok()
-            .map(|body| String::from_utf8_lossy(&body[..body.len().min(512)]).to_string())
-            .unwrap_or_default();
-        if let Ok(mut file) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/chatgpt2api-native-upstream.log")
-        {
-            let _ = writeln!(
-                file,
-                "model={} status={} body={}",
-                payload
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                status,
-                preview
-            );
-        }
-        log::warn!(
-            "native conversation upstream failed: model={} token_len={} status={} body={}",
-            payload
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            token.len(),
-            status,
-            preview
-        );
         let retryable = matches!(
             status,
             StatusCode::TOO_MANY_REQUESTS
