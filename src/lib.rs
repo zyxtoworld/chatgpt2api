@@ -202,7 +202,11 @@ fn upstream_client_for_profile(profile: &ProxyProfile) -> Result<Client, ()> {
         let proxy = reqwest::Proxy::all(&profile.proxy_url).map_err(|_| ())?;
         builder = builder.proxy(proxy);
     }
-    let _ = profile.skip_ssl_verify;
+    if profile.skip_ssl_verify {
+        builder = builder
+            .tls_cert_verification(false)
+            .tls_verify_hostname(false);
+    }
     builder.build().map_err(|_| ())
 }
 
