@@ -3837,10 +3837,8 @@ async fn persist_account_refresh_updates(
                         "last_refresh_error_at".to_owned(),
                         Value::String(now.clone()),
                     );
-                    if invalid_token_should_mark_abnormal(previous) {
-                        if !remove_invalid {
-                            object.insert("status".to_owned(), Value::String("异常".to_owned()));
-                        }
+                    if invalid_token_should_mark_abnormal(previous) && !remove_invalid {
+                        object.insert("status".to_owned(), Value::String("异常".to_owned()));
                     }
                 }
             }
@@ -13465,9 +13463,14 @@ fn account_tokens_to_remove_after_refresh(
         }
     }
     if remove_rate_limited {
-        tokens.extend(updated_records.iter().filter_map(|(token, updated)| {
-            (updated.get("status").and_then(Value::as_str) == Some("限流")).then(|| token.clone())
-        }));
+        tokens.extend(
+            updated_records
+                .iter()
+                .filter(|(_, updated)| {
+                    updated.get("status").and_then(Value::as_str) == Some("限流")
+                })
+                .map(|(token, _)| token.clone()),
+        );
     }
     tokens
 }

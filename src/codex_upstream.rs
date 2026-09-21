@@ -64,6 +64,7 @@ pub(crate) fn native_browser_headers_with_referer(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn native_browser_headers_with_clearance(
     request: RequestBuilder,
     context: &NativeRequestContext,
