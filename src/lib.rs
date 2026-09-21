@@ -1059,7 +1059,14 @@ pub(crate) fn canonicalize_account_item(value: &Value) -> Result<Value, AppInitE
         .filter(|token| !token.is_empty() && token.len() <= MAX_ACCOUNT_TOKEN_LENGTH)
         .ok_or(AppInitError::AccountSnapshot)?;
     let mut canonical = object.clone();
-    for key in ["accessToken", "token", "refresh_token", "id_token"] {
+    for key in [
+        "accessToken",
+        "token",
+        "refresh_token",
+        "id_token",
+        "_refresh_token",
+        "_id_token",
+    ] {
         canonical.remove(key);
     }
     canonical.insert("access_token".to_owned(), Value::String(token.to_owned()));
@@ -2721,7 +2728,7 @@ fn account_image_capability_proof(object: &Map<String, Value>) -> bool {
 }
 
 fn merge_account_models(
-    raw: &Value,
+    _raw: &Value,
     fetched: Option<Vec<PublicModel>>,
     image_capable: bool,
 ) -> Option<(Vec<String>, Value)> {
@@ -2757,12 +2764,6 @@ fn merge_account_models(
         for model in fetched {
             push(&model.id, model.provenance);
         }
-    } else if let Some(object) = raw.as_object()
-        && account_model_source_proof(object)
-    {
-        for (id, provenance) in project_account_model_entries(object, ModelProvenance::Unknown) {
-            push(&id, provenance);
-        }
     }
     if models.is_empty() {
         return None;
@@ -2792,9 +2793,16 @@ fn account_request_payload_token(value: &Value) -> Option<String> {
 
 fn account_request_has_forbidden_tokens(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
-        ["accessToken", "token", "refresh_token", "id_token"]
-            .iter()
-            .any(|key| object.contains_key(*key))
+        [
+            "accessToken",
+            "token",
+            "refresh_token",
+            "id_token",
+            "_refresh_token",
+            "_id_token",
+        ]
+        .iter()
+        .any(|key| object.contains_key(*key))
     })
 }
 
@@ -13979,62 +13987,6 @@ impl AccountTypeCatalog {
         }
     }
 
-    fn persisted_web_model_types(&self, requested_model: Option<&str>) -> HashSet<String> {
-        self.account_store
-            .records()
-            .into_iter()
-            .filter(|record| {
-                record.source_type != "codex" && !matches!(record.status.as_str(), "禁用" | "异常")
-            })
-            .filter_map(|record| {
-                let object = record.raw.as_object()?;
-                let has_model = project_account_model_entries(object, ModelProvenance::Web)
-                    .into_iter()
-                    .any(|(id, provenance)| {
-                        provenance == ModelProvenance::Web
-                            && requested_model.is_none_or(|requested| requested == id)
-                    });
-                has_model.then_some(record.account_type)
-            })
-            .collect()
-    }
-
-    fn persisted_web_models(&self) -> Vec<PublicModel> {
-        let mut models = HashMap::<String, PublicModel>::new();
-        for record in self.account_store.records().into_iter().filter(|record| {
-            record.source_type != "codex" && !matches!(record.status.as_str(), "禁用" | "异常")
-        }) {
-            let Some(object) = record.raw.as_object() else {
-                continue;
-            };
-            for (id, provenance) in project_account_model_entries(object, ModelProvenance::Web) {
-                if provenance != ModelProvenance::Web || is_web_image_model_id(&id) {
-                    continue;
-                }
-                let Some(mut model) = ModelCatalog::project(&json!({
-                    "id": id,
-                    "owned_by": "chatgpt"
-                })) else {
-                    continue;
-                };
-                model.provenance = ModelProvenance::Web;
-                model.supported_account_types = vec![record.account_type.to_ascii_lowercase()];
-                models
-                    .entry(model.id.clone())
-                    .and_modify(|existing| {
-                        for account_type in &model.supported_account_types {
-                            if !existing.supported_account_types.contains(account_type) {
-                                existing.supported_account_types.push(account_type.clone());
-                                existing.supported_account_types.sort();
-                            }
-                        }
-                    })
-                    .or_insert(model);
-            }
-        }
-        models.into_values().collect()
-    }
-
     async fn fetch_catalog_job(
         &self,
         job: CatalogFetchJob,
@@ -14079,8 +14031,7 @@ impl AccountTypeCatalog {
             // normalized account type.  source_type is only a later
             // conversation capability selector; it never selects another
             // model-discovery endpoint.  The shared imported catalog cache
-            // owns the representative fetch.  Only a failed representative
-            // may fall through to the next same-type token.
+            // owns the representative fetch and its bounded retry policy.
             if let Some(candidate) = candidate_accounts.first() {
                 let base_url = self.base_url.as_deref()?;
                 if let Some(models) =
@@ -14326,24 +14277,6 @@ impl AccountTypeCatalog {
         }
 
         if self.protocol == UpstreamProtocol::ChatGpt {
-            for persisted in self.persisted_web_models() {
-                if let Some(index) = indexes.get(&persisted.id).copied() {
-                    for account_type in &persisted.supported_account_types {
-                        if !models[index].supported_account_types.contains(account_type) {
-                            models[index]
-                                .supported_account_types
-                                .push(account_type.clone());
-                            models[index].supported_account_types.sort();
-                        }
-                    }
-                } else {
-                    indexes.insert(persisted.id.clone(), models.len());
-                    models.push(persisted);
-                }
-            }
-        }
-
-        if self.protocol == UpstreamProtocol::ChatGpt {
             models.retain(|model| {
                 is_public_chatgpt_model(model) && !is_native_image_model_id(&model.id)
             });
@@ -14418,9 +14351,6 @@ impl AccountTypeCatalog {
                 types.insert(account_group.clone());
             }
         }
-        if types.is_empty() {
-            types.extend(self.persisted_web_model_types((model != "auto").then_some(model)));
-        }
         Some(types)
     }
 
@@ -14442,9 +14372,6 @@ impl AccountTypeCatalog {
                 sources.extend(model_sources.iter().cloned());
             }
         }
-        if sources.is_empty() && !self.persisted_web_model_types(Some(model)).is_empty() {
-            sources.insert("web".to_owned());
-        }
         sources
     }
 
@@ -14460,12 +14387,6 @@ impl AccountTypeCatalog {
 
     fn model_catalog_pending(&self, model: &str) -> bool {
         let snapshot = self.snapshot.read().expect("account type catalog lock");
-        if !self
-            .persisted_web_model_types((model != "auto").then_some(model))
-            .is_empty()
-        {
-            return false;
-        }
         if model == "auto" {
             if snapshot.anonymous_ready && !snapshot.anonymous_models.is_empty() {
                 return false;
@@ -18036,11 +17957,6 @@ async fn chat_completions_with_timeout(
             .upstream_base_url
             .as_deref()
             .ok_or_else(ApiError::unavailable)?;
-        let has_static_model = state
-            .models
-            .current()
-            .iter()
-            .any(|candidate| candidate.id == model);
         let catalog_enabled = state.account_type_catalog.enabled();
         if catalog_enabled {
             state.account_type_catalog.refresh_for_model(model).await;
@@ -18058,8 +17974,6 @@ async fn chat_completions_with_timeout(
             catalog_groups.clone()
         } else if allows_anonymous {
             Some(HashSet::new())
-        } else if has_static_model && !state.account_type_catalog.model_catalog_pending(model) {
-            None
         } else {
             return Err(if state.account_type_catalog.model_catalog_pending(model) {
                 ApiError::catalog_pending()

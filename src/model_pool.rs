@@ -42,6 +42,10 @@ fn model_provenance_from_object(
     object: &serde_json::Map<String, Value>,
     default: ModelProvenance,
 ) -> ModelProvenance {
+    const CANONICAL_WEB_MODEL_ENDPOINTS: &[&str] = &[
+        "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true",
+        "/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true",
+    ];
     let mut explicit = None;
     for source in ["provenance", "source", "source_type", "endpoint"]
         .iter()
@@ -54,15 +58,9 @@ fn model_provenance_from_object(
             "codex" | "codex_api" | "codex_endpoint" => Some(ModelProvenance::Codex),
             value if value.contains("/backend-api/codex/models") => Some(ModelProvenance::Codex),
             "image" | "image_generation" => Some(ModelProvenance::Image),
-            "web" | "tpp" | "chatgpt_web" => Some(ModelProvenance::Web),
             "configured" | "manual" | "static" => Some(ModelProvenance::Configured),
             "unknown" | "untrusted" | "unavailable" => Some(ModelProvenance::Unknown),
-            value
-                if value.contains("/backend-api/models")
-                    || value.contains("/backend-api/tpp/models") =>
-            {
-                Some(ModelProvenance::Web)
-            }
+            value if CANONICAL_WEB_MODEL_ENDPOINTS.contains(&value) => Some(ModelProvenance::Web),
             _ => None,
         };
         if provenance == Some(ModelProvenance::Codex) {
@@ -170,11 +168,47 @@ pub(super) fn project_account_model_entries(
     object: &serde_json::Map<String, Value>,
     default: ModelProvenance,
 ) -> Vec<(String, ModelProvenance)> {
-    project_imported_model_entries_with_sources(
+    let mut entries = project_imported_model_entries_with_sources(
         object.get("models"),
         object.get("model_sources"),
         default,
-    )
+    );
+    let verified_web_catalog = object
+        .get("_model_source_version")
+        .and_then(Value::as_u64)
+        == Some(1)
+        && object
+        .get("_verified_web_model_paths")
+        .and_then(Value::as_array)
+        .is_some_and(|paths| {
+            !paths.is_empty()
+                && paths.iter().all(|path| {
+                    path.as_str().is_some_and(|path| {
+                        matches!(
+                            path,
+                            "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true"
+                                | "/backend-api/tpp/models/?supports_model_picker_upgrade_presets=true"
+                        )
+                    })
+                })
+        });
+    if verified_web_catalog {
+        let web_ids = object
+            .get("model_sources")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|sources| sources.iter())
+            .filter_map(|(id, source)| {
+                (source.as_str().map(str::trim) == Some("web")).then_some(id.as_str())
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for (id, provenance) in &mut entries {
+            if *provenance == ModelProvenance::Unknown && web_ids.contains(id.as_str()) {
+                *provenance = ModelProvenance::Web;
+            }
+        }
+    }
+    entries
 }
 
 pub(super) fn project_imported_model_ids(

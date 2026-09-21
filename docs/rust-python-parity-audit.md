@@ -19,7 +19,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 - 账号快照会做规范化、文件版本校验、原子替换和并发重载；不可用状态、`invalid_count` 和模型来源会参与请求选号。
 - 图片账号在真正发起图片请求前按账号单独刷新 `/backend-api/me`、conversation init、账号检查和图片能力/额度；只有验证成功的账号进入图片请求。
 - 网页图片模型 `gpt-image-2` 使用配置的 `default_upstream_model_name`；其它网页图片模型使用 `auto`，与 Python `OpenAIBackendAPI._image_model_settings` 一致。
-- ccLoad 导入会校验频道、OAuth 类型、凭据、计划类型和账号 ID，并将网页模型与图片模型按来源合并；Codex 模型不会误当作网页模型。
+- ccLoad 导入会校验频道、OAuth 类型和 access token、计划类型及账号 ID；频道模型浏览和导入都只接受当前 access token 通过两个 canonical Web endpoint 刷新的目录与同一 token 的图片 capability/quota，Codex 模型不会误当作网页模型。
 
 ### 管理页面和持久化
 
@@ -63,7 +63,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
 1. CPA：Python 对选中文件使用最多 16 个并发 worker，并逐文件更新进度；Rust `execute_cpa_import` 当前逐个请求，最后一次性写入 job 结果。
 2. Sub2API：Python 支持分页读取账号/分组，并对导出账号逐项统计缺失凭据；Rust 管理端用单次 `page_size=5000` 请求，导入失败/完成进度在批量结束后写入。
-3. ccLoad：Rust 已实现登录、频道 editor、OAuth credential、模型来源合并、按模型组共享 fallback 和逐频道进度；这是当前三种导入中最接近 Python/实际页面需求的一条，但它是 Rust 扩展逻辑，Python baseline 中没有同名服务文件可直接逐行对照。
+3. ccLoad：Rust 已实现登录、频道 editor 中的 OAuth access token 提取、逐频道 canonical 目录刷新和逐频道进度；不会从旧账号快照、其它同套餐频道或 editor 模型字段借用目录。这是当前三种导入中最接近 Python/实际页面需求的一条，但它是 Rust 扩展逻辑，Python baseline 中没有同名服务文件可直接逐行对照。
 
 ## 需要继续处理的顺序
 

@@ -1335,6 +1335,8 @@ fn merge_import_records_in_place(
                 object.remove("token");
                 object.remove("refresh_token");
                 object.remove("id_token");
+                object.remove("_refresh_token");
+                object.remove("_id_token");
                 object.insert("access_token".to_owned(), serde_json::json!(token));
                 if !object.contains_key("status") {
                     object.insert("status".to_owned(), serde_json::json!("正常"));
@@ -1467,6 +1469,8 @@ fn merge_account_values(
     merged.remove("token");
     merged.remove("refresh_token");
     merged.remove("id_token");
+    merged.remove("_refresh_token");
+    merged.remove("_id_token");
     merged.insert(
         "access_token".to_owned(),
         serde_json::Value::String(preferred_token),
