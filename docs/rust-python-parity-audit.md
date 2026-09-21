@@ -1,6 +1,6 @@
 # Rust/Python Parity Audit
 
-审计基线：`.local/public-minimal` 中的 Python 实现。审计日期：2026-09-20。
+审计基线：`.local/public-minimal` 中的 Python 实现。审计日期：2026-09-21。
 Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经核对了输入校验、路由选择、上游请求、结果投影和持久化边界；“部分对齐”表示接口存在，但仍有可观察的行为差异；“未实现”表示 Rust 明确返回 `unsupported_capability` 或只保存配置而没有运行时逻辑。
 
 ## 已对齐的主链路
@@ -42,21 +42,21 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
    Python 导出要求 `access_token + refresh_token + id_token`，JSON 单账号直接返回对象，多账号返回数组，ZIP 每账号一个 JSON 文件。Rust `api_accounts_export` 当前导出 `{"items": [...]}` 原始记录，不支持 `format=zip`，且 access-token-only 规范化会丢弃 refresh/id token。因此 Rust 不能声称与 Python 导出格式兼容。
 
-3. **FlareSolverr/clearance 只有配置和探测接口，没有运行时 provider/cache**
+3. **FlareSolverr 的自动覆盖仍未覆盖全部上游路径**
 
-   Python `services/proxy_service.py` 实现了 FlareSolverr 请求、cookie/user-agent bundle、缓存、过期刷新和 header 注入。Rust `management::test_clearance` 目前只返回 disabled/failed 状态，`runtime_status` 固定报告没有 clearance bundle，上游请求也没有应用 clearance bundle。
+   Rust 已实现 `ClearanceStore`、FlareSolverr 刷新、过期时间、single-flight、管理端测试和账号刷新请求注入；但 clearance helper 目前只接入部分账号刷新/通用 JSON 路径，普通 Chat、Web 图片、搜索、editable 和 Codex 请求仍需逐条核对，不能声称已达到 Python 的所有请求路径覆盖。
 
-4. **账号级 proxy 没有贯穿所有上游请求**
+4. **账号级 proxy 仍需逐路径核验**
 
-   Rust `AccountLease::proxy_url()` 已能读取账号 `proxy`，但大部分 native 请求仍使用共享的 `state.client`。Python 会在 `OpenAIBackendAPI` 创建 session 时调用 `proxy_settings.build_session_kwargs(account=account)`，账号代理优先于 runtime/global proxy。Rust 目前不能保证不同账号按各自代理出网。
+   Rust 已为账号 lease 创建独立上游 client，并按账号代理优先级选择；但仍需对所有 native bootstrap、图片资源、搜索、editable、Codex 和管理导入路径做运行时核验。
 
 ### P1：配置已能保存，但运行时没有等价行为
 
-1. `global_system_prompt`：Rust settings 能读写和脱敏，但 Chat/Responses/native image 请求没有统一按 Python `conversation.normalize_messages` 注入。
-2. `sensitive_words` 和 `ai_review`：Rust settings 能读写，但没有 Python `content_filter.check_request` 的本地敏感词拦截、base64 清理、AI 审核、fail-open/fail-closed 和日志行为。
-3. `chat_completion_cache`：Rust 只有配置规范化，没有 Python 的 TTL cache、stream replay、in-flight dedupe、消息去重和 assistant history 处理。
-4. `auto_remove_invalid_accounts`、`auto_remove_rate_limited_accounts`：Rust 记录状态和失败计数，但没有 Python `AccountService.remove_invalid_token` / 限流自动移除开关对应的运行时删除行为。
-5. `image_remove_conversation_after_result`、`image_remove_conversation_always`：Rust 图片结果链路没有 Python 的后台 `delete_conversation` 清理逻辑。
+1. `global_system_prompt`：Rust 已接入 Chat 和 Responses；仍需核对 Anthropic、搜索、图片和 editable 的消息顺序是否与 Python 完全一致。
+2. `sensitive_words` 和 `ai_review`：Rust 已接入敏感词拦截、审核文本提取、base64 替换、100k 截断和审核结果处理；仍需补齐配置异常、日志和所有 API 入口的行为测试。
+3. `chat_completion_cache`：Rust 已实现非流式 TTL cache、流式帧 replay 和 in-flight dedupe；仍需逐项核对 Python 的 assistant history、消息规范化和所有 cache key 字段。
+4. `auto_remove_invalid_accounts`、`auto_remove_rate_limited_accounts`：Rust 已实现刷新写回时的确认失效删除、刚变为限流时删除，以及 native Codex 401 记录；Web 图片 401 和其它文本失败路径仍需核验。
+5. `image_remove_conversation_after_result`、`image_remove_conversation_always`：Rust 已实现异步 PATCH 隐藏 conversation；仍需核对失败、超时、部分结果和多图路径。
 6. refresh token keepalive、过期 access token 自动刷新和 `auto_relogin_after_refresh`：Rust 的 access-token-only 边界不会保存或刷新 Python 维护的 refresh/id token 三件套。
 
 ### P2：导入实现可用但不完全相同
@@ -67,9 +67,9 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
 ## 需要继续处理的顺序
 
-1. 先实现账号级 proxy client/session 选择，并把 clearance bundle 接入 native bootstrap、conversation、image、search、editable 和 Codex 请求。
-2. 再移植 content filter 和 global system prompt，补测试验证拒绝、fail-open、系统消息顺序和图片请求。
-3. 再实现 chat completion cache，至少覆盖非流式结果、流式 replay、TTL 和并发 dedupe。
+1. 完成 clearance、账号 proxy、Web 图片 401 和搜索/editable/Codex 的逐路径验证。
+2. 补齐内容审核、全局 system prompt、缓存和图片清理的行为测试。
+3. 继续审计 CPA/Sub2API/ccLoad 的并发、分页和进度差异。
 4. 最后决定是否突破 access-token-only 安全边界，移植 OAuth、密码重登、refresh token keepalive 和 Python 完整导出；如果不突破，接口必须继续明确返回 unsupported，而不能返回看似成功的数据。
 
 ## 当前验证记录
