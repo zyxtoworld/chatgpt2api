@@ -696,7 +696,7 @@ impl AccountStore {
 
     async fn acquire_filtered(
         &self,
-        model: &str,
+        _model: &str,
         excluded_tokens: &HashSet<String>,
         allowed_groups: Option<&HashSet<AccountModelGroup>>,
         required_source_type: Option<&str>,
