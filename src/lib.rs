@@ -3192,6 +3192,7 @@ async fn account_upstream_json_at_with_proxy(
         Some(&proxy_runtime_value(state)),
         &profile.proxy_url,
         base_url,
+        None,
     )
     .await
     .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -3773,6 +3774,15 @@ async fn persist_account_refresh_updates(
         .unwrap_or_default()
         .as_secs()
         .to_string();
+    let runtime_config = fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    let remove_invalid = settings_bool(runtime_config.get("auto_remove_invalid_accounts"), false);
+    let remove_rate_limited = settings_bool(
+        runtime_config.get("auto_remove_rate_limited_accounts"),
+        false,
+    );
     state
         .account_store
         .mutate_raw(|current| {
@@ -3828,9 +3838,38 @@ async fn persist_account_refresh_updates(
                         Value::String(now.clone()),
                     );
                     if invalid_token_should_mark_abnormal(previous) {
-                        object.insert("status".to_owned(), Value::String("异常".to_owned()));
+                        if !remove_invalid {
+                            object.insert("status".to_owned(), Value::String("异常".to_owned()));
+                        }
                     }
                 }
+            }
+            let confirmed_invalid = invalid_tokens
+                .iter()
+                .filter_map(|(token, _)| {
+                    current
+                        .iter()
+                        .find(|item| account_token(item).as_deref() == Some(token.as_str()))
+                        .and_then(|item| {
+                            (item
+                                .get("invalid_count")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default()
+                                >= ACCOUNT_INVALID_CONFIRM_ATTEMPTS)
+                                .then(|| token.clone())
+                        })
+                })
+                .collect::<Vec<_>>();
+            let remove_tokens = account_tokens_to_remove_after_refresh(
+                updated_records,
+                &confirmed_invalid,
+                remove_invalid,
+                remove_rate_limited,
+            );
+            if !remove_tokens.is_empty() {
+                current.retain(|item| {
+                    account_token(item).is_none_or(|token| !remove_tokens.contains(token.as_str()))
+                });
             }
             Ok(())
         })
@@ -13411,6 +13450,26 @@ impl AccountRefreshProgressSink {
 
 fn invalid_token_should_mark_abnormal(previous_count: u64) -> bool {
     previous_count.saturating_add(1) >= ACCOUNT_INVALID_CONFIRM_ATTEMPTS
+}
+
+fn account_tokens_to_remove_after_refresh(
+    updated_records: &[(String, Value)],
+    confirmed_invalid_tokens: &[String],
+    remove_invalid: bool,
+    remove_rate_limited: bool,
+) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    if remove_invalid {
+        for token in confirmed_invalid_tokens {
+            tokens.insert(token.clone());
+        }
+    }
+    if remove_rate_limited {
+        tokens.extend(updated_records.iter().filter_map(|(token, updated)| {
+            (updated.get("status").and_then(Value::as_str) == Some("限流")).then(|| token.clone())
+        }));
+    }
+    tokens
 }
 const AUTHENTICATED_NATIVE_MODEL_PATHS: &[&str] = &[
     "/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true",
@@ -29945,6 +30004,24 @@ data: [DONE]
         assert!(!invalid_token_should_mark_abnormal(0));
         assert!(!invalid_token_should_mark_abnormal(1));
         assert!(invalid_token_should_mark_abnormal(2));
+    }
+
+    #[test]
+    fn refresh_auto_removal_targets_only_confirmed_invalid_and_newly_limited_accounts() {
+        let updated = vec![
+            ("limited-now".to_owned(), json!({"status":"限流"})),
+            ("healthy".to_owned(), json!({"status":"正常"})),
+            ("old-limited".to_owned(), json!({"status":"正常"})),
+        ];
+        let invalid = vec!["confirmed-invalid".to_owned()];
+        let removed = account_tokens_to_remove_after_refresh(&updated, &invalid, true, true);
+        assert_eq!(
+            removed,
+            HashSet::from(["confirmed-invalid".to_owned(), "limited-now".to_owned(),])
+        );
+        assert!(
+            account_tokens_to_remove_after_refresh(&updated, &invalid, false, false).is_empty()
+        );
     }
 
     #[test]

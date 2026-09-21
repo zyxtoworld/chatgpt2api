@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 
 use super::protocol_codex_payload::native_codex_tool;
-use super::proxy_service::{cookie_header, parse_cookie_header};
+use super::proxy_service::{cookie_header, merge_cookie_header, parse_cookie_header};
 use super::{
     ApiError, CODEX_RESPONSES_MODEL, NATIVE_CLIENT_BUILD_NUMBER, NATIVE_CLIENT_VERSION,
     NATIVE_ORIGIN, NATIVE_SEC_CH_UA, NATIVE_USER_AGENT, is_semver, native_message_id,
@@ -72,6 +72,7 @@ pub(crate) async fn native_browser_headers_with_clearance(
     runtime: Option<&Value>,
     proxy_url: &str,
     target_url: &str,
+    existing_cookie: Option<&str>,
 ) -> RequestBuilder {
     let mut request = native_browser_headers_with_referer(request, context, referer);
     let bundle = if let Some(store) = store {
@@ -119,7 +120,10 @@ pub(crate) async fn native_browser_headers_with_clearance(
             request = request.header(header::USER_AGENT, bundle.user_agent);
         }
         if !bundle.cookies.is_empty() {
-            request = request.header(header::COOKIE, cookie_header(&bundle.cookies));
+            let merged = merge_cookie_header(existing_cookie.unwrap_or_default(), &bundle.cookies);
+            if !merged.is_empty() {
+                request = request.header(header::COOKIE, merged);
+            }
         }
     }
     request
