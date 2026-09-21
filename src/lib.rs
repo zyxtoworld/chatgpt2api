@@ -3196,6 +3196,7 @@ async fn refresh_access_token_account(
         account_type: plan_type.to_owned(),
         token: token.clone(),
         account_id: account_id.map(ToOwned::to_owned),
+        cache_key: Some(format!("{}:{}", plan_type.to_ascii_lowercase(), token)),
         deadline: Instant::now() + NATIVE_UPSTREAM_TIMEOUT,
         batch,
         retry: true,
