@@ -199,6 +199,109 @@ static BACKUP_OWNER_GATES: LazyLock<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> 
     LazyLock::new(|| StdMutex::new(HashMap::new()));
 static IMAGE_TASK_MUTATION_GATE: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
+#[derive(Default)]
+struct ChatCacheState {
+    entries: HashMap<String, ChatCacheEntry>,
+}
+
+struct ChatCacheEntry {
+    expires_at: SystemTime,
+    value: Value,
+}
+
+fn chat_cache_config(state: &AppState) -> Value {
+    fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("chat_completion_cache").cloned())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn chat_cache_key(object: &Map<String, Value>) -> Option<String> {
+    let model = object.get("model").and_then(Value::as_str)?;
+    let messages = object.get("messages")?;
+    let mut canonical = Map::new();
+    for key in [
+        "frequency_penalty",
+        "max_completion_tokens",
+        "max_tokens",
+        "metadata",
+        "model",
+        "presence_penalty",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "stop",
+        "temperature",
+        "thinking_effort",
+        "tool_choice",
+        "tools",
+        "top_p",
+        "user",
+        "reasoning",
+    ] {
+        if let Some(value) = object.get(key) {
+            canonical.insert(key.to_owned(), value.clone());
+        }
+    }
+    canonical.insert("model".to_owned(), Value::String(model.to_owned()));
+    canonical.insert("messages".to_owned(), messages.clone());
+    canonical.insert("stream".to_owned(), Value::Bool(false));
+    let bytes = serde_json::to_vec(&canonical).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn chat_cache_read(state: &AppState, key: &str) -> Option<Value> {
+    let config = chat_cache_config(state);
+    if !settings_bool(config.get("enabled"), true)
+        || settings_u64(config.get("ttl_seconds"), 60, 0) == 0
+    {
+        return None;
+    }
+    let mut cache = state.chat_cache.lock().ok()?;
+    let entry = cache.entries.get(key)?;
+    if SystemTime::now() >= entry.expires_at {
+        cache.entries.remove(key);
+        return None;
+    }
+    Some(entry.value.clone())
+}
+
+fn chat_cache_write(state: &AppState, key: String, value: Value) {
+    let config = chat_cache_config(state);
+    if !settings_bool(config.get("enabled"), true) {
+        return;
+    }
+    let ttl = settings_u64(config.get("ttl_seconds"), 60, 0);
+    if ttl == 0 {
+        return;
+    }
+    let max_entries = settings_u64(config.get("max_entries"), 256, 1) as usize;
+    if let Ok(mut cache) = state.chat_cache.lock() {
+        let now = SystemTime::now();
+        cache.entries.retain(|_, item| now < item.expires_at);
+        cache.entries.insert(
+            key,
+            ChatCacheEntry {
+                expires_at: now + Duration::from_secs(ttl),
+                value,
+            },
+        );
+        while cache.entries.len() > max_entries {
+            let oldest = cache
+                .entries
+                .iter()
+                .min_by_key(|(_, item)| item.expires_at)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = oldest {
+                cache.entries.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 struct HealthBlockingTestHook {
@@ -1892,6 +1995,7 @@ pub struct AppState {
     health_snapshot_cache: Arc<StdMutex<HealthSnapshotCache>>,
     health_storage_semaphore: Arc<Semaphore>,
     health_accounts_semaphore: Arc<Semaphore>,
+    chat_cache: Arc<StdMutex<ChatCacheState>>,
     client: Client,
     #[cfg(test)]
     health_snapshot_publish_test_hook: Arc<RwLock<Option<HealthSnapshotPublishTestHook>>>,
@@ -2053,6 +2157,7 @@ impl AppState {
             health_snapshot_cache,
             health_storage_semaphore: Arc::new(Semaphore::new(1)),
             health_accounts_semaphore: Arc::new(Semaphore::new(1)),
+            chat_cache: Arc::new(StdMutex::new(ChatCacheState::default())),
             client,
             #[cfg(test)]
             health_snapshot_publish_test_hook: Arc::new(RwLock::new(None)),
@@ -2232,6 +2337,7 @@ impl AppState {
             health_snapshot_cache,
             health_storage_semaphore: Arc::new(Semaphore::new(1)),
             health_accounts_semaphore: Arc::new(Semaphore::new(1)),
+            chat_cache: Arc::new(StdMutex::new(ChatCacheState::default())),
             client,
             #[cfg(test)]
             health_snapshot_publish_test_hook,
@@ -17952,6 +18058,15 @@ async fn chat_completions_with_timeout(
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or("auto");
+        let cache_key =
+            (required_capability.is_none() && chat_payload.is_ok() && codex_payload.is_err())
+                .then(|| chat_cache_key(&object))
+                .flatten();
+        if let Some(key) = cache_key.as_deref()
+            && let Some(cached) = chat_cache_read(&state, key)
+        {
+            return Ok(Json(cached).into_response());
+        }
         let base_url = state
             .config
             .upstream_base_url
@@ -18154,16 +18269,19 @@ async fn chat_completions_with_timeout(
         }
         let text = native_completion_text(&body)?;
         let usage = native_usage(&object, &text)?;
-        drop(lease);
-        return Ok(Json(json!({
+        let response = json!({
             "id": native_completion_id(),
             "object": "chat.completion",
             "created": native_created(),
             "model": model,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
             "usage": usage,
-        }))
-        .into_response());
+        });
+        if let Some(key) = cache_key {
+            chat_cache_write(&state, key, response.clone());
+        }
+        drop(lease);
+        return Ok(Json(response).into_response());
     }
     let payload = Value::Object(object.clone());
     let Some(base_url) = state.config.upstream_base_url.as_deref() else {
