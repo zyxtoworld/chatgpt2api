@@ -6644,7 +6644,7 @@ impl NativeImageTempGuard {
                 let mut current = match open_regular_file_for_delete_at(directory, OsStr::new(name))
                 {
                     Ok(current) => current,
-                    Err(error) => {
+                    Err(_error) => {
                         removal_error = Some(error);
                         break;
                     }
