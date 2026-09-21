@@ -17706,7 +17706,10 @@ async fn responses_with_timeout(
                         tool.get("type").and_then(Value::as_str) == Some("web_search_preview")
                     })
                 });
-        if !has_web_search_tool {
+        let has_codex_account = state.account_store.records().into_iter().any(|record| {
+            record.source_type == "codex" && !matches!(record.status.as_str(), "禁用" | "异常")
+        });
+        if !has_web_search_tool && !has_codex_account {
             return native_responses_via_web_chat(state, headers, object, upstream_timeout).await;
         }
         return native_responses_with_timeout(state, object, upstream_timeout).await;
