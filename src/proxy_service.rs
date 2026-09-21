@@ -107,6 +107,12 @@ pub(crate) fn profile_from_runtime(
     }
 }
 
+pub(crate) fn should_reset_session(profile: &ProxyProfile, status: u16) -> bool {
+    profile
+        .reset_session_status_codes
+        .contains(&status)
+}
+
 pub(crate) fn normalize_proxy_url(raw: &str) -> String {
     let value = raw.trim();
     if value.len() >= 8 && value[..8].eq_ignore_ascii_case("socks://") {
@@ -291,5 +297,7 @@ mod tests {
         );
         assert_eq!(runtime.proxy_source, "runtime_resource");
         assert_eq!(runtime.proxy_url, "http://resource:2");
+        assert!(should_reset_session(&runtime, 403));
+        assert!(!should_reset_session(&runtime, 500));
     }
 }
