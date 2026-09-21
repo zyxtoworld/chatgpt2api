@@ -7904,18 +7904,23 @@ async fn native_upload_image(
     let file_name = format!("image-{index}.{extension}");
     let path = "/backend-api/files";
     let client = upstream_client_for_lease(state, lease, true);
-    let mut request = native_browser_headers(
-        client.post(format!(
-            "{}{path}",
-            state
-                .config
-                .upstream_base_url
-                .as_deref()
-                .ok_or_else(ApiError::unavailable)?
-                .trim_end_matches('/')
-        )),
+    let base_url = state
+        .config
+        .upstream_base_url
+        .as_deref()
+        .ok_or_else(ApiError::unavailable)?
+        .trim_end_matches('/');
+    let mut request = native_browser_headers_with_clearance(
+        client.post(format!("{base_url}{path}")),
         context,
+        &format!("{base_url}/"),
+        Some(&state.clearance_store),
+        Some(&proxy_runtime_value(state)),
+        lease.proxy_url().unwrap_or_default(),
+        base_url,
+        None,
     )
+    .await
     .header(header::CONTENT_TYPE, "application/json")
     .header(header::ACCEPT, "application/json")
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
@@ -8022,18 +8027,17 @@ async fn native_upload_image(
         return Err(ApiError::upstream());
     }
     let uploaded_path = format!("/backend-api/files/{file_id}/uploaded");
-    let mut confirm = native_browser_headers(
-        client.post(format!(
-            "{}{uploaded_path}",
-            state
-                .config
-                .upstream_base_url
-                .as_deref()
-                .ok_or_else(ApiError::unavailable)?
-                .trim_end_matches('/')
-        )),
+    let mut confirm = native_browser_headers_with_clearance(
+        client.post(format!("{base_url}{uploaded_path}")),
         context,
+        &format!("{base_url}/"),
+        Some(&state.clearance_store),
+        Some(&proxy_runtime_value(state)),
+        lease.proxy_url().unwrap_or_default(),
+        base_url,
+        None,
     )
+    .await
     .header(header::CONTENT_TYPE, "application/json")
     .header(header::ACCEPT, "application/json")
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
@@ -8267,11 +8271,17 @@ async fn native_poll_image_file_ids(
         }
         let path = format!("/backend-api/conversation/{conversation_id}");
         let referer = format!("{base_url}/c/{conversation_id}");
-        let mut request = native_browser_headers_with_referer(
+        let mut request = native_browser_headers_with_clearance(
             client.get(format!("{base_url}{path}")),
             context,
             &referer,
+            Some(&state.clearance_store),
+            Some(&proxy_runtime_value(state)),
+            lease.proxy_url().unwrap_or_default(),
+            base_url,
+            None,
         )
+        .await
         .header(header::ACCEPT, "application/json")
         .header("X-OpenAI-Target-Path", path.as_str())
         .header("X-OpenAI-Target-Route", path.as_str())
@@ -8372,11 +8382,17 @@ async fn native_download_image_files(
         let mut downloaded = None;
         for (path, referer, with_file_query) in candidates {
             let client = upstream_client_for_lease(state, lease, true);
-            let mut request = native_browser_headers_with_referer(
+            let mut request = native_browser_headers_with_clearance(
                 client.get(format!("{base_url}{path}")),
                 context,
                 &referer,
+                Some(&state.clearance_store),
+                Some(&proxy_runtime_value(state)),
+                lease.proxy_url().unwrap_or_default(),
+                base_url,
+                None,
             )
+            .await
             .header(header::ACCEPT, "application/json")
             .header("X-OpenAI-Target-Path", path.as_str())
             .header("X-OpenAI-Target-Route", path.as_str())
@@ -8410,11 +8426,17 @@ async fn native_download_image_files(
             };
             let blob_referer = format!("{base_url}/c/{conversation_id}");
             let resource_client = upstream_client_for_lease(state, lease, true);
-            let mut blob_request = native_browser_headers_with_referer(
+            let mut blob_request = native_browser_headers_with_clearance(
                 resource_client.get(url),
                 context,
                 &blob_referer,
-            );
+                Some(&state.clearance_store),
+                Some(&proxy_runtime_value(state)),
+                lease.proxy_url().unwrap_or_default(),
+                base_url,
+                None,
+            )
+            .await;
             if url.starts_with(base_url) {
                 blob_request =
                     blob_request.header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
@@ -8461,6 +8483,9 @@ fn native_spawn_image_cleanup(
         return;
     }
     let client = state.client.clone();
+    let clearance_store = state.clearance_store.clone();
+    let proxy_runtime = proxy_runtime_value(state);
+    let proxy_url = lease.proxy_url().unwrap_or_default().to_owned();
     let base_url = state.config.upstream_base_url.clone().unwrap_or_default();
     let token = lease.token().to_owned();
     let account_id = lease.chatgpt_account_id().map(ToOwned::to_owned);
@@ -8469,11 +8494,17 @@ fn native_spawn_image_cleanup(
     tokio::spawn(async move {
         let base_url = base_url.trim_end_matches('/');
         let path = format!("/backend-api/conversation/{conversation_id}");
-        let mut request = native_browser_headers_with_referer(
+        let mut request = native_browser_headers_with_clearance(
             client.patch(format!("{base_url}{path}")),
             &context,
             &format!("{base_url}/c/{conversation_id}"),
+            Some(&clearance_store),
+            Some(&proxy_runtime),
+            &proxy_url,
+            base_url,
+            None,
         )
+        .await
         .header(header::ACCEPT, "*/*")
         .header(header::CONTENT_TYPE, "application/json")
         .header("X-OpenAI-Target-Path", path.as_str())
