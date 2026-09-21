@@ -13995,7 +13995,7 @@ impl AccountTypeCatalog {
                         provenance == ModelProvenance::Web
                             && requested_model.is_none_or(|requested| requested == id)
                     });
-                has_model.then(|| record.account_type)
+                has_model.then_some(record.account_type)
             })
             .collect()
     }
