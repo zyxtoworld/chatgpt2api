@@ -2081,13 +2081,14 @@ async fn execute_cpa_import(
         .filter_map(|item| item.get("access_token").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    let (added, skipped, mut failed) = match state.account_store.merge_import_records(imported).await {
-        Ok((added, skipped)) => (added, skipped, failed),
-        Err(_) => {
-            errors.push(json!({"name": "accounts", "error": "账号快照写入失败"}));
-            (0, 0, failed.saturating_add(successful))
-        }
-    };
+    let (added, skipped, mut failed) =
+        match state.account_store.merge_import_records(imported).await {
+            Ok((added, skipped)) => (added, skipped, failed),
+            Err(_) => {
+                errors.push(json!({"name": "accounts", "error": "账号快照写入失败"}));
+                (0, 0, failed.saturating_add(successful))
+            }
+        };
     let refresh_result = super::refresh_imported_accounts_with_batch_until(
         &state,
         &imported_tokens,
@@ -2872,13 +2873,14 @@ async fn execute_sub2api_import(
         .filter_map(|item| item.get("access_token").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    let (added, skipped, mut failed) = match state.account_store.merge_import_records(imported).await {
-        Ok((added, skipped)) => (added, skipped, failed),
-        Err(_) => {
-            errors.push(json!({"name": "accounts", "error": "账号快照写入失败"}));
-            (0, 0, failed.saturating_add(successful))
-        }
-    };
+    let (added, skipped, mut failed) =
+        match state.account_store.merge_import_records(imported).await {
+            Ok((added, skipped)) => (added, skipped, failed),
+            Err(_) => {
+                errors.push(json!({"name": "accounts", "error": "账号快照写入失败"}));
+                (0, 0, failed.saturating_add(successful))
+            }
+        };
     let refresh_result = super::refresh_imported_accounts_with_batch_until(
         &state,
         &imported_tokens,
