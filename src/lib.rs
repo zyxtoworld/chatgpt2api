@@ -436,7 +436,10 @@ fn chat_cache_write_stream(state: &AppState, key: String, value: Value) {
 }
 
 fn chat_cache_begin_stream(state: &AppState, key: &str) -> Option<(Arc<ChatCacheInflight>, bool)> {
-    chat_cache_enabled(state, true)?;
+    let (_, _, dedupe_inflight) = chat_cache_enabled(state, true)?;
+    if !dedupe_inflight {
+        return None;
+    }
     let mut cache = state.chat_cache.lock().ok()?;
     if let Some(entry) = cache.entries.get(key)
         && SystemTime::now() < entry.expires_at
