@@ -2088,9 +2088,28 @@ async fn execute_cpa_import(
             (0, 0, failed.saturating_add(successful))
         }
     };
-    let refreshed =
-        super::refresh_imported_accounts_with_batch(&state, &imported_tokens, batch_stats.clone())
-            .await;
+    let refresh_result = super::refresh_imported_accounts_with_batch_until(
+        &state,
+        &imported_tokens,
+        batch_stats.clone(),
+        std::time::Instant::now() + CCLOAD_IMPORT_DEADLINE,
+    )
+    .await;
+    let refreshed = refresh_result
+        .get("refreshed")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_default();
+    let refresh_errors = refresh_result
+        .get("errors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let refresh_failed = imported_tokens.len().saturating_sub(refreshed);
+    for error in refresh_errors {
+        push_import_error(&mut errors, error);
+    }
+    failed = failed.saturating_add(refresh_failed);
     let mut job = import_job(
         &expected_job_id,
         names.len(),
@@ -2860,9 +2879,27 @@ async fn execute_sub2api_import(
             (0, 0, failed.saturating_add(successful))
         }
     };
-    let refreshed =
-        super::refresh_imported_accounts_with_batch(&state, &imported_tokens, batch_stats.clone())
-            .await;
+    let refresh_result = super::refresh_imported_accounts_with_batch_until(
+        &state,
+        &imported_tokens,
+        batch_stats.clone(),
+        std::time::Instant::now() + CCLOAD_IMPORT_DEADLINE,
+    )
+    .await;
+    let refreshed = refresh_result
+        .get("refreshed")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_default();
+    let refresh_errors = refresh_result
+        .get("errors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    failed = failed.saturating_add(imported_tokens.len().saturating_sub(refreshed));
+    for error in refresh_errors {
+        push_import_error(&mut errors, error);
+    }
     let mut job = import_job(
         &expected_job_id,
         ids.len(),
@@ -3185,7 +3222,8 @@ pub(super) async fn ccload_channels(
                 "plan_type": bounded_public_text(object.get("codex_plan_type"), 256),
                 "subscription_active_until": bounded_public_text(object.get("codex_subscription_active_until"), 256),
                 "models": [],
-                "models_loaded": !enabled,
+                "models_loaded": false,
+                "model_load_status": if enabled { "pending" } else { "disabled" },
             }));
         }
         offset = next_offset;
