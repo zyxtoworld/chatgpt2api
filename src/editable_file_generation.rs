@@ -37,7 +37,7 @@ use super::{
     account_pool::current_timestamp, acquire_path_write_lock, acquire_path_write_lock_sync,
     atomic_replace_checked_with_limit, authenticated_subject, bounded_response_body,
     editable_capability_digest, editable_file_tasks_path, editable_relative_path,
-    native_bootstrap_with_timeout_context, native_browser_headers_with_referer,
+    native_bootstrap_with_timeout_context, native_browser_headers_with_clearance,
     native_chat_requirements_with_resources_for_route_context, native_created, native_image_input,
     native_message_id, read_editable_task_records, read_editable_task_records_at,
     search_conversation_id_from_response, valid_editable_task_id,
@@ -775,7 +775,8 @@ async fn json_before_deadline(
     serde_json::from_slice(&bytes).map_err(|_| TaskFailure::Generic)
 }
 
-fn authenticated_request(
+async fn authenticated_request(
+    state: &AppState,
     request: RequestBuilder,
     lease: &AccountLease,
     context: &NativeRequestContext,
@@ -783,10 +784,24 @@ fn authenticated_request(
     path: &str,
     route: &str,
 ) -> RequestBuilder {
-    let request = native_browser_headers_with_referer(request, context, referer)
-        .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
-        .header("X-OpenAI-Target-Path", path)
-        .header("X-OpenAI-Target-Route", route);
+    let request = native_browser_headers_with_clearance(
+        request,
+        context,
+        referer,
+        Some(&state.clearance_store),
+        Some(&super::proxy_runtime_value(state)),
+        lease.proxy_url().unwrap_or_default(),
+        state
+            .config
+            .upstream_base_url
+            .as_deref()
+            .unwrap_or_default(),
+        None,
+    )
+    .await
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
+    .header("X-OpenAI-Target-Path", path)
+    .header("X-OpenAI-Target-Route", route);
     match lease.chatgpt_account_id() {
         Some(account_id) => request.header("ChatGPT-Account-ID", account_id),
         None => request,
@@ -821,6 +836,7 @@ async fn upload_editable_image(
     let path = "/backend-api/files";
     let referer = format!("{base_url}/");
     let request = authenticated_request(
+        state,
         state.client.post(format!("{base_url}{path}")),
         lease,
         context,
@@ -828,6 +844,7 @@ async fn upload_editable_image(
         path,
         path,
     )
+    .await
     .header(header::ACCEPT, "*/*")
     .json(&json!({
         "file_name": file_name,
@@ -869,6 +886,7 @@ async fn upload_editable_image(
     drop(upload_response);
     let uploaded_path = format!("/backend-api/files/{file_id}/uploaded");
     let uploaded = authenticated_request(
+        state,
         state.client.post(format!("{base_url}{uploaded_path}")),
         lease,
         context,
@@ -876,6 +894,7 @@ async fn upload_editable_image(
         &uploaded_path,
         "/backend-api/files/{file_id}/uploaded",
     )
+    .await
     .header(header::ACCEPT, "*/*")
     .json(&json!({}));
     let _ = json_before_deadline(send_before_deadline(uploaded, deadline).await?, deadline).await?;
@@ -930,6 +949,7 @@ async fn prepare_editable_conversation(
         );
     }
     let request = authenticated_request(
+        state,
         state.client.post(format!("{base_url}{path}")),
         lease,
         context,
@@ -937,6 +957,7 @@ async fn prepare_editable_conversation(
         path,
         path,
     )
+    .await
     .header(header::ACCEPT, "*/*")
     .header("X-Conduit-Token", "no-token")
     .json(&payload);
@@ -1052,6 +1073,7 @@ async fn run_editable_conversation(
         "thinking_effort": EDITABLE_THINKING_EFFORT,
     });
     let mut request = authenticated_request(
+        state,
         state.client.post(format!("{base_url}{path}")),
         lease,
         context,
@@ -1059,6 +1081,7 @@ async fn run_editable_conversation(
         path,
         path,
     )
+    .await
     .header(header::ACCEPT, "text/event-stream")
     .header("X-Conduit-Token", conduit_token)
     .header(
@@ -1379,6 +1402,7 @@ async fn wait_for_editable_artifacts(
         let path = format!("/backend-api/conversation/{conversation_id}");
         let referer = format!("{base_url}/c/{conversation_id}");
         let request = authenticated_request(
+            state,
             state.client.get(format!("{base_url}{path}")),
             lease,
             context,
@@ -1386,6 +1410,7 @@ async fn wait_for_editable_artifacts(
             &path,
             "/backend-api/conversation/{conversation_id}",
         )
+        .await
         .header(header::ACCEPT, "*/*");
         let response = send_before_deadline(request, deadline).await?;
         let status = response.status();
@@ -1460,6 +1485,7 @@ async fn probe_download_url(
     let deadline = upstream.deadline;
     let referer = format!("{base_url}/c/{conversation_id}");
     let mut request = authenticated_request(
+        state,
         state.client.get(format!("{base_url}{path}")),
         lease,
         context,
@@ -1467,6 +1493,7 @@ async fn probe_download_url(
         path,
         route,
     )
+    .await
     .header(header::ACCEPT, "*/*");
     if let Some(query) = query {
         request = request.query(query);
