@@ -467,6 +467,19 @@ async fn chat_cache_wait_stream(
     }
 }
 
+fn chat_cache_stream_frames(value: Value) -> Option<Vec<Vec<u8>>> {
+    value.as_array().map(|frames| {
+        frames
+            .iter()
+            .filter_map(|frame| frame.as_str().map(|value| value.as_bytes().to_vec()))
+            .collect()
+    })
+}
+
+fn chat_cache_read_stream_frames(state: &AppState, key: &str) -> Option<Vec<Vec<u8>>> {
+    chat_cache_read_stream(state, key).and_then(chat_cache_stream_frames)
+}
+
 fn chat_cache_finish_stream(
     state: &AppState,
     key: &str,
@@ -483,7 +496,13 @@ fn chat_cache_finish_stream(
         chat_cache_write_stream(
             state,
             key.to_owned(),
-            Value::Array(frames.iter().map(|frame| json!(frame)).collect()),
+            Value::Array(
+                frames
+                    .iter()
+                    .filter_map(|frame| String::from_utf8(frame.clone()).ok())
+                    .map(Value::String)
+                    .collect(),
+            ),
         );
     }
     inflight.notify.notify_waiters();
