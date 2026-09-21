@@ -17082,9 +17082,16 @@ fn response_stream_from_chat(response: Response, model: String, deadline: Instan
             let next = tokio::time::timeout(remaining, state.input.next()).await;
             let chunk = match next {
                 Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(error))) | Err(_) => {
+                Ok(Some(Err(error))) => {
                     state.terminal = true;
                     return Some((Err(io::Error::other(error.to_string())), state));
+                }
+                Err(_) => {
+                    state.terminal = true;
+                    return Some((
+                        Err(io::Error::other("chat response stream timed out")),
+                        state,
+                    ));
                 }
                 Ok(None) => {
                     let item = json!({
