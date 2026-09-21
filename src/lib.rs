@@ -3141,7 +3141,7 @@ async fn account_upstream_json_with_proxy(
         .ok_or("upstream_unavailable")?
         .trim_end_matches('/');
     account_upstream_json_at_with_proxy(
-        state: Some(state),
+        state,
         base_url,
         context,
         token,
@@ -3261,7 +3261,7 @@ async fn refresh_access_token_account(
         .as_deref()
         .ok_or("upstream_unavailable")?;
     let me = account_upstream_json_with_proxy(
-        state,
+        state: Some(state),
         &context,
         &token,
         account_proxy,
