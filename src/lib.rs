@@ -11605,7 +11605,7 @@ async fn run_resumed_image_task(
             for bytes in downloaded {
                 let bytes = match native_image_output(&bytes, "png", None) {
                     Ok(bytes) => bytes,
-                    Err(error) => {
+                    Err(_error) => {
                         let _ = update_image_task(
                             &state,
                             &owner,
