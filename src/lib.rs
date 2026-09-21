@@ -312,7 +312,7 @@ fn canonicalize_cache_value(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
             let mut entries = object.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
             let mut sorted = Map::new();
             for (key, value) in entries {
                 sorted.insert(key.clone(), canonicalize_cache_value(value));
