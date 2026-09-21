@@ -730,10 +730,10 @@ impl AccountStore {
             {
                 continue;
             }
-            if let Some(allowed_groups) = allowed_groups
-                && !allowed_groups.contains(&slot.record.account_type)
-            {
-                continue;
+            if let Some(allowed_groups) = allowed_groups {
+                if !allowed_groups.contains(&slot.record.account_type) {
+                    continue;
+                }
             } else if model != "auto"
                 && !slot.record.models.is_empty()
                 && !slot
