@@ -25453,8 +25453,8 @@ mod tests {
         let raw = json!({
             "models": [
                 "configured-model",
-                {"model":"web-model","source":"web"},
-                {"model":"gpt-image-2","source":"image"},
+                "web-model",
+                "gpt-image-2",
                 "configured-model"
             ],
             "model_sources": {"web-model":"web", "gpt-image-2":"image"},
@@ -25477,10 +25477,7 @@ mod tests {
         without_quota.dedup();
         assert_eq!(
             without_quota,
-            vec![
-                json!("configured-model"),
-                json!({"model":"web-model","source":"web"})
-            ]
+            vec![json!("configured-model"), json!("web-model")]
         );
     }
 
