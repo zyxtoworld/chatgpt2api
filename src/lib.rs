@@ -8580,6 +8580,20 @@ async fn native_web_image_request_proxy(
             }
             Err(error) => {
                 last_error = Some(error);
+                if last_error
+                    .as_ref()
+                    .is_some_and(|error| error.code() == "invalid_api_key")
+                {
+                    let config = fs::read(state.config_path.as_ref())
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        .unwrap_or_else(|| json!({}));
+                    let remove = settings_bool(config.get("auto_remove_invalid_accounts"), false);
+                    let _ = state
+                        .account_store
+                        .record_invalid_token(&token, "invalid_token", remove)
+                        .await;
+                }
                 if !state.account_store.mark_image_result(&token, false).await {
                     AccountStore::note_usage_mark_failure();
                 }
@@ -8688,6 +8702,9 @@ async fn native_web_image_attempt(
         .map_err(|_| ApiError::upstream())?
         .map_err(|_| ApiError::upstream())?;
     if !prepare.status().is_success() {
+        if prepare.status() == StatusCode::UNAUTHORIZED {
+            return Err(ApiError::unauthorized());
+        }
         return Err(ApiError::upstream());
     }
     let conduit = serde_json::from_slice::<Value>(&bounded_response_body(prepare).await?)
@@ -8793,6 +8810,9 @@ async fn native_web_image_attempt(
         .map_err(|_| ApiError::upstream())?
         .map_err(|_| ApiError::upstream())?;
     if !response.status().is_success() {
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(ApiError::unauthorized());
+        }
         return Err(ApiError::upstream());
     }
     let conversation_id = search_conversation_id_from_response(response, deadline, true)
