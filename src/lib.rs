@@ -11198,6 +11198,13 @@ fn absolute_legacy_config_path(initial_cwd: &Path, data_dir: &Path) -> PathBuf {
     }
 }
 
+pub(crate) fn config_path_for_runtime() -> PathBuf {
+    absolute_legacy_config_path(
+        &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        &config::runtime_data_dir(),
+    )
+}
+
 fn read_legacy_config_strict(path: &Path) -> Result<Value, ApiError> {
     let bytes = fs::read(path).map_err(|_| ApiError::unavailable())?;
     serde_json::from_slice(&bytes)

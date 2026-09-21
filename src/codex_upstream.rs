@@ -3,6 +3,7 @@ use base64::Engine;
 use reqwest::RequestBuilder;
 use serde_json::{Map, Value, json};
 use std::env;
+use std::fs;
 
 use super::protocol_codex_payload::native_codex_tool;
 use super::{
@@ -69,7 +70,7 @@ fn native_browser_headers_for_client(
     client_version: &str,
     client_build_number: &str,
 ) -> RequestBuilder {
-    request
+    let mut request = request
         // wreq's emulation profile installs browser headers as client defaults.
         // Disable those defaults before adding the canonical web headers below;
         // RequestBuilder::header appends and would otherwise send duplicates.
@@ -100,7 +101,37 @@ fn native_browser_headers_for_client(
         .header("OAI-Session-Id", &context.session_id)
         .header("OAI-Language", "zh-CN")
         .header("OAI-Client-Version", client_version)
-        .header("OAI-Client-Build-Number", client_build_number)
+        .header("OAI-Client-Build-Number", client_build_number);
+    if let Ok(bytes) = fs::read(crate::config_path_for_runtime())
+        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        && let Some(clearance) = value
+            .get("proxy_runtime")
+            .and_then(Value::as_object)
+            .and_then(|runtime| runtime.get("clearance"))
+            .and_then(Value::as_object)
+    {
+        if let Some(user_agent) = clearance
+            .get("user_agent")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.header(header::USER_AGENT, user_agent);
+        }
+        if let Some(cookies) = clearance
+            .get("cf_cookies")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.header(header::COOKIE, cookies);
+        } else if let Some(clearance) = clearance
+            .get("cf_clearance")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            request = request.header(header::COOKIE, format!("cf_clearance={clearance}"));
+        }
+    }
+    request
 }
 
 pub(super) fn codex_client_version() -> Option<String> {
