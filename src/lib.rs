@@ -2807,6 +2807,17 @@ fn public_token_ref(token: &str) -> String {
         .collect()
 }
 
+#[allow(dead_code)]
+fn native_debug_stage(stage: &str, detail: &str) {
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/chatgpt2api-stage-debug.log")
+    {
+        let _ = writeln!(file, "{stage} {detail}");
+    }
+}
+
 pub(crate) async fn account_upstream_json(
     state: &AppState,
     context: &NativeRequestContext,
@@ -7820,6 +7831,10 @@ async fn native_poll_image_file_ids(
     conversation_id: &str,
     deadline: Instant,
 ) -> Result<Vec<String>, ApiError> {
+    native_debug_stage(
+        "image_poll_start",
+        &format!("conversation_id={conversation_id}"),
+    );
     let base_url = state
         .config
         .upstream_base_url
@@ -7877,6 +7892,10 @@ async fn native_poll_image_file_ids(
         let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
         let mut ids = Vec::new();
         native_collect_image_file_ids(&value, &mut ids, 0);
+        native_debug_stage(
+            "image_poll_result",
+            &format!("conversation_id={conversation_id} ids={}", ids.len()),
+        );
         if !ids.is_empty() {
             if !settle_enabled {
                 return Ok(ids);
@@ -8010,6 +8029,10 @@ async fn native_web_image_request_proxy(
     request: NativeImageRequest,
     endpoint: &'static str,
 ) -> Result<Response, ApiError> {
+    native_debug_stage(
+        "image_request_start",
+        &format!("model={} endpoint={endpoint}", request.model),
+    );
     state
         .account_type_catalog
         .refresh_image_quotas_for_public(&state)
@@ -8030,6 +8053,14 @@ async fn native_web_image_request_proxy(
         };
         let token = lease.token().to_owned();
         attempted_tokens.insert(token.clone());
+        native_debug_stage(
+            "image_lease",
+            &format!(
+                "attempt={} token_len={}",
+                attempted_tokens.len(),
+                token.len()
+            ),
+        );
         let validation_deadline =
             (Instant::now() + PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE).min(deadline);
         let validated = refresh_accounts_now_with_deadline(
@@ -8044,6 +8075,10 @@ async fn native_web_image_request_proxy(
         .is_some_and(|refreshed| refreshed == 1)
             && state.account_store.image_token_is_eligible(&token).await;
         if !validated {
+            native_debug_stage(
+                "image_validation_failed",
+                &format!("attempt={}", attempted_tokens.len()),
+            );
             log::debug!(
                 "native Web image account rejected by per-token capability refresh: attempt={}",
                 attempted_tokens.len()
@@ -8062,11 +8097,19 @@ async fn native_web_image_request_proxy(
                         upstream_model: candidate.clone(),
                         default_thinking_effort: configured.default_thinking_effort.clone(),
                     };
+                    native_debug_stage(
+                        "image_attempt_start",
+                        &format!("candidate={candidate} index={index}"),
+                    );
                     result = native_web_image_attempt(
                         &state, &lease, &request, endpoint, &settings, deadline,
                     )
                     .await;
                     if result.is_ok() {
+                        native_debug_stage(
+                            "image_attempt_ok",
+                            &format!("candidate={candidate} index={index}"),
+                        );
                         log::info!(
                             "native Web image upstream model selected: requested={}, selected={}, candidate_index={}, account_attempt={}",
                             request.model,
@@ -8076,6 +8119,10 @@ async fn native_web_image_request_proxy(
                         );
                         break;
                     }
+                    native_debug_stage(
+                        "image_attempt_error",
+                        &format!("candidate={candidate} index={index}"),
+                    );
                     log::warn!(
                         "native Web image upstream model failed: requested={}, candidate={}, candidate_index={}, account_attempt={}",
                         request.model,
@@ -8135,6 +8182,7 @@ async fn native_web_image_attempt(
     model_settings: &RuntimeModelSettings,
     deadline: Instant,
 ) -> Result<Response, ApiError> {
+    native_debug_stage("image_stage", "attempt_enter");
     let base_url = state
         .config
         .upstream_base_url
@@ -8146,6 +8194,7 @@ async fn native_web_image_attempt(
     for (index, image) in request.images.iter().enumerate() {
         uploads.push(native_upload_image(state, lease, &context, image, index + 1).await?);
     }
+    native_debug_stage("image_stage", &format!("uploads={}", uploads.len()));
     let resources = native_bootstrap_with_timeout_context(
         &state.client,
         base_url,
@@ -8155,6 +8204,7 @@ async fn native_web_image_attempt(
     )
     .await
     .map_err(|_| ApiError::upstream())?;
+    native_debug_stage("image_stage", "bootstrap_ok");
     let requirements = native_chat_requirements_with_resources_for_route_context(
         &state.client,
         base_url,
@@ -8166,6 +8216,7 @@ async fn native_web_image_attempt(
     )
     .await
     .map_err(|_| ApiError::upstream())?;
+    native_debug_stage("image_stage", "requirements_ok");
     let upstream_model = &model_settings.upstream_model;
     let prepare_path = "/backend-api/f/conversation/prepare";
     let mut prepare_payload = json!({
@@ -8208,8 +8259,13 @@ async fn native_web_image_attempt(
         .map_err(|_| ApiError::upstream())?
         .map_err(|_| ApiError::upstream())?;
     if !prepare.status().is_success() {
+        native_debug_stage(
+            "image_prepare_status_error",
+            &format!("status={}", prepare.status()),
+        );
         return Err(ApiError::upstream());
     }
+    native_debug_stage("image_stage", "prepare_ok");
     let conduit = serde_json::from_slice::<Value>(&bounded_response_body(prepare).await?)
         .map_err(|_| ApiError::upstream())?
         .get("conduit_token")
@@ -8314,16 +8370,23 @@ async fn native_web_image_attempt(
         .map_err(|_| ApiError::upstream())?
         .map_err(|_| ApiError::upstream())?;
     if !response.status().is_success() {
+        native_debug_stage(
+            "image_run_status_error",
+            &format!("status={}", response.status()),
+        );
         return Err(ApiError::upstream());
     }
+    native_debug_stage("image_stage", "run_ok");
     let conversation_id = search_conversation_id_from_response(response, deadline, true)
         .await
         .map_err(|_| ApiError::upstream())?;
+    native_debug_stage("image_stage", &format!("conversation_id={conversation_id}"));
     let ids =
         native_poll_image_file_ids(state, lease, &context, &conversation_id, deadline).await?;
     let downloaded =
         native_download_image_files(state, lease, &context, &conversation_id, &ids, deadline)
             .await?;
+    native_debug_stage("image_stage", &format!("downloaded={}", downloaded.len()));
     let mut data = Vec::new();
     for bytes in downloaded {
         let bytes =
@@ -16783,11 +16846,26 @@ async fn native_conversation_attempt(
     payload: &Value,
 ) -> Result<reqwest::Response, (ApiError, bool)> {
     let authenticated = !token.is_empty();
+    native_debug_stage(
+        "conversation_start",
+        &format!(
+            "model={} token_len={} authenticated={authenticated}",
+            payload
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            token.len()
+        ),
+    );
     let context = NativeRequestContext::new();
     let pow_resources = match native_bootstrap(client, base_url, token, &context).await {
         Ok(resources) => resources,
-        Err(error) => return Err(error),
+        Err(error) => {
+            native_debug_stage("conversation_bootstrap_error", "upstream");
+            return Err(error);
+        }
     };
+    native_debug_stage("conversation_bootstrap_ok", "ok");
     let requirements = match native_chat_requirements_with_resources_for_route_context(
         client,
         base_url,
@@ -16800,8 +16878,12 @@ async fn native_conversation_attempt(
     .await
     {
         Ok(requirements) => requirements,
-        Err(error) => return Err(error),
+        Err(error) => {
+            native_debug_stage("conversation_requirements_error", "upstream");
+            return Err(error);
+        }
     };
+    native_debug_stage("conversation_requirements_ok", "ok");
     let route_base = if authenticated {
         "/backend-api/conversation"
     } else {
@@ -16835,6 +16917,7 @@ async fn native_conversation_attempt(
         .map_err(|_| (ApiError::upstream(), false))?;
     if !upstream.status().is_success() {
         let status = upstream.status();
+        native_debug_stage("conversation_status_error", &format!("status={status}"));
         let retryable = matches!(
             status,
             StatusCode::TOO_MANY_REQUESTS
@@ -16845,6 +16928,7 @@ async fn native_conversation_attempt(
         );
         return Err((ApiError::upstream(), retryable));
     }
+    native_debug_stage("conversation_status_ok", "ok");
     if upstream_declares_oversize(&upstream) {
         return Err((ApiError::upstream(), false));
     }
