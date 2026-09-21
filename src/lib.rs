@@ -249,11 +249,26 @@ static IMAGE_TASK_MUTATION_GATE: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMu
 #[derive(Default)]
 struct ChatCacheState {
     entries: HashMap<String, ChatCacheEntry>,
+    inflight: HashMap<String, Arc<ChatCacheInflight>>,
 }
 
 struct ChatCacheEntry {
     expires_at: SystemTime,
     value: Value,
+}
+
+struct ChatCacheInflight {
+    notify: tokio::sync::Notify,
+    result: StdMutex<Option<Result<Vec<Vec<u8>>, String>>>,
+}
+
+impl ChatCacheInflight {
+    fn new() -> Self {
+        Self {
+            notify: tokio::sync::Notify::new(),
+            result: StdMutex::new(None),
+        }
+    }
 }
 
 fn chat_cache_config(state: &AppState) -> Value {
@@ -418,6 +433,60 @@ fn chat_cache_write_stream(state: &AppState, key: String, value: Value) {
             cache.entries.remove(&oldest);
         }
     }
+}
+
+fn chat_cache_begin_stream(state: &AppState, key: &str) -> Option<(Arc<ChatCacheInflight>, bool)> {
+    chat_cache_enabled(state, true)?;
+    let mut cache = state.chat_cache.lock().ok()?;
+    if let Some(entry) = cache.entries.get(key)
+        && SystemTime::now() < entry.expires_at
+    {
+        return None;
+    }
+    if let Some(entry) = cache.inflight.get(key) {
+        return Some((entry.clone(), false));
+    }
+    let entry = Arc::new(ChatCacheInflight::new());
+    cache.inflight.insert(key.to_owned(), entry.clone());
+    Some((entry, true))
+}
+
+async fn chat_cache_wait_stream(
+    inflight: &Arc<ChatCacheInflight>,
+) -> Result<Vec<Vec<u8>>, ApiError> {
+    loop {
+        if let Some(result) = inflight
+            .result
+            .lock()
+            .ok()
+            .and_then(|result| result.clone())
+        {
+            return result.map_err(|_| ApiError::upstream());
+        }
+        inflight.notify.notified().await;
+    }
+}
+
+fn chat_cache_finish_stream(
+    state: &AppState,
+    key: &str,
+    inflight: &Arc<ChatCacheInflight>,
+    result: Result<Vec<Vec<u8>>, String>,
+) {
+    if let Ok(mut slot) = inflight.result.lock() {
+        *slot = Some(result.clone());
+    }
+    if let Ok(mut cache) = state.chat_cache.lock() {
+        cache.inflight.remove(key);
+    }
+    if let Ok(Ok(frames)) = &result {
+        chat_cache_write_stream(
+            state,
+            key.to_owned(),
+            Value::Array(frames.iter().map(|frame| json!(frame)).collect()),
+        );
+    }
+    inflight.notify.notify_waiters();
 }
 
 #[cfg(test)]
