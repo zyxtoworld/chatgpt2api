@@ -14327,11 +14327,6 @@ impl AccountTypeCatalog {
                         account_type: account_group.clone(),
                         token: candidate.token.clone(),
                         account_id: candidate.chatgpt_account_id.clone(),
-                        cache_key: Some(format!(
-                            "{}:{}",
-                            account_group.to_ascii_lowercase(),
-                            candidate.token
-                        )),
                         deadline,
                         batch: None,
                         retry: false,
