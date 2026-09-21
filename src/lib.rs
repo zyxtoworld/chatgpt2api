@@ -11612,7 +11612,7 @@ async fn run_resumed_image_task(
                             &task_id,
                             "error",
                             Map::new(),
-                            Some(error.to_string()),
+                            Some("图片结果处理失败".to_owned()),
                             Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
                         );
                         return;
