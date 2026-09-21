@@ -734,7 +734,8 @@ impl AccountStore {
                 if !allowed_groups.contains(&slot.record.account_type) {
                     continue;
                 }
-            } else if model != "auto"
+            }
+            if model != "auto"
                 && !slot.record.models.is_empty()
                 && !slot
                     .record
