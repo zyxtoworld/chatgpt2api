@@ -216,6 +216,22 @@ fn upstream_client_for_lease(state: &AppState, lease: &AccountLease, resource: b
     );
     upstream_client_for_profile(&profile).unwrap_or_else(|_| state.client.clone())
 }
+
+fn upstream_client_for_account_proxy(
+    state: &AppState,
+    account_proxy: Option<&str>,
+    resource: bool,
+) -> Client {
+    let profile = proxy_service::profile_from_runtime(
+        &proxy_runtime_value(state),
+        account_proxy,
+        None,
+        None,
+        resource,
+        true,
+    );
+    upstream_client_for_profile(&profile).unwrap_or_else(|_| state.client.clone())
+}
 type HealthSnapshotSync = Arc<dyn Fn() + Send + Sync>;
 static NATIVE_POW_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(NATIVE_POW_MAX_CONCURRENCY)));
@@ -3175,7 +3191,7 @@ async fn refresh_access_token_account(
     let (quota, restore_at) = image_quota_from_limits_progress(init.get("limits_progress"));
     let fetched_models = fetch_imported_model_catalog_request(ImportedModelCatalogRequest {
         cache: state.imported_model_catalog.clone(),
-        client: state.client.clone(),
+        client: upstream_client_for_account_proxy(state, account_proxy, false),
         base_url: base_url.to_owned(),
         account_type: plan_type.to_owned(),
         token: token.clone(),
@@ -7737,8 +7753,7 @@ async fn native_upload_image(
         .as_deref()
         .unwrap_or("https://chatgpt.com")
         .trim_end_matches('/');
-    let mut upload_request = state
-        .client
+    let mut upload_request = client
         .put(upload_url)
         .header(header::CONTENT_TYPE, &mime_type)
         .header(header::CONTENT_LENGTH, file_size)
@@ -8040,6 +8055,7 @@ async fn native_poll_image_file_ids(
         return Err(ApiError::upstream());
     }
     let mut last_ids: Option<Vec<String>> = None;
+    let client = upstream_client_for_lease(state, lease, true);
     loop {
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(ApiError::upstream());
@@ -8047,7 +8063,7 @@ async fn native_poll_image_file_ids(
         let path = format!("/backend-api/conversation/{conversation_id}");
         let referer = format!("{base_url}/c/{conversation_id}");
         let mut request = native_browser_headers_with_referer(
-            state.client.get(format!("{base_url}{path}")),
+            client.get(format!("{base_url}{path}")),
             context,
             &referer,
         )
@@ -8402,12 +8418,13 @@ async fn native_web_image_attempt(
         .ok_or_else(ApiError::unavailable)?
         .trim_end_matches('/');
     let context = NativeRequestContext::new();
+    let client = upstream_client_for_lease(state, lease, false);
     let mut uploads = Vec::new();
     for (index, image) in request.images.iter().enumerate() {
         uploads.push(native_upload_image(state, lease, &context, image, index + 1).await?);
     }
     let resources = native_bootstrap_with_timeout_context(
-        &state.client,
+        &client,
         base_url,
         lease.token(),
         deadline.saturating_duration_since(Instant::now()),
@@ -8416,7 +8433,7 @@ async fn native_web_image_attempt(
     .await
     .map_err(|_| ApiError::upstream())?;
     let requirements = native_chat_requirements_with_resources_for_route_context(
-        &state.client,
+        &client,
         base_url,
         lease.token(),
         &resources,
@@ -8450,7 +8467,6 @@ async fn native_web_image_attempt(
     if let Some(effort) = model_settings.default_thinking_effort.as_deref() {
         prepare_payload["thinking_effort"] = Value::String(effort.to_owned());
     }
-    let client = upstream_client_for_lease(state, lease, false);
     let mut prepare =
         native_browser_headers(client.post(format!("{base_url}{prepare_path}")), &context)
             .header(header::ACCEPT, "*/*")
@@ -9545,8 +9561,9 @@ async fn native_search_attempt(
     if remaining.is_zero() {
         return Err((ApiError::upstream(), false));
     }
+    let client = upstream_client_for_lease(state, lease, false);
     let resources = native_bootstrap_with_timeout_context(
-        &state.client,
+        &client,
         base_url,
         lease.token(),
         remaining,
@@ -9554,7 +9571,7 @@ async fn native_search_attempt(
     )
     .await?;
     let requirements = native_chat_requirements_with_resources_for_route_context(
-        &state.client,
+        &client,
         base_url,
         lease.token(),
         &resources,
@@ -9645,7 +9662,7 @@ async fn native_search_attempt(
     }
     let conversation_id = search_conversation_id_from_response(run, deadline, false).await?;
     native_search_poll(NativeSearchPollRequest {
-        client: &state.client,
+        client: &client,
         base_url,
         token: lease.token(),
         account_id: lease.chatgpt_account_id(),
@@ -13345,6 +13362,7 @@ pub(crate) async fn fetch_imported_model_catalog(
         account_type: account_type.to_owned(),
         token: token.to_owned(),
         account_id: account_id.map(ToOwned::to_owned),
+        cache_key: None,
         deadline,
         batch: None,
         retry: true,
@@ -13360,6 +13378,7 @@ struct ImportedModelCatalogRequest {
     account_type: String,
     token: String,
     account_id: Option<String>,
+    cache_key: Option<String>,
     deadline: Instant,
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
     retry: bool,
@@ -13376,12 +13395,13 @@ async fn fetch_imported_model_catalog_request(
         account_type,
         token,
         account_id,
+        cache_key,
         deadline,
         batch,
         retry,
         require_web_catalog,
     } = request;
-    let key = account_type.to_ascii_lowercase();
+    let key = cache_key.unwrap_or_else(|| account_type.to_ascii_lowercase());
     let retry_key = key.clone();
     let retry_cache = cache.clone();
     let retry_batch = batch.clone();
@@ -14306,6 +14326,11 @@ impl AccountTypeCatalog {
                         account_type: account_group.clone(),
                         token: candidate.token.clone(),
                         account_id: candidate.chatgpt_account_id.clone(),
+                        cache_key: Some(format!(
+                            "{}:{}",
+                            account_group.to_ascii_lowercase(),
+                            candidate.token
+                        )),
                         deadline,
                         batch: None,
                         retry: false,
@@ -17999,8 +18024,9 @@ async fn native_responses_with_timeout_and_groups(
             return Err(ApiError::upstream());
         }
         attempted_tokens.insert(lease.token().to_owned());
+        let client = upstream_client_for_lease(&state, &lease, false);
         match native_codex_response_attempt(
-            &state.client,
+            &client,
             &lease,
             base_url,
             &payload,
@@ -18330,8 +18356,9 @@ async fn chat_completions_with_timeout(
                 let current = lease.as_ref().expect("Codex route lease");
                 debug_assert!(!current.account_type().is_empty());
                 let payload = native_codex_response_payload(&object)?;
+                let client = upstream_client_for_lease(&state, current, false);
                 native_codex_response_attempt(
-                    &state.client,
+                    &client,
                     current,
                     base_url,
                     &payload,
@@ -18341,7 +18368,11 @@ async fn chat_completions_with_timeout(
                 .await
             } else {
                 let payload = native_conversation_payload(&object)?;
-                native_conversation_attempt(&state.client, base_url, token, &payload).await
+                let client = lease
+                    .as_ref()
+                    .map(|current| upstream_client_for_lease(&state, current, false))
+                    .unwrap_or_else(|| state.client.clone());
+                native_conversation_attempt(&client, base_url, token, &payload).await
             };
             match attempt {
                 Ok(upstream) => break upstream,
