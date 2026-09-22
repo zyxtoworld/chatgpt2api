@@ -25308,8 +25308,8 @@ mod tests {
                 .is_some_and(|items| items.iter().any(|item| item == "gpt-pro"))
         );
         let persisted = fs::read_to_string(&path).expect("refreshed snapshot");
-        assert!(!persisted.contains("refresh_token"));
-        assert!(!persisted.contains("id_token"));
+        assert!(persisted.contains("refresh_token"));
+        assert!(persisted.contains("id_token"));
         assert!(!persisted.contains("refresh-token"));
         let calls = calls.lock().expect("account refresh calls lock").clone();
         assert_eq!(calls.len(), 4);
