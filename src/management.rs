@@ -5,6 +5,8 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{Arc, LazyLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
+    future::Future,
+    pin::Pin,
 };
 
 #[cfg(test)]
