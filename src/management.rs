@@ -2915,13 +2915,20 @@ pub(super) async fn sub2api_groups(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let server = registry_value(&state, "sub2api", &server_id)?;
-    let base = server.get("base_url").and_then(Value::as_str).ok_or_else(ApiError::invalid_request)?;
+    let base = server
+        .get("base_url")
+        .and_then(Value::as_str)
+        .ok_or_else(ApiError::invalid_request)?;
     let mut groups = Vec::new();
     let mut page = 1usize;
     while groups.len() < 5_000 && page <= 100 {
-        let request = state.client.get(format!("{base}/api/v1/admin/groups")).query(&[("page", page.to_string()), ("page_size", "200".to_owned())]);
+        let request = state
+            .client
+            .get(format!("{base}/api/v1/admin/groups"))
+            .query(&[("page", page.to_string()), ("page_size", "200".to_owned())]);
         let value = remote_json(&state, sub2api_request(&state, &server, request).await?).await?;
-        let page_items = remote_array(&value, &["items", "groups", "data"]).ok_or_else(ApiError::upstream)?;
+        let page_items =
+            remote_array(&value, &["items", "groups", "data"]).ok_or_else(ApiError::upstream)?;
         let page_len = page_items.len();
         groups.extend(page_items.into_iter().take(5_000 - groups.len()).filter_map(|item| {
             let object = item.as_object()?;
@@ -2936,7 +2943,9 @@ pub(super) async fn sub2api_groups(
                 "active_account_count": object.get("active_account_count").and_then(Value::as_u64).unwrap_or(0),
             }))
         }));
-        if page_len < 200 { break; }
+        if page_len < 200 {
+            break;
+        }
         page += 1;
     }
     Ok(Json(json!({"server_id": server_id, "groups": groups})))
@@ -2949,15 +2958,33 @@ pub(super) async fn sub2api_accounts(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let server = registry_value(&state, "sub2api", &server_id)?;
-    let base = server.get("base_url").and_then(Value::as_str).ok_or_else(ApiError::invalid_request)?;
-    let group = server.get("group_id").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).map(ToOwned::to_owned);
+    let base = server
+        .get("base_url")
+        .and_then(Value::as_str)
+        .ok_or_else(ApiError::invalid_request)?;
+    let group = server
+        .get("group_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
     let mut accounts = Vec::new();
     let mut page = 1usize;
     while accounts.len() < 5_000 && page <= 100 {
-        let mut request = state.client.get(format!("{base}/api/v1/admin/accounts")).query(&[("platform", "openai"), ("type", "oauth"), ("page", page.to_string()), ("page_size", "200".to_owned())]);
-        if let Some(group) = group.as_deref() { request = request.query(&[("group", group)]); }
+        let mut request = state
+            .client
+            .get(format!("{base}/api/v1/admin/accounts"))
+            .query(&[
+                ("platform", "openai"),
+                ("type", "oauth"),
+                ("page", page.to_string()),
+                ("page_size", "200".to_owned()),
+            ]);
+        if let Some(group) = group.as_deref() {
+            request = request.query(&[("group", group)]);
+        }
         let value = remote_json(&state, sub2api_request(&state, &server, request).await?).await?;
-        let page_items = remote_array(&value, &["items", "accounts", "data"]).ok_or_else(ApiError::upstream)?;
+        let page_items =
+            remote_array(&value, &["items", "accounts", "data"]).ok_or_else(ApiError::upstream)?;
         let page_len = page_items.len();
         accounts.extend(page_items.into_iter().take(5_000 - accounts.len()).filter_map(|item| {
             let object = item.as_object()?;
