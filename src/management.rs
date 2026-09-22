@@ -1967,6 +1967,35 @@ fn begin_registry_job(
     })
 }
 
+fn update_registry_job_progress(
+    state: &AppState,
+    kind: &str,
+    id: &str,
+    expected_job_id: &str,
+    completed: usize,
+    total: usize,
+    added: usize,
+    skipped: usize,
+    failed: usize,
+    errors: &[Value],
+) -> Result<bool, ApiError> {
+    let job = progress_job_with_created(
+        expected_job_id,
+        ImportProgress {
+            total,
+            completed,
+            added,
+            skipped,
+            refreshed: 0,
+            failed,
+        },
+        "running",
+        errors.to_vec(),
+        None,
+    );
+    set_registry_job(state, kind, id, job, Some(expected_job_id))
+}
+
 fn set_registry_job(
     state: &AppState,
     kind: &str,
@@ -2180,24 +2209,39 @@ async fn execute_cpa_import(
     let mut successful = 0usize;
     let mut failed = 0usize;
     let mut imported = Vec::new();
-    for name in &names {
-        let value = remote_json(
-            &state,
-            state
-                .client
-                .get(format!("{base}/v0/management/auth-files/download"))
-                .query(&[("name", name)])
-                .bearer_auth(&secret)
-                .header("Accept", "application/json"),
-        )
-        .await;
-        match value.and_then(|value| {
-            value
-                .get("access_token")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .ok_or_else(ApiError::upstream)
-        }) {
+    let total = names.len();
+    let concurrency = total.min(16).max(1);
+    let mut queue = names.into_iter();
+    let mut active = FuturesUnordered::new();
+    for _ in 0..concurrency {
+        if let Some(name) = queue.next() {
+            let request_state = state.clone();
+            let request_base = base.clone();
+            let request_secret = secret.clone();
+            active.push(async move {
+                let value = remote_json(
+                    &request_state,
+                    request_state
+                        .client
+                        .get(format!("{request_base}/v0/management/auth-files/download"))
+                        .query(&[("name", name.clone())])
+                        .bearer_auth(&request_secret)
+                        .header("Accept", "application/json"),
+                )
+                .await;
+                let result = value.and_then(|value| {
+                    value
+                        .get("access_token")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(ApiError::upstream)
+                });
+                (name, result)
+            });
+        }
+    }
+    while let Some((name, result)) = active.next().await {
+        match result {
             Ok(token) => {
                 imported.push(json!({"access_token": token}));
                 successful += 1;
@@ -2206,6 +2250,44 @@ async fn execute_cpa_import(
                 failed += 1;
                 errors.push(json!({"name": name, "error": "远程文件导入失败"}));
             }
+        }
+        let completed = successful + failed;
+        let _ = update_registry_job_progress(
+            &state,
+            "cpa_pools",
+            &pool_id,
+            &expected_job_id,
+            completed,
+            total,
+            successful,
+            0,
+            failed,
+            &errors,
+        );
+        if let Some(next_name) = queue.next() {
+            let request_state = state.clone();
+            let request_base = base.clone();
+            let request_secret = secret.clone();
+            active.push(async move {
+                let value = remote_json(
+                    &request_state,
+                    request_state
+                        .client
+                        .get(format!("{request_base}/v0/management/auth-files/download"))
+                        .query(&[("name", next_name.clone())])
+                        .bearer_auth(&request_secret)
+                        .header("Accept", "application/json"),
+                )
+                .await;
+                let result = value.and_then(|value| {
+                    value
+                        .get("access_token")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(ApiError::upstream)
+                });
+                (next_name, result)
+            });
         }
     }
     let imported_tokens = imported
