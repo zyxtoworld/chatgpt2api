@@ -3698,6 +3698,40 @@ async fn api_accounts_export(
     if exported.is_empty() {
         return Err(ApiError::not_found());
     }
+    let format = value
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("json")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(format.as_str(), "json" | "zip") {
+        return Err(ApiError::invalid_request());
+    }
+    if format == "zip" {
+        let files = exported
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let mut payload = serde_json::to_vec_pretty(item)
+                    .map_err(|_| ApiError::unavailable())?;
+                payload.push(b'\n');
+                Ok((format!("account-{index:03}.json"), payload))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let archive = management::zip_archive(files)?;
+        return Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/zip"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=codex-accounts.zip",
+                ),
+            ],
+            Body::from(archive),
+        )
+            .into_response());
+    }
     let payload = if exported.len() == 1 {
         exported.into_iter().next().expect("one exported account")
     } else {

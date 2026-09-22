@@ -563,7 +563,7 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn zip_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, ApiError> {
+pub(super) fn zip_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, ApiError> {
     if files.is_empty() {
         return Err(ApiError::not_found());
     }
