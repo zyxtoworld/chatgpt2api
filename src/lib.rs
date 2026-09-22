@@ -25245,6 +25245,8 @@ mod tests {
             &path,
             serde_json::to_vec(&json!([{
                 "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "id_token": "id-token",
                 "status": "正常",
                 "type": "free"
             }]))
