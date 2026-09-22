@@ -4155,6 +4155,37 @@ fn backup_state_map(state: &AppState) -> Result<Map<String, Value>, ApiError> {
         .ok_or_else(ApiError::backup_state_invalid)
 }
 
+fn backup_schedule_due(settings: &Value, state: &Map<String, Value>, now: SystemTime) -> bool {
+    if !bool_or(settings.get("enabled"), false)
+        || state
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    let interval_minutes = settings
+        .get("interval_minutes")
+        .and_then(Value::as_u64)
+        .unwrap_or(360)
+        .max(1);
+    let Some(last_finished) = state.get("last_finished_at").and_then(Value::as_str) else {
+        return true;
+    };
+    let Ok(finished) = time::OffsetDateTime::parse(
+        last_finished,
+        &time::format_description::well_known::Rfc3339,
+    ) else {
+        return true;
+    };
+    let Ok(now) = time::OffsetDateTime::from_unix_timestamp(
+        now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
+    ) else {
+        return true;
+    };
+    (now - finished).whole_seconds() >= (interval_minutes * 60) as i64
+}
+
 fn backup_state_value(current: &Map<String, Value>, key: &str) -> Value {
     current.get(key).cloned().unwrap_or(Value::Null)
 }
@@ -6038,10 +6069,24 @@ mod tests {
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
         apply_ccload_image_capability, ccload_model_entries, ccload_model_ids,
         ccload_model_payload, merge_ccload_account_catalog, normalized_ccload_credential,
-        parse_r2_list_xml, public_backup_error,
+        parse_r2_list_xml, public_backup_error, backup_schedule_due,
     };
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
+
+    #[test]
+    fn backup_schedule_due_matches_python_scheduler_rules() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let enabled = json!({"enabled": true, "interval_minutes": 60});
+        assert!(!backup_schedule_due(&json!({"enabled": false}), &Map::new(), now));
+        let running = serde_json::from_value(json!({"running": true})).expect("running state");
+        assert!(!backup_schedule_due(&enabled, &running, now));
+        assert!(backup_schedule_due(&enabled, &Map::new(), now));
+        let recent = serde_json::from_value(json!({"last_finished_at":"1970-01-12T13:46:40Z"})).expect("recent state");
+        assert!(!backup_schedule_due(&enabled, &recent, now));
+        let old = serde_json::from_value(json!({"last_finished_at":"1970-01-12T11:46:40Z"})).expect("old state");
+        assert!(backup_schedule_due(&enabled, &old, now));
+    }
 
     #[test]
     fn r2_list_parser_matches_python_optional_fields_and_cleaning() {
