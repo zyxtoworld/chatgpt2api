@@ -2177,6 +2177,8 @@ pub(super) fn cpa_download_future(
             value
                 .get("access_token")
                 .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
                 .map(ToOwned::to_owned)
                 .ok_or_else(ApiError::upstream)
         });
@@ -2261,9 +2263,9 @@ async fn execute_cpa_import(
                 imported.push(json!({"access_token": token}));
                 successful += 1;
             }
-            Err(_) => {
+            Err(error) => {
                 failed += 1;
-                errors.push(json!({"name": name, "error": "远程文件导入失败"}));
+                errors.push(json!({"name": name, "error": error.to_string()}));
             }
         }
         let completed = successful + failed;
@@ -3062,11 +3064,11 @@ async fn execute_sub2api_import(
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_default();
-                let token = credentials
-                    .get("access_token")
-                    .and_then(Value::as_str)
+                let token = ["access_token", "accessToken", "token"]
+                    .into_iter()
+                    .filter_map(|key| credentials.get(key).and_then(Value::as_str))
                     .map(str::trim)
-                    .filter(|value| !value.is_empty())
+                    .find(|value| !value.is_empty())
                     .map(ToOwned::to_owned);
                 match token {
                     Some(token) => {
