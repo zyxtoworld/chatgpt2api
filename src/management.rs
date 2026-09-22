@@ -367,9 +367,7 @@ fn cleanup_orphaned_image_thumbnails(data_dir: &Path) {
         let Some(relative) = relative_string(&thumbnails, &path) else {
             continue;
         };
-        if relative.ends_with(".png")
-            && !images.join(relative.trim_end_matches(".png")).is_file()
-        {
+        if relative.ends_with(".png") && !images.join(relative.trim_end_matches(".png")).is_file() {
             let _ = fs::remove_file(path);
         }
     }
@@ -6086,10 +6084,10 @@ mod tests {
         ccload_model_payload, merge_ccload_account_catalog, normalized_ccload_credential,
         parse_r2_list_xml, public_backup_error,
     };
-    use serde_json::json;
-    use std::time::{Duration, SystemTime};
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
+    use serde_json::json;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn backup_schedule_due_matches_python_scheduler_rules() {
