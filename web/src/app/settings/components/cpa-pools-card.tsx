@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 
 import { useSettingsStore } from "../store";
+import { ImportProgressCard } from "./import-progress-card";
 
 export function CPAPoolsCard() {
   const pools = useSettingsStore((state) => state.pools);
@@ -61,9 +62,6 @@ export function CPAPoolsCard() {
               const importJob = pool.import_job ?? null;
               const importRunning = importJob?.status === "pending" || importJob?.status === "running";
               const isBusy = hasMutation || importRunning || loadingFilesId === pool.id;
-              const progress = importJob?.total
-                ? Math.round((importJob.completed / importJob.total) * 100)
-                : 0;
 
               return (
                 <div key={pool.id} className="flex flex-col gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3">
@@ -115,42 +113,7 @@ export function CPAPoolsCard() {
                   </div>
 
                   {importJob ? (
-                    <div className="space-y-2 rounded-xl bg-stone-50 px-3 py-3">
-                      <div className="text-xs font-medium tracking-[0.16em] text-stone-400 uppercase">导入任务</div>
-                      <div className="rounded-lg border border-stone-200 bg-white px-3 py-3">
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="text-sm font-medium text-stone-700">
-                              状态 {importJob.status}，已处理 {importJob.completed}/{importJob.total}
-                            </div>
-                            <div className="truncate text-xs text-stone-400">
-                              任务 {importJob.job_id.slice(0, 8)} · {importJob.created_at}
-                            </div>
-                          </div>
-                          <Badge
-                            variant={
-                              importJob.status === "completed"
-                                ? "success"
-                                : importJob.status === "failed"
-                                  ? "danger"
-                                  : "info"
-                            }
-                            className="rounded-md"
-                          >
-                            {progress}%
-                          </Badge>
-                        </div>
-                        <div className="mt-3 h-2 overflow-hidden rounded-full bg-stone-200">
-                          <div className="h-full rounded-full bg-stone-900 transition-all" style={{ width: `${progress}%` }} />
-                        </div>
-                        <div className="mt-2 flex flex-wrap gap-2 text-xs text-stone-500">
-                          <span>新增 {importJob.added}</span>
-                          <span>跳过 {importJob.skipped}</span>
-                          <span>刷新 {importJob.refreshed}</span>
-                          <span>失败 {importJob.failed}</span>
-                        </div>
-                      </div>
-                    </div>
+                    <ImportProgressCard job={importJob} />
                   ) : null}
                 </div>
               );

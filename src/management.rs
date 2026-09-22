@@ -1646,6 +1646,9 @@ fn public_import_job(value: Option<&Value>) -> Value {
     for key in [
         "job_id",
         "status",
+        "phase",
+        "phase_completed",
+        "phase_total",
         "created_at",
         "updated_at",
         "total",
@@ -1943,6 +1946,37 @@ fn progress_job_with_created(
     errors: Vec<Value>,
     created_at: Option<&str>,
 ) -> Value {
+    let phase = match status {
+        "pending" => "pending",
+        "completed" => "completed",
+        "failed" => "failed",
+        _ => "processing",
+    };
+    let phase_completed = progress.completed;
+    let phase_total = progress.total;
+    progress_job_with_phase(
+        job_id,
+        progress,
+        status,
+        errors,
+        created_at,
+        phase,
+        phase_completed,
+        phase_total,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn progress_job_with_phase(
+    job_id: &str,
+    progress: ImportProgress,
+    status: &str,
+    errors: Vec<Value>,
+    created_at: Option<&str>,
+    phase: &str,
+    phase_completed: usize,
+    phase_total: usize,
+) -> Value {
     let timestamp = iso_timestamp(SystemTime::now());
     let created_at = created_at
         .filter(|value| !value.trim().is_empty())
@@ -1954,6 +1988,9 @@ fn progress_job_with_created(
         "updated_at": iso_timestamp(SystemTime::now()),
         "total": progress.total,
         "completed": progress.completed,
+        "phase": phase,
+        "phase_completed": phase_completed.min(phase_total),
+        "phase_total": phase_total,
         "added": progress.added,
         "skipped": progress.skipped,
         "refreshed": progress.refreshed,
@@ -2027,7 +2064,7 @@ fn update_registry_job_progress(
     failed: usize,
     errors: &[Value],
 ) -> Result<bool, ApiError> {
-    let job = progress_job_with_created(
+    let job = progress_job_with_phase(
         expected_job_id,
         ImportProgress {
             total,
@@ -2040,6 +2077,9 @@ fn update_registry_job_progress(
         "running",
         errors.to_vec(),
         None,
+        "fetching_credentials",
+        completed,
+        total,
     );
     set_registry_job(state, kind, id, job, Some(expected_job_id))
 }
@@ -2287,6 +2327,29 @@ async fn execute_cpa_import(
     let mut failed = 0usize;
     let mut imported = Vec::new();
     let total = names.len();
+    let _ = set_registry_job(
+        &state,
+        "cpa_pools",
+        &pool_id,
+        progress_job_with_phase(
+            &expected_job_id,
+            ImportProgress {
+                total,
+                completed: 0,
+                added: 0,
+                skipped: 0,
+                refreshed: 0,
+                failed: 0,
+            },
+            "running",
+            Vec::new(),
+            None,
+            "downloading_credentials",
+            0,
+            total,
+        ),
+        Some(&expected_job_id),
+    );
     let concurrency = total.clamp(1, 16);
     let mut queue = names.into_iter();
     let mut active: FuturesUnordered<CpaDownloadFuture> = FuturesUnordered::new();
@@ -2346,6 +2409,29 @@ async fn execute_cpa_import(
                 (0, 0, failed.saturating_add(successful))
             }
         };
+    let _ = set_registry_job(
+        &state,
+        "cpa_pools",
+        &pool_id,
+        progress_job_with_phase(
+            &expected_job_id,
+            ImportProgress {
+                total,
+                completed: successful.saturating_add(failed),
+                added,
+                skipped,
+                refreshed: 0,
+                failed,
+            },
+            "running",
+            errors.clone(),
+            None,
+            "refreshing_accounts",
+            0,
+            imported_tokens.len(),
+        ),
+        Some(&expected_job_id),
+    );
     let refresh_result = super::refresh_imported_accounts_with_batch_until(
         &state,
         &imported_tokens,
@@ -3060,6 +3146,29 @@ async fn execute_sub2api_import(
     expected_job_id: String,
 ) {
     let batch_stats = Arc::new(super::ImportedModelCatalogBatchStats::default());
+    let _ = set_registry_job(
+        &state,
+        "sub2api",
+        &server_id,
+        progress_job_with_phase(
+            &expected_job_id,
+            ImportProgress {
+                total: ids.len(),
+                completed: 0,
+                added: 0,
+                skipped: 0,
+                refreshed: 0,
+                failed: 0,
+            },
+            "running",
+            Vec::new(),
+            None,
+            "fetching_credentials",
+            0,
+            ids.len(),
+        ),
+        Some(&expected_job_id),
+    );
     let Ok(server) = registry_value(&state, "sub2api", &server_id) else {
         return;
     };
@@ -3148,6 +3257,29 @@ async fn execute_sub2api_import(
                 (0, 0, failed.saturating_add(successful))
             }
         };
+    let _ = set_registry_job(
+        &state,
+        "sub2api",
+        &server_id,
+        progress_job_with_phase(
+            &expected_job_id,
+            ImportProgress {
+                total: ids.len(),
+                completed: successful.saturating_add(failed),
+                added,
+                skipped,
+                refreshed: 0,
+                failed,
+            },
+            "running",
+            errors.clone(),
+            None,
+            "refreshing_accounts",
+            0,
+            imported_tokens.len(),
+        ),
+        Some(&expected_job_id),
+    );
     let refresh_result = super::refresh_imported_accounts_with_batch_until(
         &state,
         &imported_tokens,
@@ -3756,13 +3888,16 @@ async fn execute_ccload_import(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     let publish_progress = |completed: usize,
+                            phase: &str,
+                            phase_completed: usize,
+                            phase_total: usize,
                             added: usize,
                             skipped: usize,
                             refreshed: usize,
                             failed: usize,
                             status: &str,
                             errors: &[Value]| {
-        let job = progress_job_with_created(
+        let job = progress_job_with_phase(
             &expected_job_id,
             ImportProgress {
                 total: ids.len(),
@@ -3775,10 +3910,13 @@ async fn execute_ccload_import(
             status,
             errors.to_vec(),
             created_at.as_deref(),
+            phase,
+            phase_completed,
+            phase_total,
         );
         let _ = set_registry_job(&state, "ccload", &server_id, job, Some(&expected_job_id));
     };
-    publish_progress(0, 0, 0, 0, 0, "running", &[]);
+    publish_progress(0, "connecting", 0, 1, 0, 0, 0, 0, "running", &[]);
     let Ok((base, token)) = ccload_login_until(&state, &server, deadline).await else {
         let job = import_job(
             &expected_job_id,
@@ -3869,7 +4007,18 @@ async fn execute_ccload_import(
                 );
             }
         }
-        publish_progress(index.saturating_add(1), 0, 0, 0, failed, "running", &errors);
+        publish_progress(
+            index.saturating_add(1),
+            "fetching_credentials",
+            index.saturating_add(1),
+            ids.len(),
+            0,
+            0,
+            0,
+            failed,
+            "running",
+            &errors,
+        );
     }
     let fetch_failed = failed;
     if candidates.is_empty() {
@@ -3902,6 +4051,18 @@ async fn execute_ccload_import(
         .filter_map(|item| item.get("access_token").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
+    publish_progress(
+        ids.len(),
+        "merging_accounts",
+        0,
+        1,
+        0,
+        0,
+        0,
+        fetch_failed,
+        "running",
+        &errors,
+    );
     let (added, skipped) = match tokio::time::timeout(
         deadline
             .checked_duration_since(std::time::Instant::now())
@@ -3934,6 +4095,18 @@ async fn execute_ccload_import(
             return;
         }
     };
+    publish_progress(
+        ids.len(),
+        "refreshing_accounts",
+        0,
+        imported_tokens.len(),
+        added,
+        skipped,
+        0,
+        fetch_failed,
+        "running",
+        &errors,
+    );
     let refresh_result = super::refresh_imported_accounts_with_batch_until(
         &state,
         &imported_tokens,
@@ -3948,6 +4121,9 @@ async fn execute_ccload_import(
         .unwrap_or_default();
     publish_progress(
         ids.len(),
+        "refreshing_accounts",
+        refreshed,
+        imported_tokens.len(),
         added,
         skipped,
         refreshed,

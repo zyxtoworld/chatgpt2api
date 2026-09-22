@@ -679,6 +679,9 @@ export type CPARemoteFile = {
 export type CPAImportJob = {
   job_id: string;
   status: "pending" | "running" | "completed" | "failed";
+  phase?: string;
+  phase_completed?: number;
+  phase_total?: number;
   created_at: string;
   updated_at: string;
   total: number;

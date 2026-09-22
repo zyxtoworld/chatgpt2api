@@ -58,6 +58,7 @@ import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "@/lib/query-life
 import { createSerialPoller } from "@/lib/serial-poll";
 import { commitSynchronousSnapshot } from "@/lib/synchronous-snapshot";
 import { normalizeSub2APIRemoteAccounts } from "@/lib/sub2api-selection";
+import { ImportProgressCard } from "./import-progress-card";
 
 const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 
@@ -591,53 +592,7 @@ export function Sub2APIConnections() {
                     </div>
 
                     {importJob ? (
-                      <div className="space-y-2 rounded-xl bg-stone-50 px-3 py-3">
-                        <div className="text-xs font-medium tracking-[0.16em] text-stone-400 uppercase">导入任务</div>
-                        {(() => {
-                          const progress =
-                            importJob.total > 0
-                              ? Math.round((importJob.completed / importJob.total) * 100)
-                              : 0;
-                          return (
-                            <div className="rounded-lg border border-stone-200 bg-white px-3 py-3">
-                              <div className="flex items-center justify-between gap-3">
-                                <div className="min-w-0">
-                                  <div className="text-sm font-medium text-stone-700">
-                                    状态 {importJob.status}，已处理 {importJob.completed}/{importJob.total}
-                                  </div>
-                                  <div className="truncate text-xs text-stone-400">
-                                    任务 {importJob.job_id.slice(0, 8)} · {importJob.created_at}
-                                  </div>
-                                </div>
-                                <Badge
-                                  variant={
-                                    importJob.status === "completed"
-                                      ? "success"
-                                      : importJob.status === "failed"
-                                        ? "danger"
-                                        : "info"
-                                  }
-                                  className="rounded-md"
-                                >
-                                  {progress}%
-                                </Badge>
-                              </div>
-                              <div className="mt-3 h-2 overflow-hidden rounded-full bg-stone-200">
-                                <div
-                                  className="h-full rounded-full bg-stone-900 transition-all"
-                                  style={{ width: `${progress}%` }}
-                                />
-                              </div>
-                              <div className="mt-2 flex flex-wrap gap-2 text-xs text-stone-500">
-                                <span>新增 {importJob.added}</span>
-                                <span>跳过 {importJob.skipped}</span>
-                                <span>刷新 {importJob.refreshed}</span>
-                                <span>失败 {importJob.failed}</span>
-                              </div>
-                            </div>
-                          );
-                        })()}
-                      </div>
+                      <ImportProgressCard job={importJob} />
                     ) : null}
                   </div>
                 );
