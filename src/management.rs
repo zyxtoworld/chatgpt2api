@@ -2151,6 +2151,33 @@ pub(super) async fn delete_cpa_pool(
     Ok(Json(json!({"pools": public_registry("cpa_pools", values)})))
 }
 
+pub(super) fn cpa_download_future(
+    state: AppState,
+    base: String,
+    secret: String,
+    name: String,
+) -> Pin<Box<dyn Future<Output = (String, Result<String, ApiError>)> + Send>> {
+    Box::pin(async move {
+        let value = remote_json(
+            &state,
+            state
+                .client
+                .get(format!("{base}/v0/management/auth-files/download"))
+                .query(&[("name", name.clone())])
+                .bearer_auth(secret)
+                .header("Accept", "application/json"),
+        )
+        .await;
+        let result = value.and_then(|value| {
+            value
+                .get("access_token")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(ApiError::upstream)
+        });
+        (name, result)
+    })
+}
 pub(super) async fn cpa_pool_files(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2212,32 +2239,10 @@ async fn execute_cpa_import(
     let total = names.len();
     let concurrency = total.min(16).max(1);
     let mut queue = names.into_iter();
-    let mut active = FuturesUnordered::new();
+    let mut active: FuturesUnordered<Pin<Box<dyn Future<Output = (String, Result<String, ApiError>)> + Send>>> = FuturesUnordered::new();
     for _ in 0..concurrency {
         if let Some(name) = queue.next() {
-            let request_state = state.clone();
-            let request_base = base.clone();
-            let request_secret = secret.clone();
-            active.push(async move {
-                let value = remote_json(
-                    &request_state,
-                    request_state
-                        .client
-                        .get(format!("{request_base}/v0/management/auth-files/download"))
-                        .query(&[("name", name.clone())])
-                        .bearer_auth(&request_secret)
-                        .header("Accept", "application/json"),
-                )
-                .await;
-                let result = value.and_then(|value| {
-                    value
-                        .get("access_token")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .ok_or_else(ApiError::upstream)
-                });
-                (name, result)
-            });
+            active.push(cpa_download_future(state.clone(), base.clone(), secret.clone(), name));
         }
     }
     while let Some((name, result)) = active.next().await {
@@ -2252,42 +2257,9 @@ async fn execute_cpa_import(
             }
         }
         let completed = successful + failed;
-        let _ = update_registry_job_progress(
-            &state,
-            "cpa_pools",
-            &pool_id,
-            &expected_job_id,
-            completed,
-            total,
-            successful,
-            0,
-            failed,
-            &errors,
-        );
+        let _ = update_registry_job_progress(&state, "cpa_pools", &pool_id, &expected_job_id, completed, total, successful, 0, failed, &errors);
         if let Some(next_name) = queue.next() {
-            let request_state = state.clone();
-            let request_base = base.clone();
-            let request_secret = secret.clone();
-            active.push(async move {
-                let value = remote_json(
-                    &request_state,
-                    request_state
-                        .client
-                        .get(format!("{request_base}/v0/management/auth-files/download"))
-                        .query(&[("name", next_name.clone())])
-                        .bearer_auth(&request_secret)
-                        .header("Accept", "application/json"),
-                )
-                .await;
-                let result = value.and_then(|value| {
-                    value
-                        .get("access_token")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .ok_or_else(ApiError::upstream)
-                });
-                (next_name, result)
-            });
+            active.push(cpa_download_future(state.clone(), base.clone(), secret.clone(), next_name));
         }
     }
     let imported_tokens = imported
