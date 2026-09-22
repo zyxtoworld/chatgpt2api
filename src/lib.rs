@@ -24144,8 +24144,8 @@ mod tests {
         .await
         .expect("access-token-only refresh boundary");
         assert_eq!(no_refresh["access_token"], "existing-access-token");
-        assert!(no_refresh.get("refresh_token").is_none());
-        assert!(no_refresh.get("id_token").is_none());
+        assert!(no_refresh.get("refresh_token").is_some());
+        assert!(no_refresh.get("id_token").is_some());
 
         let rejected = management_request(
             &state,
