@@ -1432,14 +1432,7 @@ pub(crate) fn canonicalize_account_item(value: &Value) -> Result<Value, AppInitE
         .filter(|token| !token.is_empty() && token.len() <= MAX_ACCOUNT_TOKEN_LENGTH)
         .ok_or(AppInitError::AccountSnapshot)?;
     let mut canonical = object.clone();
-    for key in [
-        "accessToken",
-        "token",
-        "refresh_token",
-        "id_token",
-        "_refresh_token",
-        "_id_token",
-    ] {
+    for key in ["accessToken", "token", "_refresh_token", "_id_token"] {
         canonical.remove(key);
     }
     canonical.insert("access_token".to_owned(), Value::String(token.to_owned()));
