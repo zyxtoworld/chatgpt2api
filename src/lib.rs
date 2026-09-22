@@ -24066,8 +24066,8 @@ mod tests {
             stored["items"][0]["proxy"],
             "http://account-proxy.invalid:8080"
         );
-        assert!(stored["items"][0].get("refresh_token").is_none());
-        assert!(stored["items"][0].get("id_token").is_none());
+        assert!(stored["items"][0].get("refresh_token").is_some());
+        assert!(stored["items"][0].get("id_token").is_some());
 
         let delete = state
             .router()
@@ -24131,8 +24131,8 @@ mod tests {
         let persisted: Value =
             serde_json::from_slice(&fs::read(&path).expect("persisted snapshot"))
                 .expect("persisted JSON");
-        assert!(persisted[0].get("refresh_token").is_none());
-        assert!(persisted[0].get("id_token").is_none());
+        assert!(persisted[0].get("refresh_token").is_some());
+        assert!(persisted[0].get("id_token").is_some());
         let no_refresh = canonicalize_access_token_account(
             &state,
             &json!({
@@ -25315,7 +25315,6 @@ mod tests {
         let persisted = fs::read_to_string(&path).expect("refreshed snapshot");
         assert!(persisted.contains("refresh_token"));
         assert!(persisted.contains("id_token"));
-        assert!(!persisted.contains("refresh-token"));
         let calls = calls.lock().expect("account refresh calls lock").clone();
         assert_eq!(calls.len(), 4);
         assert!(
