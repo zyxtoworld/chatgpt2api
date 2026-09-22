@@ -1,6 +1,6 @@
 # Rust/Python Parity Audit
 
-审计基线：`.local/public-minimal` 中的 Python 实现。审计日期：2026-09-21。
+审计基线：`.local/public-minimal` 中的 Python 实现。审计日期：2026-09-22。
 Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经核对了输入校验、路由选择、上游请求、结果投影和持久化边界；“部分对齐”表示接口存在，但仍有可观察的行为差异；“未实现”表示 Rust 明确返回 `unsupported_capability` 或只保存配置而没有运行时逻辑。
 
 ## 已对齐的主链路
@@ -26,7 +26,8 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 - 用户密钥接口只返回 `role=user`，账号更新保留 `proxy` 字段；账号、模型、图片、标签、日志、备份、代理、CPA、Sub2API、ccLoad 的主要 CRUD 路由均已存在。
 - CPA/Sub2API/ccLoad 导入均使用后台任务、幂等 job id、错误列表和账号快照合并；账号快照只保留 access token 边界，避免将 refresh/id token 重新暴露给 Rust 运行时。
 - PPT/PSD 后台任务已具备任务恢复、账号类型筛选、文件下载能力哈希和受限文件读取。
-- 图片任务在 `04c0a8d1` 修复：提交后会启动后台图片生成、按用户隔离任务、保存 `queued/running/success/error`、结果/usage/耗时，并支持 JSON 和 multipart 编辑输入。
+- 图片任务已覆盖提交幂等、按用户隔离、`queued/running/success/error`、结果/usage/耗时、JSON/multipart 编辑输入，以及超时任务的 `resume-poll` 恢复轮询。
+- 账号刷新在模型目录暂时不可用时保留最后一次成功的 Web/Codex 模型目录；quota 归零时只清理 image 模型，避免管理页面模型列表被瞬时刷新失败清空。
 
 ## 已确认的行为差异
 
@@ -71,6 +72,18 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 2. 补齐内容审核、全局 system prompt、缓存和图片清理的行为测试。
 3. 继续审计 CPA/Sub2API/ccLoad 的并发、分页和进度差异。
 4. 最后决定是否突破 access-token-only 安全边界，移植 OAuth、密码重登、refresh token keepalive 和 Python 完整导出；如果不突破，接口必须继续明确返回 unsupported，而不能返回看似成功的数据。
+
+## v1.7 之后功能清单（暂不实现）
+
+- 账号级官方模型目录和按账号权限路由（`641e0dea`）。
+- 默认上游模型名称配置（`79199cbc`）。
+- 默认思考强度配置及模型后缀覆盖（`62dd0efb`）。
+- 无图片结果时移除本地 conversation（`d83cef80`）。
+- 过滤内部 assistant tool 消息（`6675eb33`）。
+- 数据库增量同步（`ca26e54f`）。
+- 图片 SSE 硬超时（`3aafaf76`）。
+- 保留代码/命令标点前空格的清洗修复（`df2398fa`）。
+- v1.8.0 版本与 changelog 更新（`e55aef28`）。
 
 ## 当前验证记录
 
