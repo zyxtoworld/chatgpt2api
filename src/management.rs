@@ -408,6 +408,7 @@ pub(super) async fn list_images(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
+    cleanup_orphaned_image_thumbnails(state.data_dir.as_ref());
     let tags = read_image_tags(&state)?;
     let mut items = Vec::new();
     for (relative, path) in image_files(&state) {
