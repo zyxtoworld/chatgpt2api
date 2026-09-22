@@ -360,6 +360,21 @@ fn relative_string(root: &Path, path: &Path) -> Option<String> {
     safe_relative_path(&relative).map(|value| value.to_string_lossy().replace('\\', "/"))
 }
 
+fn cleanup_orphaned_image_thumbnails(data_dir: &Path) {
+    let images = data_dir.join("images");
+    let thumbnails = data_dir.join("image-thumbnails");
+    for path in walk_regular_files(&thumbnails) {
+        let Some(relative) = relative_string(&thumbnails, &path) else {
+            continue;
+        };
+        if relative.ends_with(".png")
+            && !images.join(relative.trim_end_matches(".png")).is_file()
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 fn is_image_path(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -6071,6 +6086,8 @@ mod tests {
         ccload_model_payload, merge_ccload_account_catalog, normalized_ccload_credential,
         parse_r2_list_xml, public_backup_error,
     };
+    use serde_json::json;
+    use std::time::{Duration, SystemTime};
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
 
