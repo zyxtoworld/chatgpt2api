@@ -1969,6 +1969,9 @@ fn begin_registry_job(
     })
 }
 
+type CpaDownloadFuture = Pin<Box<dyn Future<Output = (String, Result<String, ApiError>)> + Send>>;
+
+#[allow(clippy::too_many_arguments)]
 fn update_registry_job_progress(
     state: &AppState,
     kind: &str,
@@ -2158,7 +2161,7 @@ pub(super) fn cpa_download_future(
     base: String,
     secret: String,
     name: String,
-) -> Pin<Box<dyn Future<Output = (String, Result<String, ApiError>)> + Send>> {
+) -> CpaDownloadFuture {
     Box::pin(async move {
         let value = remote_json(
             &state,
@@ -2239,11 +2242,9 @@ async fn execute_cpa_import(
     let mut failed = 0usize;
     let mut imported = Vec::new();
     let total = names.len();
-    let concurrency = total.min(16).max(1);
+    let concurrency = total.clamp(1, 16);
     let mut queue = names.into_iter();
-    let mut active: FuturesUnordered<
-        Pin<Box<dyn Future<Output = (String, Result<String, ApiError>)> + Send>>,
-    > = FuturesUnordered::new();
+    let mut active: FuturesUnordered<CpaDownloadFuture> = FuturesUnordered::new();
     for _ in 0..concurrency {
         if let Some(name) = queue.next() {
             active.push(cpa_download_future(
