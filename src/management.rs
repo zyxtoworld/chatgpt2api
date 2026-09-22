@@ -6395,8 +6395,8 @@ mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
         apply_ccload_image_capability, backup_schedule_due, ccload_model_entries, ccload_model_ids,
-        ccload_model_payload, merge_ccload_account_catalog, normalized_ccload_credential,
-        parse_r2_list_xml, public_backup_error,
+        ccload_model_payload, ccload_recent_refresh_time, merge_ccload_account_catalog,
+        normalized_ccload_credential, parse_r2_list_xml, public_backup_error,
     };
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
