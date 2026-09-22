@@ -6067,9 +6067,9 @@ pub(super) async fn download_backup(
 mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
-        apply_ccload_image_capability, ccload_model_entries, ccload_model_ids,
+        apply_ccload_image_capability, backup_schedule_due, ccload_model_entries, ccload_model_ids,
         ccload_model_payload, merge_ccload_account_catalog, normalized_ccload_credential,
-        parse_r2_list_xml, public_backup_error, backup_schedule_due,
+        parse_r2_list_xml, public_backup_error,
     };
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
@@ -6078,13 +6078,19 @@ mod tests {
     fn backup_schedule_due_matches_python_scheduler_rules() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let enabled = json!({"enabled": true, "interval_minutes": 60});
-        assert!(!backup_schedule_due(&json!({"enabled": false}), &Map::new(), now));
+        assert!(!backup_schedule_due(
+            &json!({"enabled": false}),
+            &Map::new(),
+            now
+        ));
         let running = serde_json::from_value(json!({"running": true})).expect("running state");
         assert!(!backup_schedule_due(&enabled, &running, now));
         assert!(backup_schedule_due(&enabled, &Map::new(), now));
-        let recent = serde_json::from_value(json!({"last_finished_at":"1970-01-12T13:46:40Z"})).expect("recent state");
+        let recent = serde_json::from_value(json!({"last_finished_at":"1970-01-12T13:46:40Z"}))
+            .expect("recent state");
         assert!(!backup_schedule_due(&enabled, &recent, now));
-        let old = serde_json::from_value(json!({"last_finished_at":"1970-01-12T11:46:40Z"})).expect("old state");
+        let old = serde_json::from_value(json!({"last_finished_at":"1970-01-12T11:46:40Z"}))
+            .expect("old state");
         assert!(backup_schedule_due(&enabled, &old, now));
     }
 
