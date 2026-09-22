@@ -500,7 +500,30 @@ pub(super) async fn delete_images(
             let _ = fs::remove_file(thumbnail);
         }
     }
+    remove_empty_image_dirs(&root);
+    remove_empty_image_dirs(&state.data_dir.join("image-thumbnails"));
     Ok(Json(json!({"removed": removed})))
+}
+
+fn remove_empty_image_dirs(root: &Path) {
+    let mut directories = Vec::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path.clone());
+                directories.push(path);
+            }
+        }
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in directories {
+        let _ = fs::remove_dir(directory);
+    }
 }
 
 fn zip_u16(output: &mut Vec<u8>, value: u16) {
