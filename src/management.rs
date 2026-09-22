@@ -2976,8 +2976,8 @@ pub(super) async fn sub2api_accounts(
             .query(&[
                 ("platform", "openai"),
                 ("type", "oauth"),
-                ("page", page.to_string()),
-                ("page_size", "200".to_owned()),
+                ("page", &page.to_string()),
+                ("page_size", "200"),
             ]);
         if let Some(group) = group.as_deref() {
             request = request.query(&[("group", group)]);
