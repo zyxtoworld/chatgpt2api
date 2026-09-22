@@ -23177,7 +23177,7 @@ mod tests {
         stub_task.await.expect("stub join");
         let hit_text = hits.lock().await.join("\n");
         assert!(hit_text.contains("auth=true"));
-        assert!(hit_text.contains("page_size=5000"));
+        assert!(hit_text.contains("page_size=200"));
         assert!(hit_text.contains("target_path=/backend-api/models"));
         assert!(hit_text.contains("target_route=/backend-api/models"));
         assert_eq!(
