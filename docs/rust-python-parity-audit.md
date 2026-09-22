@@ -28,6 +28,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 - PPT/PSD 后台任务已具备任务恢复、账号类型筛选、文件下载能力哈希和受限文件读取。
 - 图片任务已覆盖提交幂等、按用户隔离、`queued/running/success/error`、结果/usage/耗时、JSON/multipart 编辑输入，以及超时任务的 `resume-poll` 恢复轮询。
 - 账号刷新在模型目录暂时不可用时保留最后一次成功的 Web/Codex 模型目录；quota 归零时只清理 image 模型，避免管理页面模型列表被瞬时刷新失败清空。
+- /api/accounts 新增账号现在透传刷新阶段的 rrors 和刷新后的 items，不再固定返回空错误数组；这与 Python create_accounts 的返回契约一致。
 
 ## 已确认的行为差异
 
