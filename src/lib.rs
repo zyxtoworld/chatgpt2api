@@ -3695,15 +3695,23 @@ async fn api_accounts_export(
             })
         })
         .collect::<Vec<_>>();
-    let bytes =
-        serde_json::to_vec(&json!({"items": exported})).map_err(|_| ApiError::unavailable())?;
+    if exported.is_empty() {
+        return Err(ApiError::not_found());
+    }
+    let payload = if exported.len() == 1 {
+        exported.into_iter().next().expect("one exported account")
+    } else {
+        Value::Array(exported)
+    };
+    let mut bytes = serde_json::to_vec_pretty(&payload).map_err(|_| ApiError::unavailable())?;
+    bytes.push(b'\n');
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/json"),
             (
                 header::CONTENT_DISPOSITION,
-                "attachment; filename=accounts.json",
+                "attachment; filename=codex-accounts.json",
             ),
         ],
         Body::from(bytes),
