@@ -3000,7 +3000,9 @@ pub(super) async fn sub2api_accounts(
                 "expires_at": bounded_public_text(credentials.and_then(|value| value.get("expires_at")), 64),
             }))
         }));
-        if page_len < 200 { break; }
+        if page_len < 200 {
+            break;
+        }
         page += 1;
     }
     Ok(Json(json!({"server_id": server_id, "accounts": accounts})))
