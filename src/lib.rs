@@ -23863,6 +23863,7 @@ mod tests {
                         "access_token":"cc-access-token",
                         "type":"Codex",
                         "plan_type":"pro",
+                        "refresh_time":"2026-08-20T12:34:56Z",
                         "refresh_token":"discarded-cc-refresh",
                         "id_token":"discarded-cc-id"
                     }
@@ -24239,6 +24240,7 @@ mod tests {
             .iter()
             .find(|item| item["access_token"] == "cc-access-token")
             .expect("ccLoad imported account");
+        assert_eq!(ccload_item["created_at"], "2026-08-20 12:34:56");
         assert!(
             !ccload_item["models"]
                 .as_array()

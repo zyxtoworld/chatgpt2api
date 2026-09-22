@@ -2730,6 +2730,84 @@ fn normalized_ccload_credential(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn normalized_ccload_refresh_time(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let seconds = match value {
+        Value::Number(number) => number.as_i64().map(i128::from),
+        Value::String(text) => text.trim().parse::<i128>().ok(),
+        _ => None,
+    }?;
+    let seconds = if seconds > 100_000_000_000 {
+        seconds / 1_000
+    } else {
+        seconds
+    };
+    let seconds = i64::try_from(seconds).ok()?;
+    let timestamp = UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(seconds).ok()?))?;
+    Some(
+        iso_timestamp(timestamp)
+            .trim_end_matches('Z')
+            .replace('T', " "),
+    )
+}
+
+fn normalized_ccload_refresh_text(value: Option<&Value>) -> Option<String> {
+    if let Some(timestamp) = normalized_ccload_refresh_time(value) {
+        return Some(timestamp);
+    }
+    let text = value?.as_str()?.trim();
+    if text.is_empty() || text.len() > 128 {
+        return None;
+    }
+    if text.len() >= 19
+        && text.as_bytes().get(4) == Some(&b'-')
+        && text.as_bytes().get(7) == Some(&b'-')
+        && matches!(text.as_bytes().get(10), Some(b'T' | b' '))
+    {
+        return Some(text[..19].replace('T', " "));
+    }
+    Some(text.to_owned())
+}
+
+fn ccload_recent_refresh_time(
+    channel: Option<&Value>,
+    credential: Option<&Value>,
+) -> Option<String> {
+    const TIME_KEYS: &[&str] = &[
+        "refresh_time",
+        "refresh_at",
+        "last_refresh",
+        "last_refresh_at",
+        "last_refreshed_at",
+        "refreshed_at",
+        "updated_at",
+        "updatedAt",
+    ];
+    const NESTED_KEYS: &[&str] = &["metadata", "meta", "oauth_credential"];
+    let mut objects = Vec::new();
+    for value in [credential, channel].into_iter().flatten() {
+        objects.push(value);
+        if let Some(object) = value.as_object() {
+            for key in NESTED_KEYS {
+                if let Some(nested) = object.get(*key) {
+                    objects.push(nested);
+                }
+            }
+        }
+    }
+    for value in objects {
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        for key in TIME_KEYS {
+            if let Some(timestamp) = normalized_ccload_refresh_text(object.get(*key)) {
+                return Some(timestamp);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 struct CcLoadModelEntry {
     id: String,
@@ -4044,6 +4122,9 @@ async fn execute_ccload_import(
                         .filter(|value| !value.is_empty())
                     {
                         candidate["chatgpt_account_id"] = Value::String(account_id.to_owned());
+                    }
+                    if let Some(created_at) = ccload_recent_refresh_time(channel, credential) {
+                        candidate["created_at"] = Value::String(created_at);
                     }
                     candidates.push(candidate);
                     accepted = true;
@@ -6441,6 +6522,23 @@ mod tests {
         })))
         .expect("access-token-only ccLoad credential");
         assert_eq!(credential, "access-only");
+    }
+
+    #[test]
+    fn ccload_import_uses_recent_refresh_time_as_created_at() {
+        let credential = serde_json::json!({
+            "refresh_time": "2026-08-20T12:34:56Z"
+        });
+        assert_eq!(
+            ccload_recent_refresh_time(None, Some(&credential)),
+            Some("2026-08-20 12:34:56".to_owned())
+        );
+
+        let channel = serde_json::json!({"updated_at": 1_755_693_296_i64});
+        assert_eq!(
+            ccload_recent_refresh_time(Some(&channel), None),
+            Some("2025-08-20 12:34:56".to_owned())
+        );
     }
 
     #[test]
