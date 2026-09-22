@@ -1896,6 +1896,17 @@ async fn run_task(
     images: Vec<String>,
     _permit: OwnedSemaphorePermit,
 ) {
+    let started = Instant::now();
+    let endpoint = if kind == "psd" {
+        "/v1/psd/generations"
+    } else {
+        "/v1/ppt/generations"
+    };
+    let summary = if kind == "psd" {
+        "PSD生成任务"
+    } else {
+        "PPT生成任务"
+    };
     if update_task(state, &owner, &task_id, "running", None)
         .await
         .is_err()
@@ -1911,6 +1922,16 @@ async fn run_task(
             Some(TaskFailure::PsdImageRequired.public_message()),
         )
         .await;
+        super::append_api_call_log(
+            state,
+            endpoint,
+            EDITABLE_MODEL,
+            summary,
+            started,
+            "failed",
+            Some(&prompt),
+            Some(TaskFailure::PsdImageRequired.public_message()),
+        );
         return;
     }
     let allowed_groups = HashSet::<AccountModelGroup>::from([
@@ -1937,6 +1958,16 @@ async fn run_task(
             Some(TaskFailure::Generic.public_message()),
         )
         .await;
+        super::append_api_call_log(
+            state,
+            endpoint,
+            EDITABLE_MODEL,
+            summary,
+            started,
+            "failed",
+            Some(&prompt),
+            Some(TaskFailure::Generic.public_message()),
+        );
         return;
     };
 
@@ -1957,6 +1988,27 @@ async fn run_task(
                     Some(TaskFailure::Generic.public_message()),
                 )
                 .await;
+                super::append_api_call_log(
+                    state,
+                    endpoint,
+                    EDITABLE_MODEL,
+                    summary,
+                    started,
+                    "failed",
+                    Some(&prompt),
+                    Some(TaskFailure::Generic.public_message()),
+                );
+            } else {
+                super::append_api_call_log(
+                    state,
+                    endpoint,
+                    EDITABLE_MODEL,
+                    summary,
+                    started,
+                    "success",
+                    Some(&prompt),
+                    None,
+                );
             }
         }
         Err(error) => {
@@ -1968,6 +2020,16 @@ async fn run_task(
                 Some(error.public_message()),
             )
             .await;
+            super::append_api_call_log(
+                state,
+                endpoint,
+                EDITABLE_MODEL,
+                summary,
+                started,
+                "failed",
+                Some(&prompt),
+                Some(error.public_message()),
+            );
         }
     }
     drop(lease);

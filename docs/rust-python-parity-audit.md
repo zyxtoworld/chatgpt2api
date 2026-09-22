@@ -27,6 +27,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 - CPA/Sub2API/ccLoad 导入均使用后台任务、幂等 job id、错误列表和账号快照合并；账号快照只保留 access token 边界，避免将 refresh/id token 重新暴露给 Rust 运行时。
 - PPT/PSD 后台任务已具备任务恢复、账号类型筛选、文件下载能力哈希和受限文件读取。
 - 图片任务已覆盖提交幂等、按用户隔离、`queued/running/success/error`、结果/usage/耗时、JSON/multipart 编辑输入，以及超时任务的 `resume-poll` 恢复轮询。
+- `/api/logs` 现在会持久化 API 调用、图片后台任务、PPT/PSD 后台任务和账号新增/删除/更新/刷新/异常移除事件；敏感 token 只保留公开引用，调用日志保留受限的请求摘要、状态、耗时和错误。
 - 账号刷新在模型目录暂时不可用时保留最后一次成功的 Web/Codex 模型目录；quota 归零时只清理 image 模型，避免管理页面模型列表被瞬时刷新失败清空。
 - /api/accounts 新增账号现在透传刷新阶段的 rrors 和刷新后的 items，不再固定返回空错误数组；这与 Python create_accounts 的返回契约一致。
 
@@ -55,7 +56,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 ### P1：配置已能保存，但运行时没有等价行为
 
 1. `global_system_prompt`：Rust 已接入 Chat 和 Responses；仍需核对 Anthropic、搜索、图片和 editable 的消息顺序是否与 Python 完全一致。
-2. `sensitive_words` 和 `ai_review`：Rust 已接入敏感词拦截、审核文本提取、base64 替换、100k 截断和审核结果处理；仍需补齐配置异常、日志和所有 API 入口的行为测试。
+2. `sensitive_words` 和 `ai_review`：Rust 已接入敏感词拦截、审核文本提取、base64 替换、100k 截断、审核结果处理和调用失败日志；仍需补齐配置异常和所有 API 入口的行为测试。
 3. `chat_completion_cache`：Rust 已实现非流式 TTL cache、流式帧 replay、in-flight dedupe、消息规范化及递归 JSON key 排序；仍需补并发边界测试。
 4. `auto_remove_invalid_accounts`、`auto_remove_rate_limited_accounts`：Rust 已实现刷新写回时的确认失效删除、刚变为限流时删除、native Codex 401 记录和 Web 图片 401 记录；仍需补边界重试测试。
 5. `image_remove_conversation_after_result`、`image_remove_conversation_always`：Rust 已实现异步 PATCH 隐藏 conversation；仍需核对失败、超时、部分结果和多图路径。

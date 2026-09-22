@@ -3516,6 +3516,16 @@ async fn api_accounts_add(
     }
     let (added, skipped) = state.account_store.merge_import_records(additions).await?;
     let refresh_result = refresh_accounts_now(&state, &requested_tokens, None).await?;
+    management::append_account_log(
+        &state,
+        &format!("新增 {} 个账号，跳过 {} 个", added, skipped),
+        json!({
+            "added": added,
+            "skipped": skipped,
+            "refreshed": refresh_result["refreshed"],
+            "failed": refresh_result["errors"].as_array().map_or(0, Vec::len),
+        }),
+    );
     Ok(Json(json!({
         "added": added,
         "skipped": skipped,
@@ -3559,6 +3569,13 @@ async fn api_accounts_delete(
             Ok(before.saturating_sub(records.len()))
         })
         .await?;
+    if removed > 0 {
+        management::append_account_log(
+            &state,
+            &format!("删除 {} 个账号", removed),
+            json!({"removed": removed}),
+        );
+    }
     Ok(Json(
         json!({"removed": removed, "items": public_accounts(&state)["items"]}),
     ))
@@ -3609,6 +3626,14 @@ async fn api_accounts_update(
     if let Some(last_used_at) = state.account_store.last_used_at(&record.token) {
         item["last_used_at"] = Value::String(last_used_at);
     }
+    management::append_account_log(
+        &state,
+        "更新账号",
+        json!({
+            "token": public_token_ref(&token),
+            "status": record.status,
+        }),
+    );
     Ok(Json(json!({
         "item": item,
         "items": public_accounts(&state)["items"]
@@ -3794,6 +3819,15 @@ async fn api_accounts_refresh(
         if let Some(item) = progress.get_mut(&task_progress_id) {
             match result {
                 Ok(result) => {
+                    management::append_account_log(
+                        &task_state,
+                        "刷新账号",
+                        json!({
+                            "total": item["total"],
+                            "refreshed": result["refreshed"],
+                            "failed": result["errors"].as_array().map_or(0, Vec::len),
+                        }),
+                    );
                     item["status"] = Value::String("completed".to_owned());
                     item["done"] = Value::Bool(true);
                     item["processed"] = item["total"].clone();
@@ -3804,6 +3838,11 @@ async fn api_accounts_refresh(
                     item["items"] = result["items"].clone();
                 }
                 Err(_) => {
+                    management::append_account_log(
+                        &task_state,
+                        "刷新账号失败",
+                        json!({"total": item["total"], "status": "failed"}),
+                    );
                     item["status"] = Value::String("failed".to_owned());
                     item["done"] = Value::Bool(true);
                     item["processed"] = item["total"].clone();
@@ -3846,6 +3885,11 @@ async fn persist_account_refresh_updates(
         runtime_config.get("auto_remove_rate_limited_accounts"),
         false,
     );
+    let invalid_log_items = invalid_tokens
+        .iter()
+        .map(|(token, code)| (public_token_ref(token), (*code).to_owned()))
+        .collect::<Vec<_>>();
+    let mut removed_tokens = Vec::new();
     state
         .account_store
         .mutate_raw(|current| {
@@ -3927,6 +3971,7 @@ async fn persist_account_refresh_updates(
                 remove_invalid,
                 remove_rate_limited,
             );
+            removed_tokens = remove_tokens.iter().cloned().collect();
             if !remove_tokens.is_empty() {
                 current.retain(|item| {
                     account_token(item).is_none_or(|token| !remove_tokens.contains(token.as_str()))
@@ -3935,6 +3980,20 @@ async fn persist_account_refresh_updates(
             Ok(())
         })
         .await?;
+    for (token, code) in invalid_log_items {
+        management::append_account_log(
+            state,
+            "账号刷新失败",
+            json!({"token": token, "error": code}),
+        );
+    }
+    if !removed_tokens.is_empty() {
+        management::append_account_log(
+            state,
+            "自动移除异常账号",
+            json!({"removed": removed_tokens.len()}),
+        );
+    }
     updated_records.clear();
     invalid_tokens.clear();
     Ok(())
@@ -4316,6 +4375,74 @@ async fn api_users_delete(
 
 fn data_file(state: &AppState, name: &str) -> PathBuf {
     state.data_dir.join(name)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_api_call_log(
+    state: &AppState,
+    endpoint: &str,
+    model: &str,
+    summary: &str,
+    started: Instant,
+    status: &str,
+    request_text: Option<&str>,
+    error: Option<&str>,
+) {
+    let mut detail = Map::new();
+    detail.insert("endpoint".to_owned(), Value::String(endpoint.to_owned()));
+    detail.insert("model".to_owned(), Value::String(model.to_owned()));
+    detail.insert("status".to_owned(), Value::String(status.to_owned()));
+    let ended_at = SystemTime::now();
+    let started_at = ended_at.checked_sub(started.elapsed()).unwrap_or(ended_at);
+    detail.insert(
+        "duration_ms".to_owned(),
+        Value::from(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+    );
+    detail.insert(
+        "started_at".to_owned(),
+        Value::String(management::iso_timestamp(started_at)),
+    );
+    detail.insert(
+        "ended_at".to_owned(),
+        Value::String(management::iso_timestamp(ended_at)),
+    );
+    if let Some(text) = request_text.map(str::trim).filter(|text| !text.is_empty()) {
+        detail.insert(
+            "request_text".to_owned(),
+            Value::String(text.chars().take(1000).collect()),
+        );
+    }
+    if let Some(error) = error.map(str::trim).filter(|error| !error.is_empty()) {
+        detail.insert(
+            "error".to_owned(),
+            Value::String(error.chars().take(4096).collect()),
+        );
+    }
+    management::append_call_log(state, summary, Value::Object(detail));
+}
+
+async fn record_invalid_token_with_log(
+    state: &AppState,
+    token: &str,
+    error: &str,
+    remove_invalid: bool,
+) {
+    if state
+        .account_store
+        .record_invalid_token(token, error, remove_invalid)
+        .await
+        .unwrap_or(false)
+    {
+        management::append_account_log(
+            state,
+            "标记账号异常",
+            json!({
+                "token": public_token_ref(token),
+                "error": error,
+                "auto_remove": remove_invalid,
+            }),
+        );
+    }
 }
 
 fn path_write_lock_path(path: &Path) -> PathBuf {
@@ -5367,6 +5494,41 @@ async fn api_image_tag_delete(
 }
 
 async fn image_proxy(
+    state: AppState,
+    request: AxumRequest,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    let log_openai = state.config.upstream_protocol == UpstreamProtocol::OpenAi;
+    let started = Instant::now();
+    let log_state = state.clone();
+    let result = image_proxy_inner(state, request, endpoint).await;
+    if log_openai {
+        let endpoint = format!("/v1/{endpoint}");
+        let summary = if endpoint.ends_with("/edits") {
+            "图生图"
+        } else {
+            "文生图"
+        };
+        match &result {
+            Ok(_) => append_api_call_log(
+                &log_state, &endpoint, "", summary, started, "success", None, None,
+            ),
+            Err(error) => append_api_call_log(
+                &log_state,
+                &endpoint,
+                "",
+                summary,
+                started,
+                "failed",
+                None,
+                Some(error.code()),
+            ),
+        }
+    }
+    result
+}
+
+async fn image_proxy_inner(
     state: AppState,
     request: AxumRequest,
     endpoint: &'static str,
@@ -7666,14 +7828,70 @@ async fn native_image_request_proxy(
         return Err(ApiError::invalid_request());
     };
     let request = native_apply_image_edit_mask(request)?;
-    reject_sensitive_words(&state, &Value::String(request.prompt.clone()))?;
-    review_request_content(&state, &Value::String(request.prompt.clone())).await?;
-    native_validate_image_sources(&request)?;
-    if request.codex {
-        native_codex_image_request_proxy(state, request, endpoint).await
+    let log_started = Instant::now();
+    let log_model = request.model.clone();
+    let log_prompt = request.prompt.clone();
+    let log_endpoint = format!("/v1/{endpoint}");
+    let log_summary = if endpoint == "images/edits" {
+        "图生图"
     } else {
-        native_web_image_request_proxy(state, request, endpoint).await
+        "文生图"
+    };
+    if let Err(error) = reject_sensitive_words(&state, &Value::String(log_prompt.clone())) {
+        append_api_call_log(
+            &state,
+            &log_endpoint,
+            &log_model,
+            log_summary,
+            log_started,
+            "failed",
+            Some(&log_prompt),
+            Some(error.code()),
+        );
+        return Err(error);
     }
+    if let Err(error) = review_request_content(&state, &Value::String(log_prompt.clone())).await {
+        append_api_call_log(
+            &state,
+            &log_endpoint,
+            &log_model,
+            log_summary,
+            log_started,
+            "failed",
+            Some(&log_prompt),
+            Some(error.code()),
+        );
+        return Err(error);
+    }
+    native_validate_image_sources(&request)?;
+    let result = if request.codex {
+        native_codex_image_request_proxy(state.clone(), request, endpoint).await
+    } else {
+        native_web_image_request_proxy(state.clone(), request, endpoint).await
+    };
+    match &result {
+        Ok(_) => append_api_call_log(
+            &state,
+            &log_endpoint,
+            &log_model,
+            log_summary,
+            log_started,
+            "success",
+            Some(&log_prompt),
+            None,
+        ),
+        Err(error) => append_api_call_log(
+            &state,
+            &log_endpoint,
+            &log_model,
+            log_summary,
+            log_started,
+            "failed",
+            Some(&log_prompt),
+            Some(error.code()),
+        ),
+    }
+    result
 }
 
 struct NativeUploadedImage {
@@ -8703,10 +8921,7 @@ async fn native_web_image_request_proxy(
                         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                         .unwrap_or_else(|| json!({}));
                     let remove = settings_bool(config.get("auto_remove_invalid_accounts"), false);
-                    let _ = state
-                        .account_store
-                        .record_invalid_token(&token, "invalid_token", remove)
-                        .await;
+                    record_invalid_token_with_log(&state, &token, "invalid_token", remove).await;
                 }
                 if !state.account_store.mark_image_result(&token, false).await {
                     AccountStore::note_usage_mark_failure();
@@ -9420,9 +9635,7 @@ async fn native_codex_image_request_proxy(
                             .unwrap_or_else(|| json!({}));
                         let remove =
                             settings_bool(config.get("auto_remove_invalid_accounts"), false);
-                        let _ = state
-                            .account_store
-                            .record_invalid_token(&token, "invalid_token", remove)
+                        record_invalid_token_with_log(&state, &token, "invalid_token", remove)
                             .await;
                     }
                     drop(lease);
@@ -9557,6 +9770,39 @@ async fn openai_proxy(
 }
 
 async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let log_state = state.clone();
+    let result = search_inner(State(state), headers, body).await;
+    match &result {
+        Ok(_) => append_api_call_log(
+            &log_state,
+            "/v1/search",
+            "gpt-5-search-api",
+            "搜索",
+            started,
+            "success",
+            None,
+            None,
+        ),
+        Err(error) => append_api_call_log(
+            &log_state,
+            "/v1/search",
+            "gpt-5-search-api",
+            "搜索",
+            started,
+            "failed",
+            None,
+            Some(error.code()),
+        ),
+    }
+    result
+}
+
+async fn search_inner(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Body,
@@ -11321,6 +11567,18 @@ async fn run_image_task(
     mode: &'static str,
     request: NativeImageRequest,
 ) {
+    let log_endpoint = if mode == "edit" {
+        "/v1/images/edits"
+    } else {
+        "/v1/images/generations"
+    };
+    let log_summary = if mode == "edit" {
+        "图生图任务"
+    } else {
+        "文生图任务"
+    };
+    let log_model = request.model.clone();
+    let log_prompt = request.prompt.clone();
     let _ = update_image_task(
         &state,
         &owner,
@@ -11372,6 +11630,16 @@ async fn run_image_task(
                     Some(String::new()),
                     Some(duration_ms),
                 );
+                append_api_call_log(
+                    &state,
+                    log_endpoint,
+                    &log_model,
+                    log_summary,
+                    started,
+                    "success",
+                    Some(&log_prompt),
+                    None,
+                );
             } else {
                 let _ = update_image_task(
                     &state,
@@ -11382,9 +11650,20 @@ async fn run_image_task(
                     Some("号池中没有可用账号或图片结果为空".to_owned()),
                     Some(duration_ms),
                 );
+                append_api_call_log(
+                    &state,
+                    log_endpoint,
+                    &log_model,
+                    log_summary,
+                    started,
+                    "failed",
+                    Some(&log_prompt),
+                    Some("image result was empty"),
+                );
             }
         }
         Err(error) => {
+            let error_message = error.clone();
             let _ = update_image_task(
                 &state,
                 &owner,
@@ -11393,6 +11672,16 @@ async fn run_image_task(
                 Map::new(),
                 Some(error),
                 Some(duration_ms),
+            );
+            append_api_call_log(
+                &state,
+                log_endpoint,
+                &log_model,
+                log_summary,
+                started,
+                "failed",
+                Some(&log_prompt),
+                Some(&error_message),
             );
         }
     }
@@ -11422,6 +11711,7 @@ async fn enqueue_image_task(
             "status": "queued",
             "mode": mode,
             "model": model,
+            "prompt": request.prompt.clone(),
             "size": size,
             "quality": quality,
             "created_at": created_at,
@@ -11590,8 +11880,21 @@ async fn run_resumed_image_task(
     task_id: String,
     conversation_id: String,
     model: String,
+    mode: String,
+    prompt: String,
 ) {
     let started = Instant::now();
+    let log_endpoint = if mode == "edit" {
+        "/v1/images/edits"
+    } else {
+        "/v1/images/generations"
+    };
+    let log_summary = if mode == "edit" {
+        "图生图任务"
+    } else {
+        "文生图任务"
+    };
+    let request_text = (!prompt.trim().is_empty()).then_some(prompt.as_str());
     let _ = update_image_task(
         &state,
         &owner,
@@ -11614,6 +11917,16 @@ async fn run_resumed_image_task(
             Map::new(),
             Some("号池中没有可用图片账号".to_owned()),
             Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+        );
+        append_api_call_log(
+            &state,
+            log_endpoint,
+            &model,
+            log_summary,
+            started,
+            "failed",
+            request_text,
+            Some("号池中没有可用图片账号"),
         );
         return;
     };
@@ -11644,6 +11957,16 @@ async fn run_resumed_image_task(
                             Some("图片结果处理失败".to_owned()),
                             Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
                         );
+                        append_api_call_log(
+                            &state,
+                            log_endpoint,
+                            &model,
+                            log_summary,
+                            started,
+                            "failed",
+                            request_text,
+                            Some("图片结果处理失败"),
+                        );
                         return;
                     }
                 };
@@ -11654,7 +11977,7 @@ async fn run_resumed_image_task(
             let mut updates = Map::new();
             updates.insert("data".to_owned(), Value::Array(data));
             updates.insert("conversation_id".to_owned(), Value::String(conversation_id));
-            updates.insert("model".to_owned(), Value::String(model));
+            updates.insert("model".to_owned(), Value::String(model.clone()));
             let _ = update_image_task(
                 &state,
                 &owner,
@@ -11663,6 +11986,16 @@ async fn run_resumed_image_task(
                 updates,
                 Some(String::new()),
                 Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            );
+            append_api_call_log(
+                &state,
+                log_endpoint,
+                &model,
+                log_summary,
+                started,
+                "success",
+                request_text,
+                None,
             );
         }
         _ => {
@@ -11674,6 +12007,16 @@ async fn run_resumed_image_task(
                 Map::new(),
                 Some("继续等待后仍未找到图片结果".to_owned()),
                 Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+            );
+            append_api_call_log(
+                &state,
+                log_endpoint,
+                &model,
+                log_summary,
+                started,
+                "failed",
+                request_text,
+                Some("继续等待后仍未找到图片结果"),
             );
         }
     }
@@ -11718,6 +12061,17 @@ async fn image_task_resume(
         .and_then(Value::as_str)
         .unwrap_or("gpt-image-2")
         .to_owned();
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .filter(|value| *value == "edit")
+        .unwrap_or("generate")
+        .to_owned();
+    let prompt = object
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     mutate_image_tasks(&state, |tasks| {
         let task = tasks
             .iter_mut()
@@ -11742,6 +12096,8 @@ async fn image_task_resume(
             worker_task,
             worker_conversation,
             model,
+            mode,
+            prompt,
         )
         .await;
     });
@@ -17970,7 +18326,32 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    chat_completions_with_timeout(state, headers, body, NATIVE_UPSTREAM_TIMEOUT).await
+    let started = Instant::now();
+    let log_state = state.0.clone();
+    let result = chat_completions_with_timeout(state, headers, body, NATIVE_UPSTREAM_TIMEOUT).await;
+    match &result {
+        Ok(_) => append_api_call_log(
+            &log_state,
+            "/v1/chat/completions",
+            "auto",
+            "文本生成",
+            started,
+            "success",
+            None,
+            None,
+        ),
+        Err(error) => append_api_call_log(
+            &log_state,
+            "/v1/chat/completions",
+            "auto",
+            "文本生成",
+            started,
+            "failed",
+            None,
+            Some(error.code()),
+        ),
+    }
+    result
 }
 
 async fn responses(
@@ -17978,7 +18359,32 @@ async fn responses(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    responses_with_timeout(state, headers, body, NATIVE_UPSTREAM_TIMEOUT).await
+    let started = Instant::now();
+    let log_state = state.0.clone();
+    let result = responses_with_timeout(state, headers, body, NATIVE_UPSTREAM_TIMEOUT).await;
+    match &result {
+        Ok(_) => append_api_call_log(
+            &log_state,
+            "/v1/responses",
+            "auto",
+            "Responses",
+            started,
+            "success",
+            None,
+            None,
+        ),
+        Err(error) => append_api_call_log(
+            &log_state,
+            "/v1/responses",
+            "auto",
+            "Responses",
+            started,
+            "failed",
+            None,
+            Some(error.code()),
+        ),
+    }
+    result
 }
 
 async fn responses_websocket_upgrade(
@@ -18369,7 +18775,32 @@ async fn native_responses_via_web_chat(
 }
 
 async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Body) -> Response {
-    match messages_inner(State(state), headers, body).await {
+    let started = Instant::now();
+    let log_state = state.clone();
+    let result = messages_inner(State(state), headers, body).await;
+    match &result {
+        Ok(_) => append_api_call_log(
+            &log_state,
+            "/v1/messages",
+            "auto",
+            "Messages",
+            started,
+            "success",
+            None,
+            None,
+        ),
+        Err(error) => append_api_call_log(
+            &log_state,
+            "/v1/messages",
+            "auto",
+            "Messages",
+            started,
+            "failed",
+            None,
+            Some(error.code()),
+        ),
+    }
+    match result {
         Ok(response) => response,
         Err(error) => error.into_anthropic_response(),
     }
@@ -18974,10 +19405,7 @@ async fn native_responses_with_timeout_and_groups(
                         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                         .unwrap_or_else(|| json!({}));
                     let remove = settings_bool(config.get("auto_remove_invalid_accounts"), false);
-                    let _ = state
-                        .account_store
-                        .record_invalid_token(&token, "invalid_token", remove)
-                        .await;
+                    record_invalid_token_with_log(&state, &token, "invalid_token", remove).await;
                 }
                 drop(lease);
                 return Err(error);
@@ -22982,6 +23410,29 @@ mod tests {
         let logs = json_response(logs).await;
         assert_eq!(logs["items"][0]["id"], "log-1");
         assert!(logs["items"][0]["detail"].get("access_token").is_none());
+        management::append_call_log(
+            &state,
+            "文生图",
+            json!({
+                "endpoint": "/v1/images/generations",
+                "model": "gpt-image-2",
+                "status": "success",
+                "duration_ms": 12,
+                "request_text": "draw a test image",
+                "account_email": "test@example.com",
+            }),
+        );
+        let logs = management_request(&state, "GET", "/api/logs", None, Some("admin")).await;
+        let logs = json_response(logs).await;
+        assert_eq!(logs["items"][0]["summary"], "文生图");
+        assert_eq!(
+            logs["items"][0]["detail"]["endpoint"],
+            "/v1/images/generations"
+        );
+        assert_eq!(
+            logs["items"][0]["detail"]["account_email"],
+            "test@example.com"
+        );
 
         let storage =
             management_request(&state, "GET", "/api/images/storage", None, Some("admin")).await;

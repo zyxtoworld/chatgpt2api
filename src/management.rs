@@ -2,16 +2,16 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
     future::Future,
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex as StdMutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
 use std::sync::{
-    Condvar, Mutex as StdMutex,
+    Condvar,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -70,6 +70,7 @@ const BACKUP_CRYPT_BLOCK_BYTES: usize = 16;
 
 static BACKUP_CRYPT_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(BACKUP_CRYPT_MAX_CONCURRENCY)));
+static LOG_WRITE_GATE: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct LogQuery {
@@ -267,7 +268,7 @@ fn date_from_unix(seconds: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-fn iso_timestamp(value: SystemTime) -> String {
+pub(super) fn iso_timestamp(value: SystemTime) -> String {
     let seconds = unix_seconds(value);
     let day_seconds = seconds.rem_euclid(86_400);
     let hour = day_seconds / 3_600;
@@ -854,12 +855,21 @@ fn public_log_detail(value: &Value) -> Value {
         "added",
         "skipped",
         "removed",
+        "total",
+        "refreshed",
+        "failed",
+        "auto_remove",
         "reason",
         "key_id",
         "key_name",
         "role",
         "endpoint",
         "model",
+        "request_text",
+        "account_email",
+        "conversation_id",
+        "error",
+        "result",
         "started_at",
         "ended_at",
         "duration_ms",
@@ -910,10 +920,57 @@ fn public_log_detail(value: &Value) -> Value {
                     .collect::<Map<_, _>>();
                 projected.insert(key.to_owned(), Value::Object(shape));
             }
+            Value::Object(object) if key == "result" => {
+                let result = object
+                    .iter()
+                    .filter(|(key, value)| {
+                        matches!(key.as_str(), "primary_url" | "zip_url" | "conversation_id")
+                            && value.as_str().is_some_and(|value| value.len() <= 4096)
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Map<_, _>>();
+                projected.insert(key.to_owned(), Value::Object(result));
+            }
             _ => {}
         }
     }
     Value::Object(projected)
+}
+
+/// Append one public call/account log record. Logging is best-effort: a log
+/// failure must never change the API response or make an upstream request fail.
+pub(super) fn append_log(state: &AppState, log_type: &str, summary: &str, detail: Value) {
+    let timestamp = super::current_timestamp();
+    let mut record = Map::new();
+    record.insert(
+        "id".to_owned(),
+        Value::String(format!("log-{}-{}", std::process::id(), now_nanos())),
+    );
+    record.insert("time".to_owned(), Value::String(timestamp));
+    record.insert("type".to_owned(), Value::String(log_type.to_owned()));
+    record.insert("summary".to_owned(), Value::String(summary.to_owned()));
+    record.insert("detail".to_owned(), detail);
+    let Ok(bytes) = serde_json::to_vec(&Value::Object(record)) else {
+        return;
+    };
+    let path = data_file(state, "logs.jsonl");
+    let _guard = LOG_WRITE_GATE.lock().ok();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = file.write_all(&bytes);
+    let _ = file.write_all(b"\n");
+}
+
+pub(super) fn append_call_log(state: &AppState, summary: &str, detail: Value) {
+    append_log(state, "call", summary, detail);
+}
+
+pub(super) fn append_account_log(state: &AppState, summary: &str, detail: Value) {
+    append_log(state, "account", summary, detail);
 }
 
 fn log_id(raw: &Map<String, Value>, line: &str, ordinal: usize) -> String {
