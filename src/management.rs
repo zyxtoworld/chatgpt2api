@@ -2265,7 +2265,7 @@ async fn execute_cpa_import(
             }
             Err(error) => {
                 failed += 1;
-                errors.push(json!({"name": name, "error": error.to_string()}));
+                errors.push(json!({"name": name, "error": error.code()}));
             }
         }
         let completed = successful + failed;
