@@ -3712,8 +3712,8 @@ async fn api_accounts_export(
             .iter()
             .enumerate()
             .map(|(index, item)| {
-                let mut payload = serde_json::to_vec_pretty(item)
-                    .map_err(|_| ApiError::unavailable())?;
+                let mut payload =
+                    serde_json::to_vec_pretty(item).map_err(|_| ApiError::unavailable())?;
                 payload.push(b'\n');
                 Ok((format!("account-{index:03}.json"), payload))
             })
