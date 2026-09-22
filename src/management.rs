@@ -2324,7 +2324,7 @@ async fn execute_cpa_import(
     failed = failed.saturating_add(refresh_failed);
     let mut job = import_job(
         &expected_job_id,
-        names.len(),
+        total,
         added,
         skipped,
         refreshed,
