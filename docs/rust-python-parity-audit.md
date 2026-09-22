@@ -62,15 +62,15 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
 ### P2：导入实现可用但不完全相同
 
-1. CPA：Python 对选中文件使用最多 16 个并发 worker，并逐文件更新进度；Rust `execute_cpa_import` 当前逐个请求，最后一次性写入 job 结果。
-2. Sub2API：Python 支持分页读取账号/分组，并对导出账号逐项统计缺失凭据；Rust 管理端用单次 `page_size=5000` 请求，导入失败/完成进度在批量结束后写入。
+1. CPA：Rust `execute_cpa_import` 已改为最多 16 个并发下载，并在每个文件完成后更新 job 进度；仍需补远程服务模拟测试。
+2. Sub2API：Rust 管理端已按每页 200 条循环读取账号/分组，最多 5000 条；导入接口仍需补远程分页/缺失凭据模拟测试。
 3. ccLoad：Rust 已实现登录、频道 editor 中的 OAuth access token 提取、逐频道 canonical 目录刷新和逐频道进度；不会从旧账号快照、其它同套餐频道或 editor 模型字段借用目录。这是当前三种导入中最接近 Python/实际页面需求的一条，但它是 Rust 扩展逻辑，Python baseline 中没有同名服务文件可直接逐行对照。
 
 ## 需要继续处理的顺序
 
 1. 完成 clearance、账号 proxy、Web 图片 401 和搜索/editable/Codex 的逐路径验证。
 2. 补齐内容审核、全局 system prompt、缓存和图片清理的行为测试。
-3. 继续审计 CPA/Sub2API/ccLoad 的并发、分页和进度差异。
+3. 为 CPA/Sub2API 导入补远程服务模拟测试，并继续核对 ccLoad 的并发、分页和进度差异。
 4. 最后决定是否突破 access-token-only 安全边界，移植 OAuth、密码重登、refresh token keepalive 和 Python 完整导出；如果不突破，接口必须继续明确返回 unsupported，而不能返回看似成功的数据。
 
 ## v1.7 之后功能清单（暂不实现）
