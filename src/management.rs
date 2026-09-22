@@ -490,8 +490,14 @@ pub(super) async fn delete_images(
         let Some(safe) = safe_relative_path(&relative) else {
             continue;
         };
-        if fs::remove_file(root.join(safe)).is_ok() {
+        if fs::remove_file(root.join(&safe)).is_ok() {
             removed += 1;
+            let thumbnail = state
+                .data_dir
+                .join("image-thumbnails")
+                .join(&safe)
+                .with_extension("png");
+            let _ = fs::remove_file(thumbnail);
         }
     }
     Ok(Json(json!({"removed": removed})))
