@@ -2239,10 +2239,17 @@ async fn execute_cpa_import(
     let total = names.len();
     let concurrency = total.min(16).max(1);
     let mut queue = names.into_iter();
-    let mut active: FuturesUnordered<Pin<Box<dyn Future<Output = (String, Result<String, ApiError>)> + Send>>> = FuturesUnordered::new();
+    let mut active: FuturesUnordered<
+        Pin<Box<dyn Future<Output = (String, Result<String, ApiError>)> + Send>>,
+    > = FuturesUnordered::new();
     for _ in 0..concurrency {
         if let Some(name) = queue.next() {
-            active.push(cpa_download_future(state.clone(), base.clone(), secret.clone(), name));
+            active.push(cpa_download_future(
+                state.clone(),
+                base.clone(),
+                secret.clone(),
+                name,
+            ));
         }
     }
     while let Some((name, result)) = active.next().await {
@@ -2257,9 +2264,25 @@ async fn execute_cpa_import(
             }
         }
         let completed = successful + failed;
-        let _ = update_registry_job_progress(&state, "cpa_pools", &pool_id, &expected_job_id, completed, total, successful, 0, failed, &errors);
+        let _ = update_registry_job_progress(
+            &state,
+            "cpa_pools",
+            &pool_id,
+            &expected_job_id,
+            completed,
+            total,
+            successful,
+            0,
+            failed,
+            &errors,
+        );
         if let Some(next_name) = queue.next() {
-            active.push(cpa_download_future(state.clone(), base.clone(), secret.clone(), next_name));
+            active.push(cpa_download_future(
+                state.clone(),
+                base.clone(),
+                secret.clone(),
+                next_name,
+            ));
         }
     }
     let imported_tokens = imported
