@@ -3392,6 +3392,16 @@ async fn refresh_access_token_account(
         "last_refresh_error": Value::Null,
         "last_refresh_error_at": Value::Null,
     });
+    for key in ["refresh_token", "id_token"] {
+        if let Some(value) = raw
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            result[key] = Value::String(value.to_owned());
+        }
+    }
     if let Some((model_items, model_sources)) = model_items {
         let has_web_models = model_sources.as_object().is_some_and(|sources| {
             sources
