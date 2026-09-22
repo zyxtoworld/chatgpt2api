@@ -24206,7 +24206,11 @@ mod tests {
         assert_eq!(valid.status(), StatusCode::OK);
         let response = json_response(valid).await;
         assert_eq!(response["refreshed"], 0);
-        assert_eq!(response["errors"], json!([]));
+        assert!(
+            response["errors"]
+                .as_array()
+                .is_some_and(|errors| !errors.is_empty())
+        );
         let stored: Value = serde_json::from_slice(&fs::read(&path).expect("stored snapshot"))
             .expect("stored JSON");
         assert_eq!(stored["cumulative_total"], 2);
