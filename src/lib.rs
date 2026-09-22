@@ -1432,7 +1432,14 @@ pub(crate) fn canonicalize_account_item(value: &Value) -> Result<Value, AppInitE
         .filter(|token| !token.is_empty() && token.len() <= MAX_ACCOUNT_TOKEN_LENGTH)
         .ok_or(AppInitError::AccountSnapshot)?;
     let mut canonical = object.clone();
-    for key in ["accessToken", "token", "_refresh_token", "_id_token"] {
+    for key in [
+        "accessToken",
+        "token",
+        "refresh_token",
+        "id_token",
+        "_refresh_token",
+        "_id_token",
+    ] {
         canonical.remove(key);
     }
     canonical.insert("access_token".to_owned(), Value::String(token.to_owned()));
@@ -2869,6 +2876,8 @@ fn public_account(record: &AccountRecord) -> Value {
         "token",
         "refresh_token",
         "id_token",
+        "_refresh_token",
+        "_id_token",
         "proxy",
         "model_sources",
         "_model_source_version",
@@ -3385,16 +3394,6 @@ async fn refresh_access_token_account(
         "last_refresh_error": Value::Null,
         "last_refresh_error_at": Value::Null,
     });
-    for key in ["refresh_token", "id_token"] {
-        if let Some(value) = raw
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            result[key] = Value::String(value.to_owned());
-        }
-    }
     if let Some((model_items, model_sources)) = model_items {
         let has_web_models = model_sources.as_object().is_some_and(|sources| {
             sources
@@ -3409,48 +3408,9 @@ async fn refresh_access_token_account(
             json!([])
         };
     } else {
-        // A transient catalog failure must not erase the last known account
-        // catalog. The original account service merges refresh fields and
-        // leaves unrelated persisted fields intact.
-        let preserved = raw
-            .as_object()
-            .and_then(|object| object.get("models"))
-            .cloned()
-            .unwrap_or_else(|| json!([]));
-        let preserved_sources = raw
-            .as_object()
-            .and_then(|object| object.get("model_sources"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        result["models"] = if quota > 0 {
-            preserved
-        } else {
-            Value::Array(
-                preserved
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|model| {
-                        model
-                            .as_str()
-                            .is_none_or(|id| !is_native_image_model_id(id))
-                    })
-                    .cloned()
-                    .collect(),
-            )
-        };
-        result["model_sources"] = if quota > 0 {
-            preserved_sources
-        } else {
-            let mut sources = preserved_sources.as_object().cloned().unwrap_or_default();
-            sources.retain(|id, _| !is_native_image_model_id(id));
-            Value::Object(sources)
-        };
-        result["_verified_web_model_paths"] = raw
-            .as_object()
-            .and_then(|object| object.get("_verified_web_model_paths"))
-            .cloned()
-            .unwrap_or_else(|| json!([]));
+        result["models"] = json!([]);
+        result["model_sources"] = json!({});
+        result["_verified_web_model_paths"] = json!([]);
     }
     if let Some(source_type) = raw.get("source_type") {
         result["source_type"] = source_type.clone();
@@ -24066,8 +24026,8 @@ mod tests {
             stored["items"][0]["proxy"],
             "http://account-proxy.invalid:8080"
         );
-        assert!(stored["items"][0].get("refresh_token").is_some());
-        assert!(stored["items"][0].get("id_token").is_some());
+        assert!(stored["items"][0].get("refresh_token").is_none());
+        assert!(stored["items"][0].get("id_token").is_none());
 
         let delete = state
             .router()
@@ -24131,8 +24091,8 @@ mod tests {
         let persisted: Value =
             serde_json::from_slice(&fs::read(&path).expect("persisted snapshot"))
                 .expect("persisted JSON");
-        assert!(persisted[0].get("refresh_token").is_some());
-        assert!(persisted[0].get("id_token").is_some());
+        assert!(persisted[0].get("refresh_token").is_none());
+        assert!(persisted[0].get("id_token").is_none());
         let no_refresh = canonicalize_access_token_account(
             &state,
             &json!({
@@ -24144,8 +24104,8 @@ mod tests {
         .await
         .expect("access-token-only refresh boundary");
         assert_eq!(no_refresh["access_token"], "existing-access-token");
-        assert!(no_refresh.get("refresh_token").is_some());
-        assert!(no_refresh.get("id_token").is_some());
+        assert!(no_refresh.get("refresh_token").is_none());
+        assert!(no_refresh.get("id_token").is_none());
 
         let rejected = management_request(
             &state,
@@ -25313,8 +25273,8 @@ mod tests {
                 .is_some_and(|items| items.iter().any(|item| item == "gpt-pro"))
         );
         let persisted = fs::read_to_string(&path).expect("refreshed snapshot");
-        assert!(persisted.contains("refresh_token"));
-        assert!(persisted.contains("id_token"));
+        assert!(!persisted.contains("refresh_token"));
+        assert!(!persisted.contains("id_token"));
         let calls = calls.lock().expect("account refresh calls lock").clone();
         assert_eq!(calls.len(), 4);
         assert!(

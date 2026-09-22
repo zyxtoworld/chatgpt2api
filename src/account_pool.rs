@@ -1388,6 +1388,8 @@ fn merge_import_records_in_place(
             if let Some(object) = value.as_object_mut() {
                 object.remove("accessToken");
                 object.remove("token");
+                object.remove("refresh_token");
+                object.remove("id_token");
                 object.remove("_refresh_token");
                 object.remove("_id_token");
                 object.insert("access_token".to_owned(), serde_json::json!(token));
@@ -1520,6 +1522,8 @@ fn merge_account_values(
     let preferred_token = account_payload_token(preferred).unwrap_or_default();
     merged.remove("accessToken");
     merged.remove("token");
+    merged.remove("refresh_token");
+    merged.remove("id_token");
     merged.remove("_refresh_token");
     merged.remove("_id_token");
     merged.insert(
