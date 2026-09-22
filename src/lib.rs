@@ -2599,7 +2599,7 @@ impl AppState {
             .route("/version", get(version))
             .route("/api/images", get(management::list_images))
             .route("/images/{*image_path}", get(image_file))
-            .route("/image-thumbnails/{*image_path}", get(image_file))
+            .route("/image-thumbnails/{*image_path}", get(image_thumbnail_file))
             .route("/files/{*file_path}", get(download_editable_file))
             .route("/api/images/delete", post(management::delete_images))
             .route("/api/images/download", post(management::download_images))
@@ -5158,6 +5158,30 @@ async fn image_file(
         .into_response())
 }
 
+async fn image_thumbnail_file(
+    State(state): State<AppState>,
+    AxumPath(image_path): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let relative = safe_relative_path(&image_path).ok_or_else(ApiError::invalid_request)?;
+    let path = image_root(&state).join(&relative);
+    let bytes = fs::read(&path).map_err(|_| ApiError::unavailable())?;
+    let image = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| ApiError::unavailable())?
+        .decode()
+        .map_err(|_| ApiError::unavailable())?;
+    let thumbnail = image.thumbnail(320, 320);
+    let mut output = Cursor::new(Vec::new());
+    thumbnail
+        .write_to(&mut output, image::ImageFormat::Png)
+        .map_err(|_| ApiError::unavailable())?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/png")],
+        Body::from(output.into_inner()),
+    )
+        .into_response())
+}
 fn image_tags_path(state: &AppState) -> PathBuf {
     data_file(state, "image_tags.json")
 }
