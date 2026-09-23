@@ -1,7 +1,7 @@
 # Rust/Python Parity Audit
 
-审计基线：`.local/public-minimal` 中的 Python 实现。审计日期：2026-09-22。
-Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经核对了输入校验、路由选择、上游请求、结果投影和持久化边界；“部分对齐”表示接口存在，但仍有可观察的行为差异；“未实现”表示 Rust 明确返回 `unsupported_capability` 或只保存配置而没有运行时逻辑。
+审计基线：`.local/public-minimal` 的 Git tag `v1.7.0`（commit `1f96b49b2bf35e607a2c587e3fb9d40c5acb475d`）。审计日期：2026-09-23。
+Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经核对了输入校验、路由选择、上游请求、结果投影、持久化边界和后台生命周期；“部分对齐”表示接口存在，但仍有可观察的行为差异；“未实现”表示 Rust 明确返回 `unsupported_capability` 或受 access-token-only 边界限制。
 
 ## 已对齐的主链路
 
@@ -29,19 +29,24 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 - 图片任务已覆盖提交幂等、按用户隔离、`queued/running/success/error`、结果/usage/耗时、JSON/multipart 编辑输入，以及超时任务的 `resume-poll` 恢复轮询。
 - `/api/logs` 现在会持久化 API 调用、图片后台任务、PPT/PSD 后台任务和账号新增/删除/更新/刷新/异常移除事件；敏感 token 只保留公开引用，调用日志保留受限的请求摘要、状态、耗时和错误。
 - 账号刷新在模型目录暂时不可用时保留最后一次成功的 Web/Codex 模型目录；quota 归零时只清理 image 模型，避免管理页面模型列表被瞬时刷新失败清空。
+- 账号导入新增记录会持久化 Python 1.7 同格式的 `created_at`；ccLoad 有最近刷新时间时优先使用该时间。
+- Rust 服务启动后会按 `refresh_account_interval_minute` 周期刷新正常/限流 access token 账号，并在关闭时停止 watcher；同时恢复图片保留清理和 R2 备份调度。
+- 图片 `n>1` 已按 1.7 的 `image_parallel_generation`、账号级 `image_account_concurrency`、串行/并行结果合并和 `image_check_before_hit_enabled` 运行；Web/Codex 图片入口都经过同一多图调度边界。
+- ccLoad 导入最终进度会合并账号刷新阶段的失败数与错误列表，不再把“凭据获取成功但刷新失败”显示成成功。
+- AI 审核支持 1.7 的 `fail_open`（默认 `true`）；审核服务网络、JSON 或决策异常时按配置放行或失败。
 - /api/accounts 新增账号现在透传刷新阶段的 rrors 和刷新后的 items，不再固定返回空错误数组；这与 Python create_accounts 的返回契约一致。
 
 ## 已确认的行为差异
 
 这些不是推测，而是逐一对照 Python 路由或服务实现后确认的差异。
 
-### P0：功能缺失或会造成误判
+### P0：有意保留的 access-token-only 边界
 
-1. **OAuth 和密码重新登录未实现**
+1. **OAuth 和密码重新登录未实现（有意）**
 
    Rust `src/lib.rs` 中 `/api/accounts/re-login`、re-login progress、`/api/accounts/oauth/start`、`/api/accounts/oauth/finish` 仍由 `access_token_only_disabled` 处理，返回 `unsupported_capability`。Python 对应逻辑在 `api/accounts.py`、`services/account_service.py` 和 `services/oauth_login_service.py`，包含密码登录、验证码、PKCE、授权码兑换和三件套落盘。
 
-2. **账号导出不是 Python 的 JSON/ZIP 导出**
+2. **账号导出不是 Python 的完整三件套 JSON/ZIP 导出（有意）**
 
    Python 导出要求 `access_token + refresh_token + id_token`，JSON 单账号直接返回对象，多账号返回数组，ZIP 每账号一个 JSON 文件。Rust `api_accounts_export` 当前导出 `{"items": [...]}` 原始记录，不支持 `format=zip`，且 access-token-only 规范化会丢弃 refresh/id token。因此 Rust 不能声称与 Python 导出格式兼容。
 
@@ -53,9 +58,16 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
    Rust 已为账号 lease 创建独立上游 client，并按账号代理优先级选择；模型目录、Web conversation、图片资源、搜索、editable 和 Codex 路径已接入，仍需运行时核验管理导入和边界重试路径。
 
-### P1：配置已能保存，但运行时没有等价行为
+### 已清理的历史遗漏
 
-1. `global_system_prompt`：Rust 已接入 Chat 和 Responses；仍需核对 Anthropic、搜索、图片和 editable 的消息顺序是否与 Python 完全一致。
+- `image_parallel_generation`、`image_account_concurrency`、`image_check_before_hit_enabled` 不再只是设置项，已经接入实际生图和轮询逻辑。
+- `refresh_account_interval_minute` 不再只是设置项，已经接入后台账号 watcher。
+- `image_retention_days`、备份 `interval_minutes` 不再只是设置项，已经接入服务生命周期调度。
+- `ai_review.fail_open` 已接入审核异常处理。
+
+### P1：需要继续关注的差异
+
+1. `global_system_prompt`：Rust 已接入 Chat、Responses 和 Web 图片 prompt；仍需核对 Anthropic、搜索和 editable 的消息顺序是否与 Python 完全一致。
 2. `sensitive_words` 和 `ai_review`：Rust 已接入敏感词拦截、审核文本提取、base64 替换、100k 截断、审核结果处理和调用失败日志；仍需补齐配置异常和所有 API 入口的行为测试。
 3. `chat_completion_cache`：Rust 已实现非流式 TTL cache、流式帧 replay、in-flight dedupe、消息规范化及递归 JSON key 排序；仍需补并发边界测试。
 4. `auto_remove_invalid_accounts`、`auto_remove_rate_limited_accounts`：Rust 已实现刷新写回时的确认失效删除、刚变为限流时删除、native Codex 401 记录和 Web 图片 401 记录；仍需补边界重试测试。
@@ -70,10 +82,10 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
 ## 需要继续处理的顺序
 
-1. 完成 clearance、账号 proxy、Web 图片 401 和搜索/editable/Codex 的逐路径验证。
-2. 补齐内容审核、全局 system prompt、缓存和图片清理的行为测试。
-3. 为 CPA/Sub2API 导入补远程服务模拟测试，并继续核对 ccLoad 的并发、分页和进度差异。
-4. 最后决定是否突破 access-token-only 安全边界，移植 OAuth、密码重登、refresh token keepalive 和 Python 完整导出；如果不突破，接口必须继续明确返回 unsupported，而不能返回看似成功的数据。
+1. 完成 clearance、账号 proxy、Web 图片 401 和搜索/editable/Codex 的线上逐路径验证。
+2. 补齐内容审核、全局 system prompt、缓存和后台调度的边界测试。
+3. 为 CPA/Sub2API 导入补远程服务模拟测试，并继续核对 ccLoad 的分页与边界错误。
+4. 继续维持 access-token-only 安全边界；OAuth、密码重登、refresh-token keepalive 和 Python 完整导出必须继续明确返回 unsupported，不能伪装成成功。
 
 ## v1.7 之后功能清单（暂不实现）
 

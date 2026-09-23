@@ -2970,6 +2970,9 @@ fn public_account(record: &AccountRecord) -> Value {
             object.insert(key.to_owned(), Value::from(0));
         }
     }
+    if !object.contains_key("restore_at") {
+        object.insert("restore_at".to_owned(), Value::Null);
+    }
     let models = record
         .raw
         .as_object()
