@@ -13455,7 +13455,7 @@ async fn review_request_content(state: &AppState, value: &Value) -> Result<(), A
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(ApiError::invalid_request)?;
-    let fail_open = settings_bool(review.get("fail_open"), true);
+    let fail_open = settings_bool(review.and_then(|object| object.get("fail_open")), true);
     let mut text = String::new();
     review_text_value(value, &mut text, 0);
     if text.trim().is_empty() {
