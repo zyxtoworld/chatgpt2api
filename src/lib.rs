@@ -9880,16 +9880,18 @@ async fn native_codex_image_request_proxy(
     let mut responses = Vec::new();
     let mut errors = Vec::new();
     if parallel {
-        let mut active = FuturesUnordered::new();
+        type CodexImageFuture =
+            Pin<Box<dyn Future<Output = (usize, Result<Response, ApiError>)> + Send>>;
+        let mut active: FuturesUnordered<CodexImageFuture> = FuturesUnordered::new();
         for index in 0..requested.min(concurrency) {
             let task_state = state.clone();
             let task_template = template.clone_without_temp_guard();
-            active.push(async move {
+            active.push(Box::pin(async move {
                 (
                     index,
                     native_codex_image_request_single(task_state, task_template, endpoint).await,
                 )
-            });
+            }));
         }
         let mut next = active.len();
         while let Some((index, result)) = active.next().await {
@@ -9900,13 +9902,13 @@ async fn native_codex_image_request_proxy(
             if next < requested {
                 let task_state = state.clone();
                 let task_template = template.clone_without_temp_guard();
-                active.push(async move {
+                active.push(Box::pin(async move {
                     (
                         next,
                         native_codex_image_request_single(task_state, task_template, endpoint)
                             .await,
                     )
-                });
+                }));
                 next += 1;
             }
         }
