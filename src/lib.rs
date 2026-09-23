@@ -1443,6 +1443,17 @@ pub(crate) fn canonicalize_account_item(value: &Value) -> Result<Value, AppInitE
         canonical.remove(key);
     }
     canonical.insert("access_token".to_owned(), Value::String(token.to_owned()));
+    let has_created_at = canonical.get("created_at").is_some_and(|value| match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        _ => true,
+    });
+    if !has_created_at {
+        canonical.insert(
+            "created_at".to_owned(),
+            Value::String(current_timestamp()),
+        );
+    }
     canonicalize_account_models(&mut canonical);
     Ok(Value::Object(canonical))
 }
@@ -30970,6 +30981,24 @@ data: [DONE]
         );
         assert!(!canonical.to_string().contains("codex-endpoint-model"));
         assert!(!canonical.to_string().contains("unknown-channel-model"));
+    }
+
+    #[test]
+    fn account_canonicalization_fills_missing_created_at_like_python() {
+        let canonical = canonicalize_account_item(&json!({
+            "access_token": "account-token",
+            "status": "正常"
+        }))
+        .expect("canonical account");
+        let created_at = canonical["created_at"]
+            .as_str()
+            .expect("created_at string");
+        assert_eq!(created_at.len(), 19);
+        assert_eq!(&created_at[4..5], "-");
+        assert_eq!(&created_at[7..8], "-");
+        assert_eq!(&created_at[10..11], " ");
+        assert_eq!(&created_at[13..14], ":");
+        assert_eq!(&created_at[16..17], ":");
     }
 
     #[test]
