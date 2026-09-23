@@ -3875,6 +3875,68 @@ async fn refresh_accounts_now(
     refresh_accounts_now_with_deadline(state, requested, batch, None, None).await
 }
 
+fn account_refresh_interval(state: &AppState) -> Duration {
+    let minutes = fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("refresh_account_interval_minute").cloned())
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            _ => None,
+        })
+        .unwrap_or(5)
+        .max(1);
+    Duration::from_secs(minutes.saturating_mul(60))
+}
+
+fn account_watcher_tokens(state: &AppState) -> Vec<String> {
+    state
+        .account_store
+        .raw_records()
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record.get("status").and_then(Value::as_str),
+                None | Some("正常") | Some("限流")
+            )
+        })
+        .filter_map(|record| account_token(&record))
+        .collect()
+}
+
+/// Match the v1.7 account watcher for the access-token-only runtime.  The
+/// Python service also keeps refresh tokens alive and performs password
+/// relogin; those flows are intentionally outside this Rust token boundary.
+async fn account_refresh_watcher(state: AppState) {
+    if state.config.upstream_protocol != UpstreamProtocol::ChatGpt
+        || state.config.upstream_base_url.is_none()
+    {
+        return;
+    }
+    loop {
+        let tokens = account_watcher_tokens(&state);
+        if !tokens.is_empty() {
+            let _ = refresh_accounts_now(&state, &tokens, None).await;
+        }
+        tokio::time::sleep(account_refresh_interval(&state)).await;
+    }
+}
+
+async fn image_cleanup_scheduler(state: AppState) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1_800)).await;
+        management::cleanup_old_images(&state);
+    }
+}
+
+async fn backup_scheduler(state: AppState) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        management::run_scheduled_backup_if_due(&state).await;
+    }
+}
+
 async fn persist_account_refresh_updates(
     state: &AppState,
     updated_records: &mut Vec<(String, Value)>,
@@ -5936,6 +5998,29 @@ struct NativeImageRequest {
     images: Vec<NativeImageSource>,
     mask: Option<NativeImageSource>,
     temp_guard: Option<NativeImageTempGuard>,
+}
+
+impl NativeImageRequest {
+    fn clone_without_temp_guard(&self) -> Self {
+        Self {
+            model: self.model.clone(),
+            client_task_id: self.client_task_id.clone(),
+            codex: self.codex,
+            plan_type: self.plan_type.clone(),
+            prompt: self.prompt.clone(),
+            n: self.n,
+            size: self.size.clone(),
+            quality: self.quality.clone(),
+            response_format: self.response_format.clone(),
+            output_format: self.output_format.clone(),
+            output_compression: self.output_compression,
+            background: self.background.clone(),
+            stream: self.stream,
+            images: self.images.clone(),
+            mask: self.mask.clone(),
+            temp_guard: None,
+        }
+    }
 }
 
 fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<String>), ApiError> {
@@ -8572,7 +8657,8 @@ async fn native_poll_image_file_ids(
         .as_deref()
         .ok_or_else(ApiError::unavailable)?
         .trim_end_matches('/');
-    let (initial_wait, poll_interval, settle, settle_enabled) = native_image_poll_timing(state);
+    let (initial_wait, poll_interval, settle, settle_enabled, check_before_hit) =
+        native_image_poll_timing(state);
     if !initial_wait.is_zero() && !sleep_search_poll_with_interval(deadline, initial_wait).await {
         return Err(ApiError::upstream());
     }
@@ -8631,7 +8717,7 @@ async fn native_poll_image_file_ids(
         let mut ids = Vec::new();
         native_collect_image_file_ids(&value, &mut ids, 0);
         if !ids.is_empty() {
-            if !settle_enabled {
+            if !check_before_hit || !settle_enabled {
                 return Ok(ids);
             }
             if last_ids.as_ref() == Some(&ids) {
@@ -8830,7 +8916,137 @@ fn native_spawn_image_cleanup(
         let _ = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send()).await;
     });
 }
+fn native_web_image_generation_settings(state: &AppState) -> (bool, usize) {
+    let config = fs::read(state.config_path.as_ref())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    let parallel = settings_bool(config.get("image_parallel_generation"), true);
+    let concurrency = usize::try_from(settings_u64(config.get("image_account_concurrency"), 3, 1))
+        .unwrap_or(3)
+        .max(1);
+    (parallel, concurrency)
+}
+
+async fn combine_native_web_image_responses(
+    responses: Vec<Response>,
+    stream: bool,
+) -> Result<Response, ApiError> {
+    if responses.is_empty() {
+        return Err(ApiError::upstream());
+    }
+    if stream {
+        let mut bytes = Vec::new();
+        for response in responses {
+            let body = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+                .await
+                .map_err(|_| ApiError::upstream())?;
+            bytes.extend_from_slice(&body);
+        }
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            Body::from(bytes),
+        )
+            .into_response());
+    }
+    let mut merged = Value::Null;
+    let mut data = Vec::new();
+    for response in responses {
+        let body = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .map_err(|_| ApiError::upstream())?;
+        let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+        let object = value.as_object().ok_or_else(ApiError::upstream)?;
+        if merged.is_null() {
+            merged = value.clone();
+        }
+        if let Some(items) = object.get("data").and_then(Value::as_array) {
+            data.extend(items.iter().cloned());
+        }
+    }
+    let object = merged.as_object_mut().ok_or_else(ApiError::upstream)?;
+    object.insert("data".to_owned(), Value::Array(data));
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(merged),
+    )
+        .into_response())
+}
+
 async fn native_web_image_request_proxy(
+    state: AppState,
+    mut request: NativeImageRequest,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    if request.n <= 1 {
+        return native_web_image_request_single(state, request, endpoint).await;
+    }
+    let requested = request.n;
+    let stream = request.stream;
+    let (parallel, _concurrency) = native_web_image_generation_settings(&state);
+    let _temp_guard = request.temp_guard.take();
+    request.n = 1;
+    let template = request.clone_without_temp_guard();
+    let mut responses = Vec::new();
+    let mut errors = Vec::new();
+    if parallel {
+        let mut active = FuturesUnordered::new();
+        let mut next = 0usize;
+        while next < requested {
+            if active.len() >= requested {
+                break;
+            }
+            let index = next;
+            let task_state = state.clone();
+            let task_template = template.clone_without_temp_guard();
+            active.push(async move {
+                (
+                    index,
+                    native_web_image_request_single(task_state, task_template, endpoint).await,
+                )
+            });
+            next += 1;
+        }
+        while let Some(result) = active.next().await {
+            let (index, result) = result;
+            match result {
+                Ok(response) => responses.push((index, response)),
+                Err(error) => errors.push((index, error)),
+            }
+        }
+    } else {
+        for index in 0..requested {
+            match native_web_image_request_single(
+                state.clone(),
+                template.clone_without_temp_guard(),
+                endpoint,
+            )
+            .await
+            {
+                Ok(response) => responses.push((index, response)),
+                Err(error) => errors.push((index, error)),
+            }
+        }
+    }
+    responses.sort_by_key(|(index, _)| *index);
+    let responses = responses
+        .into_iter()
+        .map(|(_, response)| response)
+        .collect::<Vec<_>>();
+    if responses.is_empty() {
+        errors.sort_by_key(|(index, _)| *index);
+        return Err(errors
+            .into_iter()
+            .last()
+            .map(|(_, error)| error)
+            .unwrap_or_else(ApiError::upstream));
+    }
+    combine_native_web_image_responses(responses, stream).await
+}
+
+async fn native_web_image_request_single(
     state: AppState,
     request: NativeImageRequest,
     endpoint: &'static str,
@@ -8839,6 +9055,7 @@ async fn native_web_image_request_proxy(
         .account_type_catalog
         .refresh_image_quotas_for_public(&state)
         .await;
+    let (_, max_inflight_per_account) = native_web_image_generation_settings(&state);
     let deadline = Instant::now() + native_image_operation_timeout(&state);
     let mut attempted_tokens = HashSet::new();
     let mut last_error = None;
@@ -8848,10 +9065,22 @@ async fn native_web_image_request_proxy(
         }
         let Some(lease) = state
             .account_store
-            .acquire_image_lease(&attempted_tokens)
+            .acquire_image_lease_with_limit(&attempted_tokens, max_inflight_per_account)
             .await
         else {
-            return Err(last_error.unwrap_or_else(ApiError::unavailable));
+            if !state
+                .account_store
+                .image_has_eligible_account(&attempted_tokens)
+                .await
+            {
+                return Err(last_error.unwrap_or_else(ApiError::unavailable));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(last_error.unwrap_or_else(ApiError::unavailable));
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+            continue;
         };
         let token = lease.token().to_owned();
         attempted_tokens.insert(token.clone());
@@ -8964,6 +9193,26 @@ async fn resolve_web_image_upstream_models(
     Ok((configured, candidates))
 }
 
+fn native_image_upstream_prompt(state: &AppState, request: &NativeImageRequest) -> String {
+    let mut prompt = request.prompt.trim().to_owned();
+    let mut hints = Vec::new();
+    if let Some(size) = request.size.as_deref().filter(|value| !value.is_empty()) {
+        hints.push(format!("输出图片尺寸为 {size}。"));
+    }
+    if !request.quality.trim().is_empty() {
+        hints.push(format!("输出图片质量为 {}。", request.quality));
+    }
+    if !hints.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&hints.join(""));
+    }
+    if let Some(global) = configured_global_system_prompt(state) {
+        format!("{global}\n\n{prompt}")
+    } else {
+        prompt
+    }
+}
+
 async fn native_web_image_attempt(
     state: &AppState,
     lease: &AccountLease,
@@ -8980,6 +9229,7 @@ async fn native_web_image_attempt(
         .trim_end_matches('/');
     let context = NativeRequestContext::new();
     let client = upstream_client_for_lease(state, lease, false);
+    let upstream_prompt = native_image_upstream_prompt(state, request);
     let mut uploads = Vec::new();
     for (index, image) in request.images.iter().enumerate() {
         uploads.push(native_upload_image(state, lease, &context, image, index + 1).await?);
@@ -9019,7 +9269,7 @@ async fn native_web_image_attempt(
         "partial_query": {
             "id": native_message_id(),
             "author": {"role": "user"},
-            "content": {"content_type": "text", "parts": [request.prompt]},
+            "content": {"content_type": "text", "parts": [upstream_prompt.clone()]},
         },
         "supports_buffering": true,
         "supported_encodings": ["v1"],
@@ -9075,7 +9325,7 @@ async fn native_web_image_attempt(
             "size_bytes": upload.file_size,
         }));
     }
-    parts.push(Value::String(request.prompt.clone()));
+    parts.push(Value::String(upstream_prompt));
     let content = if uploads.is_empty() {
         json!({"content_type":"text","parts":parts})
     } else {
@@ -9285,10 +9535,16 @@ fn native_codex_image_body_stream(
     request: &NativeImageRequest,
     action: &str,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
+    native_codex_image_body_stream_with_prompt(request, action, request.prompt.clone())
+}
+
+fn native_codex_image_body_stream_with_prompt(
+    request: &NativeImageRequest,
+    action: &str,
+    prompt: String,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     let mut prefix = b"{\"model\":\"gpt-5.5\",\"instructions\":\"Use the image_generation tool to create exactly one image for the user's request.\",\"store\":false,\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":".to_vec();
-    prefix.extend(
-        serde_json::to_vec(&request.prompt).expect("validated image prompt must serialize"),
-    );
+    prefix.extend(serde_json::to_vec(&prompt).expect("validated image prompt must serialize"));
     prefix.extend_from_slice(b"}");
     if !request.images.is_empty() {
         prefix.push(b',');
@@ -9533,7 +9789,11 @@ async fn native_codex_image_attempt(
         "{}/backend-api/codex/responses",
         base_url.trim_end_matches('/')
     );
-    let body = reqwest::Body::wrap_stream(native_codex_image_body_stream(request, action));
+    let body = reqwest::Body::wrap_stream(native_codex_image_body_stream_with_prompt(
+        request,
+        action,
+        native_image_upstream_prompt(state, request),
+    ));
     let request = codex_request_headers(
         native_browser_headers_with_clearance(
             state.client.post(url),
@@ -9577,7 +9837,122 @@ async fn native_codex_image_attempt(
     Ok(response)
 }
 
+async fn combine_native_codex_image_responses(
+    responses: Vec<Response>,
+) -> Result<Response, ApiError> {
+    if responses.is_empty() {
+        return Err(ApiError::upstream());
+    }
+    let mut merged = Value::Null;
+    let mut data = Vec::new();
+    for response in responses {
+        let body = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .map_err(|_| ApiError::upstream())?;
+        let value: Value = serde_json::from_slice(&body).map_err(|_| ApiError::upstream())?;
+        let object = value.as_object().ok_or_else(ApiError::upstream)?;
+        if merged.is_null() {
+            merged = value.clone();
+        }
+        if let Some(items) = object.get("data").and_then(Value::as_array) {
+            data.extend(items.iter().cloned());
+        }
+    }
+    let object = merged.as_object_mut().ok_or_else(ApiError::upstream)?;
+    object.insert("data".to_owned(), Value::Array(data));
+    Ok(Json(merged).into_response())
+}
+
 async fn native_codex_image_request_proxy(
+    state: AppState,
+    mut request: NativeImageRequest,
+    endpoint: &'static str,
+) -> Result<Response, ApiError> {
+    if request.n <= 1 {
+        return native_codex_image_request_single(state, request, endpoint).await;
+    }
+    let requested = request.n;
+    let stream = request.stream;
+    let (parallel, concurrency) = native_web_image_generation_settings(&state);
+    let _temp_guard = request.temp_guard.take();
+    request.n = 1;
+    let template = request.clone_without_temp_guard();
+    let mut responses = Vec::new();
+    let mut errors = Vec::new();
+    if parallel {
+        let mut active = FuturesUnordered::new();
+        for index in 0..requested.min(concurrency) {
+            let task_state = state.clone();
+            let task_template = template.clone_without_temp_guard();
+            active.push(async move {
+                (
+                    index,
+                    native_codex_image_request_single(task_state, task_template, endpoint).await,
+                )
+            });
+        }
+        let mut next = active.len();
+        while let Some((index, result)) = active.next().await {
+            match result {
+                Ok(response) => responses.push((index, response)),
+                Err(error) => errors.push((index, error)),
+            }
+            if next < requested {
+                let task_state = state.clone();
+                let task_template = template.clone_without_temp_guard();
+                active.push(async move {
+                    (
+                        next,
+                        native_codex_image_request_single(task_state, task_template, endpoint)
+                            .await,
+                    )
+                });
+                next += 1;
+            }
+        }
+    } else {
+        for index in 0..requested {
+            match native_codex_image_request_single(
+                state.clone(),
+                template.clone_without_temp_guard(),
+                endpoint,
+            )
+            .await
+            {
+                Ok(response) => responses.push((index, response)),
+                Err(error) => errors.push((index, error)),
+            }
+        }
+    }
+    responses.sort_by_key(|(index, _)| *index);
+    let responses = responses
+        .into_iter()
+        .map(|(_, response)| response)
+        .collect::<Vec<_>>();
+    if responses.is_empty() {
+        errors.sort_by_key(|(index, _)| *index);
+        return Err(errors
+            .into_iter()
+            .last()
+            .map(|(_, error)| error)
+            .unwrap_or_else(ApiError::upstream));
+    }
+    let combined = combine_native_codex_image_responses(responses).await?;
+    if !stream {
+        return Ok(combined);
+    }
+    let body = to_bytes(combined.into_body(), MAX_REQUEST_BODY_BYTES)
+        .await
+        .map_err(|_| ApiError::upstream())?;
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    Ok(response)
+}
+
+async fn native_codex_image_request_single(
     state: AppState,
     request: NativeImageRequest,
     endpoint: &'static str,
@@ -13206,7 +13581,7 @@ fn native_image_operation_timeout(state: &AppState) -> Duration {
         .max(NATIVE_IMAGE_DEFAULT_TIMEOUT)
 }
 
-fn native_image_poll_timing(state: &AppState) -> (Duration, Duration, Duration, bool) {
+fn native_image_poll_timing(state: &AppState) -> (Duration, Duration, Duration, bool, bool) {
     let config = fs::read(state.config_path.as_ref())
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -13243,6 +13618,8 @@ fn native_image_poll_timing(state: &AppState) -> (Duration, Duration, Duration, 
             _ => None,
         })
         .unwrap_or(!test_defaults);
+    let check_before_hit =
+        settings_bool(config.get("image_check_before_hit_enabled"), !test_defaults);
     (
         number(
             "image_poll_initial_wait_secs",
@@ -13256,6 +13633,7 @@ fn native_image_poll_timing(state: &AppState) -> (Duration, Duration, Duration, 
             if test_defaults { 0.0 } else { 0.5 },
         ),
         enabled,
+        check_before_hit,
     )
 }
 
@@ -18436,26 +18814,42 @@ fn responses_text_to_chat_object(
             role
         };
         let content = item.get("content").ok_or_else(ApiError::invalid_request)?;
-        let mut text = String::new();
-        match content {
-            Value::String(value) => text.push_str(value),
+        let content = match content {
+            Value::String(value) => Value::String(value.clone()),
             Value::Array(parts) => {
+                let mut chat_parts = Vec::new();
                 for part in parts {
                     let part = part.as_object().ok_or_else(ApiError::invalid_request)?;
                     match part.get("type").and_then(Value::as_str) {
-                        Some("input_text" | "output_text") => text.push_str(
-                            part.get("text")
+                        Some("input_text" | "output_text" | "text") => chat_parts.push(json!({
+                            "type": "text",
+                            "text": part
+                                .get("text")
                                 .and_then(Value::as_str)
                                 .ok_or_else(ApiError::invalid_request)?,
-                        ),
-                        Some("input_image") => return Err(ApiError::unsupported_capability()),
+                        })),
+                        Some("input_image" | "image_url" | "image") => {
+                            if role != "user" {
+                                return Err(ApiError::invalid_request());
+                            }
+                            let image_url = part
+                                .get("image_url")
+                                .or_else(|| part.get("image"))
+                                .cloned()
+                                .ok_or_else(ApiError::invalid_request)?;
+                            chat_parts.push(json!({
+                                "type": "image_url",
+                                "image_url": image_url,
+                            }));
+                        }
                         _ => return Err(ApiError::invalid_request()),
                     }
                 }
+                Value::Array(chat_parts)
             }
             _ => return Err(ApiError::invalid_request()),
-        }
-        messages.push(json!({"role": role, "content": text}));
+        };
+        messages.push(json!({"role": role, "content": content}));
     }
     if messages.is_empty() {
         return Err(ApiError::invalid_request());
@@ -34301,6 +34695,31 @@ data: [DONE]
         assert_eq!(converted["service_tier"], "priority");
         assert_eq!(converted["text"]["format"]["type"], "json_schema");
         assert_eq!(converted["tools"][0]["type"], "image_generation");
+    }
+
+    #[test]
+    fn responses_web_chat_conversion_preserves_input_images() {
+        let converted = responses_text_to_chat_object(
+            json!({
+                "model": "gpt-test",
+                "input": [{
+                    "role": "user",
+                    "content": [
+                        {"type":"input_text","text":"describe this"},
+                        {"type":"input_image","image_url":"data:image/png;base64,AQI="}
+                    ]
+                }]
+            })
+            .as_object()
+            .expect("responses object"),
+        )
+        .expect("web chat conversion");
+        assert_eq!(converted["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(converted["messages"][0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            converted["messages"][0]["content"][1]["image_url"],
+            "data:image/png;base64,AQI="
+        );
     }
 
     #[test]

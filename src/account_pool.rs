@@ -603,6 +603,15 @@ impl AccountStore {
         &self,
         excluded_tokens: &HashSet<String>,
     ) -> Option<AccountLease> {
+        self.acquire_image_lease_with_limit(excluded_tokens, usize::MAX)
+            .await
+    }
+
+    pub(super) async fn acquire_image_lease_with_limit(
+        &self,
+        excluded_tokens: &HashSet<String>,
+        max_inflight_per_account: usize,
+    ) -> Option<AccountLease> {
         if !self.reload().await {
             return None;
         }
@@ -612,6 +621,7 @@ impl AccountStore {
         }
         let accounts = snapshot.accounts.as_ref();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let max_inflight = u64::try_from(max_inflight_per_account).unwrap_or(u64::MAX);
         for offset in 0..accounts.len() {
             let slot = accounts[(start.wrapping_add(offset)) % accounts.len()].clone();
             let Some(quota) = image_quota(slot.record.raw.get("quota")) else {
@@ -627,7 +637,7 @@ impl AccountStore {
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
                         (u64::try_from(inflight)
                             .ok()
-                            .is_some_and(|inflight| inflight < quota))
+                            .is_some_and(|inflight| inflight < quota && inflight < max_inflight))
                         .then(|| inflight.checked_add(1))
                         .flatten()
                     });
@@ -648,6 +658,20 @@ impl AccountStore {
             .iter()
             .find(|slot| slot.record.token == token)
             .is_some_and(|slot| has_verified_web_image_capability(&slot.record))
+    }
+
+    pub(super) async fn image_has_eligible_account(
+        &self,
+        excluded_tokens: &HashSet<String>,
+    ) -> bool {
+        if !self.reload().await {
+            return false;
+        }
+        let snapshot = self.snapshot.read().expect("account snapshot lock");
+        snapshot.accounts.iter().any(|slot| {
+            !excluded_tokens.contains(&slot.record.token)
+                && has_verified_web_image_capability(&slot.record)
+        })
     }
 
     /// Persist image quota accounting for the account that owned the lease.
@@ -1396,6 +1420,16 @@ fn merge_import_records_in_place(
                 object.insert("access_token".to_owned(), serde_json::json!(token));
                 if !object.contains_key("status") {
                     object.insert("status".to_owned(), serde_json::json!("正常"));
+                }
+                if !object
+                    .get("created_at")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    object.insert(
+                        "created_at".to_owned(),
+                        serde_json::Value::String(super::current_timestamp()),
+                    );
                 }
             }
             records.push(value);

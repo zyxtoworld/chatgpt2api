@@ -18,10 +18,14 @@ pub(super) async fn serve_state_with_bounded_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    super::management::cleanup_old_images(&state);
     let catalog = state.account_type_catalog.clone();
     let editable_workers = state.editable_workers.clone();
     let storage_backend = state.storage_backend.clone();
     let admission_state = state.clone();
+    let account_watcher = tokio::spawn(super::account_refresh_watcher(state.clone()));
+    let image_cleanup_scheduler = tokio::spawn(super::image_cleanup_scheduler(state.clone()));
+    let backup_scheduler = tokio::spawn(super::backup_scheduler(state.clone()));
     serve_with_bounded_shutdown_and_cleanup(
         listener,
         state.router(),
@@ -30,10 +34,22 @@ where
             admission_state.begin_http_shutdown();
             editable_workers.begin_shutdown();
             catalog.begin_shutdown();
+            account_watcher.abort();
+            image_cleanup_scheduler.abort();
+            backup_scheduler.abort();
             async move {
                 tokio::join!(
                     editable_workers.finish_shutdown(),
                     catalog.finish_shutdown(),
+                    async move {
+                        let _ = account_watcher.await;
+                    },
+                    async move {
+                        let _ = image_cleanup_scheduler.await;
+                    },
+                    async move {
+                        let _ = backup_scheduler.await;
+                    },
                     async move {
                         if let Some(storage_backend) = storage_backend {
                             storage_backend.close().await;

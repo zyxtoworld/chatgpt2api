@@ -374,6 +374,29 @@ fn cleanup_orphaned_image_thumbnails(data_dir: &Path) {
     }
 }
 
+pub(super) fn cleanup_old_images(state: &AppState) {
+    let config = read_config(state);
+    let retention_days = super::settings_u64(config.get("image_retention_days"), 30, 1);
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)))
+        .unwrap_or(UNIX_EPOCH);
+    let root = image_root(state);
+    for path in walk_regular_files(&root) {
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata
+            .modified()
+            .ok()
+            .is_some_and(|modified| modified < cutoff)
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+    remove_empty_image_dirs(&root);
+    cleanup_orphaned_image_thumbnails(state.data_dir.as_ref());
+}
+
 fn is_image_path(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -4257,6 +4280,15 @@ async fn execute_ccload_import(
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or_default();
+    let refresh_errors = refresh_result
+        .get("errors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for error in refresh_errors {
+        push_import_error(&mut errors, error);
+    }
+    let refresh_failed = imported_tokens.len().saturating_sub(refreshed);
     publish_progress(
         ids.len(),
         "refreshing_accounts",
@@ -4265,12 +4297,12 @@ async fn execute_ccload_import(
         added,
         skipped,
         refreshed,
-        fetch_failed,
+        fetch_failed.saturating_add(refresh_failed),
         "running",
         &errors,
     );
 
-    let failed = fetch_failed.min(ids.len());
+    let failed = fetch_failed.saturating_add(refresh_failed).min(ids.len());
     let status = if failed > 0 { "failed" } else { "completed" };
     let mut job = progress_job_with_created(
         &expected_job_id,
@@ -5566,7 +5598,7 @@ fn add_tar_file(
     add_tar_bytes(builder, name, &payload)
 }
 
-async fn build_backup(state: &AppState, key: &str) -> Result<Vec<u8>, ApiError> {
+async fn build_backup(state: &AppState, key: &str, trigger: &str) -> Result<Vec<u8>, ApiError> {
     let settings = backup_raw_settings(state);
     let include = object_or_empty(
         settings
@@ -5577,7 +5609,7 @@ async fn build_backup(state: &AppState, key: &str) -> Result<Vec<u8>, ApiError> 
     let mut metadata = json!({
         "version": 2,
         "created_at": iso_timestamp(SystemTime::now()),
-        "trigger": "manual",
+        "trigger": trigger,
         "app_version": state.config.version,
         "storage_backend": state
             .storage_backend
@@ -5821,11 +5853,7 @@ pub(super) async fn list_backups(
     })))
 }
 
-pub(super) async fn run_backup(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
-    admin_authenticated(&headers, &state).await?;
+async fn run_backup_impl(state: AppState, trigger: &str) -> Result<Value, ApiError> {
     let remote = backup_is_remote(&state);
     let state_path = backup_state_path(&state);
     let owner_gate = super::backup_owner_gate(&state_path);
@@ -5893,7 +5921,7 @@ pub(super) async fn run_backup(
     write_json_unlocked(&state_path, &running_state)?;
     #[cfg(test)]
     backup_test_after_running(&state_path, &key).await;
-    let result = build_backup(&state, &key).await;
+    let result = build_backup(&state, &key, trigger).await;
     match result {
         Ok(payload_raw) => {
             let payload = match if encryption_enabled {
@@ -5936,7 +5964,7 @@ pub(super) async fn run_backup(
                         "encrypted".to_owned(),
                         if encryption_enabled { "true" } else { "false" }.to_owned(),
                     ),
-                    ("trigger".to_owned(), "manual".to_owned()),
+                    ("trigger".to_owned(), trigger.to_owned()),
                 ];
                 match R2Client::from_state(&state) {
                     Ok(client) => client.upload_bytes(&key, &payload, &metadata).await,
@@ -6008,9 +6036,9 @@ pub(super) async fn run_backup(
                 let _ = write_json_unlocked(&state_path, &failure);
                 return Err(error);
             }
-            Ok(Json(
+            Ok(
                 json!({"result": {"key": key, "size": payload.len(), "encrypted": encryption_enabled}}),
-            ))
+            )
         }
         Err(error) => {
             let failure = backup_error_state(
@@ -6024,6 +6052,26 @@ pub(super) async fn run_backup(
             Err(error)
         }
     }
+}
+
+pub(super) async fn run_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    admin_authenticated(&headers, &state).await?;
+    Ok(Json(run_backup_impl(state, "manual").await?))
+}
+
+pub(super) async fn run_scheduled_backup_if_due(state: &AppState) {
+    let settings = backup_raw_settings(state);
+    let current = match backup_state_map(state) {
+        Ok(current) => current,
+        Err(_) => return,
+    };
+    if !backup_schedule_due(&Value::Object(settings), &current, SystemTime::now()) {
+        return;
+    }
+    let _ = run_backup_impl(state.clone(), "schedule").await;
 }
 
 fn content_type(name: &str) -> &'static str {
