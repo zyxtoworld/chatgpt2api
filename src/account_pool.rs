@@ -46,6 +46,7 @@ fn is_request_eligible_record(record: &AccountRecord) -> bool {
 #[derive(Clone, Debug)]
 pub(super) struct AccountRecord {
     pub(super) token: String,
+    pub(super) created_at: String,
     pub(super) status: String,
     pub(super) source_type: String,
     pub(super) chatgpt_account_id: Option<String>,

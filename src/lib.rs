@@ -1443,16 +1443,6 @@ pub(crate) fn canonicalize_account_item(value: &Value) -> Result<Value, AppInitE
         canonical.remove(key);
     }
     canonical.insert("access_token".to_owned(), Value::String(token.to_owned()));
-    let has_created_at = canonical
-        .get("created_at")
-        .is_some_and(|value| match value {
-            Value::Null => false,
-            Value::String(text) => !text.trim().is_empty(),
-            _ => true,
-        });
-    if !has_created_at {
-        canonical.insert("created_at".to_owned(), Value::String(current_timestamp()));
-    }
     canonicalize_account_models(&mut canonical);
     Ok(Value::Object(canonical))
 }
@@ -1618,6 +1608,13 @@ fn parse_account_document_bytes(
         }
         let account_type = normalize_account_type(object.get("type"))?;
         let source_type = normalize_source_type(object.get("source_type"))?;
+        let created_at = object
+            .get("created_at")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(current_timestamp);
         let chatgpt_account_id = optional_bounded_text(
             object
                 .get("chatgpt_account_id")
@@ -1647,6 +1644,7 @@ fn parse_account_document_bytes(
         };
         records.push(AccountRecord {
             token,
+            created_at,
             status,
             source_type,
             chatgpt_account_id,
@@ -2901,6 +2899,10 @@ fn public_account(record: &AccountRecord) -> Value {
         Value::String(record.token.clone()),
     );
     object.insert("status".to_owned(), Value::String(record.status.clone()));
+    object.insert(
+        "created_at".to_owned(),
+        Value::String(record.created_at.clone()),
+    );
     object.insert(
         "type".to_owned(),
         Value::String(record.account_type.clone()),
@@ -30984,12 +30986,11 @@ data: [DONE]
 
     #[test]
     fn account_canonicalization_fills_missing_created_at_like_python() {
-        let canonical = canonicalize_account_item(&json!({
-            "access_token": "account-token",
-            "status": "正常"
-        }))
-        .expect("canonical account");
-        let created_at = canonical["created_at"].as_str().expect("created_at string");
+        let (_, records, _) = parse_account_document_bytes(
+            r#"[{"access_token":"account-token","status":"正常"}]"#.as_bytes(),
+        )
+        .expect("parsed account");
+        let created_at = records[0].created_at.as_str();
         assert_eq!(created_at.len(), 19);
         assert_eq!(&created_at[4..5], "-");
         assert_eq!(&created_at[7..8], "-");
