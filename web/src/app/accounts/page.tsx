@@ -105,6 +105,25 @@ function formatQuota(account: Account) {
   return String(Math.max(0, account.quota));
 }
 
+function formatCreatedAt(value?: string | null) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return "—";
+  }
+  const legacy = raw.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+  if (legacy) {
+    return legacy[1];
+  }
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) {
+    return raw;
+  }
+  const pad = (number: number) => String(number).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(
+    date.getUTCHours(),
+  )}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+}
+
 function formatRestoreAt(value?: string | null) {
   if (!value) {
     return { absolute: "—", relative: "" };
@@ -1030,15 +1049,7 @@ function AccountsPageContent() {
                           <div className="text-xs leading-5 text-stone-500">{account.email ?? "—"}</div>
                         </td>
                         <td className="px-4 py-3 text-xs leading-5 text-stone-500">
-                          {(() => {
-                            const raw = (account as any).created_at;
-                            if (!raw) return "—";
-                            try {
-                              const d = new Date(raw + "Z");
-                              if (isNaN(d.getTime())) return String(raw).slice(0, 10);
-                              return d.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
-                            } catch { return String(raw).slice(0, 10); }
-                          })()}
+                          {formatCreatedAt(account.created_at)}
                         </td>
                         <td className="px-4 py-3">
                           <Badge variant="info" className="rounded-md">
