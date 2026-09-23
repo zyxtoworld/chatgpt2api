@@ -9535,16 +9535,10 @@ fn native_codex_image_body_stream(
     request: &NativeImageRequest,
     action: &str,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
-    native_codex_image_body_stream_with_prompt(request, action, request.prompt.clone())
-}
-
-fn native_codex_image_body_stream_with_prompt(
-    request: &NativeImageRequest,
-    action: &str,
-    prompt: String,
-) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static {
     let mut prefix = b"{\"model\":\"gpt-5.5\",\"instructions\":\"Use the image_generation tool to create exactly one image for the user's request.\",\"store\":false,\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":".to_vec();
-    prefix.extend(serde_json::to_vec(&prompt).expect("validated image prompt must serialize"));
+    prefix.extend(
+        serde_json::to_vec(&request.prompt).expect("validated image prompt must serialize"),
+    );
     prefix.extend_from_slice(b"}");
     if !request.images.is_empty() {
         prefix.push(b',');
@@ -9789,11 +9783,7 @@ async fn native_codex_image_attempt(
         "{}/backend-api/codex/responses",
         base_url.trim_end_matches('/')
     );
-    let body = reqwest::Body::wrap_stream(native_codex_image_body_stream_with_prompt(
-        request,
-        action,
-        native_image_upstream_prompt(state, request),
-    ));
+    let body = reqwest::Body::wrap_stream(native_codex_image_body_stream(request, action));
     let request = codex_request_headers(
         native_browser_headers_with_clearance(
             state.client.post(url),
