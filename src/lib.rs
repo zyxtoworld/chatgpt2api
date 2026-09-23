@@ -12932,6 +12932,7 @@ fn normalize_ai_review(value: Option<&Value>, public: bool) -> Value {
         },
         "model": settings_text(source.get("model"), ""),
         "prompt": settings_text(source.get("prompt"), ""),
+        "fail_open": settings_bool(source.get("fail_open"), true),
     })
 }
 
@@ -13454,6 +13455,7 @@ async fn review_request_content(state: &AppState, value: &Value) -> Result<(), A
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(ApiError::invalid_request)?;
+    let fail_open = settings_bool(review.get("fail_open"), true);
     let mut text = String::new();
     review_text_value(value, &mut text, 0);
     if text.trim().is_empty() {
@@ -13469,7 +13471,7 @@ async fn review_request_content(state: &AppState, value: &Value) -> Result<(), A
         "messages": [{"role":"user","content":format!("{}\n\n用户请求:\n{}\n\n只回答 ALLOW 或 REJECT。", prompt, sanitize_review_text(&text))}],
         "temperature": 0
     });
-    let response = tokio::time::timeout(
+    let response = match tokio::time::timeout(
         Duration::from_secs(60),
         state
             .client
@@ -13480,13 +13482,17 @@ async fn review_request_content(state: &AppState, value: &Value) -> Result<(), A
             .send(),
     )
     .await
-    .map_err(|_| ApiError::content_review_unavailable())?
-    .map_err(|_| ApiError::content_review_unavailable())?;
-    let value: Value = response
-        .json()
-        .await
-        .map_err(|_| ApiError::content_review_unavailable())?;
-    let decision = value
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) | Err(_) if fail_open => return Ok(()),
+        Ok(Err(_)) | Err(_) => return Err(ApiError::content_review_unavailable()),
+    };
+    let value: Value = match response.json().await {
+        Ok(value) => value,
+        Err(_) if fail_open => return Ok(()),
+        Err(_) => return Err(ApiError::content_review_unavailable()),
+    };
+    let Some(decision) = value
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
@@ -13495,7 +13501,13 @@ async fn review_request_content(state: &AppState, value: &Value) -> Result<(), A
         .and_then(Value::as_str)
         .map(str::trim)
         .map(str::to_ascii_lowercase)
-        .ok_or_else(ApiError::content_review_unavailable)?;
+    else {
+        return if fail_open {
+            Ok(())
+        } else {
+            Err(ApiError::content_review_unavailable())
+        };
+    };
     if decision.starts_with("allow")
         || decision.starts_with("pass")
         || decision.starts_with("true")
@@ -13518,7 +13530,11 @@ async fn review_request_content(state: &AppState, value: &Value) -> Result<(), A
     {
         return Err(ApiError::content_policy("AI 审核未通过，拒绝本次任务"));
     }
-    Err(ApiError::content_review_unavailable())
+    if fail_open {
+        Ok(())
+    } else {
+        Err(ApiError::content_review_unavailable())
+    }
 }
 
 fn apply_global_system_prompt_to_chat(state: &AppState, object: &mut Map<String, Value>) {
