@@ -27,6 +27,15 @@ pub enum UpstreamProtocol {
 
 impl AppConfig {
     pub fn from_env() -> Self {
+        let upstream_protocol = match env::var("RUST_UPSTREAM_PROTOCOL")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "chatgpt" | "native" => UpstreamProtocol::ChatGpt,
+            _ => UpstreamProtocol::OpenAi,
+        };
         let config_path = config_path();
         let legacy = read_json_object(&config_path);
         let data_dir = runtime_data_dir();
@@ -56,7 +65,11 @@ impl AppConfig {
             models,
             upstream_base_url: env::var("RUST_UPSTREAM_BASE_URL")
                 .ok()
-                .filter(|value| !value.trim().is_empty()),
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    (upstream_protocol == UpstreamProtocol::ChatGpt)
+                        .then(|| "https://chatgpt.com".to_owned())
+                }),
             upstream_auth: env::var("RUST_UPSTREAM_AUTH")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
@@ -71,15 +84,7 @@ impl AppConfig {
                 &data_dir,
                 "accounts.json",
             ),
-            upstream_protocol: match env::var("RUST_UPSTREAM_PROTOCOL")
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "chatgpt" | "native" => UpstreamProtocol::ChatGpt,
-                _ => UpstreamProtocol::OpenAi,
-            },
+            upstream_protocol,
         }
     }
 }
@@ -260,10 +265,12 @@ fn text_or(value: Option<String>, default: &str) -> String {
 #[derive(Debug)]
 pub enum AppInitError {
     Client(reqwest::Error),
+    MissingAuthKey,
     AuthSnapshot,
     ModelSnapshot,
     AccountSnapshot,
     EditableTaskSnapshot,
+    ImageTaskSnapshot,
     StorageBackend,
 }
 
@@ -271,10 +278,12 @@ impl std::fmt::Display for AppInitError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Client(_) => formatter.write_str("HTTP client initialization failed"),
+            Self::MissingAuthKey => formatter.write_str("authentication key is not configured"),
             Self::AuthSnapshot => formatter.write_str("authentication snapshot is invalid"),
             Self::ModelSnapshot => formatter.write_str("model snapshot is invalid"),
             Self::AccountSnapshot => formatter.write_str("account snapshot is invalid"),
             Self::EditableTaskSnapshot => formatter.write_str("editable task snapshot is invalid"),
+            Self::ImageTaskSnapshot => formatter.write_str("image task snapshot is invalid"),
             Self::StorageBackend => formatter.write_str("storage backend initialization failed"),
         }
     }

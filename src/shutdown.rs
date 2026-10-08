@@ -18,14 +18,25 @@ pub(super) async fn serve_state_with_bounded_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    super::management::recover_backup_state_after_restart(&state);
     super::management::cleanup_old_images(&state);
     let catalog = state.account_type_catalog.clone();
     let editable_workers = state.editable_workers.clone();
     let storage_backend = state.storage_backend.clone();
     let admission_state = state.clone();
-    let account_watcher = tokio::spawn(super::account_refresh_watcher(state.clone()));
-    let image_cleanup_scheduler = tokio::spawn(super::image_cleanup_scheduler(state.clone()));
-    let backup_scheduler = tokio::spawn(super::backup_scheduler(state.clone()));
+    let (scheduler_shutdown_tx, scheduler_shutdown_rx) = tokio::sync::watch::channel(false);
+    let account_watcher = tokio::spawn(super::account_refresh_watcher(
+        state.clone(),
+        scheduler_shutdown_rx.clone(),
+    ));
+    let image_cleanup_scheduler = tokio::spawn(super::image_cleanup_scheduler(
+        state.clone(),
+        scheduler_shutdown_rx.clone(),
+    ));
+    let backup_scheduler = tokio::spawn(super::backup_scheduler(
+        state.clone(),
+        scheduler_shutdown_rx,
+    ));
     serve_with_bounded_shutdown_and_cleanup(
         listener,
         state.router(),
@@ -34,9 +45,7 @@ where
             admission_state.begin_http_shutdown();
             editable_workers.begin_shutdown();
             catalog.begin_shutdown();
-            account_watcher.abort();
-            image_cleanup_scheduler.abort();
-            backup_scheduler.abort();
+            scheduler_shutdown_tx.send_replace(true);
             async move {
                 tokio::join!(
                     editable_workers.finish_shutdown(),

@@ -53,7 +53,7 @@ jobs:
       - name: Rust tests
         env:
           CHATGPT2API_AUTH_KEY: chatgpt2api
-        run: cargo test --workspace --locked --all-targets
+        run: cargo test --workspace --locked --all-targets -- --test-threads=1
 
       - name: Install Rust dependency auditors
         run: |

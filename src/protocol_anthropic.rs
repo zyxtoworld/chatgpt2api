@@ -10,8 +10,11 @@ use std::{
     collections::{BTreeMap, HashMap},
     io,
     pin::Pin,
+    sync::LazyLock,
     time::Instant,
 };
+
+use regex::Regex;
 
 use super::{ApiError, native_message_id, sse_delimiter};
 
@@ -129,325 +132,473 @@ fn citations_from_annotations(annotations: &[&Value], text: &str) -> Result<Vec<
 
 pub(super) fn validate_message_request(payload: Value) -> Result<Map<String, Value>, ApiError> {
     let Value::Object(mut object) = payload else {
-        return Err(ApiError::validation());
+        return Err(ApiError::validation_message(
+            "Input should be a valid dictionary or object to extract fields from",
+        ));
     };
-    const UNSUPPORTED_FIELDS: &[&str] = &[
-        "temperature",
-        "top_p",
-        "top_k",
-        "stop_sequences",
-        "metadata",
-        "thinking",
-        "service_tier",
-        "cache_control",
-    ];
     if object
-        .keys()
-        .any(|key| UNSUPPORTED_FIELDS.contains(&key.as_str()))
+        .get("model")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
     {
-        return Err(ApiError::unsupported_capability());
-    }
-    if object.keys().any(|key| {
-        !matches!(
-            key.as_str(),
-            "model" | "messages" | "system" | "max_tokens" | "stream" | "tools" | "tool_choice"
-        )
-    }) {
-        return Err(ApiError::invalid_request());
+        return Err(ApiError::validation_message(
+            "model: Input should be a valid string",
+        ));
     }
     let model = object
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(ApiError::invalid_request)?
+        .unwrap_or("auto")
         .to_owned();
-    let max_tokens = object
-        .get("max_tokens")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0 && *value <= 1_000_000)
-        .ok_or_else(ApiError::invalid_request)?;
-    let messages = object
-        .get("messages")
-        .and_then(Value::as_array)
-        .filter(|items| !items.is_empty())
-        .ok_or_else(ApiError::invalid_request)?;
-    for message in messages {
-        validate_message(message)?;
-    }
-    if let Some(system) = object.get("system")
-        && !system.is_string()
-        && !(system.is_array()
-            && system
-                .as_array()
-                .is_some_and(|items| items.iter().all(valid_text_block)))
-    {
-        return Err(ApiError::invalid_request());
-    }
-    if let Some(tools) = object.get("tools") {
-        let tools = tools.as_array().ok_or_else(ApiError::invalid_request)?;
-        for tool in tools {
-            let tool = tool.as_object().ok_or_else(ApiError::invalid_request)?;
-            match tool.get("type").and_then(Value::as_str) {
-                Some("web_search_20250305") => {
-                    if tool.keys().any(|key| {
-                        !matches!(
-                            key.as_str(),
-                            "type"
-                                | "name"
-                                | "max_uses"
-                                | "allowed_domains"
-                                | "blocked_domains"
-                                | "user_location"
-                        )
-                    }) || tool.get("name").and_then(Value::as_str) != Some("web_search")
-                    {
-                        return Err(ApiError::invalid_request());
-                    }
-                    if tool.get("max_uses").is_some_and(|value| {
-                        value.as_u64().is_none_or(|uses| uses == 0 || uses > 10)
-                    }) {
-                        return Err(ApiError::invalid_request());
-                    }
-                    if tool.get("max_uses").is_some() {
-                        return Err(ApiError::unsupported_capability());
-                    }
-                    if tool.get("allowed_domains").is_some()
-                        || tool.get("blocked_domains").is_some()
-                        || tool.get("user_location").is_some()
-                    {
-                        return Err(ApiError::unavailable());
-                    }
-                }
-                None | Some("function") => {
-                    if tool
-                        .keys()
-                        .any(|key| !matches!(key.as_str(), "name" | "description" | "input_schema"))
-                        || tool.get("name").and_then(Value::as_str).is_none()
-                        || tool
-                            .get("input_schema")
-                            .and_then(Value::as_object)
-                            .is_none()
-                    {
-                        return Err(ApiError::invalid_request());
-                    }
-                }
-                _ => return Err(ApiError::invalid_request()),
-            }
+    if let Some(messages) = object.get("messages") {
+        if !messages.is_null() && !messages.is_array() {
+            return Err(ApiError::validation_message(
+                "messages: Input should be a valid list",
+            ));
+        }
+        if let Some((index, _)) = messages
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .find(|(_, message)| !message.is_object())
+        {
+            return Err(ApiError::validation_message(format!(
+                "messages.{index}: Input should be a valid dictionary"
+            )));
         }
     }
-    if let Some(choice) = object.get("tool_choice") {
-        validate_tool_choice(choice)?;
-    }
-    if object
-        .get("stream")
-        .is_some_and(|value| !value.is_boolean() && !value.is_null())
-    {
-        return Err(ApiError::validation());
+    if let Some(value) = object.get("stream").filter(|value| !value.is_null()) {
+        let stream = match value {
+            Value::Bool(value) => *value,
+            Value::Number(value) if value.as_i64() == Some(0) => false,
+            Value::Number(value) if value.as_i64() == Some(1) => true,
+            Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "t" | "yes" | "y" | "on" => true,
+                "0" | "false" | "f" | "no" | "n" | "off" => false,
+                _ => {
+                    return Err(ApiError::validation_message(
+                        "stream: Input should be a valid boolean",
+                    ));
+                }
+            },
+            _ => {
+                return Err(ApiError::validation_message(
+                    "stream: Input should be a valid boolean",
+                ));
+            }
+        };
+        object.insert("stream".to_owned(), Value::Bool(stream));
     }
     object.insert("model".to_owned(), Value::String(model));
-    object.insert("max_tokens".to_owned(), Value::Number(max_tokens.into()));
     Ok(object)
 }
 
-fn valid_text_block(value: &Value) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
+fn python_string_repr(value: &str) -> String {
+    let quote = if !value.contains('\'') {
+        '\''
+    } else if !value.contains('"') {
+        '"'
+    } else {
+        '\''
     };
-    object.keys().all(|key| key == "type" || key == "text")
-        && object.get("type").and_then(Value::as_str) == Some("text")
-        && object.get("text").and_then(Value::as_str).is_some()
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push(quote);
+    for character in value.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character == quote => {
+                output.push('\\');
+                output.push(character);
+            }
+            character => output.push(character),
+        }
+    }
+    output.push(quote);
+    output
 }
 
-fn validate_message(value: &Value) -> Result<(), ApiError> {
-    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "role" | "content"))
-    {
-        return Err(ApiError::invalid_request());
+fn python_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".to_owned(),
+        Value::Bool(true) => "True".to_owned(),
+        Value::Bool(false) => "False".to_owned(),
+        Value::Number(value) => super::native_turnstile_json_number(value),
+        Value::String(value) => python_string_repr(value),
+        Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(python_repr).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Object(items) => format!(
+            "{{{}}}",
+            items
+                .iter()
+                .map(|(key, value)| format!("{}: {}", python_string_repr(key), python_repr(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
-    let role = object
-        .get("role")
-        .and_then(Value::as_str)
-        .ok_or_else(ApiError::invalid_request)?;
-    if !matches!(role, "user" | "assistant") {
-        return Err(ApiError::invalid_request());
+}
+
+pub(super) fn python_str(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        value => python_repr(value),
     }
-    let content = object
-        .get("content")
-        .ok_or_else(ApiError::invalid_request)?;
-    match content {
-        Value::String(_) => Ok(()),
+}
+
+pub(super) fn python_text(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null | Value::Bool(false)) => String::new(),
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Bool(true)) => "True".to_owned(),
+        Some(Value::Number(value)) if value.as_f64() == Some(0.0) => String::new(),
+        Some(Value::Array(values)) if values.is_empty() => String::new(),
+        Some(Value::Object(values)) if values.is_empty() => String::new(),
+        Some(value) => python_repr(value),
+    }
+}
+
+fn anthropic_message_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
         Value::Array(items) => {
+            let mut output = String::new();
             for item in items {
-                let item = item.as_object().ok_or_else(ApiError::invalid_request)?;
-                let kind = item
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .ok_or_else(ApiError::invalid_request)?;
-                match kind {
-                    "text" => {
-                        if item
-                            .keys()
-                            .any(|key| !matches!(key.as_str(), "type" | "text" | "citations"))
-                        {
-                            return Err(ApiError::invalid_request());
-                        }
-                        if item.get("text").and_then(Value::as_str).is_none() {
-                            return Err(ApiError::invalid_request());
-                        }
-                        if let Some(citations) = item.get("citations") {
-                            for citation in
-                                citations.as_array().ok_or_else(ApiError::invalid_request)?
-                            {
-                                let citation =
-                                    citation.as_object().ok_or_else(ApiError::invalid_request)?;
-                                if citation.keys().any(|key| {
-                                    !matches!(
-                                        key.as_str(),
-                                        "type" | "url" | "title" | "cited_text" | "encrypted_index"
-                                    )
-                                }) || citation.get("type").and_then(Value::as_str)
-                                    != Some("web_search_result_location")
-                                    || citation.get("url").and_then(Value::as_str).is_none()
-                                    || citation.get("title").and_then(Value::as_str).is_none()
-                                    || citation.get("cited_text").and_then(Value::as_str).is_none()
-                                {
-                                    return Err(ApiError::invalid_request());
-                                }
-                                if let Some(index) = citation.get("encrypted_index") {
-                                    let index =
-                                        index.as_str().ok_or_else(ApiError::invalid_request)?;
-                                    decode_search_opaque(index, "search-index")?;
-                                }
-                            }
-                        }
+                match item {
+                    Value::String(text) => output.push_str(text),
+                    Value::Object(object)
+                        if matches!(
+                            object.get("type").and_then(Value::as_str),
+                            Some("text" | "input_text" | "output_text")
+                        ) =>
+                    {
+                        output.push_str(&python_text(object.get("text")));
                     }
-                    "tool_use" => {
-                        if item
-                            .keys()
-                            .any(|key| !matches!(key.as_str(), "type" | "id" | "name" | "input"))
-                            || role != "assistant"
-                            || item.get("id").and_then(Value::as_str).is_none()
-                            || item.get("name").and_then(Value::as_str).is_none()
-                            || item.get("input").and_then(Value::as_object).is_none()
-                        {
-                            return Err(ApiError::invalid_request());
-                        }
-                    }
-                    "tool_result" => {
-                        if item.keys().any(|key| {
-                            !matches!(
-                                key.as_str(),
-                                "type" | "tool_use_id" | "content" | "is_error"
-                            )
-                        }) || item
-                            .get("is_error")
-                            .is_some_and(|value| !value.is_boolean())
-                            || role != "user"
-                            || item.get("tool_use_id").and_then(Value::as_str).is_none()
-                        {
-                            return Err(ApiError::invalid_request());
-                        }
-                    }
-                    "server_tool_use" => {
-                        if role != "assistant"
-                            || item.keys().any(|key| {
-                                !matches!(key.as_str(), "type" | "id" | "name" | "input")
-                            })
-                            || item.get("id").and_then(Value::as_str).is_none()
-                            || item.get("name").and_then(Value::as_str) != Some("web_search")
-                            || item.get("input").and_then(Value::as_object).is_none()
-                        {
-                            return Err(ApiError::invalid_request());
-                        }
-                    }
-                    "web_search_tool_result" => {
-                        if role != "assistant"
-                            || item.keys().any(|key| {
-                                !matches!(key.as_str(), "type" | "tool_use_id" | "content")
-                            })
-                            || item.get("tool_use_id").and_then(Value::as_str).is_none()
-                            || item.get("content").and_then(Value::as_array).is_none()
-                        {
-                            return Err(ApiError::invalid_request());
-                        }
-                        for result in item
-                            .get("content")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                        {
-                            let result =
-                                result.as_object().ok_or_else(ApiError::invalid_request)?;
-                            if result.keys().any(|key| {
-                                !matches!(
-                                    key.as_str(),
-                                    "type" | "url" | "title" | "encrypted_content" | "page_age"
-                                )
-                            }) || result.get("type").and_then(Value::as_str)
-                                != Some("web_search_result")
-                            {
-                                return Err(ApiError::invalid_request());
-                            }
-                        }
-                    }
-                    "image" => {
-                        if role != "user"
-                            || item
-                                .keys()
-                                .any(|key| !matches!(key.as_str(), "type" | "source"))
-                        {
-                            return Err(ApiError::invalid_request());
-                        }
-                        let source = item
-                            .get("source")
-                            .and_then(Value::as_object)
-                            .ok_or_else(ApiError::invalid_request)?;
-                        if source
-                            .keys()
-                            .any(|key| !matches!(key.as_str(), "type" | "media_type" | "data"))
-                            || source.get("type").and_then(Value::as_str) != Some("base64")
-                            || source.get("media_type").and_then(Value::as_str).is_none()
-                            || source.get("data").and_then(Value::as_str).is_none()
-                        {
-                            return Err(ApiError::invalid_request());
-                        }
-                    }
-                    "image_url" | "input_image" => {
-                        if role != "user" {
-                            return Err(ApiError::invalid_request());
-                        }
-                        if item.keys().any(|key| {
-                            !matches!(
-                                key.as_str(),
-                                "type" | "image_url" | "url" | "source" | "b64_json" | "base64"
-                            )
-                        }) {
-                            return Err(ApiError::invalid_request());
-                        }
-                        let has_reference = item
-                            .get("url")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| !value.trim().is_empty())
-                            || item
-                                .get("image_url")
-                                .and_then(Value::as_str)
-                                .is_some_and(|value| !value.trim().is_empty())
-                            || item.get("source").is_some()
-                            || item.get("b64_json").is_some()
-                            || item.get("base64").is_some();
-                        if !has_reference {
-                            return Err(ApiError::invalid_request());
-                        }
-                    }
-                    _ => return Err(ApiError::invalid_request()),
+                    _ => {}
                 }
             }
-            Ok(())
+            output
         }
-        _ => Err(ApiError::invalid_request()),
+        _ => String::new(),
+    }
+}
+
+fn python_truthy(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null | Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(Value::Number(value)) => value.as_f64().is_some_and(|value| value != 0.0),
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(Value::Array(value)) => !value.is_empty(),
+        Some(Value::Object(value)) => !value.is_empty(),
+    }
+}
+
+fn python_json_dumps(value: &Value) -> String {
+    match value {
+        Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(python_json_dumps)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Object(items) => format!(
+            "{{{}}}",
+            items
+                .iter()
+                .map(|(key, value)| format!(
+                    "{}: {}",
+                    serde_json::to_string(key).expect("JSON string key"),
+                    python_json_dumps(value)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Number(value) => super::native_turnstile_json_number(value),
+        _ => serde_json::to_string(value).expect("JSON value"),
+    }
+}
+
+fn tool_prompt(tools: Option<&Value>, system: Option<&Value>) -> String {
+    static XML_RULE: &str = "Tool output adapter: when calling tools, output ONLY this XML and no prose/markdown:\n<tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM><![CDATA[value]]></PARAM></parameters></tool_call></tool_calls>";
+    static CLAUDE_CODE: &str = "You are Claude Code";
+
+    let has_claude_code_system = match system {
+        Some(Value::String(text)) => text.contains(CLAUDE_CODE),
+        Some(Value::Array(items)) => items.iter().any(|item| {
+            item.as_object().is_some_and(|object| {
+                object
+                    .get("text")
+                    .filter(|value| python_truthy(Some(value)))
+                    .map(python_str)
+                    .is_some_and(|text| text.contains(CLAUDE_CODE))
+            })
+        }),
+        _ => false,
+    };
+    if has_claude_code_system {
+        return XML_RULE.to_owned();
+    }
+
+    let Some(Value::Array(tools)) = tools else {
+        return String::new();
+    };
+    let mut blocks = Vec::new();
+    for tool in tools {
+        let Some(tool) = tool.as_object() else {
+            continue;
+        };
+        let function = tool.get("function").and_then(Value::as_object);
+        let name = tool
+            .get("name")
+            .filter(|value| python_truthy(Some(value)))
+            .or_else(|| {
+                function
+                    .and_then(|function| function.get("name"))
+                    .filter(|value| python_truthy(Some(value)))
+            })
+            .map(python_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let description = tool
+            .get("description")
+            .filter(|value| python_truthy(Some(value)))
+            .or_else(|| {
+                function
+                    .and_then(|function| function.get("description"))
+                    .filter(|value| python_truthy(Some(value)))
+            })
+            .map(python_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let schema = [
+            tool.get("input_schema"),
+            tool.get("parameters"),
+            function.and_then(|function| function.get("input_schema")),
+            function.and_then(|function| function.get("parameters")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|value| python_truthy(Some(value)))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+        blocks.push(format!(
+            "Tool: {name}\nDescription: {description}\nParameters: {}",
+            python_json_dumps(&schema)
+        ));
+    }
+    if blocks.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Available tools:\n{}\n\nTool use rules:\n- If the user asks to list/read/search files, inspect project state, run a command, or answer from local code, you MUST call a suitable tool first. Do not say you cannot access files.\n- To call tools, output ONLY XML and no prose/markdown:\n<tool_calls><tool_call><tool_name>TOOL_NAME</tool_name><parameters><PARAM><![CDATA[value]]></PARAM></parameters></tool_call></tool_calls>\n- Put parameters under <parameters> using the exact schema names.",
+        blocks.join("\n")
+    )
+}
+
+fn compact_system(system: Option<&Value>) -> Value {
+    match system {
+        Some(Value::String(text)) => json!(text),
+        Some(Value::Array(items)) => Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    let Some(object) = item.as_object() else {
+                        return item.clone();
+                    };
+                    if object.get("type").and_then(Value::as_str) != Some("text") {
+                        return item.clone();
+                    }
+                    let mut copied = object.clone();
+                    let text = copied
+                        .get("text")
+                        .filter(|value| python_truthy(Some(value)))
+                        .map(python_str)
+                        .unwrap_or_default();
+                    copied.insert("text".to_owned(), Value::String(text));
+                    Value::Object(copied)
+                })
+                .collect(),
+        ),
+        Some(value) => value.clone(),
+        None => Value::Null,
+    }
+}
+
+fn merged_system(system: Option<&Value>, tools: Option<&Value>) -> Value {
+    let mut system = compact_system(system);
+    let extra = tool_prompt(tools, Some(&system));
+    if extra.is_empty() {
+        return system;
+    }
+    match &mut system {
+        Value::String(text) if !text.trim().is_empty() => {
+            *text = format!("{}\n\n{extra}", text.trim());
+        }
+        Value::Array(items) => items.push(json!({"type":"text","text":extra})),
+        _ => system = Value::String(extra),
+    }
+    system
+}
+
+fn preprocess_message_content(content: &Value) -> Value {
+    let Value::Array(items) = content else {
+        return content.clone();
+    };
+    Value::Array(
+        items
+            .iter()
+            .map(|item| {
+                let Some(block) = item.as_object() else {
+                    return item.clone();
+                };
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let mut copied = block.clone();
+                        let text = copied
+                            .get("text")
+                            .filter(|value| python_truthy(Some(value)))
+                            .map(python_str)
+                            .unwrap_or_default();
+                        copied.insert("text".to_owned(), Value::String(text));
+                        Value::Object(copied)
+                    }
+                    Some("tool_use") => {
+                        let name = block
+                            .get("name")
+                            .filter(|value| python_truthy(Some(value)))
+                            .map(python_str)
+                            .unwrap_or_default();
+                        let input = block
+                            .get("input")
+                            .filter(|value| python_truthy(Some(value)))
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        json!({"type":"text","text":format!("<tool_calls><tool_call><tool_name>{name}</tool_name><parameters>{}</parameters></tool_call></tool_calls>", python_json_dumps(&input))})
+                    }
+                    Some("tool_result") => {
+                        let id = block
+                            .get("tool_use_id")
+                            .filter(|value| python_truthy(Some(value)))
+                            .map(python_str)
+                            .unwrap_or_default();
+                        let content = block
+                            .get("content")
+                            .filter(|value| python_truthy(Some(value)))
+                            .map(python_str)
+                            .unwrap_or_default();
+                        json!({"type":"text","text":format!("Tool result {id}: {content}")})
+                    }
+                    _ => item.clone(),
+                }
+            })
+            .collect(),
+    )
+}
+
+fn nonempty_image_reference(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    value
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            ["url", "image_url"].into_iter().find_map(|key| {
+                value
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        })
+}
+
+fn chat_image_url(block: &Map<String, Value>) -> Option<String> {
+    let block_type = block.get("type").and_then(Value::as_str).map(str::trim)?;
+    if !matches!(block_type, "image" | "image_url" | "input_image") {
+        return None;
+    }
+    if let Some(url) = ["image_url", "url"]
+        .into_iter()
+        .find_map(|key| nonempty_image_reference(block.get(key)))
+    {
+        return Some(url);
+    }
+    if block_type == "image_url" {
+        return None;
+    }
+    let source = block.get("source").and_then(Value::as_object);
+    let source_is_base64 = source
+        .and_then(|source| source.get("type"))
+        .and_then(Value::as_str)
+        == Some("base64");
+    let encoded = ["b64_json", "base64"]
+        .into_iter()
+        .filter_map(|key| block.get(key))
+        .find(|value| python_truthy(Some(value)))
+        .or_else(|| {
+            source
+                .filter(|_| block_type != "image" || source_is_base64)
+                .and_then(|source| source.get("data"))
+                .filter(|value| python_truthy(Some(value)))
+        })
+        .map(python_str)
+        .filter(|value| !value.is_empty())?;
+    let mime = ["media_type", "mime_type"]
+        .into_iter()
+        .filter_map(|key| source.and_then(|source| source.get(key)))
+        .chain(
+            ["media_type", "mime_type", "mimeType"]
+                .into_iter()
+                .filter_map(|key| block.get(key)),
+        )
+        .find(|value| python_truthy(Some(value)))
+        .map(python_str)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| "image/png".to_owned());
+    let mime = if mime == "image/jpg" {
+        "image/jpeg".to_owned()
+    } else {
+        mime
+    };
+    Some(format!("data:{mime};base64,{encoded}"))
+}
+
+fn chat_content(content: &Value, role: &str) -> Value {
+    let Value::Array(items) = content else {
+        return Value::String(anthropic_message_text(content));
+    };
+    let text = anthropic_message_text(content);
+    if role != "user" {
+        return Value::String(text);
+    }
+    let images = items
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(chat_image_url)
+        .map(|url| json!({"type":"image_url","image_url":{"url":url}}))
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        Value::String(text)
+    } else {
+        let mut parts = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
+        if !text.is_empty() {
+            parts.push(json!({"type":"text","text":text}));
+        }
+        parts.extend(images);
+        Value::Array(parts)
     }
 }
 
@@ -563,223 +714,45 @@ fn web_search_replay_text(object: &Map<String, Value>) -> Result<String, ApiErro
     }
 }
 
-fn content_to_openai(content: &Value) -> Result<(Vec<Value>, Vec<Value>), ApiError> {
-    let items = match content {
-        Value::String(text) => vec![json!({"type":"text","text":text})],
-        Value::Array(items) => items.clone(),
-        _ => return Err(ApiError::invalid_request()),
-    };
-    let mut text = Vec::new();
-    let mut tool_calls = Vec::new();
-    for item in items {
-        let object = item.as_object().ok_or_else(ApiError::invalid_request)?;
-        match object.get("type").and_then(Value::as_str) {
-            Some("text") => text.push(json!({"type":"text","text":object.get("text").and_then(Value::as_str).ok_or_else(ApiError::invalid_request)?})),
-            Some("tool_use") => tool_calls.push(json!({
-                "id": object.get("id").and_then(Value::as_str).ok_or_else(ApiError::invalid_request)?,
-                "type": "function",
-                "function": {
-                    "name": object.get("name").and_then(Value::as_str).ok_or_else(ApiError::invalid_request)?,
-                    "arguments": serde_json::to_string(object.get("input").ok_or_else(ApiError::invalid_request)?).map_err(|_| ApiError::invalid_request())?,
-                }
-            })),
-            Some("tool_result") => {
-                let is_error = object
-                    .get("is_error")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let text_value = tool_result_text(object)?;
-                let text_value = if is_error {
-                    format!("tool_error: {text_value}")
-                } else {
-                    text_value
-                };
-                text.push(json!({"type":"text","text":text_value}));
-            }
-            Some("server_tool_use") | Some("web_search_tool_result") => {
-                text.push(json!({
-                    "type":"text",
-                    "text":web_search_replay_text(object)?
-                }));
-            }
-            _ => return Err(ApiError::invalid_request()),
-        }
-    }
-    Ok((text, tool_calls))
-}
-
 pub(super) fn to_chat_payload(object: &Map<String, Value>) -> Result<Value, ApiError> {
     let mut messages = Vec::new();
-    if let Some(system) = object.get("system") {
-        let (content, _) = content_to_openai(system)?;
-        messages.push(json!({"role":"system","content":content}));
+    let system = merged_system(object.get("system"), object.get("tools"));
+    let system_text = anthropic_message_text(&system);
+    if !system_text.is_empty() {
+        messages.push(json!({"role":"system","content":system_text}));
     }
-    for message in object
-        .get("messages")
-        .and_then(Value::as_array)
-        .ok_or_else(ApiError::invalid_request)?
-    {
-        let source = message.as_object().ok_or_else(ApiError::invalid_request)?;
-        let role = source
-            .get("role")
-            .and_then(Value::as_str)
-            .ok_or_else(ApiError::invalid_request)?;
-        if role == "user"
-            && let Some(items) = source.get("content").and_then(Value::as_array)
-        {
-            let mut text_parts = Vec::new();
-            for item in items {
-                let item = item.as_object().ok_or_else(ApiError::invalid_request)?;
-                match item.get("type").and_then(Value::as_str) {
-                    Some("text") => text_parts.push(
-                        item.get("text")
-                            .and_then(Value::as_str)
-                            .ok_or_else(ApiError::invalid_request)?
-                            .to_owned(),
-                    ),
-                    Some("tool_result") => {
-                        if !text_parts.is_empty() {
-                            messages.push(json!({"role":"user","content":text_parts.join("")}));
-                            text_parts.clear();
-                        }
-                        let is_error = item
-                            .get("is_error")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let content = tool_result_text(item)?;
-                        let content = if is_error {
-                            format!("tool_error: {content}")
-                        } else {
-                            content
-                        };
-                        messages.push(json!({
-                            "role":"tool",
-                            "tool_call_id":item.get("tool_use_id").cloned().ok_or_else(ApiError::invalid_request)?,
-                            "content":content,
-                        }));
-                    }
-                    _ => return Err(ApiError::invalid_request()),
-                }
-            }
-            if !text_parts.is_empty() {
-                messages.push(json!({"role":"user","content":text_parts.join("")}));
-            }
-            continue;
-        }
-        let (content, tool_calls) = content_to_openai(
-            source
+    if let Some(source_messages) = object.get("messages").and_then(Value::as_array) {
+        for source in source_messages {
+            let Some(source) = source.as_object() else {
+                continue;
+            };
+            let role = source.get("role").cloned().unwrap_or_else(|| json!("user"));
+            let role_text = match &role {
+                Value::String(value) => value.clone(),
+                value => python_str(value),
+            };
+            let content = source
                 .get("content")
-                .ok_or_else(ApiError::invalid_request)?,
-        )?;
-        let mut converted = json!({"role":role,"content": if content.len() == 1 { content[0].get("text").cloned().unwrap_or(Value::Array(content.clone())) } else { Value::Array(content) }});
-        if !tool_calls.is_empty() {
-            converted["tool_calls"] = Value::Array(tool_calls);
+                .map(preprocess_message_content)
+                .unwrap_or_else(|| json!(""));
+            messages.push(json!({
+                "role":role,
+                "content":chat_content(&content, &role_text),
+            }));
         }
-        messages.push(converted);
     }
-    let mut payload = json!({
+    Ok(json!({
         "model": object.get("model").cloned().ok_or_else(ApiError::invalid_request)?,
         "messages": messages,
-        "max_tokens": object.get("max_tokens").cloned().ok_or_else(ApiError::invalid_request)?,
         "stream": object.get("stream").and_then(Value::as_bool).unwrap_or(false),
-    });
-    if let Some(tools) = object.get("tools") {
-        payload["tools"] = Value::Array(
-            tools
-                .as_array()
-                .ok_or_else(ApiError::invalid_request)?
-                .iter()
-                .map(|tool| {
-                    let tool = tool.as_object().ok_or_else(ApiError::invalid_request)?;
-                    Ok(json!({
-                        "type":"function",
-                        "function": {
-                            "name": tool.get("name").cloned().ok_or_else(ApiError::invalid_request)?,
-                            "description": tool.get("description").cloned().unwrap_or_else(|| json!("")),
-                            "parameters": tool.get("input_schema").cloned().ok_or_else(ApiError::invalid_request)?,
-                        }
-                    }))
-                })
-                .collect::<Result<Vec<_>, ApiError>>()?
-        );
-    }
-    if let Some(choice) = object.get("tool_choice") {
-        payload["tool_choice"] = match choice {
-            Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-                Some("none") => Value::String("none".to_owned()),
-                Some("auto") => Value::String("auto".to_owned()),
-                Some("any") => Value::String("required".to_owned()),
-                Some("tool") => json!({
-                    "type":"function",
-                    "function":{"name":object.get("name").and_then(Value::as_str).ok_or_else(ApiError::invalid_request)?}
-                }),
-                _ => return Err(ApiError::invalid_request()),
-            },
-            _ => return Err(ApiError::invalid_request()),
-        };
-        if choice
-            .get("disable_parallel_tool_use")
-            .and_then(Value::as_bool)
-            .is_some_and(|disabled| disabled)
-        {
-            payload["parallel_tool_calls"] = Value::Bool(false);
-        }
-    }
-    Ok(payload)
-}
-
-fn responses_content_block(item: &Map<String, Value>) -> Result<Vec<Value>, ApiError> {
-    match item.get("type").and_then(Value::as_str) {
-        Some("text") => Ok(vec![json!({
-            "type": "input_text",
-            "text": item.get("text").and_then(Value::as_str).ok_or_else(ApiError::invalid_request)?,
-        })]),
-        Some("image") => {
-            let source = item
-                .get("source")
-                .and_then(Value::as_object)
-                .ok_or_else(ApiError::invalid_request)?;
-            if source.get("type").and_then(Value::as_str) != Some("base64") {
-                return Err(ApiError::invalid_request());
-            }
-            let media_type = source
-                .get("media_type")
-                .and_then(Value::as_str)
-                .ok_or_else(ApiError::invalid_request)?;
-            let data = source
-                .get("data")
-                .and_then(Value::as_str)
-                .ok_or_else(ApiError::invalid_request)?;
-            Ok(vec![json!({
-                "type": "input_image",
-                "image_url": format!("data:{media_type};base64,{data}"),
-            })])
-        }
-        Some("image_url") | Some("input_image") => {
-            let url = item
-                .get("url")
-                .or_else(|| item.get("image_url"))
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .or_else(|| value.get("url").and_then(Value::as_str))
-                })
-                .ok_or_else(ApiError::invalid_request)?;
-            Ok(vec![json!({"type":"input_image","image_url":url})])
-        }
-        Some("server_tool_use") | Some("web_search_tool_result") => Ok(vec![json!({
-            "type":"input_text",
-            "text":web_search_replay_text(item)?
-        })]),
-        _ => Err(ApiError::invalid_request()),
-    }
+    }))
 }
 
 pub(super) fn to_responses_payload(object: &Map<String, Value>) -> Result<Value, ApiError> {
     let mut input = Vec::new();
-    for message in object
-        .get("messages")
-        .and_then(Value::as_array)
+    let chat_payload = to_chat_payload(object)?;
+    for message in chat_payload["messages"]
+        .as_array()
         .ok_or_else(ApiError::invalid_request)?
     {
         let message = message.as_object().ok_or_else(ApiError::invalid_request)?;
@@ -787,6 +760,9 @@ pub(super) fn to_responses_payload(object: &Map<String, Value>) -> Result<Value,
             .get("role")
             .and_then(Value::as_str)
             .ok_or_else(ApiError::invalid_request)?;
+        if role == "system" {
+            continue;
+        }
         let content = message
             .get("content")
             .ok_or_else(ApiError::invalid_request)?;
@@ -797,35 +773,22 @@ pub(super) fn to_responses_payload(object: &Map<String, Value>) -> Result<Value,
                 for item in items {
                     let item = item.as_object().ok_or_else(ApiError::invalid_request)?;
                     match item.get("type").and_then(Value::as_str) {
-                        Some("tool_use") => {
-                            let input_value =
-                                item.get("input").ok_or_else(ApiError::invalid_request)?;
-                            input.push(json!({
-                                "type":"function_call",
-                                "id":item.get("id").cloned().ok_or_else(ApiError::invalid_request)?,
-                                "call_id":item.get("id").cloned().ok_or_else(ApiError::invalid_request)?,
-                                "name":item.get("name").cloned().ok_or_else(ApiError::invalid_request)?,
-                                "arguments":serde_json::to_string(input_value).map_err(|_| ApiError::invalid_request())?,
-                            }));
+                        Some("text") => converted.push(json!({
+                            "type":"input_text",
+                            "text":item.get("text").and_then(Value::as_str).unwrap_or_default(),
+                        })),
+                        Some("image_url") => {
+                            let image_url = item
+                                .get("image_url")
+                                .and_then(|value| {
+                                    value
+                                        .as_str()
+                                        .or_else(|| value.get("url").and_then(Value::as_str))
+                                })
+                                .ok_or_else(ApiError::invalid_request)?;
+                            converted.push(json!({"type":"input_image","image_url":image_url}));
                         }
-                        Some("tool_result") => {
-                            let output = tool_result_text(item)?;
-                            let output = if item
-                                .get("is_error")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false)
-                            {
-                                format!("tool_error: {output}")
-                            } else {
-                                output
-                            };
-                            input.push(json!({
-                                "type":"function_call_output",
-                                "call_id":item.get("tool_use_id").cloned().ok_or_else(ApiError::invalid_request)?,
-                                "output":output,
-                            }));
-                        }
-                        _ => converted.extend(responses_content_block(item)?),
+                        _ => {}
                     }
                 }
                 converted
@@ -836,58 +799,31 @@ pub(super) fn to_responses_payload(object: &Map<String, Value>) -> Result<Value,
             input.push(json!({"type":"message","role":role,"content":items}));
         }
     }
-    if input.is_empty() {
-        return Err(ApiError::invalid_request());
-    }
     let mut payload = json!({
         "model": object.get("model").cloned().ok_or_else(ApiError::invalid_request)?,
         "input": input,
         "stream": object.get("stream").and_then(Value::as_bool).unwrap_or(false),
-        "max_output_tokens": object.get("max_tokens").cloned().ok_or_else(ApiError::invalid_request)?,
     });
-    if let Some(system) = object.get("system") {
-        payload["instructions"] = match system {
-            Value::String(value) => Value::String(value.clone()),
-            Value::Array(items) => Value::String(
-                items
-                    .iter()
-                    .map(|item| item.get("text").and_then(Value::as_str).unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join(""),
-            ),
-            _ => return Err(ApiError::invalid_request()),
-        };
-    }
-    if let Some(tools) = object.get("tools") {
-        let mut converted = Vec::new();
-        for tool in tools.as_array().ok_or_else(ApiError::invalid_request)? {
-            let tool = tool.as_object().ok_or_else(ApiError::invalid_request)?;
-            match tool.get("type").and_then(Value::as_str) {
-                Some("web_search_20250305") => converted.push(json!({
-                    "type":"web_search_preview",
-                    "search_context_size":"medium"
-                })),
-                Some("function") | None => converted.push(json!({
-                    "type":"function",
-                    "name":tool.get("name").cloned().ok_or_else(ApiError::invalid_request)?,
-                    "description":tool.get("description").cloned().unwrap_or_else(|| json!("")),
-                    "parameters":tool.get("input_schema").cloned().ok_or_else(ApiError::invalid_request)?,
-                })),
-                _ => return Err(ApiError::invalid_request()),
-            }
-        }
-        payload["tools"] = Value::Array(converted);
-    }
-    if object
-        .get("tool_choice")
-        .is_some_and(|choice| choice != &json!({"type":"auto"}))
+    if let Some(system) = chat_payload["messages"]
+        .as_array()
+        .and_then(|messages| messages.first())
+        .filter(|message| message["role"] == "system")
+        .and_then(|message| message.get("content"))
     {
-        return Err(ApiError::invalid_request());
+        let instructions = anthropic_message_text(system);
+        if !instructions.is_empty() {
+            payload["instructions"] = Value::String(instructions);
+        }
     }
     Ok(payload)
 }
 
-pub(super) fn from_responses_response(body: &[u8], model: &str) -> Result<Value, ApiError> {
+pub(super) fn from_responses_response(
+    body: &[u8],
+    model: &str,
+    tools_enabled: bool,
+    input_tokens: usize,
+) -> Result<Value, ApiError> {
     let value: Value = serde_json::from_slice(body).map_err(|_| ApiError::upstream())?;
     let output = value
         .get("output")
@@ -962,9 +898,25 @@ pub(super) fn from_responses_response(body: &[u8], model: &str) -> Result<Value,
     }
     let text = content
         .iter()
-        .find_map(|item| (item["type"] == "text").then(|| item["text"].as_str()))
-        .flatten()
-        .unwrap_or_default();
+        .filter(|item| item["type"] == "text")
+        .filter_map(|item| item["text"].as_str())
+        .collect::<String>();
+    if tools_enabled {
+        let (content, stop_reason) = content_blocks(&text, true);
+        return Ok(json!({
+            "id":format!("msg_{}",native_message_id()),
+            "type":"message",
+            "role":"assistant",
+            "model":model,
+            "content":content,
+            "stop_reason":stop_reason,
+            "stop_sequence":null,
+            "usage":{
+                "input_tokens":input_tokens,
+                "output_tokens":model_token_count(model, &text),
+            }
+        }));
+    }
     if !searches.is_empty() {
         let annotations = output
             .iter()
@@ -979,7 +931,7 @@ pub(super) fn from_responses_response(body: &[u8], model: &str) -> Result<Value,
             .collect::<Vec<_>>();
         let mut result_blocks = Vec::new();
         let mut seen_sources = std::collections::HashSet::new();
-        for block in search_result_blocks_from_annotations(&annotations, text)? {
+        for block in search_result_blocks_from_annotations(&annotations, &text)? {
             let key = (
                 block["url"].as_str().unwrap_or_default().to_owned(),
                 block["title"].as_str().unwrap_or_default().to_owned(),
@@ -1019,6 +971,8 @@ pub(super) fn from_responses_response(body: &[u8], model: &str) -> Result<Value,
         "end_turn"
     };
     let mut usage = value.get("usage").cloned().unwrap_or_else(|| json!({}));
+    usage["input_tokens"] = json!(input_tokens);
+    usage["output_tokens"] = json!(model_token_count(model, &text));
     let search_requests = content
         .iter()
         .filter(|item| item["type"] == "server_tool_use")
@@ -1042,7 +996,209 @@ pub(super) fn from_responses_response(body: &[u8], model: &str) -> Result<Value,
     }))
 }
 
-pub(super) fn from_chat_response(body: &[u8], model: &str) -> Result<Value, ApiError> {
+pub(super) fn has_tools(object: &Map<String, Value>) -> bool {
+    object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+}
+
+fn model_token_count(model: &str, text: &str) -> usize {
+    let bpe =
+        tiktoken_rs::bpe_for_model(model).unwrap_or_else(|_| tiktoken_rs::o200k_base_singleton());
+    bpe.count(text, &std::collections::HashSet::new())
+        .unwrap_or_default()
+}
+
+pub(super) fn input_token_count(
+    object: &Map<String, Value>,
+    global_system_prompt: Option<&str>,
+) -> Result<usize, ApiError> {
+    let payload = to_chat_payload(object)?;
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("auto");
+    let messages = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(ApiError::invalid_request)?;
+    let mut total = 0usize;
+    let mut image_tokens = 0usize;
+    if let Some(prompt) = global_system_prompt.filter(|prompt| !prompt.is_empty()) {
+        total = total.saturating_add(3 + model_token_count(model, "system"));
+        total = total.saturating_add(model_token_count(model, prompt));
+    }
+    for message in messages {
+        let Some(message) = message.as_object() else {
+            continue;
+        };
+        total = total.saturating_add(3);
+        if let Some(role) = message.get("role").and_then(Value::as_str) {
+            total = total.saturating_add(model_token_count(model, role));
+        }
+        if let Some(content) = message.get("content") {
+            let text = match content {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => {
+                    if message.get("role").and_then(Value::as_str) == Some("user") {
+                        for part in parts {
+                            let Some(part) = part.as_object() else {
+                                continue;
+                            };
+                            let Some(image_url) = chat_image_url(part) else {
+                                continue;
+                            };
+                            if let Ok((_, _, width, height)) = super::native_image_input(&image_url)
+                            {
+                                image_tokens = image_tokens.saturating_add(
+                                    usize::try_from(super::native_image_patch_tokens(
+                                        width, height, "auto",
+                                    ))
+                                    .unwrap_or(usize::MAX),
+                                );
+                            }
+                        }
+                    }
+                    anthropic_message_text(content)
+                }
+                value if python_truthy(Some(value)) => python_str(value),
+                _ => String::new(),
+            };
+            total = total.saturating_add(model_token_count(model, &text));
+        }
+        if let Some(name) = message.get("name").and_then(Value::as_str) {
+            total = total.saturating_add(model_token_count(model, name) + 1);
+        }
+    }
+    Ok(total.saturating_add(image_tokens).saturating_add(3))
+}
+
+fn decode_html_entities(value: &str) -> String {
+    html_escape::decode_html_entities(value).into_owned()
+}
+
+fn xml_value(text: &str, tag: &str) -> Option<String> {
+    let pattern = Regex::new(&format!(
+        r"(?is)<{}\b[^>]*>(.*?)</{}>",
+        regex::escape(tag),
+        regex::escape(tag)
+    ))
+    .ok()?;
+    let value = pattern.captures(text)?.get(1)?.as_str().trim();
+    let value = if value.starts_with("<![CDATA[") && value.ends_with("]]>") {
+        &value[9..value.len() - 3]
+    } else {
+        value
+    };
+    Some(decode_html_entities(value).trim().to_owned())
+}
+
+fn parse_tool_value(raw: &str) -> Value {
+    let wrapped = format!("<x>{raw}</x>");
+    let value = xml_value(&wrapped, "x").unwrap_or_default();
+    serde_json::from_str(&value).unwrap_or_else(|_| Value::String(value))
+}
+
+fn parse_tool_params(raw: &str) -> Value {
+    if let Ok(Value::Object(value)) = serde_json::from_str::<Value>(raw.trim()) {
+        return Value::Object(value);
+    }
+    static PARAMS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<([\w.-]+)\b[^>]*>(.*?)</([\w.-]+)>").expect("tool parameter regex")
+    });
+    let mut value = Map::new();
+    for captures in PARAMS.captures_iter(raw) {
+        let Some(name) = captures.get(1).map(|value| value.as_str()) else {
+            continue;
+        };
+        if !captures
+            .get(3)
+            .is_some_and(|closing| closing.as_str().eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let Some(raw_value) = captures.get(2).map(|value| value.as_str()) else {
+            continue;
+        };
+        value.insert(name.to_owned(), parse_tool_value(raw_value));
+    }
+    Value::Object(value)
+}
+
+fn parse_tool_calls(text: &str) -> Vec<(String, Value)> {
+    static CODE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)```.*?```").expect("code fence regex"));
+    static CALLS: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?is)<tool_call\b[^>]*>(.*?)</tool_call>|<function_call\b[^>]*>(.*?)</function_call>|<invoke\b[^>]*>(.*?)</invoke>",
+        )
+        .expect("tool call regex")
+    });
+    let text = CODE.replace_all(text, "");
+    let mut calls = Vec::new();
+    for captures in CALLS.captures_iter(text.trim()) {
+        let block = (1..=3)
+            .find_map(|index| captures.get(index).map(|value| value.as_str()))
+            .unwrap_or_default();
+        let name = ["tool_name", "name", "function"]
+            .into_iter()
+            .find_map(|tag| xml_value(block, tag))
+            .filter(|name| !name.is_empty());
+        let Some(name) = name else {
+            continue;
+        };
+        let params = ["parameters", "input", "arguments"]
+            .into_iter()
+            .find_map(|tag| xml_value(block, tag))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "{}".to_owned());
+        calls.push((name, parse_tool_params(&params)));
+    }
+    calls
+}
+
+fn strip_tool_markup(text: &str) -> String {
+    static MARKUP: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<tool_calls\b[^>]*>.*?</tool_calls>|<tool_call\b[^>]*>.*?</tool_call>|<function_call\b[^>]*>.*?</function_call>|<invoke\b[^>]*>.*?</invoke>")
+            .expect("tool markup regex")
+    });
+    MARKUP.replace_all(text, "").trim().to_owned()
+}
+
+fn content_blocks(text: &str, tools_enabled: bool) -> (Vec<Value>, &'static str) {
+    let calls = if tools_enabled {
+        parse_tool_calls(text)
+    } else {
+        Vec::new()
+    };
+    let text = strip_tool_markup(text);
+    let mut content = Vec::new();
+    if calls.is_empty() || !text.is_empty() {
+        content.push(json!({"type":"text","text":text}));
+    }
+    for (name, input) in calls {
+        content.push(json!({
+            "type":"tool_use",
+            "id":format!("toolu_{}",native_message_id()),
+            "name":name,
+            "input":input,
+        }));
+    }
+    let stop_reason = if content.iter().any(|item| item["type"] == "tool_use") {
+        "tool_use"
+    } else {
+        "end_turn"
+    };
+    (content, stop_reason)
+}
+
+pub(super) fn from_chat_response(
+    body: &[u8],
+    model: &str,
+    tools_enabled: bool,
+    input_tokens: usize,
+) -> Result<Value, ApiError> {
     let value: Value = serde_json::from_slice(body).map_err(|_| ApiError::upstream())?;
     let choice = value
         .get("choices")
@@ -1053,52 +1209,14 @@ pub(super) fn from_chat_response(body: &[u8], model: &str) -> Result<Value, ApiE
         .get("message")
         .and_then(Value::as_object)
         .ok_or_else(ApiError::upstream)?;
-    let mut content = Vec::new();
-    if let Some(text) = message.get("content").and_then(Value::as_str) {
-        content.push(json!({"type":"text","text":text}));
-    }
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .cloned()
+    let text = message
+        .get("content")
+        .filter(|value| python_truthy(Some(value)))
+        .map(python_str)
         .unwrap_or_default();
-    for call in &tool_calls {
-        let function = call
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or_else(ApiError::upstream)?;
-        let arguments = function
-            .get("arguments")
-            .and_then(Value::as_str)
-            .ok_or_else(ApiError::upstream)?;
-        let input = serde_json::from_str::<Value>(arguments).map_err(|_| ApiError::upstream())?;
-        if !input.is_object() {
-            return Err(ApiError::upstream());
-        }
-        content.push(json!({"type":"tool_use","id":call.get("id").cloned().ok_or_else(ApiError::upstream)?,"name":function.get("name").cloned().ok_or_else(ApiError::upstream)?,"input":input}));
-    }
-    let finish_reason = choice
-        .get("finish_reason")
-        .and_then(Value::as_str)
-        .ok_or_else(ApiError::upstream)?;
-    if finish_reason == "tool_calls" && tool_calls.is_empty() {
-        return Err(ApiError::upstream());
-    }
-    if !tool_calls.is_empty() && finish_reason != "tool_calls" {
-        return Err(ApiError::upstream());
-    }
-    let stop_reason = match finish_reason {
-        "stop" => "end_turn",
-        "tool_calls" => "tool_use",
-        "length" => "max_tokens",
-        _ => return Err(ApiError::upstream()),
-    };
-    let usage = value
-        .get("usage")
-        .cloned()
-        .unwrap_or_else(|| json!({"prompt_tokens":0,"completion_tokens":0}));
+    let (content, stop_reason) = content_blocks(&text, tools_enabled);
     Ok(
-        json!({"id":format!("msg_{}",native_message_id()),"type":"message","role":"assistant","model":model,"content":content,"stop_reason":stop_reason,"stop_sequence":Value::Null,"usage":{"input_tokens":usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),"output_tokens":usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0)}}),
+        json!({"id":format!("msg_{}",native_message_id()),"type":"message","role":"assistant","model":model,"content":content,"stop_reason":stop_reason,"stop_sequence":Value::Null,"usage":{"input_tokens":input_tokens,"output_tokens":model_token_count(model, &text)}}),
     )
 }
 
@@ -1107,7 +1225,17 @@ pub(super) fn stream_response(
     model: String,
     deadline: Instant,
 ) -> Response {
-    stream_body_response(
+    stream_response_with_options(response, model, deadline, false, 0)
+}
+
+pub(super) fn stream_response_with_options(
+    response: reqwest::Response,
+    model: String,
+    deadline: Instant,
+    tools_enabled: bool,
+    input_tokens: usize,
+) -> Response {
+    stream_body_response_with_options(
         Body::from_stream(
             response
                 .bytes_stream()
@@ -1115,6 +1243,8 @@ pub(super) fn stream_response(
         ),
         model,
         deadline,
+        tools_enabled,
+        input_tokens,
     )
 }
 
@@ -1654,6 +1784,474 @@ pub(super) fn stream_responses_body_response(
     response
 }
 
+struct XmlToolStreamState {
+    input: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>,
+    buffer: Vec<u8>,
+    done: bool,
+    started: bool,
+    terminal_seen: bool,
+    model: String,
+    tools_enabled: bool,
+    input_tokens: usize,
+    created: i64,
+    text_open: bool,
+    streamed_text: String,
+    current_text: String,
+    tool_started: bool,
+}
+
+fn xml_tool_stream_event(output: &mut Vec<u8>, event: &str, value: Value) {
+    output.extend_from_slice(format!("event: {event}\ndata: {value}\n\n").as_bytes());
+}
+
+fn append_xml_tool_message_start(output: &mut Vec<u8>, model: &str, input_tokens: usize) {
+    xml_tool_stream_event(
+        output,
+        "message_start",
+        json!({
+            "type":"message_start",
+            "message":{
+                "id":format!("msg_{}",native_message_id()),
+                "type":"message",
+                "role":"assistant",
+                "model":model,
+                "content":[],
+                "stop_reason":null,
+                "stop_sequence":null,
+                "usage":{"input_tokens":input_tokens,"output_tokens":0}
+            }
+        }),
+    );
+}
+
+fn append_xml_tool_text_start(output: &mut Vec<u8>) {
+    xml_tool_stream_event(
+        output,
+        "content_block_start",
+        json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+    );
+}
+
+fn streamable_tool_text(text: &str) -> &str {
+    static MARKER: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<tool_calls\b|<tool_call\b|<function_call\b|<invoke\b")
+            .expect("stream tool marker regex")
+    });
+    MARKER
+        .find(text)
+        .map_or(text, |matched| &text[..matched.start()])
+        .trim_end()
+}
+
+fn xml_stream_error(
+    state: XmlToolStreamState,
+    message: &'static str,
+) -> (Result<Bytes, io::Error>, XmlToolStreamState) {
+    let mut output = Vec::new();
+    xml_tool_stream_event(
+        &mut output,
+        "error",
+        json!({
+            "type": "error",
+            "error": {"type": "RuntimeError", "message": message},
+        }),
+    );
+    (
+        Ok(Bytes::from(output)),
+        XmlToolStreamState {
+            done: true,
+            ..state
+        },
+    )
+}
+
+pub(super) fn stream_body_response(body: Body, model: String, deadline: Instant) -> Response {
+    stream_body_response_with_options(body, model, deadline, false, 0)
+}
+
+pub(super) fn stream_body_response_with_options(
+    body: Body,
+    model: String,
+    deadline: Instant,
+    tools_enabled: bool,
+    input_tokens: usize,
+) -> Response {
+    type Input = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
+    let input: Input = Box::pin(
+        body.into_data_stream()
+            .map(|result| result.map_err(|error| io::Error::other(error.to_string()))),
+    );
+    let state = XmlToolStreamState {
+        input,
+        buffer: Vec::new(),
+        done: false,
+        started: false,
+        terminal_seen: false,
+        model,
+        tools_enabled,
+        input_tokens,
+        created: super::native_created(),
+        text_open: false,
+        streamed_text: String::new(),
+        current_text: String::new(),
+        tool_started: false,
+    };
+    let stream = stream::unfold(state, move |mut state| async move {
+        if state.done {
+            return None;
+        }
+        if !state.started {
+            let mut output = Vec::new();
+            append_xml_tool_message_start(&mut output, &state.model, state.input_tokens);
+            state.started = true;
+            if !state.tools_enabled {
+                append_xml_tool_text_start(&mut output);
+                state.text_open = true;
+            }
+            return Some((Ok(Bytes::from(output)), state));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Some(xml_stream_error(state, "Anthropic stream timed out"));
+        }
+        let chunk = match tokio::time::timeout(remaining, state.input.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(_))) | Err(_) => {
+                return Some(xml_stream_error(state, "Anthropic stream failed"));
+            }
+            Ok(None) if state.terminal_seen => return None,
+            Ok(None) => {
+                state.buffer.extend_from_slice(
+                    br#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n"#,
+                );
+                Bytes::new()
+            }
+        };
+        state.buffer.extend_from_slice(&chunk);
+        let mut output = Vec::new();
+        while let Some((position, delimiter)) = sse_delimiter(&state.buffer) {
+            let event = state.buffer.drain(..position).collect::<Vec<_>>();
+            state.buffer.drain(..delimiter);
+            let Some(data) = event.strip_prefix(b"data: ") else {
+                continue;
+            };
+            if data == b"[DONE]" {
+                xml_tool_stream_event(
+                    &mut output,
+                    "message_stop",
+                    json!({"type":"message_stop","created":state.created}),
+                );
+                state.done = true;
+                break;
+            }
+            let value: Value = match serde_json::from_slice(data) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Some(xml_stream_error(
+                        state,
+                        "Anthropic stream contained malformed JSON",
+                    ));
+                }
+            };
+            let delta = value.pointer("/choices/0/delta");
+            if let Some(text) = delta
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                state.current_text.push_str(text);
+                if !state.tool_started {
+                    let visible = if state.tools_enabled {
+                        streamable_tool_text(&state.current_text)
+                    } else {
+                        &state.current_text
+                    };
+                    if visible.starts_with(&state.streamed_text) {
+                        let next = &visible[state.streamed_text.len()..];
+                        if !next.is_empty() {
+                            if !state.text_open {
+                                append_xml_tool_text_start(&mut output);
+                                state.text_open = true;
+                            }
+                            xml_tool_stream_event(
+                                &mut output,
+                                "content_block_delta",
+                                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":next}}),
+                            );
+                            state.streamed_text = visible.to_owned();
+                        }
+                    }
+                    state.tool_started = state.tools_enabled && visible != state.current_text;
+                }
+            }
+            if value
+                .pointer("/choices/0/finish_reason")
+                .is_some_and(|value| python_truthy(Some(value)))
+            {
+                let (content, stop_reason) =
+                    content_blocks(&state.current_text, state.tools_enabled);
+                let had_text_block = state.text_open;
+                if had_text_block {
+                    xml_tool_stream_event(
+                        &mut output,
+                        "content_block_stop",
+                        json!({"type":"content_block_stop","index":0}),
+                    );
+                }
+                if stop_reason == "tool_use" {
+                    let mut blocks = content;
+                    let mut start_index = usize::from(had_text_block);
+                    if blocks.first().is_some_and(|item| item["type"] == "text") {
+                        let text = blocks[0]["text"].as_str().unwrap_or_default();
+                        let remaining = text.strip_prefix(&state.streamed_text).unwrap_or(text);
+                        if !remaining.is_empty() {
+                            if !had_text_block {
+                                append_xml_tool_text_start(&mut output);
+                            }
+                            xml_tool_stream_event(
+                                &mut output,
+                                "content_block_delta",
+                                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":remaining}}),
+                            );
+                            if !had_text_block {
+                                xml_tool_stream_event(
+                                    &mut output,
+                                    "content_block_stop",
+                                    json!({"type":"content_block_stop","index":0}),
+                                );
+                            }
+                        }
+                        start_index = 1;
+                        blocks.remove(0);
+                    }
+                    for (offset, block) in blocks.iter().enumerate() {
+                        let index = start_index + offset;
+                        xml_tool_stream_event(
+                            &mut output,
+                            "content_block_start",
+                            json!({
+                                "type":"content_block_start",
+                                "index":index,
+                                "content_block":{
+                                    "type":"tool_use",
+                                    "id":block["id"],
+                                    "name":block["name"],
+                                    "input":{}
+                                }
+                            }),
+                        );
+                        xml_tool_stream_event(
+                            &mut output,
+                            "content_block_delta",
+                            json!({
+                                "type":"content_block_delta",
+                                "index":index,
+                                "delta":{
+                                    "type":"input_json_delta",
+                                    "partial_json":python_json_dumps(&block["input"])
+                                }
+                            }),
+                        );
+                        xml_tool_stream_event(
+                            &mut output,
+                            "content_block_stop",
+                            json!({"type":"content_block_stop","index":index}),
+                        );
+                    }
+                }
+                xml_tool_stream_event(
+                    &mut output,
+                    "message_delta",
+                    json!({
+                        "type":"message_delta",
+                        "delta":{"stop_reason":stop_reason,"stop_sequence":null},
+                        "usage":{"output_tokens":model_token_count(&state.model, &state.current_text)}
+                    }),
+                );
+                xml_tool_stream_event(
+                    &mut output,
+                    "message_stop",
+                    json!({"type":"message_stop","created":state.created}),
+                );
+                state.terminal_seen = true;
+                state.done = true;
+                break;
+            }
+        }
+        if output.is_empty() && state.done {
+            return None;
+        }
+        Some((Ok(Bytes::from(output)), state))
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+
+struct ResponsesXmlToolStreamState {
+    input: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>,
+    buffer: Vec<u8>,
+    done: bool,
+    text_seen: bool,
+}
+
+fn chat_stream_chunk(text: Option<&str>, finish: bool) -> String {
+    let delta = text.map_or_else(|| json!({}), |text| json!({"content":text}));
+    let finish_reason = finish.then_some("stop");
+    format!(
+        "data: {}\n\n",
+        json!({"choices":[{"delta":delta,"finish_reason":finish_reason}]})
+    )
+}
+
+fn responses_final_text(response: &Value) -> String {
+    response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .flat_map(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("output_text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect()
+}
+
+fn responses_text_as_chat_stream(body: Body, deadline: Instant) -> Body {
+    let input = Box::pin(
+        body.into_data_stream()
+            .map(|result| result.map_err(|error| io::Error::other(error.to_string()))),
+    );
+    let state = ResponsesXmlToolStreamState {
+        input,
+        buffer: Vec::new(),
+        done: false,
+        text_seen: false,
+    };
+    let stream = stream::unfold(state, move |mut state| async move {
+        if state.done {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            state.done = true;
+            return Some((Err(io::Error::other("Responses stream timed out")), state));
+        }
+        let chunk = match tokio::time::timeout(remaining, state.input.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(_))) | Err(_) => {
+                state.done = true;
+                return Some((Err(io::Error::other("Responses stream failed")), state));
+            }
+            Ok(None) => {
+                state.done = true;
+                return Some((Err(io::Error::other("Responses stream ended early")), state));
+            }
+        };
+        state.buffer.extend_from_slice(&chunk);
+        let mut output = String::new();
+        while let Some((position, delimiter)) = sse_delimiter(&state.buffer) {
+            let event = state.buffer.drain(..position).collect::<Vec<_>>();
+            state.buffer.drain(..delimiter);
+            let Some(data) = event.strip_prefix(b"data: ") else {
+                continue;
+            };
+            if data == b"[DONE]" {
+                if state.done {
+                    break;
+                }
+                state.done = true;
+                return Some((Err(io::Error::other("Responses stream ended early")), state));
+            }
+            let value: Value = match serde_json::from_slice(data) {
+                Ok(value) => value,
+                Err(_) => {
+                    state.done = true;
+                    return Some((
+                        Err(io::Error::other("Responses stream JSON is invalid")),
+                        state,
+                    ));
+                }
+            };
+            match value.get("type").and_then(Value::as_str) {
+                Some("response.output_text.delta") => {
+                    if let Some(delta) = value.get("delta").and_then(Value::as_str)
+                        && !delta.is_empty()
+                    {
+                        output.push_str(&chat_stream_chunk(Some(delta), false));
+                        state.text_seen = true;
+                    }
+                }
+                Some("response.completed") => {
+                    let response = value.get("response").unwrap_or(&value);
+                    if !state.text_seen {
+                        let text = responses_final_text(response);
+                        if !text.is_empty() {
+                            output.push_str(&chat_stream_chunk(Some(&text), false));
+                        }
+                    }
+                    output.push_str(&chat_stream_chunk(None, true));
+                    output.push_str("data: [DONE]\n\n");
+                    state.done = true;
+                    break;
+                }
+                Some("response.failed" | "response.incomplete") => {
+                    state.done = true;
+                    return Some((Err(io::Error::other("Responses stream failed")), state));
+                }
+                _ => {}
+            }
+        }
+        if output.is_empty() && state.done {
+            return None;
+        }
+        Some((Ok(Bytes::from(output)), state))
+    });
+    Body::from_stream(stream)
+}
+
+pub(super) fn stream_responses_xml_tools_body_response(
+    body: Body,
+    model: String,
+    deadline: Instant,
+    input_tokens: usize,
+) -> Response {
+    stream_body_response_with_options(
+        responses_text_as_chat_stream(body, deadline),
+        model,
+        deadline,
+        true,
+        input_tokens,
+    )
+}
+
+pub(super) fn stream_responses_xml_tools_response(
+    response: reqwest::Response,
+    model: String,
+    deadline: Instant,
+    input_tokens: usize,
+) -> Response {
+    stream_responses_xml_tools_body_response(
+        Body::from_stream(
+            response
+                .bytes_stream()
+                .map(|result| result.map_err(|error| io::Error::other(error.to_string()))),
+        ),
+        model,
+        deadline,
+        input_tokens,
+    )
+}
+
 pub(super) fn anthropic_stream_responses_response(
     response: reqwest::Response,
     model: String,
@@ -1693,7 +2291,8 @@ fn append_message_start(output: &mut Vec<u8>, model: &str) {
     );
 }
 
-pub(super) fn stream_body_response(body: Body, model: String, deadline: Instant) -> Response {
+#[allow(dead_code)]
+fn stream_body_response_legacy(body: Body, model: String, deadline: Instant) -> Response {
     type Input = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
     let input: Input = Box::pin(
         body.into_data_stream()

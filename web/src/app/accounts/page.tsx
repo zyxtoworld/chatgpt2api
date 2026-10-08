@@ -106,22 +106,25 @@ function formatQuota(account: Account) {
 }
 
 function formatCreatedAt(value?: string | null) {
-  const raw = String(value || "").trim();
+  const raw = String(value || "");
   if (!raw) {
     return "—";
   }
-  const legacy = raw.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
-  if (legacy) {
-    return legacy[1];
+  try {
+    const hasTimezone = /(?:z|[+-]\d{2}:?\d{2})$/i.test(raw);
+    const date = new Date(hasTimezone ? raw : `${raw}Z`);
+    if (Number.isNaN(date.getTime())) {
+      return raw.slice(0, 10);
+    }
+    return date.toLocaleDateString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return raw.slice(0, 10);
   }
-  const date = new Date(raw);
-  if (Number.isNaN(date.getTime())) {
-    return raw;
-  }
-  const pad = (number: number) => String(number).padStart(2, "0");
-  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(
-    date.getUTCHours(),
-  )}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
 }
 
 function formatRestoreAt(value?: string | null) {

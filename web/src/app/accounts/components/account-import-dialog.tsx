@@ -70,7 +70,8 @@ function splitTokens(value: string) {
 }
 
 function getSessionAccessToken(value: unknown) {
-  const token = (value as { access_token?: unknown })?.access_token;
+  const raw = value as { access_token?: unknown; accessToken?: unknown };
+  const token = raw?.access_token ?? raw?.accessToken;
   return typeof token === "string" ? token.trim() : "";
 }
 

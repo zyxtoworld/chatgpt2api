@@ -24,6 +24,10 @@ impl ApiError {
         self.code
     }
 
+    pub(super) fn message(&self) -> &str {
+        self.message.as_ref()
+    }
+
     pub(super) fn detail_status(&self) -> Option<u16> {
         self.detail_status
     }
@@ -86,15 +90,73 @@ impl ApiError {
             detail_status: None,
         }
     }
+    pub(super) fn invalid_request_message(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "bad_request",
+            message: Cow::Owned(message.into()),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
 
     pub(super) fn content_policy(message: &'static str) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             kind: "invalid_request_error",
-            code: "content_policy_violation",
+            code: "bad_request",
             message: Cow::Borrowed(message),
             retry_after: None,
             python_detail: false,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn image_content_policy(message: String) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "content_policy_violation",
+            message: Cow::Owned(message),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+    pub(super) fn image_message(message: String) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "image_message",
+            message: Cow::Owned(message),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn management_bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code,
+            message: Cow::Owned(message.into()),
+            retry_after: None,
+            python_detail: true,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn management_not_found(message: &'static str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            kind: "invalid_request_error",
+            code: "not_found",
+            message: Cow::Borrowed(message),
+            retry_after: None,
+            python_detail: true,
             detail_status: None,
         }
     }
@@ -103,8 +165,20 @@ impl ApiError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             kind: "server_error",
-            code: "content_review_unavailable",
+            code: "upstream_error",
             message: Cow::Borrowed("AI 审核服务暂时不可用，请稍后重试"),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn content_review_config_incomplete() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "bad_request",
+            message: Cow::Borrowed("ai review config is incomplete"),
             retry_after: None,
             python_detail: false,
             detail_status: None,
@@ -191,12 +265,81 @@ impl ApiError {
             detail_status: None,
         }
     }
+
+    pub(super) fn validation_message(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            kind: "invalid_request_error",
+            code: "bad_request",
+            message: Cow::Owned(message.into()),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
     pub(super) fn upstream() -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
             kind: "server_error",
             code: "upstream_error",
             message: Cow::Borrowed(PUBLIC_SERVER_ERROR),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn upstream_detail(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            kind: "server_error",
+            code: "upstream_error",
+            message: Cow::Owned(message.into()),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn image_poll_timeout() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            kind: "server_error",
+            code: "image_poll_timeout",
+            message: Cow::Borrowed("Image generation timed out. Please try again later."),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn upstream_text_reply_message(message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            kind: "server_error",
+            code: "upstream_text_reply",
+            message: Cow::Owned(if message.trim().is_empty() {
+                "Image generation failed: the upstream model returned a text description instead of generating an image. Please try again later.".to_owned()
+            } else {
+                message
+            }),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
+
+    pub(super) fn upstream_text_reply() -> Self {
+        Self::upstream_text_reply_message(String::new())
+    }
+
+    pub(super) fn image_quota_exhausted() -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            kind: "insufficient_quota",
+            code: "insufficient_quota",
+            message: Cow::Borrowed("no available image quota"),
             retry_after: None,
             python_detail: false,
             detail_status: None,
@@ -314,11 +457,18 @@ impl ApiError {
     }
 
     pub(super) fn into_anthropic_response(self) -> Response {
+        let error_type = if self.status.is_server_error() {
+            "api_error"
+        } else if self.status == StatusCode::TOO_MANY_REQUESTS {
+            "rate_limit_error"
+        } else {
+            self.kind
+        };
         let mut response = (
             self.status,
             Json(json!({
                 "type": "error",
-                "error": {"type": self.kind, "message": self.message, "code": self.code}
+                "error": {"type": error_type, "message": self.message}
             })),
         )
             .into_response();

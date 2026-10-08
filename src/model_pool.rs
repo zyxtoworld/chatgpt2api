@@ -484,6 +484,10 @@ pub(super) fn project_remote_model_list_with_provenance(
         if model.provenance == ModelProvenance::Web && is_web_image_model_id(&model.id) {
             model.provenance = ModelProvenance::Image;
         }
+        model.allow_anonymous = allow_anonymous;
+        model.supported_account_types = account_type
+            .map(|value| vec![value.to_owned()])
+            .unwrap_or_default();
         if let Some(index) = indexes.get(&model.id).copied() {
             if model_provenance_rank(model.provenance)
                 > model_provenance_rank(models[index].provenance)
@@ -493,10 +497,6 @@ pub(super) fn project_remote_model_list_with_provenance(
             continue;
         }
         indexes.insert(model.id.clone(), models.len());
-        model.allow_anonymous = allow_anonymous;
-        model.supported_account_types = account_type
-            .map(|value| vec![value.to_owned()])
-            .unwrap_or_default();
         models.push(model);
     }
     (!models.is_empty()).then_some(models)

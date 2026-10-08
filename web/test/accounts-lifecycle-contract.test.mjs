@@ -7,6 +7,22 @@ import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
 const sourcePath = fileURLToPath(new URL("../src/app/accounts/page.tsx", import.meta.url));
 const importDialogPath = fileURLToPath(new URL("../src/app/accounts/components/account-import-dialog.tsx", import.meta.url));
 
+test("account creation timestamps follow the v1.7 local display contract", () => {
+  const text = readFileSync(sourcePath, "utf8");
+  const start = text.indexOf("function formatCreatedAt(");
+  const end = text.indexOf("\nfunction formatRestoreAt(", start);
+  const body = text.slice(start, end);
+
+  assert.ok(start >= 0, "formatCreatedAt must remain a named helper");
+  assert.match(body, /hasTimezone/);
+  assert.match(body, /new Date\(hasTimezone \? raw : `\$\{raw\}Z`\)/);
+  assert.match(body, /toLocaleDateString\("zh-CN"/);
+  for (const field of ["month", "day", "hour", "minute"]) {
+    assert.match(body, new RegExp(`${field}: "2-digit"`));
+  }
+  assert.match(body, /return raw\.slice\(0, 10\)/);
+});
+
 test("accounts initial loads belong to the current setup and cancel on cleanup", () => {
   const text = readFileSync(sourcePath, "utf8");
   assert.match(text, /scheduleOwnedMicrotask/);

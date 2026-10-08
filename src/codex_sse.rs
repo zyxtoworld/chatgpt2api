@@ -1199,6 +1199,13 @@ pub(super) fn validate_codex_response_event(value: &Value) -> Result<&str, io::E
     Ok(event_type)
 }
 
+pub(super) fn codex_response_event_is_known(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| response_event_rule(event_type).is_some())
+}
+
 const PUBLIC_EVENT_FIELDS: &[&str] = &[
     "type",
     "sequence_number",

@@ -17,13 +17,13 @@ test("account progress API forwards the caller signal to httpRequest", async () 
     compilerOptions: { module: typescript.ModuleKind.CommonJS, target: typescript.ScriptTarget.ES2022 },
   }).outputText;
   const calls = [];
-  const module = { exports: {} };
+  const commonJsModule = { exports: {} };
   const context = {
     AbortSignal,
     console,
     encodeURIComponent,
-    exports: module.exports,
-    module,
+    exports: commonJsModule.exports,
+    module: commonJsModule,
     httpRequest: async (url, options) => {
       calls.push({ url, options });
       return {};
@@ -34,11 +34,11 @@ test("account progress API forwards the caller signal to httpRequest", async () 
   vm.runInNewContext(output, context, { filename: "api.ts" });
 
   const signal = new AbortController().signal;
-  await module.exports.fetchRefreshProgress("refresh-id", signal);
+  await commonJsModule.exports.fetchRefreshProgress("refresh-id", signal);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, "/api/accounts/refresh/progress/refresh-id");
   assert.equal(calls[0].options.signal, signal);
-  assert.equal(typeof module.exports.fetchReLoginProgress, "undefined");
+  assert.equal(typeof commonJsModule.exports.fetchReLoginProgress, "undefined");
 });
 
 test("all serial poll callers retain an owned abort path", () => {

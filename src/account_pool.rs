@@ -5,7 +5,6 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -16,8 +15,8 @@ use file_identity::FileVersion;
 
 use super::model_pool::WEB_IMAGE_MODELS;
 use super::{
-    AccountRevisionDecision, ApiError, AppInitError, HealthSnapshotSync, account_revision_decision,
-    read_account_snapshot,
+    AccountRevisionDecision, ApiError, AppInitError, HealthSnapshotSync, NativeRequestContext,
+    account_revision_decision, read_account_snapshot,
     storage::{StorageBackend, StorageError, StorageSnapshot},
     validated_file_version,
 };
@@ -30,17 +29,25 @@ static USAGE_MARK_FAILURES: AtomicUsize = AtomicUsize::new(0);
 pub(super) type AccountModelGroup = String;
 
 fn is_request_eligible_status(status: &str) -> bool {
-    !matches!(status, "禁用" | "限流" | "异常")
+    !matches!(status, "禁用" | "异常")
 }
 
 fn is_request_eligible_record(record: &AccountRecord) -> bool {
     is_request_eligible_status(record.status.as_str())
-        && record
-            .raw
-            .get("invalid_count")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or_default()
-            == 0
+}
+
+fn is_codex_image_account_eligible(
+    record: &AccountRecord,
+    allowed_groups: Option<&HashSet<AccountModelGroup>>,
+) -> bool {
+    is_image_account_available(record)
+        && record.source_type == "codex"
+        && allowed_groups.is_none_or(|groups| groups.contains(&record.account_type))
+}
+
+fn is_image_account_available(record: &AccountRecord) -> bool {
+    !matches!(record.status.as_str(), "禁用" | "限流" | "异常")
+        && image_quota(record.raw.get("quota")).is_some()
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +67,7 @@ pub(super) struct CatalogAccountCandidate {
     pub(super) token: String,
     pub(super) source_type: String,
     pub(super) chatgpt_account_id: Option<String>,
+    pub(super) proxy_url: Option<String>,
 }
 
 pub(super) struct AccountSlot {
@@ -90,8 +98,8 @@ pub(super) struct AccountHealthStats {
     pub(super) abnormal: u64,
     pub(super) disabled: u64,
     pub(super) total_quota: u64,
-    pub(super) total_success: u64,
-    pub(super) total_fail: u64,
+    pub(super) total_success: i64,
+    pub(super) total_fail: i64,
     pub(super) by_type: BTreeMap<String, u64>,
 }
 
@@ -106,9 +114,10 @@ impl AccountHealthStats {
             match record.status.as_str() {
                 "正常" => {
                     health.active = health.active.saturating_add(1);
-                    health.total_quota = health
-                        .total_quota
-                        .saturating_add(account_counter(record.raw.get("quota")));
+                    health.total_quota = health.total_quota.saturating_add(
+                        u64::try_from(account_counter(record.raw.get("quota")).max(0))
+                            .unwrap_or_default(),
+                    );
                 }
                 "限流" => health.limited = health.limited.saturating_add(1),
                 "异常" => health.abnormal = health.abnormal.saturating_add(1),
@@ -121,39 +130,53 @@ impl AccountHealthStats {
             health.total_fail = health
                 .total_fail
                 .saturating_add(account_counter(record.raw.get("fail")));
-            let account_type = match record.account_type.as_str() {
-                "free" | "Plus" | "Pro" | "ProLite" | "Team" | "Enterprise" => {
-                    record.account_type.as_str()
-                }
-                _ => "other",
-            };
-            let count = health.by_type.entry(account_type.to_owned()).or_default();
+            let account_type = record
+                .raw
+                .get("type")
+                .filter(|value| account_value_truthy(Some(value)))
+                .map(python_account_value_string)
+                .unwrap_or_else(|| "free".to_owned());
+            let count = health.by_type.entry(account_type).or_default();
             *count = count.saturating_add(1);
         }
         health
     }
 }
 
-fn account_counter(value: Option<&serde_json::Value>) -> u64 {
+fn account_counter(value: Option<&serde_json::Value>) -> i64 {
     value
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| {
-            value
-                .and_then(serde_json::Value::as_i64)
-                .filter(|value| *value >= 0)
-                .map(|value| value as u64)
-        })
+        .and_then(super::python_integer_value)
+        .unwrap_or_default()
+}
+
+pub(super) fn account_value_truthy(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::Number(value)) => value.as_f64().is_some_and(|value| value != 0.0),
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(serde_json::Value::Array(value)) => !value.is_empty(),
+        Some(serde_json::Value::Object(value)) => !value.is_empty(),
+    }
+}
+
+pub(super) fn account_invalid_count(value: Option<&serde_json::Value>) -> i64 {
+    value
+        .and_then(super::python_integer_value)
         .unwrap_or_default()
 }
 
 fn image_quota(value: Option<&serde_json::Value>) -> Option<u64> {
-    match value {
-        Some(serde_json::Value::Number(number)) => number.as_u64().filter(|quota| *quota > 0),
-        Some(serde_json::Value::String(text)) => {
-            text.trim().parse::<u64>().ok().filter(|quota| *quota > 0)
-        }
-        _ => None,
-    }
+    let value = value?;
+    let quota = match value {
+        serde_json::Value::Bool(value) => i64::from(*value),
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value.trunc() as i64))?,
+        serde_json::Value::String(text) => text.trim().parse::<i64>().ok()?,
+        _ => return None,
+    };
+    u64::try_from(quota).ok().filter(|quota| *quota > 0)
 }
 
 fn has_verified_web_image_capability(record: &AccountRecord) -> bool {
@@ -180,6 +203,13 @@ pub(super) struct AccountLease {
     image: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ImageResultUpdate {
+    Updated,
+    RemovedRateLimited,
+    NotFound,
+}
+
 impl AccountLease {
     fn new(slot: Arc<AccountSlot>, image: bool) -> Self {
         Self { slot, image }
@@ -197,6 +227,16 @@ impl AccountLease {
         &self.slot.record.account_type
     }
 
+    pub(super) fn email(&self) -> Option<&str> {
+        self.slot
+            .record
+            .raw
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
     pub(super) fn chatgpt_account_id(&self) -> Option<&str> {
         self.slot.record.chatgpt_account_id.as_deref()
     }
@@ -209,6 +249,12 @@ impl AccountLease {
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
+    }
+    pub(super) fn native_request_context(&self) -> NativeRequestContext {
+        NativeRequestContext::for_account(&self.slot.record.raw)
+    }
+    pub(super) fn tls_emulation(&self) -> wreq_util::Profile {
+        self.native_request_context().tls_emulation()
     }
 }
 
@@ -241,7 +287,7 @@ impl AccountStore {
         let (records, fingerprint, file_version, cumulative_total) = if let Some(path) = path {
             let (value, records, fingerprint, file_version) = super::read_account_document(path)?;
             let canonical = super::canonicalize_account_document_value(&value)?;
-            if canonical != value {
+            if canonical != value && super::account_snapshot_requires_rewrite(&value, &canonical) {
                 let bytes =
                     serde_json::to_vec(&canonical).map_err(|_| AppInitError::AccountSnapshot)?;
                 super::atomic_replace_checked_with_limit(
@@ -599,6 +645,41 @@ impl AccountStore {
         .await
     }
 
+    pub(super) async fn acquire_least_recently_used_with_types(
+        &self,
+        allowed_groups: &HashSet<AccountModelGroup>,
+    ) -> Option<AccountLease> {
+        if !self.reload().await {
+            return None;
+        }
+        let snapshot = self.snapshot.read().expect("account snapshot lock");
+        if !snapshot.valid {
+            return None;
+        }
+        let mut candidates = snapshot
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| {
+                is_request_eligible_record(&slot.record)
+                    && allowed_groups.contains(&slot.record.account_type)
+            })
+            .map(|(index, slot)| {
+                let last_used_at = slot
+                    .last_used_at
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+                    .unwrap_or_default();
+                (last_used_at, index, slot.clone())
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let slot = candidates.into_iter().next()?.2;
+        slot.inflight.fetch_add(1, Ordering::AcqRel);
+        Some(AccountLease::new(slot, false))
+    }
+
     pub(super) async fn acquire_image_lease(
         &self,
         excluded_tokens: &HashSet<String>,
@@ -624,11 +705,11 @@ impl AccountStore {
         let max_inflight = u64::try_from(max_inflight_per_account).unwrap_or(u64::MAX);
         for offset in 0..accounts.len() {
             let slot = accounts[(start.wrapping_add(offset)) % accounts.len()].clone();
-            let Some(quota) = image_quota(slot.record.raw.get("quota")) else {
+            if image_quota(slot.record.raw.get("quota")).is_none() {
                 continue;
-            };
+            }
             if excluded_tokens.contains(&slot.record.token)
-                || !has_verified_web_image_capability(&slot.record)
+                || !is_image_account_available(&slot.record)
             {
                 continue;
             }
@@ -637,7 +718,7 @@ impl AccountStore {
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
                         (u64::try_from(inflight)
                             .ok()
-                            .is_some_and(|inflight| inflight < quota && inflight < max_inflight))
+                            .is_some_and(|inflight| inflight < max_inflight))
                         .then(|| inflight.checked_add(1))
                         .flatten()
                     });
@@ -646,6 +727,77 @@ impl AccountStore {
             }
         }
         None
+    }
+
+    pub(super) async fn acquire_codex_image_lease_with_limit(
+        &self,
+        excluded_tokens: &HashSet<String>,
+        allowed_groups: Option<&HashSet<AccountModelGroup>>,
+        max_inflight_per_account: usize,
+    ) -> Option<AccountLease> {
+        if !self.reload().await {
+            return None;
+        }
+        let snapshot = self.snapshot.read().expect("account snapshot lock");
+        if !snapshot.valid || snapshot.accounts.is_empty() {
+            return None;
+        }
+        let accounts = snapshot.accounts.as_ref();
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let max_inflight = u64::try_from(max_inflight_per_account).unwrap_or(u64::MAX);
+        for offset in 0..accounts.len() {
+            let slot = accounts[(start.wrapping_add(offset)) % accounts.len()].clone();
+            if excluded_tokens.contains(&slot.record.token)
+                || !is_codex_image_account_eligible(&slot.record, allowed_groups)
+            {
+                continue;
+            }
+            let reserved =
+                slot.image_inflight
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
+                        (u64::try_from(inflight)
+                            .ok()
+                            .is_some_and(|inflight| inflight < max_inflight))
+                        .then(|| inflight.checked_add(1))
+                        .flatten()
+                    });
+            if reserved.is_ok() {
+                return Some(AccountLease::new(slot, true));
+            }
+        }
+        None
+    }
+
+    pub(super) async fn codex_image_has_candidate(
+        &self,
+        excluded_tokens: &HashSet<String>,
+        allowed_groups: Option<&HashSet<AccountModelGroup>>,
+    ) -> bool {
+        if !self.reload().await {
+            return false;
+        }
+        let snapshot = self.snapshot.read().expect("account snapshot lock");
+        snapshot.valid
+            && snapshot.accounts.iter().any(|slot| {
+                !excluded_tokens.contains(&slot.record.token)
+                    && is_codex_image_account_eligible(&slot.record, allowed_groups)
+            })
+    }
+
+    pub(super) async fn codex_image_token_is_eligible(
+        &self,
+        token: &str,
+        allowed_groups: Option<&HashSet<AccountModelGroup>>,
+    ) -> bool {
+        if token.is_empty() || !self.reload().await {
+            return false;
+        }
+        let snapshot = self.snapshot.read().expect("account snapshot lock");
+        snapshot
+            .accounts
+            .iter()
+            .find(|slot| slot.record.token == token)
+            .is_some_and(|slot| is_codex_image_account_eligible(&slot.record, allowed_groups))
     }
 
     pub(super) async fn image_token_is_eligible(&self, token: &str) -> bool {
@@ -657,7 +809,7 @@ impl AccountStore {
             .accounts
             .iter()
             .find(|slot| slot.record.token == token)
-            .is_some_and(|slot| has_verified_web_image_capability(&slot.record))
+            .is_some_and(|slot| is_image_account_available(&slot.record))
     }
 
     pub(super) async fn image_has_eligible_account(
@@ -670,31 +822,40 @@ impl AccountStore {
         let snapshot = self.snapshot.read().expect("account snapshot lock");
         snapshot.accounts.iter().any(|slot| {
             !excluded_tokens.contains(&slot.record.token)
-                && has_verified_web_image_capability(&slot.record)
+                && is_image_account_available(&slot.record)
         })
     }
 
     /// Persist image quota accounting for the account that owned the lease.
-    pub(super) async fn mark_image_result(&self, token: &str, success: bool) -> bool {
+    pub(super) async fn mark_image_result(
+        &self,
+        token: &str,
+        success: bool,
+        auto_remove_rate_limited: bool,
+    ) -> Result<ImageResultUpdate, ApiError> {
         if token.is_empty() {
-            return false;
+            return Ok(ImageResultUpdate::NotFound);
         }
-        let mut found = false;
-        let result = self
-            .mutate_raw(|records| {
-                let Some(record) = records
-                    .iter_mut()
-                    .find(|value| account_payload_token(value).as_deref() == Some(token))
-                else {
-                    return Ok(());
-                };
-                let object = record.as_object_mut().ok_or_else(ApiError::unavailable)?;
+        let mut result = ImageResultUpdate::NotFound;
+        self.mutate_raw(|records| {
+            let Some(index) = records
+                .iter_mut()
+                .position(|value| account_payload_token(value).as_deref() == Some(token))
+            else {
+                return Ok(());
+            };
+            let limited = {
+                let object = records[index]
+                    .as_object_mut()
+                    .ok_or_else(ApiError::unavailable)?;
                 object.insert(
                     "last_used_at".to_owned(),
-                    serde_json::Value::String(current_timestamp()),
+                    serde_json::Value::String(current_local_timestamp()),
                 );
                 if success {
-                    let quota = account_counter(object.get("quota")).saturating_sub(1);
+                    let quota = account_counter(object.get("quota"))
+                        .saturating_sub(1)
+                        .max(0);
                     object.insert("quota".to_owned(), serde_json::json!(quota));
                     object.insert(
                         "success".to_owned(),
@@ -705,6 +866,21 @@ impl AccountStore {
                             "status".to_owned(),
                             serde_json::Value::String("限流".to_owned()),
                         );
+                        let restore_at = object
+                            .get("restore_at")
+                            .filter(|value| account_value_truthy(Some(value)))
+                            .cloned();
+                        object.insert(
+                            "restore_at".to_owned(),
+                            restore_at.unwrap_or(serde_json::Value::Null),
+                        );
+                    } else if object.get("status").and_then(serde_json::Value::as_str)
+                        == Some("限流")
+                    {
+                        object.insert(
+                            "status".to_owned(),
+                            serde_json::Value::String("正常".to_owned()),
+                        );
                     }
                 } else {
                     object.insert(
@@ -712,16 +888,23 @@ impl AccountStore {
                         serde_json::json!(account_counter(object.get("fail")).saturating_add(1)),
                     );
                 }
-                found = true;
-                Ok(())
-            })
-            .await;
-        result.is_ok() && found
+                object.get("status").and_then(serde_json::Value::as_str) == Some("限流")
+            };
+            if limited && auto_remove_rate_limited {
+                records.remove(index);
+                result = ImageResultUpdate::RemovedRateLimited;
+            } else {
+                result = ImageResultUpdate::Updated;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(result)
     }
 
     async fn acquire_filtered(
         &self,
-        model: &str,
+        _model: &str,
         excluded_tokens: &HashSet<String>,
         allowed_groups: Option<&HashSet<AccountModelGroup>>,
         required_source_type: Option<&str>,
@@ -734,45 +917,33 @@ impl AccountStore {
         if !snapshot.valid || snapshot.accounts.is_empty() {
             return None;
         }
-        let accounts = snapshot.accounts.as_ref();
-        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..accounts.len() {
-            let slot = accounts[(start.wrapping_add(offset)) % accounts.len()].clone();
-            if excluded_tokens.contains(&slot.record.token)
-                || required_source_type.is_some_and(|source| slot.record.source_type != source)
-                || required_capability.is_some_and(|capability| {
-                    let matches_capability = match capability {
+        let eligible = snapshot
+            .accounts
+            .iter()
+            .filter(|slot| {
+                !excluded_tokens.contains(&slot.record.token)
+                    && required_source_type.is_none_or(|source| slot.record.source_type == source)
+                    && required_capability.is_none_or(|capability| match capability {
                         "codex" => slot.record.source_type == "codex",
                         "web" => matches!(
                             slot.record.source_type.as_str(),
                             "web" | "password" | "password-oauth"
                         ),
                         _ => false,
-                    };
-                    !matches_capability
-                })
-                || !is_request_eligible_record(&slot.record)
-            {
-                continue;
-            }
-            if let Some(allowed_groups) = allowed_groups {
-                if !allowed_groups.contains(&slot.record.account_type) {
-                    continue;
-                }
-            } else if model != "auto"
-                && slot.record.raw.get("models").is_some()
-                && !slot
-                    .record
-                    .models
-                    .iter()
-                    .any(|candidate| candidate == model)
-            {
-                continue;
-            }
-            slot.inflight.fetch_add(1, Ordering::AcqRel);
-            return Some(AccountLease::new(slot, false));
+                    })
+                    && is_request_eligible_record(&slot.record)
+                    && allowed_groups
+                        .is_none_or(|groups| groups.contains(&slot.record.account_type))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if eligible.is_empty() {
+            return None;
         }
-        None
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed) % eligible.len();
+        let slot = eligible[start].clone();
+        slot.inflight.fetch_add(1, Ordering::AcqRel);
+        Some(AccountLease::new(slot, false))
     }
 
     #[cfg(test)]
@@ -796,7 +967,7 @@ impl AccountStore {
         }
         let mut groups = HashMap::<AccountModelGroup, Vec<CatalogAccountCandidate>>::new();
         for slot in snapshot.accounts.iter() {
-            if !is_request_eligible_record(&slot.record) {
+            if matches!(slot.record.status.as_str(), "禁用" | "异常") {
                 continue;
             }
             groups
@@ -806,6 +977,14 @@ impl AccountStore {
                     token: slot.record.token.clone(),
                     source_type: slot.record.source_type.clone(),
                     chatgpt_account_id: slot.record.chatgpt_account_id.clone(),
+                    proxy_url: slot
+                        .record
+                        .raw
+                        .get("proxy")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned),
                 });
         }
         for candidates in groups.values_mut() {
@@ -922,26 +1101,46 @@ impl AccountStore {
             .collect()
     }
 
-    pub(super) fn mark_text_used(&self, token: &str) -> bool {
-        let Ok(snapshot) = self.snapshot.read() else {
-            return false;
-        };
-        let Some(slot) = snapshot
-            .accounts
-            .iter()
-            .find(|slot| slot.record.token == token)
-        else {
-            return false;
-        };
-        #[cfg(test)]
-        if slot.fail_usage_marker.load(Ordering::Acquire) {
+    pub(super) async fn mark_text_used(&self, token: &str) -> bool {
+        if token.is_empty() {
             return false;
         }
-        let Ok(mut last_used_at) = slot.last_used_at.write() else {
+        #[cfg(test)]
+        if self
+            .snapshot
+            .read()
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .accounts
+                    .iter()
+                    .find(|slot| slot.record.token == token)
+                    .map(|slot| slot.fail_usage_marker.load(Ordering::Acquire))
+            })
+            .unwrap_or(false)
+        {
             return false;
-        };
-        *last_used_at = Some(current_timestamp());
-        true
+        }
+        let token = token.to_owned();
+        let timestamp = current_local_timestamp();
+        self.mutate_raw(|records| {
+            let Some(account) = records
+                .iter_mut()
+                .find(|account| account_payload_token(account).as_deref() == Some(token.as_str()))
+            else {
+                return Ok(false);
+            };
+            let Some(object) = account.as_object_mut() else {
+                return Ok(false);
+            };
+            object.insert(
+                "last_used_at".to_owned(),
+                serde_json::Value::String(timestamp),
+            );
+            Ok(true)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub(super) fn last_used_at(&self, token: &str) -> Option<String> {
@@ -951,6 +1150,20 @@ impl AccountStore {
             .iter()
             .find(|slot| slot.record.token == token)
             .and_then(|slot| slot.last_used_at.read().ok()?.clone())
+    }
+
+    pub(super) fn image_inflight(&self, token: &str) -> usize {
+        self.snapshot
+            .read()
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .accounts
+                    .iter()
+                    .find(|slot| slot.record.token == token)
+                    .map(|slot| slot.image_inflight.load(Ordering::Acquire))
+            })
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -1065,6 +1278,25 @@ impl AccountStore {
                 (snapshot.fingerprint, snapshot.health.cumulative_total)
             };
             let mut records = self.raw_records();
+            let runtime_created_at = self
+                .records()
+                .into_iter()
+                .map(|record| (record.token, record.created_at))
+                .collect::<HashMap<_, _>>();
+            for record in &mut records {
+                if record
+                    .get("created_at")
+                    .is_none_or(|value| !account_value_truthy(Some(value)))
+                    && let Some(token) = account_payload_token(record)
+                    && let Some(created_at) = runtime_created_at.get(&token)
+                    && let Some(object) = record.as_object_mut()
+                {
+                    object.insert(
+                        "created_at".to_owned(),
+                        serde_json::Value::String(created_at.clone()),
+                    );
+                }
+            }
             let result = merge_import_records_in_place(&mut records, incoming)?;
             let next_cumulative_total = cumulative_total
                 .checked_add(u64::try_from(result.0).map_err(|_| ApiError::invalid_request())?)
@@ -1093,7 +1325,7 @@ impl AccountStore {
     pub(super) async fn update_refreshed_account(
         &self,
         old_token: &str,
-        updated: serde_json::Value,
+        mut updated: serde_json::Value,
     ) -> Result<bool, ApiError> {
         self.mutate_raw(|records| {
             let Some(target) = records
@@ -1102,6 +1334,10 @@ impl AccountStore {
             else {
                 return Ok(false);
             };
+            if let Some(object) = updated.as_object_mut() {
+                object.remove("success");
+                object.remove("fail");
+            }
             let mut merged = merge_account_values(target, &updated);
             if let Some(updated_object) = updated.as_object()
                 && updated_object
@@ -1154,7 +1390,7 @@ impl AccountStore {
     pub(super) async fn record_invalid_token(
         &self,
         token: &str,
-        error: &str,
+        _error: &str,
         remove_invalid: bool,
     ) -> Result<bool, ApiError> {
         if token.is_empty() {
@@ -1167,39 +1403,14 @@ impl AccountStore {
             else {
                 return Ok(false);
             };
-            let should_remove = {
-                let object = records[index]
-                    .as_object_mut()
-                    .ok_or_else(ApiError::unavailable)?;
-                let previous = object
-                    .get("invalid_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                let next = previous.saturating_add(1);
-                object.insert("invalid_count".to_owned(), serde_json::json!(next));
-                object.insert(
-                    "last_invalid_at".to_owned(),
-                    serde_json::Value::String(current_timestamp()),
-                );
-                object.insert(
-                    "last_refresh_error".to_owned(),
-                    serde_json::Value::String(error.to_owned()),
-                );
-                object.insert(
-                    "last_refresh_error_at".to_owned(),
-                    serde_json::Value::String(current_timestamp()),
-                );
-                let confirmed = next >= 3;
-                if confirmed && !remove_invalid {
-                    object.insert(
-                        "status".to_owned(),
-                        serde_json::Value::String("异常".to_owned()),
-                    );
-                }
-                confirmed && remove_invalid
-            };
-            if should_remove {
+            if remove_invalid {
                 records.remove(index);
+            } else if let Some(object) = records[index].as_object_mut() {
+                object.insert(
+                    "status".to_owned(),
+                    serde_json::Value::String("异常".to_owned()),
+                );
+                object.insert("quota".to_owned(), serde_json::Value::from(0));
             }
             Ok(true)
         })
@@ -1265,6 +1476,11 @@ impl AccountStore {
             if fingerprint != expected_fingerprint {
                 return Err(StorageError::Conflict);
             }
+            let value = if next_cumulative_total.is_none() {
+                compact_account_records_for_write(&current, &value)?
+            } else {
+                value
+            };
             let output = match current {
                 serde_json::Value::Object(mut object) if object.get("items").is_some() => {
                     object.insert("items".to_owned(), value);
@@ -1350,55 +1566,123 @@ impl AccountStore {
     }
 }
 
+fn compact_account_records_for_write(
+    original: &serde_json::Value,
+    updated: &serde_json::Value,
+) -> Result<serde_json::Value, StorageError> {
+    let original_items = match original {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(object) => object
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(StorageError::Invalid)?,
+        _ => return Err(StorageError::Invalid),
+    };
+    let updated_items = updated.as_array().ok_or(StorageError::Invalid)?;
+    let mut updated_by_token = updated_items
+        .iter()
+        .filter_map(|item| account_payload_token(item).map(|token| (token, item.clone())))
+        .collect::<HashMap<_, _>>();
+    let mut compacted = Vec::with_capacity(updated_items.len());
+
+    for original_item in original_items {
+        let token = original_item
+            .as_object()
+            .and_then(|object| {
+                object
+                    .get("access_token")
+                    .or_else(|| object.get("accessToken"))
+            })
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(StorageError::Invalid)?;
+        let Some(updated_item) = updated_by_token.remove(&token) else {
+            continue;
+        };
+        let original_object = original_item.as_object().ok_or(StorageError::Invalid)?;
+        let updated_object = updated_item.as_object().ok_or(StorageError::Invalid)?;
+        let normalized_original =
+            super::canonicalize_account_item(original_item).map_err(|_| StorageError::Invalid)?;
+        let normalized_original = normalized_original
+            .as_object()
+            .ok_or(StorageError::Invalid)?;
+        let mut item = original_object.clone();
+
+        item.retain(|key, _| key == "accessToken" || updated_object.contains_key(key.as_str()));
+        for (key, value) in updated_object {
+            if key == "access_token" {
+                item.insert(key.clone(), value.clone());
+                continue;
+            }
+            if normalized_original.get(key) == Some(value) {
+                if let Some(original_value) = original_object.get(key) {
+                    item.insert(key.clone(), original_value.clone());
+                } else {
+                    item.remove(key);
+                }
+            } else {
+                item.insert(key.clone(), value.clone());
+            }
+        }
+        for key in [
+            "accessToken",
+            "token",
+            "refresh_token",
+            "id_token",
+            "_refresh_token",
+            "_id_token",
+        ] {
+            item.remove(key);
+        }
+        compacted.push(serde_json::Value::Object(item));
+    }
+
+    for updated_item in updated_items {
+        if let Some(token) = account_payload_token(updated_item)
+            && let Some(item) = updated_by_token.remove(&token)
+        {
+            compacted.push(item);
+        }
+    }
+    Ok(serde_json::Value::Array(compacted))
+}
+
 fn merge_import_records_in_place(
     records: &mut Vec<serde_json::Value>,
     incoming: &[serde_json::Value],
 ) -> Result<(usize, usize), ApiError> {
-    let mut index_by_key = HashMap::new();
     let mut index_by_token = HashMap::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(token) = account_payload_token(record) {
             index_by_token.insert(token, index);
-        }
-        if let Some(key) = account_identity_key(record) {
-            let replace = index_by_key.get(&key).copied().is_none_or(|previous| {
-                token_rank(&account_payload_token(record).unwrap_or_default())
-                    >= token_rank(&account_payload_token(&records[previous]).unwrap_or_default())
-            });
-            if replace {
-                index_by_key.insert(key, index);
-            }
         }
     }
     let mut added = 0usize;
     let mut skipped = 0usize;
     let mut incoming_keys = HashMap::<String, usize>::new();
     let mut deduped_incoming = Vec::<(String, serde_json::Value)>::new();
-    for value in incoming.iter().cloned() {
+    for value in incoming {
+        let value = prepare_import_account_value(value);
         let Some(token) = account_payload_token(&value) else {
             continue;
         };
-        let key = account_identity_key(&value).unwrap_or_else(|| format!("token:{token}"));
-        if let Some(index) = incoming_keys.get(&key).copied() {
+        if let Some(index) = incoming_keys.get(&token).copied() {
             let previous = &deduped_incoming[index].1;
-            let merged = merge_account_values(previous, &value);
+            let merged = merge_import_payload_values(previous, &value);
             deduped_incoming[index].1 = merged;
-            skipped += 1;
             continue;
         }
-        incoming_keys.insert(key.clone(), deduped_incoming.len());
-        deduped_incoming.push((key, value));
+        incoming_keys.insert(token, deduped_incoming.len());
+        deduped_incoming.push((String::new(), value));
     }
-    for (key, value) in deduped_incoming {
+    for (_, value) in deduped_incoming {
         let Some(token) = account_payload_token(&value) else {
             continue;
         };
-        let index = index_by_token
-            .get(&token)
-            .copied()
-            .or_else(|| index_by_key.get(&key).copied());
-        if let Some(index) = index {
-            let merged = merge_account_values(&records[index], &value);
+        if let Some(index) = index_by_token.get(&token).copied() {
+            let merged = merge_import_account_values(&records[index], &value);
             if let Some(previous) = account_payload_token(&records[index]) {
                 index_by_token.remove(&previous);
             }
@@ -1409,31 +1693,8 @@ fn merge_import_records_in_place(
             skipped += 1;
         } else {
             let index = records.len();
-            let mut value = value;
-            if let Some(object) = value.as_object_mut() {
-                object.remove("accessToken");
-                object.remove("token");
-                object.remove("refresh_token");
-                object.remove("id_token");
-                object.remove("_refresh_token");
-                object.remove("_id_token");
-                object.insert("access_token".to_owned(), serde_json::json!(token));
-                if !object.contains_key("status") {
-                    object.insert("status".to_owned(), serde_json::json!("正常"));
-                }
-                if !object
-                    .get("created_at")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|value| !value.trim().is_empty())
-                {
-                    object.insert(
-                        "created_at".to_owned(),
-                        serde_json::Value::String(super::current_timestamp()),
-                    );
-                }
-            }
+            let value = merge_import_account_values(&serde_json::json!({}), &value);
             records.push(value);
-            index_by_key.insert(key, index);
             index_by_token.insert(token, index);
             added += 1;
         }
@@ -1442,6 +1703,207 @@ fn merge_import_records_in_place(
         return Err(ApiError::invalid_request());
     }
     Ok((added, skipped))
+}
+
+pub(super) fn python_account_value_string(value: &serde_json::Value) -> String {
+    fn python_string_repr(value: &str) -> String {
+        let quote = if !value.contains('\'') {
+            '\''
+        } else if !value.contains('"') {
+            '"'
+        } else {
+            '\''
+        };
+        let mut output = String::with_capacity(value.len() + 2);
+        output.push(quote);
+        for character in value.chars() {
+            match character {
+                '\\' => output.push_str("\\\\"),
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                character if character == quote => {
+                    output.push('\\');
+                    output.push(character);
+                }
+                character => output.push(character),
+            }
+        }
+        output.push(quote);
+        output
+    }
+    fn python_repr(value: &serde_json::Value) -> String {
+        match value {
+            serde_json::Value::Null => "None".to_owned(),
+            serde_json::Value::Bool(true) => "True".to_owned(),
+            serde_json::Value::Bool(false) => "False".to_owned(),
+            serde_json::Value::Number(value) => super::native_turnstile_json_number(value),
+            serde_json::Value::String(value) => python_string_repr(value),
+            serde_json::Value::Array(items) => format!(
+                "[{}]",
+                items.iter().map(python_repr).collect::<Vec<_>>().join(", ")
+            ),
+            serde_json::Value::Object(items) => format!(
+                "{{{}}}",
+                items
+                    .iter()
+                    .map(|(key, value)| {
+                        format!("{}: {}", python_string_repr(key), python_repr(value))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+    match value {
+        serde_json::Value::String(value) => value.clone(),
+        value => python_repr(value),
+    }
+}
+
+fn prepare_import_account_value(value: &serde_json::Value) -> serde_json::Value {
+    let Some(mut object) = value.as_object().cloned() else {
+        return value.clone();
+    };
+    if !object.contains_key("access_token")
+        && let Some(token) = object.remove("accessToken")
+    {
+        object.insert("access_token".to_owned(), token);
+    }
+    if let Some(token) = object
+        .get("access_token")
+        .filter(|value| !value.is_null())
+        .map(python_account_value_string)
+    {
+        object.insert(
+            "access_token".to_owned(),
+            serde_json::Value::String(token.trim().to_owned()),
+        );
+    }
+    let codex_type = object
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("codex"));
+    if codex_type {
+        object.insert("export_type".to_owned(), serde_json::json!("codex"));
+        object.insert("source_type".to_owned(), serde_json::json!("codex"));
+        object.remove("type");
+    }
+    if object
+        .get("export_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("codex"))
+    {
+        object.insert("source_type".to_owned(), serde_json::json!("codex"));
+    }
+    if object
+        .get("plan_type")
+        .is_some_and(|value| account_value_truthy(Some(value)))
+        && !object
+            .get("type")
+            .is_some_and(|value| account_value_truthy(Some(value)))
+    {
+        let plan_type = object
+            .get("plan_type")
+            .map(python_account_value_string)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        object.insert("type".to_owned(), serde_json::Value::String(plan_type));
+    } else if let Some(account_type) = object
+        .get("type")
+        .filter(|value| account_value_truthy(Some(value)))
+        .map(python_account_value_string)
+    {
+        object.insert("type".to_owned(), serde_json::Value::String(account_type));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn merge_import_account_values(
+    current: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = current.as_object().cloned().unwrap_or_default();
+    if let Some(object) = incoming.as_object() {
+        for (key, value) in object {
+            if key == "created_at" && !account_value_truthy(Some(value)) {
+                continue;
+            }
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    for key in [
+        "accessToken",
+        "token",
+        "refresh_token",
+        "id_token",
+        "_refresh_token",
+        "_id_token",
+    ] {
+        merged.remove(key);
+    }
+    let token = account_payload_token(incoming)
+        .or_else(|| account_payload_token(current))
+        .unwrap_or_default();
+    merged.insert("access_token".to_owned(), serde_json::Value::String(token));
+    let account_type = incoming
+        .get("type")
+        .filter(|value| account_value_truthy(Some(value)))
+        .or_else(|| {
+            current
+                .get("type")
+                .filter(|value| account_value_truthy(Some(value)))
+        });
+    let account_type = match account_type {
+        Some(serde_json::Value::Null) | None => "free".to_owned(),
+        Some(value) => python_account_value_string(value),
+    };
+    merged.insert("type".to_owned(), serde_json::Value::String(account_type));
+    if merged
+        .get("status")
+        .is_none_or(|value| !account_value_truthy(Some(value)))
+    {
+        merged.insert("status".to_owned(), serde_json::json!("正常"));
+    }
+    if merged
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        merged.insert("type".to_owned(), serde_json::json!("free"));
+    }
+    if merged
+        .get("source_type")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        merged.insert("source_type".to_owned(), serde_json::json!("web"));
+    }
+    if merged
+        .get("created_at")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        merged.insert(
+            "created_at".to_owned(),
+            serde_json::Value::String(super::current_timestamp()),
+        );
+    }
+    serde_json::Value::Object(merged)
+}
+
+fn merge_import_payload_values(
+    current: &serde_json::Value,
+    incoming: &serde_json::Value,
+) -> serde_json::Value {
+    let mut merged = current.as_object().cloned().unwrap_or_default();
+    if let Some(object) = incoming.as_object() {
+        for (key, value) in object {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
 }
 
 pub(super) fn parse_backend_snapshot(
@@ -1555,52 +2017,20 @@ fn merge_account_values(
         }
     }
     let preferred_token = account_payload_token(preferred).unwrap_or_default();
-    merged.remove("accessToken");
-    merged.remove("token");
-    merged.remove("refresh_token");
-    merged.remove("id_token");
-    merged.remove("_refresh_token");
-    merged.remove("_id_token");
+    for key in [
+        "accessToken",
+        "token",
+        "refresh_token",
+        "id_token",
+        "_refresh_token",
+        "_id_token",
+    ] {
+        merged.remove(key);
+    }
     merged.insert(
         "access_token".to_owned(),
         serde_json::Value::String(preferred_token),
     );
-    for key in [
-        "status",
-        "quota",
-        "success",
-        "fail",
-        "invalid_count",
-        "limits_progress",
-        "last_used_at",
-        "last_invalid_at",
-        "last_refresh_error",
-        "last_refresh_error_at",
-        "last_token_refresh_at",
-        "last_token_refresh_error",
-        "last_token_refresh_error_at",
-    ] {
-        if let Some(value) = current.as_object().and_then(|object| object.get(key)) {
-            merged.insert(key.to_owned(), value.clone());
-        }
-    }
-    let created_at = [current, incoming]
-        .iter()
-        .filter_map(|value| {
-            value
-                .as_object()
-                .and_then(|object| object.get("created_at"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-        })
-        .min()
-        .map(ToOwned::to_owned);
-    if let Some(created_at) = created_at {
-        merged.insert(
-            "created_at".to_owned(),
-            serde_json::Value::String(created_at),
-        );
-    }
     serde_json::Value::Object(merged)
 }
 
@@ -1640,55 +2070,16 @@ struct PreviousAccountRuntime {
     last_used_at: Option<String>,
 }
 
-fn last_used_at_key(value: &str) -> Option<(u32, u32, u32, u32, u32, u32)> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 19
-        || !matches!(bytes[4], b'-')
-        || !matches!(bytes[7], b'-')
-        || !matches!(bytes[10], b' ')
-        || !matches!(bytes[13], b':')
-        || !matches!(bytes[16], b':')
-    {
-        return None;
-    }
-    let number = |start: usize, end: usize| {
-        value
-            .get(start..end)
-            .filter(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
-            .and_then(|part| part.parse::<u32>().ok())
-    };
-    let year = number(0, 4)?;
-    let month = number(5, 7)?;
-    let day = number(8, 10)?;
-    let hour = number(11, 13)?;
-    let minute = number(14, 16)?;
-    let second = number(17, 19)?;
-    if year == 0 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let days_in_month = match month {
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
-    if !(1..=days_in_month).contains(&day) {
-        return None;
-    }
-    Some((year, month, day, hour, minute, second))
-}
-
-fn valid_last_used_at(value: &str) -> Option<String> {
-    last_used_at_key(value).map(|_| value.to_owned())
+fn python_clean_last_used_at(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .filter(|value| account_value_truthy(Some(value)))
+        .map(python_account_value_string)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn latest_last_used_at(left: String, right: String) -> Option<String> {
-    match (last_used_at_key(&left), last_used_at_key(&right)) {
-        (Some(left_key), Some(right_key)) => Some(if left_key >= right_key { left } else { right }),
-        (Some(_), None) => Some(left),
-        (None, Some(_)) => Some(right),
-        (None, None) => None,
-    }
+    Some(if left >= right { left } else { right })
 }
 
 fn compatible_identity(previous: Option<&str>, current: Option<&str>) -> bool {
@@ -1714,11 +2105,13 @@ fn account_slots_with_runtime_state(
                     .entry(identity.clone())
                     .or_insert_with(|| slot.image_inflight.clone());
             }
-            let last_used_at = slot
-                .last_used_at
-                .read()
-                .ok()
-                .and_then(|value| value.as_deref().and_then(valid_last_used_at));
+            let last_used_at = slot.last_used_at.read().ok().and_then(|value| {
+                value
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            });
             previous_by_token.insert(
                 slot.record.token.clone(),
                 PreviousAccountRuntime {
@@ -1738,8 +2131,7 @@ fn account_slots_with_runtime_state(
             let persisted_last_used_at = record
                 .raw
                 .get("last_used_at")
-                .and_then(serde_json::Value::as_str)
-                .and_then(valid_last_used_at);
+                .and_then(|value| python_clean_last_used_at(Some(value)));
             let identity = account_identity_key(&record.raw);
             let image_inflight = previous_by_token
                 .get(&record.token)
@@ -1778,27 +2170,262 @@ fn account_slots_with_runtime_state(
 }
 
 pub(super) fn current_timestamp() -> String {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let days = seconds.div_euclid(86_400);
-    let day_seconds = seconds.rem_euclid(86_400);
-    let hour = day_seconds / 3_600;
-    let minute = day_seconds % 3_600 / 60;
-    let second = day_seconds % 60;
+    format_account_timestamp(time::OffsetDateTime::now_utc())
+}
 
-    // Civil date conversion from Unix days; this keeps the in-memory marker
-    // in the same second-resolution shape as Python's text account marker.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let month_part = (5 * doy + 2) / 153;
-    let day = doy - (153 * month_part + 2) / 5 + 1;
-    let month = month_part + if month_part < 10 { 3 } else { -9 };
-    let year = year + i64::from(month <= 2);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+pub(super) fn current_local_timestamp() -> String {
+    format_account_timestamp(
+        time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc()),
+    )
+}
+
+fn format_account_timestamp(now: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AccountHealthStats, AccountModelGroup, AccountRecord, AccountStore,
+        current_local_timestamp, current_timestamp, has_verified_web_image_capability,
+        is_codex_image_account_eligible, is_image_account_available, is_request_eligible_record,
+    };
+    use serde_json::json;
+    use std::{collections::HashSet, fs};
+
+    #[test]
+    fn account_timestamp_uses_utc_like_python() {
+        let format = time::format_description::parse_borrowed::<1>(
+            "[year]-[month]-[day] [hour]:[minute]:[second]",
+        )
+        .expect("timestamp format");
+        let before = time::OffsetDateTime::now_utc().unix_timestamp();
+        let timestamp = current_timestamp();
+        let after = time::OffsetDateTime::now_utc().unix_timestamp();
+        let parsed = time::PrimitiveDateTime::parse(&timestamp, &format)
+            .expect("naive account timestamp")
+            .assume_utc()
+            .unix_timestamp();
+        assert!((before..=after).contains(&parsed));
+    }
+    #[test]
+    fn account_value_string_matches_python_str_for_containers() {
+        assert_eq!(
+            super::python_account_value_string(&json!(["web", true, null, {"nested": "x"}])),
+            "['web', True, None, {'nested': 'x'}]"
+        );
+        assert_eq!(
+            super::python_account_value_string(&json!({"proxy": "http://example.test"})),
+            "{'proxy': 'http://example.test'}"
+        );
+        assert_eq!(
+            super::python_account_value_string(&json!("  raw value  ")),
+            "  raw value  "
+        );
+        assert_eq!(super::python_account_value_string(&json!(1e-7)), "1e-07");
+        assert_eq!(super::python_account_value_string(&json!(1e20)), "1e+20");
+    }
+    #[test]
+    fn imported_type_merge_uses_python_repr_for_containers() {
+        let merged = super::merge_import_account_values(
+            &json!({"access_token":"token","type":"free"}),
+            &json!({"access_token":"token","type":["Team", true]}),
+        );
+        assert_eq!(merged["type"], "['Team', True]");
+    }
+
+    #[test]
+    fn imported_access_token_uses_python_string_coercion() {
+        let mut records = Vec::new();
+        let (added, skipped) =
+            super::merge_import_records_in_place(&mut records, &[json!({"access_token": 42})])
+                .expect("numeric access token is coerced like Python");
+        assert_eq!((added, skipped), (1, 0));
+        assert_eq!(records[0]["access_token"], "42");
+    }
+
+    #[test]
+    fn last_used_timestamp_uses_local_time_like_python() {
+        let format = time::format_description::parse_borrowed::<1>(
+            "[year]-[month]-[day] [hour]:[minute]:[second]",
+        )
+        .expect("timestamp format");
+        let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+        let before = time::OffsetDateTime::now_utc();
+        let timestamp = current_local_timestamp();
+        let after = time::OffsetDateTime::now_utc();
+        let parsed = time::PrimitiveDateTime::parse(&timestamp, &format)
+            .expect("naive local timestamp")
+            .assume_offset(offset);
+        assert!(
+            (before.unix_timestamp()..=after.unix_timestamp()).contains(&parsed.unix_timestamp())
+        );
+    }
+
+    fn record(status: &str, invalid_count: u64) -> AccountRecord {
+        AccountRecord {
+            token: "token".to_owned(),
+            created_at: String::new(),
+            status: status.to_owned(),
+            source_type: "web".to_owned(),
+            chatgpt_account_id: None,
+            account_type: "free".to_owned(),
+            models: Vec::new(),
+            raw: json!({
+                "access_token": "token",
+                "invalid_count": invalid_count,
+                "quota": 1,
+                "_verified_image_capability": true
+            }),
+        }
+    }
+
+    #[test]
+    fn text_pool_keeps_limited_and_deferred_invalid_accounts_eligible() {
+        let limited = record("限流", 0);
+        let deferred_invalid = record("正常", 1);
+
+        assert!(is_request_eligible_record(&limited));
+        assert!(is_request_eligible_record(&deferred_invalid));
+        assert!(!has_verified_web_image_capability(&limited));
+        assert!(has_verified_web_image_capability(&deferred_invalid));
+        assert!(!is_request_eligible_record(&record("禁用", 0)));
+        assert!(!is_request_eligible_record(&record("异常", 0)));
+    }
+
+    #[test]
+    fn image_pool_excludes_only_python_blocked_statuses() {
+        for status in ["正常", "unknown", " 异常 "] {
+            assert!(
+                is_image_account_available(&record(status, 0)),
+                "Python accepts image status {status:?} when quota is positive"
+            );
+        }
+        for status in ["禁用", "限流", "异常"] {
+            assert!(
+                !is_image_account_available(&record(status, 0)),
+                "Python blocks image status {status:?}"
+            );
+        }
+
+        let mut codex = record("unknown", 0);
+        codex.source_type = "codex".to_owned();
+        codex.account_type = "pro".to_owned();
+        let allowed = HashSet::from(["pro".to_owned()]);
+        assert!(is_codex_image_account_eligible(&codex, Some(&allowed)));
+        codex.status = "异常".to_owned();
+        assert!(!is_codex_image_account_eligible(&codex, Some(&allowed)));
+    }
+
+    #[test]
+    fn health_type_counts_match_python_stored_type_labels() {
+        let make_record = |token: &str, account_type: &str| AccountRecord {
+            token: token.to_owned(),
+            created_at: String::new(),
+            status: "正常".to_owned(),
+            source_type: "web".to_owned(),
+            chatgpt_account_id: None,
+            account_type: account_type.to_ascii_lowercase(),
+            models: Vec::new(),
+            raw: json!({
+                "access_token": token,
+                "type": account_type,
+                "status": "正常"
+            }),
+        };
+        let health = AccountHealthStats::from_records(
+            &[
+                make_record("plus-upper", "Plus"),
+                make_record("plus-lower", "plus"),
+                make_record("team-alias", "Business"),
+            ],
+            3,
+        );
+        assert_eq!(health.by_type.get("Plus"), Some(&1));
+        assert_eq!(health.by_type.get("plus"), Some(&1));
+        assert_eq!(health.by_type.get("Business"), Some(&1));
+        assert_eq!(health.by_type.get("other"), None);
+    }
+
+    #[tokio::test]
+    async fn editable_account_selection_is_oldest_last_used_and_includes_codex() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chatgpt2api-editable-lru-{}-{nonce}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"[
+                {"access_token":"first","status":"正常","type":"Plus","source_type":"web","last_used_at":"2026-09-20 10:00:00"},
+                {"access_token":"codex-oldest","status":"正常","type":"Plus","source_type":"codex","last_used_at":"2026-09-19 10:00:00"},
+                {"access_token":"disabled","status":"禁用","type":"Plus","last_used_at":""},
+                {"access_token":"free","status":"正常","type":"free","last_used_at":""}
+            ]"#
+                .as_bytes(),
+        )
+        .expect("account snapshot");
+        let store = AccountStore::load(Some(&path)).expect("account store");
+        let groups = HashSet::<AccountModelGroup>::from([
+            "plus".to_owned(),
+            "team".to_owned(),
+            "pro".to_owned(),
+            "enterprise".to_owned(),
+        ]);
+
+        let lease = store
+            .acquire_least_recently_used_with_types(&groups)
+            .await
+            .expect("editable account");
+        assert_eq!(lease.token(), "codex-oldest");
+        assert_eq!(lease.source_type(), "codex");
+        drop(lease);
+        assert_eq!(store.inflight(), 0);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn text_account_round_robin_counts_only_eligible_accounts() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "chatgpt2api-text-round-robin-{}-{nonce}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"[
+                {"access_token":"disabled","status":"禁用"},
+                {"access_token":"first","status":"正常"},
+                {"access_token":"abnormal","status":"异常"},
+                {"access_token":"second","status":"正常"}
+            ]"#,
+        )
+        .expect("account snapshot");
+        let store = AccountStore::load(Some(&path)).expect("account store");
+        let mut selected = Vec::new();
+        for _ in 0..4 {
+            let lease = store
+                .acquire_excluding_with_type_and_source_filter("auto", &HashSet::new(), None, None)
+                .await
+                .expect("eligible text account");
+            selected.push(lease.token().to_owned());
+            drop(lease);
+        }
+        assert_eq!(selected, ["first", "second", "first", "second"]);
+        fs::remove_file(path).expect("cleanup");
+    }
 }

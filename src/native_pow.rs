@@ -228,6 +228,7 @@ pub(crate) fn native_pow_config_runtime(
         "outerHeight",
         "devicePixelRatio",
         "screen",
+        "chrome",
         "navigator",
         "onresize",
         "performance",

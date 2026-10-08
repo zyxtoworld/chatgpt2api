@@ -57,7 +57,9 @@ test("keeps existing top-level account and array JSON formats", () => {
   assert.deepEqual(getAccountJsonAccounts({ access_token: "single-token" }), [
     { access_token: "single-token", source_type: "codex" },
   ]);
-  assert.deepEqual(getAccountJsonAccounts([{ accessToken: "legacy-token" }]), []);
+  assert.deepEqual(getAccountJsonAccounts([{ accessToken: "legacy-token" }]), [
+    { access_token: "legacy-token", source_type: "codex" },
+  ]);
 });
 
 test("rejects top-level refresh_token or id_token instead of silently forwarding them", () => {

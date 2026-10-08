@@ -11,7 +11,7 @@ function hasForbiddenTokenFields(value) {
   if (!raw) {
     return false;
   }
-  return ["accessToken", "token", "refresh_token", "id_token"].some((key) => key in raw);
+  return ["token", "refresh_token", "id_token"].some((key) => key in raw);
 }
 
 function getSub2ApiAccount(value) {
@@ -81,7 +81,7 @@ function getAccountJsonAccount(value) {
     return null;
   }
 
-  const tokenValue = raw.access_token;
+  const tokenValue = raw.access_token ?? raw.accessToken;
   const token = typeof tokenValue === "string" ? tokenValue.trim() : "";
   if (!token) {
     return getSub2ApiAccount(raw);

@@ -3,10 +3,11 @@ use base64::Engine;
 use reqwest::RequestBuilder;
 use serde_json::{Map, Value, json};
 use std::env;
-use std::fs;
 
 use super::protocol_codex_payload::native_codex_tool;
-use super::proxy_service::{cookie_header, merge_cookie_header, parse_cookie_header};
+use super::proxy_service::{
+    ClearanceBundle, merge_cookie_header, normalize_host, normalize_proxy_url, parse_cookie_header,
+};
 use super::{
     ApiError, CODEX_RESPONSES_MODEL, NATIVE_CLIENT_BUILD_NUMBER, NATIVE_CLIENT_VERSION,
     NATIVE_ORIGIN, NATIVE_SEC_CH_UA, NATIVE_USER_AGENT, is_semver, native_message_id,
@@ -18,29 +19,114 @@ pub(crate) struct NativeRequestContext {
     pub(crate) session_id: String,
     client_version: &'static str,
     client_build_number: &'static str,
+    user_agent: String,
+    sec_ch_ua: String,
+    sec_ch_ua_mobile: String,
+    sec_ch_ua_platform: String,
+    impersonate: String,
 }
-
 impl NativeRequestContext {
     pub(crate) fn new() -> Self {
-        Self {
-            device_id: native_message_id(),
-            session_id: native_message_id(),
-            client_version: NATIVE_CLIENT_VERSION,
-            client_build_number: NATIVE_CLIENT_BUILD_NUMBER,
-        }
+        Self::for_client(NATIVE_CLIENT_VERSION, NATIVE_CLIENT_BUILD_NUMBER)
+    }
+
+    pub(crate) fn for_account(account: &Value) -> Self {
+        Self::for_account_client(account, NATIVE_CLIENT_VERSION, NATIVE_CLIENT_BUILD_NUMBER)
     }
 
     pub(crate) fn for_client(
         client_version: &'static str,
         client_build_number: &'static str,
     ) -> Self {
+        Self::from_account(None, client_version, client_build_number)
+    }
+
+    pub(crate) fn for_account_client(
+        account: &Value,
+        client_version: &'static str,
+        client_build_number: &'static str,
+    ) -> Self {
+        Self::from_account(Some(account), client_version, client_build_number)
+    }
+
+    fn from_account(
+        account: Option<&Value>,
+        client_version: &'static str,
+        client_build_number: &'static str,
+    ) -> Self {
+        let device_id = native_message_id();
+        let session_id = native_message_id();
+        let fingerprint = |name: &str, default: &str| {
+            account
+                .and_then(|account| account_fingerprint_value(account, name))
+                .unwrap_or_else(|| default.to_owned())
+        };
         Self {
-            device_id: native_message_id(),
-            session_id: native_message_id(),
+            device_id: account
+                .and_then(|account| account_fingerprint_value(account, "oai-device-id"))
+                .unwrap_or(device_id),
+            session_id: account
+                .and_then(|account| account_fingerprint_value(account, "oai-session-id"))
+                .unwrap_or(session_id),
             client_version,
             client_build_number,
+            user_agent: fingerprint("user-agent", NATIVE_USER_AGENT),
+            sec_ch_ua: fingerprint("sec-ch-ua", NATIVE_SEC_CH_UA),
+            sec_ch_ua_mobile: fingerprint("sec-ch-ua-mobile", "?0"),
+            sec_ch_ua_platform: fingerprint("sec-ch-ua-platform", r#""Windows""#),
+            impersonate: fingerprint("impersonate", "chrome110"),
         }
     }
+    pub(crate) fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+    pub(crate) fn tls_emulation(&self) -> wreq_util::Profile {
+        resolve_tls_emulation(&self.impersonate)
+    }
+}
+
+fn account_fingerprint_value(account: &Value, name: &str) -> Option<String> {
+    if let Some(value) = account
+        .get(name)
+        .filter(|value| super::account_pool::account_value_truthy(Some(value)))
+    {
+        let value = super::account_pool::python_account_value_string(value);
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_owned());
+        }
+    }
+    account
+        .get("fp")
+        .and_then(Value::as_object)
+        .and_then(|fingerprint| {
+            fingerprint.iter().find_map(|(key, value)| {
+                key.to_lowercase()
+                    .eq(name)
+                    .then(|| super::account_pool::python_account_value_string(value))
+            })
+        })
+}
+pub(crate) fn resolve_tls_emulation(value: &str) -> wreq_util::Profile {
+    fn normalized(value: &str) -> String {
+        value
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    let requested = normalized(value);
+    if requested == "chrome" {
+        return wreq_util::Emulation::Chrome110;
+    }
+    if requested == "edge" {
+        return wreq_util::Emulation::Edge101;
+    }
+    wreq_util::Profile::VARIANTS
+        .iter()
+        .copied()
+        .find(|profile| normalized(&format!("{profile:?}")) == requested)
+        .unwrap_or(wreq_util::Emulation::Chrome110)
 }
 
 pub(crate) fn native_browser_headers(
@@ -61,6 +147,7 @@ pub(crate) fn native_browser_headers_with_referer(
         referer,
         context.client_version,
         context.client_build_number,
+        &context.user_agent,
     )
 }
 
@@ -75,7 +162,6 @@ pub(crate) async fn native_browser_headers_with_clearance(
     target_url: &str,
     existing_cookie: Option<&str>,
 ) -> RequestBuilder {
-    let mut request = native_browser_headers_with_referer(request, context, referer);
     let bundle = if let Some(store) = store {
         let runtime = runtime.cloned().unwrap_or(Value::Null);
         let clearance = runtime.get("clearance").and_then(Value::as_object);
@@ -88,43 +174,87 @@ pub(crate) async fn native_browser_headers_with_clearance(
             .and_then(|value| value.get("mode"))
             .and_then(Value::as_str)
             .unwrap_or("none");
-        let cached = store.get(proxy_url, target_url).await;
-        if cached.is_some() || !enabled || mode != "flaresolverr" {
-            cached
+        if !enabled {
+            None
+        } else if mode == "manual" {
+            let mut cookies = clearance
+                .and_then(|value| value.get("cf_cookies"))
+                .and_then(Value::as_str)
+                .map(parse_cookie_header)
+                .unwrap_or_default();
+            if let Some(cf_clearance) = clearance
+                .and_then(|value| value.get("cf_clearance"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                cookies
+                    .entry("cf_clearance".to_owned())
+                    .or_insert_with(|| cf_clearance.to_owned());
+            }
+            let user_agent = clearance
+                .and_then(|value| value.get("user_agent"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            (!cookies.is_empty() || !user_agent.is_empty()).then_some(ClearanceBundle {
+                target_host: normalize_host(target_url),
+                proxy_url: normalize_proxy_url(proxy_url),
+                cookies,
+                user_agent,
+                expires_at: None,
+            })
+        } else if mode == "flaresolverr" {
+            if let Some(cached) = store.get(proxy_url, target_url).await {
+                Some(cached)
+            } else {
+                let client = crate::clearance_client_for_headers();
+                store
+                    .refresh_flaresolverr(
+                        &client,
+                        clearance
+                            .and_then(|value| value.get("flaresolverr_url"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        target_url,
+                        proxy_url,
+                        clearance
+                            .and_then(|value| value.get("timeout_sec"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(60),
+                        clearance
+                            .and_then(|value| value.get("refresh_interval"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(3600),
+                    )
+                    .await
+            }
         } else {
-            let client = crate::clearance_client_for_headers();
-            store
-                .refresh_flaresolverr(
-                    &client,
-                    clearance
-                        .and_then(|value| value.get("flaresolverr_url"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    target_url,
-                    proxy_url,
-                    clearance
-                        .and_then(|value| value.get("timeout_sec"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(60),
-                    clearance
-                        .and_then(|value| value.get("refresh_interval"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(3600),
-                )
-                .await
+            None
         }
     } else {
         None
     };
-    if let Some(bundle) = bundle {
-        if !bundle.user_agent.is_empty() {
-            request = request.header(header::USER_AGENT, bundle.user_agent);
-        }
-        if !bundle.cookies.is_empty() {
-            let merged = merge_cookie_header(existing_cookie.unwrap_or_default(), &bundle.cookies);
-            if !merged.is_empty() {
-                request = request.header(header::COOKIE, merged);
-            }
+    let user_agent = bundle
+        .as_ref()
+        .map(|bundle| bundle.user_agent.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(context.user_agent.as_str());
+    let mut request = native_browser_headers_for_client(
+        request,
+        context,
+        referer,
+        context.client_version,
+        context.client_build_number,
+        user_agent,
+    );
+    if let Some(bundle) = bundle
+        && !bundle.cookies.is_empty()
+    {
+        let merged = merge_cookie_header(existing_cookie.unwrap_or_default(), &bundle.cookies);
+        if !merged.is_empty() {
+            request = request.header(header::COOKIE, merged);
         }
     }
     request
@@ -136,20 +266,21 @@ fn native_browser_headers_for_client(
     referer: &str,
     client_version: &str,
     client_build_number: &str,
+    user_agent: &str,
 ) -> RequestBuilder {
-    let mut request = request
+    request
         // wreq's emulation profile installs browser headers as client defaults.
         // Disable those defaults before adding the canonical web headers below;
         // RequestBuilder::header appends and would otherwise send duplicates.
         .default_headers(false)
-        .header(header::USER_AGENT, NATIVE_USER_AGENT)
+        .header(header::USER_AGENT, user_agent)
         .header("Origin", NATIVE_ORIGIN)
         .header(header::REFERER, referer)
         .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7")
         .header("Cache-Control", "no-cache")
         .header("Pragma", "no-cache")
         .header("Priority", "u=1, i")
-        .header("Sec-Ch-Ua", NATIVE_SEC_CH_UA)
+        .header("Sec-Ch-Ua", &context.sec_ch_ua)
         .header("Sec-Ch-Ua-Arch", "\"x86\"")
         .header("Sec-Ch-Ua-Bitness", "\"64\"")
         .header("Sec-Ch-Ua-Full-Version", "\"143.0.3650.96\"")
@@ -157,9 +288,9 @@ fn native_browser_headers_for_client(
             "Sec-Ch-Ua-Full-Version-List",
             "\"Microsoft Edge\";v=\"143.0.3650.96\", \"Chromium\";v=\"143.0.7499.147\", \"Not A(Brand\";v=\"24.0.0.0\"",
         )
-        .header("Sec-Ch-Ua-Mobile", "?0")
+        .header("Sec-Ch-Ua-Mobile", &context.sec_ch_ua_mobile)
         .header("Sec-Ch-Ua-Model", "\"\"")
-        .header("Sec-Ch-Ua-Platform", "\"Windows\"")
+        .header("Sec-Ch-Ua-Platform", &context.sec_ch_ua_platform)
         .header("Sec-Ch-Ua-Platform-Version", "\"19.0.0\"")
         .header("Sec-Fetch-Dest", "empty")
         .header("Sec-Fetch-Mode", "cors")
@@ -168,44 +299,7 @@ fn native_browser_headers_for_client(
         .header("OAI-Session-Id", &context.session_id)
         .header("OAI-Language", "zh-CN")
         .header("OAI-Client-Version", client_version)
-        .header("OAI-Client-Build-Number", client_build_number);
-    if let Ok(bytes) = fs::read(crate::config_path_for_runtime())
-        && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
-        && let Some(clearance) = value
-            .get("proxy_runtime")
-            .and_then(Value::as_object)
-            .and_then(|runtime| runtime.get("clearance"))
-            .and_then(Value::as_object)
-    {
-        if let Some(user_agent) = clearance
-            .get("user_agent")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            request = request.header(header::USER_AGENT, user_agent.trim());
-        }
-        let mut additions = clearance
-            .get("cf_cookies")
-            .and_then(Value::as_str)
-            .map(parse_cookie_header)
-            .unwrap_or_default();
-        if let Some(clearance) = clearance
-            .get("cf_clearance")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        {
-            additions
-                .entry("cf_clearance".to_owned())
-                .or_insert_with(|| clearance.trim().to_owned());
-        }
-        if !additions.is_empty() {
-            let merged = cookie_header(&additions);
-            if !merged.is_empty() {
-                request = request.header(header::COOKIE, merged);
-            }
-        }
-    }
-    request
+        .header("OAI-Client-Build-Number", client_build_number)
 }
 
 pub(super) fn codex_client_version() -> Option<String> {
@@ -681,4 +775,131 @@ pub(super) fn native_codex_response_payload(
         payload["text"] = Value::Object(merged);
     }
     Ok(payload)
+}
+
+#[cfg(test)]
+mod clearance_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn manual_clearance_uses_runtime_config_and_disabled_modes_ignore_cached_data() {
+        let store = crate::proxy_service::ClearanceStore::default();
+        let context = NativeRequestContext::new();
+        let target = "https://chatgpt.com/";
+        let proxy = "http://proxy.example.test:8080";
+        let client = reqwest::Client::new();
+        let manual_runtime = json!({
+            "enabled": true,
+            "clearance": {
+                "enabled": true,
+                "mode": "manual",
+                "cf_cookies": "sid=from-config",
+                "cf_clearance": "manual-token",
+                "user_agent": "manual-agent"
+            }
+        });
+        let manual_request = native_browser_headers_with_clearance(
+            client.get(target),
+            &context,
+            target,
+            Some(&store),
+            Some(&manual_runtime),
+            proxy,
+            target,
+            None,
+        )
+        .await
+        .build()
+        .expect("manual request builds");
+        assert_eq!(manual_request.headers()[header::USER_AGENT], "manual-agent");
+        assert_eq!(
+            manual_request.headers()[header::COOKIE],
+            "cf_clearance=manual-token; sid=from-config"
+        );
+
+        store
+            .put(
+                proxy,
+                target,
+                ClearanceBundle {
+                    target_host: String::new(),
+                    proxy_url: String::new(),
+                    cookies: HashMap::from([("sid".to_owned(), "cached-cookie".to_owned())]),
+                    user_agent: "cached-agent".to_owned(),
+                    expires_at: None,
+                },
+                0,
+            )
+            .await;
+        for runtime in [
+            json!({
+                "enabled": false,
+                "clearance": {
+                    "enabled": true,
+                    "mode": "manual",
+                    "cf_cookies": "sid=disabled-cookie",
+                    "user_agent": "disabled-agent"
+                }
+            }),
+            json!({
+                "enabled": true,
+                "clearance": {
+                    "enabled": true,
+                    "mode": "none"
+                }
+            }),
+        ] {
+            let request = native_browser_headers_with_clearance(
+                client.get(target),
+                &context,
+                target,
+                Some(&store),
+                Some(&runtime),
+                proxy,
+                target,
+                None,
+            )
+            .await
+            .build()
+            .expect("disabled request builds");
+            assert!(!request.headers().contains_key(header::COOKIE));
+            let user_agent = request
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok());
+            assert_ne!(user_agent, Some("cached-agent"));
+            assert_ne!(user_agent, Some("disabled-agent"));
+        }
+    }
+    #[tokio::test]
+    async fn account_fingerprint_overrides_native_browser_headers() {
+        let account = json!({
+            "fp": {
+                "USER-AGENT": "nested-agent",
+                "OAI-DEVICE-ID": "nested-device",
+                "oai-session-id": "nested-session",
+                "sec-ch-ua": "nested-brands",
+                "sec-ch-ua-mobile": "?1",
+                "sec-ch-ua-platform": "\\\"Linux\\\"",
+                "impersonate": "chrome124"
+            },
+            "user-agent": "top-agent",
+            "oai-device-id": "top-device",
+            "sec-ch-ua-platform": "\\\"Android\\\""
+        });
+        let context = NativeRequestContext::for_account(&account);
+        assert_eq!(context.tls_emulation(), wreq_util::Emulation::Chrome124);
+        let request =
+            native_browser_headers(reqwest::Client::new().get("https://chatgpt.com/"), &context)
+                .build()
+                .expect("account fingerprint request builds");
+        let headers = request.headers();
+        assert_eq!(headers[header::USER_AGENT], "top-agent");
+        assert_eq!(headers["OAI-Device-Id"], "top-device");
+        assert_eq!(headers["OAI-Session-Id"], "nested-session");
+        assert_eq!(headers["Sec-Ch-Ua"], "nested-brands");
+        assert_eq!(headers["Sec-Ch-Ua-Mobile"], "?1");
+        assert_eq!(headers["Sec-Ch-Ua-Platform"], "\\\"Android\\\"");
+    }
 }

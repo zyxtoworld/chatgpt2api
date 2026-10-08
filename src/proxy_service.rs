@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
@@ -34,10 +34,74 @@ pub(crate) struct ClearanceBundle {
 #[derive(Clone, Default)]
 pub(crate) struct ClearanceStore {
     entries: Arc<Mutex<HashMap<ClearanceKey, ClearanceBundle>>>,
-    flights: Arc<Mutex<HashMap<ClearanceKey, ClearanceFlight>>>,
+    flights: Arc<StdMutex<HashMap<ClearanceKey, ClearanceFlight>>>,
+}
+
+struct ClearanceFlightOwner {
+    flights: Arc<StdMutex<HashMap<ClearanceKey, ClearanceFlight>>>,
+    key: ClearanceKey,
+    notify: ClearanceFlight,
+}
+
+impl ClearanceFlightOwner {
+    fn new(
+        flights: Arc<StdMutex<HashMap<ClearanceKey, ClearanceFlight>>>,
+        key: ClearanceKey,
+        notify: ClearanceFlight,
+    ) -> Self {
+        Self {
+            flights,
+            key,
+            notify,
+        }
+    }
+}
+
+impl Drop for ClearanceFlightOwner {
+    fn drop(&mut self) {
+        let mut flights = self
+            .flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if flights
+            .get(&self.key)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.notify))
+        {
+            flights.remove(&self.key);
+        }
+        drop(flights);
+        self.notify.notify_waiters();
+    }
 }
 
 impl ClearanceStore {
+    async fn wait_for_flight(
+        &self,
+        key: &ClearanceKey,
+        proxy_url: &str,
+        target_url: &str,
+        notify: &ClearanceFlight,
+    ) -> Option<ClearanceBundle> {
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(bundle) = self.get(proxy_url, target_url).await {
+                return Some(bundle);
+            }
+            let still_running = self
+                .flights
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, notify));
+            if !still_running {
+                return self.get(proxy_url, target_url).await;
+            }
+            notified.await;
+        }
+    }
+
     pub(crate) async fn get(&self, proxy_url: &str, target_url: &str) -> Option<ClearanceBundle> {
         let key = (normalize_proxy_url(proxy_url), normalize_host(target_url));
         let mut entries = self.entries.lock().await;
@@ -90,7 +154,10 @@ impl ClearanceStore {
             return Some(bundle);
         }
         let (notify, owner) = {
-            let mut flights = self.flights.lock().await;
+            let mut flights = self
+                .flights
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(notify) = flights.get(&key) {
                 (notify.clone(), false)
             } else {
@@ -100,10 +167,13 @@ impl ClearanceStore {
             }
         };
         if !owner {
-            notify.notified().await;
-            return self.get(proxy_url, target_url).await;
+            return self
+                .wait_for_flight(&key, proxy_url, target_url, &notify)
+                .await;
         }
-        let result = async {
+        let _flight_owner =
+            ClearanceFlightOwner::new(self.flights.clone(), key.clone(), notify.clone());
+        async {
             let endpoint = endpoint.trim_end_matches('/');
             if endpoint.is_empty() {
                 return None;
@@ -123,10 +193,7 @@ impl ClearanceStore {
                 .await;
             self.get(proxy_url, target_url).await
         }
-        .await;
-        self.flights.lock().await.remove(&key);
-        notify.notify_waiters();
-        result
+        .await
     }
 
     pub(crate) async fn hosts(&self) -> Vec<String> {
@@ -141,6 +208,33 @@ impl ClearanceStore {
         hosts.dedup();
         hosts
     }
+    pub(crate) fn cached_hosts_now(&self) -> Vec<String> {
+        let Ok(entries) = self.entries.try_lock() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut hosts = entries
+            .values()
+            .filter(|bundle| bundle.expires_at.is_none_or(|expires_at| now < expires_at))
+            .map(|bundle| bundle.target_host.clone())
+            .collect::<Vec<_>>();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
+}
+
+fn runtime_bool(value: Option<&Value>, default: bool) -> bool {
+    match value {
+        None | Some(Value::Null) => default,
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(value)) => value.as_f64().is_some_and(|value| value != 0.0),
+        // Python's `bool(value)` treats every non-empty string as true,
+        // including strings such as "false" and "0".
+        Some(Value::String(value)) => !value.is_empty(),
+        Some(Value::Array(value)) => !value.is_empty(),
+        Some(Value::Object(value)) => !value.is_empty(),
+    }
 }
 
 pub(crate) fn profile_from_runtime(
@@ -152,14 +246,13 @@ pub(crate) fn profile_from_runtime(
     upstream: bool,
 ) -> ProxyProfile {
     let object = runtime.as_object();
-    let enabled = object
-        .and_then(|value| value.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let enabled = runtime_bool(object.and_then(|value| value.get("enabled")), false);
     let egress_mode = object
         .and_then(|value| value.get("egress_mode"))
         .and_then(Value::as_str)
-        .filter(|value| *value == "single_proxy")
+        .map(str::trim)
+        .filter(|value| value.eq_ignore_ascii_case("single_proxy"))
+        .map(|_| "single_proxy")
         .unwrap_or("direct")
         .to_owned();
     let runtime_proxy = if upstream && enabled && egress_mode == "single_proxy" {
@@ -217,10 +310,7 @@ pub(crate) fn profile_from_runtime(
         runtime_enabled: enabled,
         egress_mode,
         skip_ssl_verify: enabled
-            && object
-                .and_then(|value| value.get("skip_ssl_verify"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            && runtime_bool(object.and_then(|value| value.get("skip_ssl_verify")), false),
         reset_session_status_codes: if reset_session_status_codes.is_empty() {
             vec![403]
         } else {
@@ -234,23 +324,77 @@ pub(crate) fn should_reset_session(profile: &ProxyProfile, status: u16) -> bool 
 }
 
 pub(crate) fn normalize_proxy_url(raw: &str) -> String {
-    let value = raw.trim();
-    if value.len() >= 8 && value[..8].eq_ignore_ascii_case("socks://") {
+    let mut value = raw.trim().to_owned();
+    if !value.is_empty() && !value.contains("://") {
+        let parts = value.splitn(4, ':').collect::<Vec<_>>();
+        if parts.len() == 2
+            && !parts[1].is_empty()
+            && parts[1].bytes().all(|byte| byte.is_ascii_digit())
+        {
+            value = format!("http://{value}");
+        } else if parts.len() == 4
+            && !parts[1].is_empty()
+            && parts[1].bytes().all(|byte| byte.is_ascii_digit())
+        {
+            value = format!(
+                "http://{}:{}@{}:{}",
+                quote_proxy_component(parts[2]),
+                quote_proxy_component(parts[3]),
+                parts[0],
+                parts[1]
+            );
+        }
+    }
+    if value
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("socks://"))
+    {
         return format!("socks5h://{}", &value[8..]);
     }
-    if value.len() >= 9 && value[..9].eq_ignore_ascii_case("socks5://") {
+    if value
+        .get(..9)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("socks5://"))
+    {
         return format!("socks5h://{}", &value[9..]);
     }
-    value.to_owned()
+    value
+}
+
+fn quote_proxy_component(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 pub(crate) fn normalize_host(raw: &str) -> String {
-    let value = raw.trim().to_ascii_lowercase();
+    let value = raw.trim();
+    let candidate = if value.contains("://") {
+        value.to_owned()
+    } else {
+        format!("https://{value}")
+    };
+    if let Ok(url) = url::Url::parse(&candidate)
+        && let Some(host) = url.host_str()
+    {
+        return host.trim_matches('.').to_ascii_lowercase();
+    }
+    let value = value.to_ascii_lowercase();
     let value = value
         .strip_prefix("https://")
         .or_else(|| value.strip_prefix("http://"))
         .unwrap_or(&value);
-    value.split('/').next().unwrap_or(value).to_owned()
+    value
+        .split('/')
+        .next()
+        .unwrap_or(value)
+        .trim_matches('.')
+        .to_owned()
 }
 
 pub(crate) fn domain_matches(host: &str, domain: &str) -> bool {
@@ -280,11 +424,27 @@ pub(crate) fn cookie_header(cookies: &HashMap<String, String>) -> String {
 }
 
 pub(crate) fn merge_cookie_header(existing: &str, additions: &HashMap<String, String>) -> String {
-    let mut merged = parse_cookie_header(existing);
-    for (name, value) in additions {
-        merged.entry(name.clone()).or_insert_with(|| value.clone());
+    let existing = existing.trim();
+    let existing_names = parse_cookie_header(existing)
+        .into_keys()
+        .collect::<std::collections::HashSet<_>>();
+    let mut additions = additions
+        .iter()
+        .filter(|(name, _)| !name.is_empty() && !existing_names.contains(*name))
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    additions.sort();
+    if existing.is_empty() {
+        return additions.join("; ");
     }
-    cookie_header(&merged)
+    if additions.is_empty() {
+        return existing.to_owned();
+    }
+    format!(
+        "{}; {}",
+        existing.trim_end_matches([';', ' ']),
+        additions.join("; ")
+    )
 }
 
 pub(crate) fn flaresolverr_payload(target_url: &str, proxy_url: &str, timeout_sec: u64) -> Value {
@@ -304,30 +464,45 @@ pub(crate) fn parse_flaresolverr_bundle(
     target_url: &str,
     proxy_url: &str,
 ) -> Option<ClearanceBundle> {
-    if value.get("status").and_then(Value::as_str) != Some("ok") {
+    let status = value
+        .get("status")
+        .map(|value| super::protocol_anthropic::python_text(Some(value)))
+        .unwrap_or_default();
+    if !status.eq_ignore_ascii_case("ok") {
         return None;
     }
     let solution = value.get("solution").and_then(Value::as_object)?;
     let target_host = normalize_host(target_url);
     let mut cookies = HashMap::new();
-    for cookie in solution.get("cookies")?.as_array()? {
-        let object = cookie.as_object()?;
-        let name = object.get("name").and_then(Value::as_str)?.trim();
-        let value = object
-            .get("value")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let domain = object
-            .get("domain")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !name.is_empty() && (domain.is_empty() || domain_matches(&target_host, domain)) {
-            cookies.insert(name.to_owned(), value.to_owned());
+    if let Some(raw_cookies) = solution.get("cookies").and_then(Value::as_array) {
+        for cookie in raw_cookies {
+            let Some(object) = cookie.as_object() else {
+                continue;
+            };
+            let name = object
+                .get("name")
+                .map(|value| super::protocol_anthropic::python_text(Some(value)))
+                .unwrap_or_default();
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let value = object
+                .get("value")
+                .map(|value| super::protocol_anthropic::python_text(Some(value)))
+                .unwrap_or_default();
+            let domain = object
+                .get("domain")
+                .map(|value| super::protocol_anthropic::python_text(Some(value)))
+                .unwrap_or_default();
+            if !name.is_empty() && (domain.is_empty() || domain_matches(&target_host, &domain)) {
+                cookies.insert(name.to_owned(), value.to_owned());
+            }
         }
     }
     let user_agent = solution
         .get("userAgent")
-        .and_then(Value::as_str)
+        .map(|value| super::protocol_anthropic::python_text(Some(value)))
         .unwrap_or_default()
         .trim()
         .to_owned();
@@ -344,18 +519,115 @@ pub(crate) fn parse_flaresolverr_bundle(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn clearance_flight_waiters_observe_completion_before_and_after_wait_registration() {
+        let store = ClearanceStore::default();
+        let proxy = "http://proxy.example.test:8080";
+        let target = "https://chatgpt.com/";
+        let key = (normalize_proxy_url(proxy), normalize_host(target));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        store
+            .flights
+            .lock()
+            .expect("flight map lock")
+            .insert(key.clone(), notify.clone());
+
+        let waiting_store = store.clone();
+        let waiting_key = key.clone();
+        let waiting_notify = notify.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_store
+                .wait_for_flight(&waiting_key, proxy, target, &waiting_notify)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let guard = ClearanceFlightOwner::new(store.flights.clone(), key.clone(), notify.clone());
+        drop(guard);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("registered waiter wakes")
+                .expect("waiter task")
+                .is_none()
+        );
+
+        let already_finished = Arc::new(tokio::sync::Notify::new());
+        let finished_key = (normalize_proxy_url(proxy), normalize_host(target));
+        store
+            .flights
+            .lock()
+            .expect("flight map lock")
+            .insert(finished_key.clone(), already_finished.clone());
+        store
+            .flights
+            .lock()
+            .expect("flight map lock")
+            .remove(&finished_key);
+        already_finished.notify_waiters();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                store.wait_for_flight(&finished_key, proxy, target, &already_finished),
+            )
+            .await
+            .expect("late waiter does not lose completion")
+            .is_none()
+        );
+    }
+
     #[test]
     fn proxy_and_cookie_helpers_match_python_precedence() {
         assert_eq!(
             normalize_proxy_url("socks5://proxy:1080"),
             "socks5h://proxy:1080"
         );
+        assert_eq!(
+            normalize_proxy_url("proxy.example:8080"),
+            "http://proxy.example:8080"
+        );
+        assert_eq!(
+            normalize_proxy_url("proxy.example:8080:user name:p@ss:word"),
+            "http://user%20name:p%40ss%3Aword@proxy.example:8080"
+        );
+        let normalized_runtime = profile_from_runtime(
+            &json!({
+                "enabled":" true ",
+                "egress_mode":" SINGLE_PROXY ",
+                "proxy_url":"proxy.example:8080",
+                "skip_ssl_verify":"yes"
+            }),
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(normalized_runtime.proxy_source, "runtime");
+        assert_eq!(normalized_runtime.proxy_url, "http://proxy.example:8080");
+        assert!(normalized_runtime.runtime_enabled);
+        assert_eq!(normalized_runtime.egress_mode, "single_proxy");
+        assert!(normalized_runtime.skip_ssl_verify);
+        assert_eq!(normalize_proxy_url("代理代理"), "代理代理");
+        let numeric_runtime = profile_from_runtime(
+            &json!({
+                "enabled": 1,
+                "egress_mode": " SINGLE_PROXY ",
+                "proxy_url": "http://numeric-runtime:8080"
+            }),
+            None,
+            None,
+            None,
+            false,
+            true,
+        );
+        assert_eq!(numeric_runtime.proxy_source, "runtime");
         let mut additions = HashMap::new();
         additions.insert("cf_clearance".to_owned(), "new".to_owned());
         additions.insert("foo".to_owned(), "bar".to_owned());
         assert_eq!(
             merge_cookie_header("foo=old; sid=1", &additions),
-            "cf_clearance=new; foo=old; sid=1"
+            "foo=old; sid=1; cf_clearance=new"
         );
     }
 
@@ -382,6 +654,58 @@ mod tests {
         .expect("bundle");
         assert!(bundle.cookies.contains_key("ok"));
         assert!(!bundle.cookies.contains_key("bad"));
+    }
+    #[test]
+    fn flaresolverr_keeps_user_agent_without_cookies_and_skips_bad_entries() {
+        let bundle = parse_flaresolverr_bundle(
+            &json!({
+                "status": "OK",
+                "solution": {
+                    "userAgent": " ua-only ",
+                    "cookies": [
+                        null,
+                        {"name":"sid","value":"1","domain":".CHATGPT.COM"},
+                        {"value":"missing-name"},
+                        {"name":"","value":"empty-name"},
+                        {"name":"wrong","value":"2","domain":"other.test"}
+                    ]
+                }
+            }),
+            "https://CHATGPT.com./path",
+            "http://proxy:8080",
+        )
+        .expect("UA-only bundle");
+        assert_eq!(bundle.user_agent, "ua-only");
+        assert_eq!(bundle.cookies.get("sid"), Some(&"1".to_owned()));
+        assert!(!bundle.cookies.contains_key("wrong"));
+    }
+    #[test]
+    fn flaresolverr_projection_uses_python_string_coercion() {
+        let bundle = parse_flaresolverr_bundle(
+            &json!({
+                "status": "OK",
+                "solution": {
+                    "userAgent": 7,
+                    "cookies": [{"name": 8, "value": true}]
+                }
+            }),
+            "https://chatgpt.com",
+            "",
+        )
+        .expect("coerced FlareSolverr bundle");
+        assert_eq!(bundle.user_agent, "7");
+        assert_eq!(bundle.cookies.get("8"), Some(&"True".to_owned()));
+    }
+
+    #[test]
+    fn merge_cookie_header_preserves_existing_wire_order_and_whitespace() {
+        let mut additions = HashMap::new();
+        additions.insert("foo".to_owned(), "new".to_owned());
+        additions.insert("cf_clearance".to_owned(), "clear".to_owned());
+        assert_eq!(
+            merge_cookie_header("  sid=1; foo=old;  ", &additions),
+            "sid=1; foo=old; cf_clearance=clear"
+        );
     }
 
     #[test]
@@ -420,5 +744,37 @@ mod tests {
         assert_eq!(runtime.proxy_url, "http://resource:2");
         assert!(should_reset_session(&runtime, 403));
         assert!(!should_reset_session(&runtime, 500));
+    }
+
+    #[test]
+    fn account_session_profile_matches_python_default_session_kwargs() {
+        let runtime = json!({
+            "enabled": true,
+            "egress_mode": "single_proxy",
+            "proxy_url": "http://runtime:1",
+            "resource_proxy_url": "http://runtime-resource:2",
+            "skip_ssl_verify": true
+        });
+        let global =
+            profile_from_runtime(&runtime, None, None, Some("http://global:3"), false, false);
+        assert_eq!(global.proxy_source, "global");
+        assert_eq!(global.proxy_url, "http://global:3");
+        assert!(global.skip_ssl_verify);
+
+        let account = profile_from_runtime(
+            &runtime,
+            Some("http://account:4"),
+            None,
+            Some("http://global:3"),
+            true,
+            false,
+        );
+        assert_eq!(account.proxy_source, "account");
+        assert_eq!(account.proxy_url, "http://account:4");
+
+        let direct = profile_from_runtime(&runtime, None, None, None, false, false);
+        assert_eq!(direct.proxy_source, "direct");
+        assert!(direct.proxy_url.is_empty());
+        assert!(direct.skip_ssl_verify);
     }
 }

@@ -6,7 +6,7 @@ use std::{
     path::Path,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -14,7 +14,9 @@ use std::{
 #[cfg(test)]
 use std::path::PathBuf;
 #[cfg(test)]
-use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
+#[cfg(test)]
+use std::sync::{Barrier, Mutex as StdMutex};
 
 use axum::{
     Json,
@@ -25,16 +27,16 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use file_identity::{DirectoryHandle, open_directory, open_or_create_directory};
 use futures_util::StreamExt;
-use reqwest::RequestBuilder;
+use reqwest::{Client, RequestBuilder};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
 use super::{
     AccountLease, AccountModelGroup, AccountStore, ApiError, AppState,
     MAX_EDITABLE_TASK_FILE_BYTES, MAX_EDITABLE_TASKS, MAX_REQUEST_BODY_BYTES, NativeRequestContext,
-    account_pool::current_timestamp, acquire_path_write_lock, acquire_path_write_lock_sync,
+    account_pool::current_local_timestamp, acquire_path_write_lock, acquire_path_write_lock_sync,
     atomic_replace_checked_with_limit, authenticated_subject, bounded_response_body,
     editable_capability_digest, editable_file_tasks_path, editable_relative_path,
     native_bootstrap_with_timeout_context, native_browser_headers_with_clearance,
@@ -56,7 +58,9 @@ const MAX_EDITABLE_ARTIFACT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_EDITABLE_ARTIFACT_NODES: usize = 100_000;
 const MAX_EDITABLE_ARTIFACT_DEPTH: usize = 128;
 const GENERIC_TASK_ERROR: &str = "editable file task failed";
-const PSD_IMAGE_REQUIRED_ERROR: &str = "PSD 任务需要至少一张图片";
+const NO_AVAILABLE_ACCOUNT_ERROR: &str = "no available plus/team/pro account";
+const PSD_IMAGE_REQUIRED_ERROR: &str = "base64_images is empty";
+const LEGACY_PSD_IMAGE_REQUIRED_ERROR: &str = "PSD 任务需要至少一张图片";
 const RESTART_INTERRUPTED_ERROR: &str = "服务已重启，未完成的任务已中断";
 const EDITABLE_PPT_PROMPT: &str = "我需要你根据用户的需求，来制作一个可以编辑的PPT，你可以使用Agent来做，你不要再继续询问用户问题，内容风格、版式、配色、内容结构和页面信息你可以自行补充并直接执行。整体的流程如下：\n1. 用生图的方式，帮我生成一个精美的产品介绍ppt，5-6个页面\n2. 帮我把以上涉及到的所有图像和形状素材拆分成单独png，每个素材单独一张图片，不要有遗漏，让我可以直接在ppt里拼接素材还原，不要文字\n3. 利用以上所有图片和形状素材，帮我还原你第一次生成的展示ppt，我需要是可编辑的ppt格式，主要部分需要你单独还原插入，文字需要可以编辑\n最后只需要给我生成一个PPT文件，以及生成中遇到的各种素材压缩包zip文件就行。";
 const EDITABLE_PSD_PROMPT: &str = "帮我生成这个图像，把这张海报分成若干图像，包括背景图，每个元素不要改位置，这样子我可以直接在 平时里无需拖动，底色为白色，不要伪透明底。再帮我将以上拆分的图像拼合成一个psd文件，去除白色底，不要改变每个图层的相应位置，保留每个元素所在图层的相应位置，保留每个元素的图层，最后只需要给我输出psd文件，以及每个图层的zip文件";
@@ -97,27 +101,37 @@ impl Drop for RecoveryWriteFailureGuard {
     }
 }
 
+struct EditableWorkerAdmission {
+    accepting: bool,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
 pub(super) struct EditableWorkers {
-    accepting: AtomicBool,
+    admission: std::sync::Mutex<EditableWorkerAdmission>,
     active: AtomicUsize,
-    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     idle: Notify,
     #[cfg(test)]
     completion_barrier: StdMutex<Option<(Arc<Notify>, Arc<Notify>)>>,
+    #[cfg(test)]
+    admission_barrier: StdMutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
 }
 
 impl EditableWorkers {
     pub(super) fn new() -> Self {
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         Self {
-            accepting: AtomicBool::new(true),
+            admission: std::sync::Mutex::new(EditableWorkerAdmission {
+                accepting: true,
+                handles: Vec::new(),
+            }),
             active: AtomicUsize::new(0),
-            handles: Mutex::new(Vec::new()),
             shutdown_tx,
             idle: Notify::new(),
             #[cfg(test)]
             completion_barrier: StdMutex::new(None),
+            #[cfg(test)]
+            admission_barrier: StdMutex::new(None),
         }
     }
 
@@ -125,12 +139,26 @@ impl EditableWorkers {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut handles = self.handles.lock().await;
-        handles.retain(|handle| !handle.is_finished());
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        if !self.accepting.load(Ordering::Acquire) {
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        admission.handles.retain(|handle| !handle.is_finished());
+        if !admission.accepting {
             return false;
         }
+        #[cfg(test)]
+        let admission_barrier = self
+            .admission_barrier
+            .lock()
+            .expect("editable admission barrier")
+            .take();
+        #[cfg(test)]
+        if let Some((reached, release)) = admission_barrier {
+            reached.wait();
+            release.wait();
+        }
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         self.active.fetch_add(1, Ordering::AcqRel);
         let workers = self.clone();
         let handle = tokio::spawn(async move {
@@ -144,19 +172,28 @@ impl EditableWorkers {
                 () = future => {}
             }
         });
-        handles.push(handle);
+        admission.handles.push(handle);
         true
     }
 
     pub(super) fn begin_shutdown(&self) {
-        self.accepting.store(false, Ordering::Release);
+        let mut admission = self
+            .admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        admission.accepting = false;
         self.shutdown_tx.send_replace(true);
     }
 
     pub(super) async fn finish_shutdown(&self) {
         let handles = {
-            let mut handles = self.handles.lock().await;
-            std::mem::take(&mut *handles)
+            let mut admission = self
+                .admission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            admission.accepting = false;
+            self.shutdown_tx.send_replace(true);
+            std::mem::take(&mut admission.handles)
         };
         for handle in handles {
             let _ = handle.await;
@@ -168,6 +205,17 @@ impl EditableWorkers {
     pub(super) async fn shutdown(&self) {
         self.begin_shutdown();
         self.finish_shutdown().await;
+    }
+
+    #[cfg(test)]
+    fn hold_next_admission_for_test(&self) -> (Arc<Barrier>, Arc<Barrier>) {
+        let reached = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *self
+            .admission_barrier
+            .lock()
+            .expect("editable admission barrier") = Some((reached.clone(), release.clone()));
+        (reached, release)
     }
 
     pub(super) async fn wait_for_idle(&self) {
@@ -262,9 +310,11 @@ struct EditableUpstream<'a> {
     context: &'a NativeRequestContext,
     base_url: &'a str,
     deadline: Instant,
+    client: Client,
 }
 
 enum TaskFailure {
+    NoAvailableAccount,
     PsdImageRequired,
     Generic,
 }
@@ -272,6 +322,7 @@ enum TaskFailure {
 impl TaskFailure {
     fn public_message(&self) -> &'static str {
         match self {
+            Self::NoAvailableAccount => NO_AVAILABLE_ACCOUNT_ERROR,
             Self::PsdImageRequired => PSD_IMAGE_REQUIRED_ERROR,
             Self::Generic => GENERIC_TASK_ERROR,
         }
@@ -283,7 +334,7 @@ fn current_task_time() -> (String, f64) {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let seconds = now.as_secs_f64();
-    (current_timestamp(), seconds)
+    (current_local_timestamp(), seconds)
 }
 
 fn optional_timestamp(object: &Map<String, Value>, field: &str) -> Result<Option<f64>, ApiError> {
@@ -304,11 +355,16 @@ fn persisted_error(value: Option<&Value>) -> Result<Option<String>, ApiError> {
         Some(Value::String(value))
             if matches!(
                 value.as_str(),
-                GENERIC_TASK_ERROR | PSD_IMAGE_REQUIRED_ERROR | RESTART_INTERRUPTED_ERROR
+                GENERIC_TASK_ERROR
+                    | NO_AVAILABLE_ACCOUNT_ERROR
+                    | PSD_IMAGE_REQUIRED_ERROR
+                    | LEGACY_PSD_IMAGE_REQUIRED_ERROR
+                    | RESTART_INTERRUPTED_ERROR
             ) =>
         {
             Ok(Some(value.clone()))
         }
+        Some(Value::String(_)) => Ok(Some(GENERIC_TASK_ERROR.to_owned())),
         Some(_) => Err(ApiError::unavailable()),
     }
 }
@@ -573,10 +629,13 @@ async fn parse_request(body: Body) -> Result<EditableRequest, ApiError> {
         None | Some(Value::Null) => native_message_id(),
         Some(Value::String(value)) => {
             let value = value.trim();
-            if value.is_empty() || value.chars().count() > 256 || value.contains(',') {
+            if value.is_empty() {
+                native_message_id()
+            } else if value.chars().count() > 256 || value.contains(',') {
                 return Err(ApiError::validation());
+            } else {
+                value.to_owned()
             }
-            value.to_owned()
         }
         Some(_) => return Err(ApiError::validation()),
     };
@@ -588,6 +647,45 @@ async fn parse_request(body: Body) -> Result<EditableRequest, ApiError> {
         prompt,
         images,
     })
+}
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_optional_client_task_id_gets_generated_like_python() {
+        let request = parse_request(Body::from(
+            r#"{"prompt":"optional id","client_task_id":""}"#,
+        ))
+        .await
+        .expect("empty optional id is accepted");
+        assert!(!request.task_id.is_empty());
+    }
+    #[test]
+    fn editable_public_url_matches_python_base_url_projection() {
+        assert_eq!(
+            editable_public_url(
+                Some("https://example.test/"),
+                "/files/task/result.pptx".to_owned()
+            ),
+            "https://example.test/files/task/result.pptx"
+        );
+        assert_eq!(
+            editable_public_url(None, "/files/task/result.zip".to_owned()),
+            "/files/task/result.zip"
+        );
+    }
+    #[test]
+    fn editable_url_segment_matches_python_quote_safe_slash() {
+        assert_eq!(
+            editable_url_segment("nested/result.pptx"),
+            "nested/result.pptx"
+        );
+        assert_eq!(
+            editable_url_segment("name with space"),
+            "name%20with%20space"
+        );
+    }
 }
 
 fn public_task(task: &Map<String, Value>) -> Value {
@@ -808,26 +906,59 @@ async fn authenticated_request(
     }
 }
 
+fn editable_image_input(value: &str) -> Result<(Vec<u8>, String, u32, u32), TaskFailure> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return Err(TaskFailure::Generic);
+    }
+    let normalized = if raw
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        let data = &raw[5..];
+        let (metadata, payload) = data.split_once(',').ok_or(TaskFailure::Generic)?;
+        let mut metadata_parts = metadata.split(';');
+        let mime_type = metadata_parts.next().unwrap_or_default();
+        let encoding = metadata_parts.next().unwrap_or_default();
+        if mime_type.is_empty()
+            || !encoding.eq_ignore_ascii_case("base64")
+            || metadata_parts.next().is_some()
+        {
+            return Err(TaskFailure::Generic);
+        }
+        format!("data:image/png;base64,{}", payload)
+    } else {
+        raw.to_owned()
+    };
+    native_image_input(&normalized).map_err(|_| TaskFailure::Generic)
+}
+
 fn editable_image_format(bytes: &[u8]) -> Result<(&'static str, &'static str), TaskFailure> {
     match image::guess_format(bytes).map_err(|_| TaskFailure::Generic)? {
-        image::ImageFormat::Png => Ok(("image/png", "png")),
+        image::ImageFormat::Bmp => Ok(("image/bmp", "bmp")),
+        image::ImageFormat::Gif => Ok(("image/gif", "gif")),
+        image::ImageFormat::Ico => Ok(("image/x-icon", "ico")),
         image::ImageFormat::Jpeg => Ok(("image/jpeg", "jpg")),
+        image::ImageFormat::Png => Ok(("image/png", "png")),
+        image::ImageFormat::Pnm => Ok(("image/x-portable-anymap", "pnm")),
+        image::ImageFormat::Tga => Ok(("image/x-tga", "tga")),
+        image::ImageFormat::Tiff => Ok(("image/tiff", "tiff")),
         image::ImageFormat::WebP => Ok(("image/webp", "webp")),
         _ => Err(TaskFailure::Generic),
     }
 }
 
 async fn upload_editable_image(
-    state: &AppState,
-    lease: &AccountLease,
-    context: &NativeRequestContext,
-    base_url: &str,
+    upstream: &EditableUpstream<'_>,
     image: &str,
     index: usize,
-    deadline: Instant,
 ) -> Result<EditableUpload, TaskFailure> {
-    let (bytes, _declared_mime, width, height) =
-        native_image_input(image).map_err(|_| TaskFailure::Generic)?;
+    let state = upstream.state;
+    let lease = upstream.lease;
+    let context = upstream.context;
+    let base_url = upstream.base_url;
+    let deadline = upstream.deadline;
+    let (bytes, _declared_mime, width, height) = editable_image_input(image)?;
     if bytes.len() > MAX_EDITABLE_IMAGE_BYTES {
         return Err(TaskFailure::Generic);
     }
@@ -837,7 +968,7 @@ async fn upload_editable_image(
     let referer = format!("{base_url}/");
     let request = authenticated_request(
         state,
-        state.client.post(format!("{base_url}{path}")),
+        upstream.client.post(format!("{base_url}{path}")),
         lease,
         context,
         &referer,
@@ -867,7 +998,7 @@ async fn upload_editable_image(
         .filter(|value| valid_artifact_id(value))
         .unwrap_or_default();
     let upload_response = send_before_deadline(
-        state
+        upstream
             .client
             .put(upload_url)
             .header(header::CONTENT_TYPE, mime_type)
@@ -887,7 +1018,7 @@ async fn upload_editable_image(
     let uploaded_path = format!("/backend-api/files/{file_id}/uploaded");
     let uploaded = authenticated_request(
         state,
-        state.client.post(format!("{base_url}{uploaded_path}")),
+        upstream.client.post(format!("{base_url}{uploaded_path}")),
         lease,
         context,
         &referer,
@@ -910,14 +1041,15 @@ async fn upload_editable_image(
 }
 
 async fn prepare_editable_conversation(
-    state: &AppState,
-    lease: &AccountLease,
-    context: &NativeRequestContext,
-    base_url: &str,
+    upstream: &EditableUpstream<'_>,
     prompt: &str,
     uploads: &[EditableUpload],
-    deadline: Instant,
 ) -> Result<String, TaskFailure> {
+    let state = upstream.state;
+    let lease = upstream.lease;
+    let context = upstream.context;
+    let base_url = upstream.base_url;
+    let deadline = upstream.deadline;
     let path = "/backend-api/f/conversation/prepare";
     let referer = format!("{base_url}/");
     let mut payload = json!({
@@ -950,7 +1082,7 @@ async fn prepare_editable_conversation(
     }
     let request = authenticated_request(
         state,
-        state.client.post(format!("{base_url}{path}")),
+        upstream.client.post(format!("{base_url}{path}")),
         lease,
         context,
         &referer,
@@ -982,7 +1114,7 @@ async fn run_editable_conversation(
         return Err(TaskFailure::Generic);
     }
     let resources = native_bootstrap_with_timeout_context(
-        &state.client,
+        &upstream.client,
         base_url,
         lease.token(),
         remaining,
@@ -991,7 +1123,7 @@ async fn run_editable_conversation(
     .await
     .map_err(|_| TaskFailure::Generic)?;
     let requirements = native_chat_requirements_with_resources_for_route_context(
-        &state.client,
+        &upstream.client,
         base_url,
         lease.token(),
         &resources,
@@ -1074,7 +1206,7 @@ async fn run_editable_conversation(
     });
     let mut request = authenticated_request(
         state,
-        state.client.post(format!("{base_url}{path}")),
+        upstream.client.post(format!("{base_url}{path}")),
         lease,
         context,
         &referer,
@@ -1102,7 +1234,7 @@ async fn run_editable_conversation(
     if !response.status().is_success() {
         return Err(TaskFailure::Generic);
     }
-    search_conversation_id_from_response(response, deadline, false)
+    search_conversation_id_from_response(response, deadline, false, None, None, None)
         .await
         .map_err(|_| TaskFailure::Generic)
 }
@@ -1387,14 +1519,15 @@ async fn sleep_editable_poll(deadline: Instant) -> bool {
 }
 
 async fn wait_for_editable_artifacts(
-    state: &AppState,
-    lease: &AccountLease,
-    context: &NativeRequestContext,
-    base_url: &str,
+    upstream: &EditableUpstream<'_>,
     conversation_id: &str,
     kind: &str,
-    deadline: Instant,
 ) -> Result<(EditableArtifact, EditableArtifact), TaskFailure> {
+    let state = upstream.state;
+    let lease = upstream.lease;
+    let context = upstream.context;
+    let base_url = upstream.base_url;
+    let deadline = upstream.deadline;
     loop {
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(TaskFailure::Generic);
@@ -1403,7 +1536,7 @@ async fn wait_for_editable_artifacts(
         let referer = format!("{base_url}/c/{conversation_id}");
         let request = authenticated_request(
             state,
-            state.client.get(format!("{base_url}{path}")),
+            upstream.client.get(format!("{base_url}{path}")),
             lease,
             context,
             &referer,
@@ -1486,7 +1619,7 @@ async fn probe_download_url(
     let referer = format!("{base_url}/c/{conversation_id}");
     let mut request = authenticated_request(
         state,
-        state.client.get(format!("{base_url}{path}")),
+        upstream.client.get(format!("{base_url}{path}")),
         lease,
         context,
         &referer,
@@ -1649,7 +1782,7 @@ async fn download_artifact(
     output_name: String,
 ) -> Result<String, TaskFailure> {
     let url = resolve_download_url(upstream, conversation_id, artifact).await?;
-    let response = send_before_deadline(upstream.state.client.get(url), upstream.deadline).await?;
+    let response = send_before_deadline(upstream.client.get(url), upstream.deadline).await?;
     if !response.status().is_success() {
         return Err(TaskFailure::Generic);
     }
@@ -1740,8 +1873,21 @@ fn new_download_capability() -> Result<String, TaskFailure> {
 }
 
 fn editable_url_segment(value: &str) -> String {
-    percent_encoding::percent_encode(value.as_bytes(), percent_encoding::NON_ALPHANUMERIC)
-        .to_string()
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+fn editable_public_url(base_url: Option<&str>, path: String) -> String {
+    let Some(base_url) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return path;
+    };
+    format!("{}{}", base_url.trim_end_matches('/'), path)
 }
 
 async fn complete_task(
@@ -1749,6 +1895,7 @@ async fn complete_task(
     owner: &str,
     task_id: &str,
     kind: &str,
+    public_base_url: Option<&str>,
     export: EditableExport,
 ) -> Result<(), ApiError> {
     let primary_name = editable_relative_path(&export.primary_name)
@@ -1766,13 +1913,19 @@ async fn complete_task(
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     let task_segment = editable_url_segment(task_id);
-    let primary_url = format!(
-        "/files/{capability}/{owner_scope}/{kind}/{task_segment}/{}",
-        editable_url_segment(&primary_name)
+    let primary_url = editable_public_url(
+        public_base_url,
+        format!(
+            "/files/{capability}/{owner_scope}/{kind}/{task_segment}/{}",
+            editable_url_segment(&primary_name)
+        ),
     );
-    let zip_url = format!(
-        "/files/{capability}/{owner_scope}/{kind}/{task_segment}/{}",
-        editable_url_segment(&zip_name)
+    let zip_url = editable_public_url(
+        public_base_url,
+        format!(
+            "/files/{capability}/{owner_scope}/{kind}/{task_segment}/{}",
+            editable_url_segment(&zip_name)
+        ),
     );
     let primary_digest =
         editable_capability_digest(&capability, owner, kind, task_id, &primary_name);
@@ -1845,31 +1998,17 @@ async fn execute_task(
         context: &context,
         base_url,
         deadline,
+        client: super::upstream_client_for_lease(state, lease, false),
     };
     let prompt = editable_prompt(kind, prompt);
     let mut uploads = Vec::with_capacity(images.len());
     for (index, image) in images.iter().enumerate() {
-        uploads.push(
-            upload_editable_image(state, lease, &context, base_url, image, index + 1, deadline)
-                .await?,
-        );
+        uploads.push(upload_editable_image(&upstream, image, index + 1).await?);
     }
-    let conduit_token = prepare_editable_conversation(
-        state, lease, &context, base_url, &prompt, &uploads, deadline,
-    )
-    .await?;
+    let conduit_token = prepare_editable_conversation(&upstream, &prompt, &uploads).await?;
     let conversation_id =
         run_editable_conversation(&upstream, &prompt, &uploads, &conduit_token).await?;
-    let (primary, zip) = wait_for_editable_artifacts(
-        state,
-        lease,
-        &context,
-        base_url,
-        &conversation_id,
-        kind,
-        deadline,
-    )
-    .await?;
+    let (primary, zip) = wait_for_editable_artifacts(&upstream, &conversation_id, kind).await?;
     let (primary_name, zip_name) = download_editable_outputs(
         &upstream,
         owner,
@@ -1887,6 +2026,7 @@ async fn execute_task(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_task(
     state: &AppState,
     owner: String,
@@ -1894,6 +2034,7 @@ async fn run_task(
     kind: &'static str,
     prompt: String,
     images: Vec<String>,
+    public_base_url: Option<String>,
     _permit: OwnedSemaphorePermit,
 ) {
     let started = Instant::now();
@@ -1907,6 +2048,7 @@ async fn run_task(
     } else {
         "PPT生成任务"
     };
+    let log_identity = super::subject_log_identity(state, &owner);
     if update_task(state, &owner, &task_id, "running", None)
         .await
         .is_err()
@@ -1922,7 +2064,7 @@ async fn run_task(
             Some(TaskFailure::PsdImageRequired.public_message()),
         )
         .await;
-        super::append_api_call_log(
+        super::append_api_call_log_with_context_and_identity(
             state,
             endpoint,
             EDITABLE_MODEL,
@@ -1930,7 +2072,9 @@ async fn run_task(
             started,
             "failed",
             Some(&prompt),
+            None,
             Some(TaskFailure::PsdImageRequired.public_message()),
+            log_identity.as_ref(),
         );
         return;
     }
@@ -1942,12 +2086,7 @@ async fn run_task(
     ]);
     let Some(lease) = state
         .account_store
-        .acquire_excluding_with_type_and_capability_filter(
-            EDITABLE_MODEL,
-            &HashSet::new(),
-            Some(&allowed_groups),
-            Some("web"),
-        )
+        .acquire_least_recently_used_with_types(&allowed_groups)
         .await
     else {
         let _ = update_task(
@@ -1955,10 +2094,10 @@ async fn run_task(
             &owner,
             &task_id,
             "error",
-            Some(TaskFailure::Generic.public_message()),
+            Some(TaskFailure::NoAvailableAccount.public_message()),
         )
         .await;
-        super::append_api_call_log(
+        super::append_api_call_log_with_context_and_identity(
             state,
             endpoint,
             EDITABLE_MODEL,
@@ -1966,19 +2105,29 @@ async fn run_task(
             started,
             "failed",
             Some(&prompt),
-            Some(TaskFailure::Generic.public_message()),
+            None,
+            Some(TaskFailure::NoAvailableAccount.public_message()),
+            log_identity.as_ref(),
         );
         return;
     };
+    let account_email = lease.email();
 
     match execute_task(state, kind, &prompt, &images, &owner, &task_id, &lease).await {
         Ok(export) => {
-            if !state.account_store.mark_text_used(lease.token()) {
+            if !state.account_store.mark_text_used(lease.token()).await {
                 AccountStore::note_usage_mark_failure();
             }
-            if complete_task(state, &owner, &task_id, kind, export)
-                .await
-                .is_err()
+            if complete_task(
+                state,
+                &owner,
+                &task_id,
+                kind,
+                public_base_url.as_deref(),
+                export,
+            )
+            .await
+            .is_err()
             {
                 let _ = update_task(
                     state,
@@ -1988,7 +2137,7 @@ async fn run_task(
                     Some(TaskFailure::Generic.public_message()),
                 )
                 .await;
-                super::append_api_call_log(
+                super::append_api_call_log_with_account_and_identity(
                     state,
                     endpoint,
                     EDITABLE_MODEL,
@@ -1996,10 +2145,13 @@ async fn run_task(
                     started,
                     "failed",
                     Some(&prompt),
+                    None,
                     Some(TaskFailure::Generic.public_message()),
+                    account_email,
+                    log_identity.as_ref(),
                 );
             } else {
-                super::append_api_call_log(
+                super::append_api_call_log_with_account_and_identity(
                     state,
                     endpoint,
                     EDITABLE_MODEL,
@@ -2008,6 +2160,9 @@ async fn run_task(
                     "success",
                     Some(&prompt),
                     None,
+                    None,
+                    account_email,
+                    log_identity.as_ref(),
                 );
             }
         }
@@ -2020,7 +2175,7 @@ async fn run_task(
                 Some(error.public_message()),
             )
             .await;
-            super::append_api_call_log(
+            super::append_api_call_log_with_account_and_identity(
                 state,
                 endpoint,
                 EDITABLE_MODEL,
@@ -2028,7 +2183,10 @@ async fn run_task(
                 started,
                 "failed",
                 Some(&prompt),
+                None,
                 Some(error.public_message()),
+                account_email,
+                log_identity.as_ref(),
             );
         }
     }
@@ -2040,9 +2198,58 @@ pub(super) async fn submit(
     headers: HeaderMap,
     body: Body,
     kind: &'static str,
+    request_scheme: Option<&str>,
 ) -> Result<Response, ApiError> {
     let owner = authenticated_subject(&headers, &state).await?;
+    let log_identity = super::request_log_identity(&state, &headers);
+    let public_base_url =
+        super::native_image_base_url_from_headers(&state, &headers, request_scheme);
     let request = parse_request(body).await?;
+    let started = Instant::now();
+    let endpoint = if kind == "psd" {
+        "/v1/psd/generations"
+    } else {
+        "/v1/ppt/generations"
+    };
+    let summary = if kind == "psd" {
+        "PSD生成任务"
+    } else {
+        "PPT生成任务"
+    };
+    if let Err(error) =
+        super::reject_sensitive_words(&state, &Value::String(request.prompt.clone()))
+    {
+        super::append_api_call_log_with_context_and_identity(
+            &state,
+            endpoint,
+            EDITABLE_MODEL,
+            summary,
+            started,
+            "failed",
+            Some(&request.prompt),
+            None,
+            Some(error.message()),
+            log_identity.as_ref(),
+        );
+        return Err(error);
+    }
+    if let Err(error) =
+        super::review_request_content(&state, &Value::String(request.prompt.clone())).await
+    {
+        super::append_api_call_log_with_context_and_identity(
+            &state,
+            endpoint,
+            EDITABLE_MODEL,
+            summary,
+            started,
+            "failed",
+            Some(&request.prompt),
+            None,
+            Some(error.message()),
+            log_identity.as_ref(),
+        );
+        return Err(error);
+    }
     if let Some(existing) = existing_task(&state, &owner, &request.task_id).await? {
         return Ok(Json(existing).into_response());
     }
@@ -2084,6 +2291,7 @@ pub(super) async fn submit(
         let rejected_task_id = worker_task_id.clone();
         let worker_prompt = request.prompt;
         let worker_images = request.images;
+        let worker_public_base_url = public_base_url;
         let started = worker_tracker
             .spawn(async move {
                 run_task(
@@ -2093,6 +2301,7 @@ pub(super) async fn submit(
                     kind,
                     worker_prompt,
                     worker_images,
+                    worker_public_base_url,
                     permit,
                 )
                 .await;
@@ -2160,6 +2369,41 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(workers.active_for_test(), 0);
         assert!(!workers.spawn(async {}).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn editable_shutdown_cannot_race_task_registration() {
+        let workers = Arc::new(EditableWorkers::new());
+        let (reached, release) = workers.hold_next_admission_for_test();
+        let spawn_workers = workers.clone();
+        let spawn = tokio::spawn(async move {
+            spawn_workers
+                .spawn(async {
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .expect("admission barrier reached");
+
+        let shutdown_workers = workers.clone();
+        let mut shutdown = tokio::task::spawn_blocking(move || shutdown_workers.begin_shutdown());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must wait for an in-flight admission critical section"
+        );
+
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .expect("admission barrier release");
+        shutdown.await.expect("shutdown admission fence");
+        assert!(spawn.await.expect("spawn task"));
+        workers.finish_shutdown().await;
+        assert_eq!(workers.active_for_test(), 0);
     }
 
     #[test]
@@ -2292,6 +2536,7 @@ mod tests {
                 .to_string(),
             ),
             "ppt",
+            None,
         )
         .await
         .expect("duplicate editable submission response");

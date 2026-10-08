@@ -5,15 +5,15 @@ use std::{
     io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::{Arc, LazyLock, Mutex as StdMutex},
+    sync::{
+        Arc, LazyLock, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
-use std::sync::{
-    Condvar,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::sync::{Condvar, atomic::AtomicUsize};
 
 use aes::Aes256;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
@@ -24,30 +24,36 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use flate2::{
+    Compression,
+    read::GzDecoder,
+    write::{DeflateEncoder, GzEncoder},
+};
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use image::ImageReader;
+use image::{ImageDecoder, ImageEncoder, ImageReader};
 use reqwest::{Client, Method};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
 use tokio::sync::Semaphore;
+use url::Url;
 
 use super::model_pool::{
     ModelProvenance, is_web_image_model_id, model_provenance_label, model_provenance_rank,
     project_account_model_entries, project_imported_model_entries,
 };
-use super::proxy_service::{flaresolverr_payload, parse_flaresolverr_bundle};
+use super::proxy_service::{ProxyProfile, flaresolverr_payload, parse_flaresolverr_bundle};
 use super::{
     ApiError, AppState, admin_authenticated, authenticated, config, data_file, image_content_type,
     image_root, read_image_tags, redact_config, safe_relative_path,
 };
+pub(super) type Sub2ApiLoginCache = HashMap<String, (String, [u8; 32], std::time::Instant)>;
 
 const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_IMAGE_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LOG_ITEMS: usize = 200;
-const MAX_IMAGE_ITEMS: usize = 5_000;
-const MAX_IMAGE_ARCHIVE_ITEMS: usize = 5_000;
 const MAX_IMAGE_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_BACKUP_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
@@ -71,6 +77,7 @@ const BACKUP_CRYPT_BLOCK_BYTES: usize = 16;
 static BACKUP_CRYPT_SEMAPHORE: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(BACKUP_CRYPT_MAX_CONCURRENCY)));
 static LOG_WRITE_GATE: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+static IMAGE_INDEX_LOCK: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
 
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct LogQuery {
@@ -81,9 +88,15 @@ pub(super) struct LogQuery {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub(super) struct ImageListQuery {
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub(super) struct ImageCleanupQuery {
-    pub target_free_mb: Option<u64>,
-    pub dry_run: Option<bool>,
+    pub target_free_mb: Option<String>,
+    pub dry_run: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -238,6 +251,42 @@ fn now_nanos() -> u128 {
         .map(|value| value.as_nanos())
         .unwrap_or_default()
 }
+fn random_hex_id(bytes_len: usize) -> String {
+    let mut bytes = vec![0_u8; bytes_len];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let fallback = now_nanos().to_be_bytes();
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = fallback[index % fallback.len()];
+        }
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn log_uuid_hex() -> String {
+    let mut bytes = [0_u8; 16];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let fallback = now_nanos().to_be_bytes();
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = fallback[index % fallback.len()];
+        }
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+fn backup_object_name(encrypted: bool) -> String {
+    let timestamp = iso_timestamp(SystemTime::now()).replace(['-', ':'], "");
+    let mut random = [0_u8; 2];
+    let value = if getrandom::getrandom(&mut random).is_ok() {
+        u16::from_be_bytes(random)
+    } else {
+        (now_nanos() & 0xffff) as u16
+    };
+    format!(
+        "backup-{timestamp}-{value:04x}.{}",
+        if encrypted { "tar.gz.enc" } else { "tar.gz" }
+    )
+}
 
 fn unix_seconds(value: SystemTime) -> i64 {
     value
@@ -268,6 +317,34 @@ fn date_from_unix(seconds: i64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+fn image_local_timestamp() -> String {
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    )
+}
+pub(super) fn local_timestamp(value: SystemTime) -> String {
+    let utc = time::OffsetDateTime::from_unix_timestamp(unix_seconds(value))
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let local =
+        utc.to_offset(time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC));
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        local.year(),
+        local.month() as u8,
+        local.day(),
+        local.hour(),
+        local.minute(),
+        local.second(),
+    )
+}
+
 pub(super) fn iso_timestamp(value: SystemTime) -> String {
     let seconds = unix_seconds(value);
     let day_seconds = seconds.rem_euclid(86_400);
@@ -276,6 +353,21 @@ pub(super) fn iso_timestamp(value: SystemTime) -> String {
     let second = day_seconds % 60;
     format!(
         "{}T{hour:02}:{minute:02}:{second:02}Z",
+        date_from_unix(seconds)
+    )
+}
+pub(super) fn python_iso_timestamp(value: SystemTime) -> String {
+    let seconds = unix_seconds(value);
+    let micros = value
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_micros())
+        .unwrap_or_default();
+    let day_seconds = seconds.rem_euclid(86_400);
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    format!(
+        "{}T{hour:02}:{minute:02}:{second:02}.{micros:06}+00:00",
         date_from_unix(seconds)
     )
 }
@@ -312,13 +404,15 @@ fn maybe_fail_backup_state_publish(path: &Path) -> Result<(), ApiError> {
 
 fn write_json(path: &Path, value: &Value) -> Result<(), ApiError> {
     maybe_fail_backup_state_publish(path)?;
-    let bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::unavailable())?;
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::unavailable())?;
+    bytes.push(b'\n');
     write_atomic(path, &bytes)
 }
 
 fn write_json_unlocked(path: &Path, value: &Value) -> Result<(), ApiError> {
     maybe_fail_backup_state_publish(path)?;
-    let bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::unavailable())?;
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(|_| ApiError::unavailable())?;
+    bytes.push(b'\n');
     write_atomic_unlocked(path, &bytes)
 }
 
@@ -361,14 +455,114 @@ fn relative_string(root: &Path, path: &Path) -> Option<String> {
     safe_relative_path(&relative).map(|value| value.to_string_lossy().replace('\\', "/"))
 }
 
+fn image_index_path(state: &AppState) -> PathBuf {
+    data_file(state, "image_index.json")
+}
+
+fn read_image_index_unlocked(state: &AppState) -> Result<Map<String, Value>, ApiError> {
+    let bytes = match fs::read(image_index_path(state)) {
+        Ok(bytes) if bytes.len() <= MAX_IMAGE_INDEX_BYTES => bytes,
+        Ok(_) => return Err(ApiError::unavailable()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
+        Err(_) => return Err(ApiError::unavailable()),
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(Map::new());
+    };
+    let items = object_or_empty(value.get("items").cloned().unwrap_or_default());
+    Ok(items
+        .into_iter()
+        .filter(|(relative, item)| {
+            safe_relative_path(relative)
+                .is_some_and(|path| is_image_path(&path) && item.is_object())
+        })
+        .collect())
+}
+fn update_image_index<F, T>(state: &AppState, update: F) -> Result<T, ApiError>
+where
+    F: FnOnce(&mut Map<String, Value>) -> Result<T, ApiError>,
+{
+    let _guard = IMAGE_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut items = read_image_index_unlocked(state)?;
+    let result = update(&mut items)?;
+    write_json(&image_index_path(state), &json!({"items": items}))?;
+    Ok(result)
+}
+
+fn local_image_index_item(
+    relative: &str,
+    path: &Path,
+    previous: Option<&Map<String, Value>>,
+) -> Option<Value> {
+    let metadata = fs::metadata(path).ok()?;
+    let created_at = previous
+        .and_then(|item| item.get("created_at"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| local_timestamp(metadata.modified().unwrap_or(UNIX_EPOCH)));
+    let date = previous
+        .and_then(|item| item.get("date"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| created_at.get(..10).map(str::to_owned))
+        .unwrap_or_else(|| "1970-01-01".to_owned());
+    let webdav = previous
+        .and_then(|item| item.get("webdav"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut item = previous.cloned().unwrap_or_default();
+    item.insert("rel".to_owned(), json!(relative));
+    item.insert("path".to_owned(), json!(relative));
+    item.insert(
+        "name".to_owned(),
+        json!(
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image")
+        ),
+    );
+    item.insert("date".to_owned(), json!(date));
+    item.insert("size".to_owned(), json!(metadata.len()));
+    item.insert("created_at".to_owned(), json!(created_at));
+    item.insert(
+        "storage".to_owned(),
+        json!(if webdav { "both" } else { "local" }),
+    );
+    item.insert("local".to_owned(), json!(true));
+    item.insert("webdav".to_owned(), json!(webdav));
+    Some(Value::Object(item))
+}
+
 fn cleanup_orphaned_image_thumbnails(data_dir: &Path) {
     let images = data_dir.join("images");
     let thumbnails = data_dir.join("image-thumbnails");
+    let remote_images = {
+        let _guard = IMAGE_INDEX_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        fs::read(data_dir.join("image_index.json"))
+            .ok()
+            .filter(|bytes| bytes.len() <= MAX_IMAGE_INDEX_BYTES)
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get("items").cloned())
+            .map(object_or_empty)
+            .unwrap_or_default()
+    };
     for path in walk_regular_files(&thumbnails) {
         let Some(relative) = relative_string(&thumbnails, &path) else {
             continue;
         };
-        if relative.ends_with(".png") && !images.join(relative.trim_end_matches(".png")).is_file() {
+        let image_relative = relative.trim_end_matches(".png");
+        let is_remote = remote_images
+            .get(image_relative)
+            .and_then(|item| item.get("webdav"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if relative.ends_with(".png") && !images.join(image_relative).is_file() && !is_remote {
             let _ = fs::remove_file(path);
         }
     }
@@ -414,58 +608,234 @@ fn image_files(state: &AppState) -> Vec<(String, PathBuf)> {
         .into_iter()
         .filter(|path| is_image_path(path))
         .filter_map(|path| relative_string(&root, &path).map(|relative| (relative, path)))
-        .take(MAX_IMAGE_ITEMS)
         .collect()
 }
 
-fn image_item(tags: &Map<String, Value>, relative: &str, path: &Path) -> Option<Value> {
-    let metadata = fs::metadata(path).ok()?;
-    let created_at = metadata
-        .modified()
-        .ok()
-        .map(unix_seconds)
+fn image_item(
+    tags: &Map<String, Value>,
+    relative: &str,
+    path: Option<&Path>,
+    indexed: &Value,
+    public_base_url: Option<&str>,
+    request_base_url: Option<&str>,
+) -> Option<Value> {
+    let metadata = match path {
+        Some(path) => Some(fs::metadata(path).ok()?),
+        None => None,
+    };
+    let local = metadata.is_some();
+    let webdav = indexed
+        .get("webdav")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !local && !webdav {
+        return None;
+    }
+    let created_at = indexed
+        .get("created_at")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(local_timestamp)
+        })
         .unwrap_or_default();
-    let date = date_from_unix(created_at);
+    let date = indexed
+        .get("date")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| created_at.get(..10).map(str::to_owned))
+        .unwrap_or_else(|| "1970-01-01".to_owned());
     let tags = tags.get(relative).cloned().unwrap_or_else(|| json!([]));
-    Some(json!({
+    let url = public_base_url
+        .filter(|value| !value.is_empty())
+        .map(|base| format!("{}/{}", base.trim_end_matches('/'), relative))
+        .or_else(|| {
+            request_base_url
+                .filter(|value| !value.is_empty())
+                .map(|base| format!("{}/images/{relative}", base.trim_end_matches('/')))
+        })
+        .unwrap_or_else(|| format!("/images/{relative}"));
+    let thumbnail_url = request_base_url
+        .filter(|value| !value.is_empty())
+        .map(|base| format!("{}/image-thumbnails/{relative}", base.trim_end_matches('/')))
+        .unwrap_or_else(|| format!("/image-thumbnails/{relative}"));
+    let name = path
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .or_else(|| indexed.get("name").and_then(Value::as_str))
+        .unwrap_or("image");
+    let size = metadata
+        .as_ref()
+        .map(|metadata| metadata.len())
+        .or_else(|| indexed.get("size").and_then(Value::as_u64))
+        .unwrap_or_default();
+    let storage = match (local, webdav) {
+        (true, true) => "both",
+        (false, true) => "webdav",
+        _ => "local",
+    };
+    let mut item = json!({
         "rel": relative,
         "path": relative,
-        "name": path.file_name().and_then(|value| value.to_str()).unwrap_or("image"),
+        "name": name,
         "date": date,
-        "size": metadata.len(),
-        "url": format!("/images/{relative}"),
-        "thumbnail_url": format!("/image-thumbnails/{relative}"),
-        "created_at": created_at.to_string(),
+        "size": size,
+        "storage": storage,
+        "local": local,
+        "webdav": webdav,
+        "url": url,
+        "thumbnail_url": thumbnail_url,
+        "created_at": created_at,
         "tags": tags,
-    }))
+    });
+    for key in ["remote_url", "width", "height"] {
+        if let Some(value) = indexed.get(key) {
+            item[key] = value.clone();
+        }
+    }
+    Some(item)
 }
 
 pub(super) async fn list_images(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ImageListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
+    cleanup_old_images(&state);
+    let start_date = query.start_date.unwrap_or_default().trim().to_owned();
+    let end_date = query.end_date.unwrap_or_default().trim().to_owned();
     cleanup_orphaned_image_thumbnails(state.data_dir.as_ref());
     let tags = read_image_tags(&state)?;
+    let settings = image_storage_settings(&state);
+    let public_base_url = settings
+        .get("public_base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let request_base_url = super::native_image_base_url_from_headers(&state, &headers, None);
+    let _index_guard = IMAGE_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut index = read_image_index_unlocked(&state)?;
+    let mut index_changed = false;
     let mut items = Vec::new();
+    let mut local_paths = HashSet::new();
     for (relative, path) in image_files(&state) {
-        if let Some(item) = image_item(&tags, &relative, &path) {
+        local_paths.insert(relative.clone());
+        let previous = index.get(&relative).and_then(Value::as_object);
+        if let Some(next) = local_image_index_item(&relative, &path, previous) {
+            if index.get(&relative) != Some(&next) {
+                index.insert(relative.clone(), next.clone());
+                index_changed = true;
+            }
+            if let Some(item) = image_item(
+                &tags,
+                &relative,
+                Some(&path),
+                &next,
+                public_base_url,
+                request_base_url.as_deref(),
+            ) {
+                let date = item.get("date").and_then(Value::as_str).unwrap_or_default();
+                if (!start_date.is_empty() && date < start_date.as_str())
+                    || (!end_date.is_empty() && date > end_date.as_str())
+                {
+                    continue;
+                }
+                items.push(item);
+            }
+        }
+    }
+    let indexed_items = index
+        .iter()
+        .map(|(relative, item)| (relative.clone(), item.clone()))
+        .collect::<Vec<_>>();
+    for (relative, indexed) in indexed_items {
+        if local_paths.contains(&relative) {
+            continue;
+        }
+        let Some(path) = safe_relative_path(&relative) else {
+            continue;
+        };
+        if !is_image_path(&path) {
+            continue;
+        }
+        if image_root(&state).join(&path).is_file() {
+            continue;
+        }
+        let webdav = indexed
+            .get("webdav")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !webdav {
+            index.remove(&relative);
+            index_changed = true;
+            continue;
+        }
+        let mut normalized = indexed.clone();
+        if let Some(object) = normalized.as_object_mut() {
+            object.insert("local".to_owned(), json!(false));
+            object.insert("storage".to_owned(), json!("webdav"));
+        }
+        if normalized != indexed {
+            index.insert(relative.clone(), normalized.clone());
+            index_changed = true;
+        }
+        if let Some(item) = image_item(
+            &tags,
+            &relative,
+            None,
+            &normalized,
+            public_base_url,
+            request_base_url.as_deref(),
+        ) {
+            let date = item.get("date").and_then(Value::as_str).unwrap_or_default();
+            if (!start_date.is_empty() && date < start_date.as_str())
+                || (!end_date.is_empty() && date > end_date.as_str())
+            {
+                continue;
+            }
             items.push(item);
         }
     }
-    let mut grouped: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    if index_changed {
+        write_json(&image_index_path(&state), &json!({"items": index}))?;
+    }
+    items.sort_by(|left, right| {
+        right
+            .get("created_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(
+                left.get("created_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+    });
+    let mut groups: Vec<Value> = Vec::new();
     for item in &items {
         let date = item
             .get("date")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        grouped.entry(date).or_default().push(item.clone());
+        if let Some(group) = groups.last_mut()
+            && group.get("date").and_then(Value::as_str) == Some(date.as_str())
+        {
+            group["items"]
+                .as_array_mut()
+                .expect("image group items")
+                .push(item.clone());
+        } else {
+            groups.push(json!({"date": date, "items": [item]}));
+        }
     }
-    let groups = grouped
-        .into_iter()
-        .map(|(date, items)| json!({"date": date, "items": items}))
-        .collect::<Vec<_>>();
     Ok(Json(json!({"items": items, "groups": groups})))
 }
 
@@ -473,7 +843,23 @@ fn image_path_from_value(value: &Value) -> Result<PathBuf, ApiError> {
     value
         .as_str()
         .and_then(safe_relative_path)
-        .ok_or_else(ApiError::invalid_request)
+        .ok_or_else(|| ApiError::management_not_found("image not found"))
+}
+
+fn pydantic_management_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(value) if value.as_i64() == Some(0) => Some(false),
+        Value::Number(value) if value.as_i64() == Some(1) => Some(true),
+        Value::Number(value) if value.as_f64() == Some(0.0) => Some(false),
+        Value::Number(value) if value.as_f64() == Some(1.0) => Some(true),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "t" | "yes" | "y" | "on" => Some(true),
+            "0" | "false" | "f" | "no" | "n" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub(super) async fn delete_images(
@@ -483,24 +869,31 @@ pub(super) async fn delete_images(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let value = super::account_json_body(body).await?;
-    let object = value.as_object().ok_or_else(ApiError::invalid_request)?;
+    let object = value.as_object().ok_or_else(ApiError::validation)?;
     let all_matching = object
         .get("all_matching")
-        .and_then(Value::as_bool)
+        .map(|value| pydantic_management_bool(value).ok_or_else(ApiError::validation))
+        .transpose()?
         .unwrap_or(false);
-    let start_date = object
-        .get("start_date")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim();
-    let end_date = object
-        .get("end_date")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim();
+    let start_date = match object.get("start_date") {
+        None => "",
+        Some(Value::String(value)) => value.trim(),
+        Some(_) => return Err(ApiError::validation()),
+    };
+    let end_date = match object.get("end_date") {
+        None => "",
+        Some(Value::String(value)) => value.trim(),
+        Some(_) => return Err(ApiError::validation()),
+    };
     let mut targets = Vec::new();
     if all_matching {
-        let listed = list_images(State(state.clone()), headers.clone()).await?.0;
+        let listed = list_images(
+            State(state.clone()),
+            headers.clone(),
+            Query(ImageListQuery::default()),
+        )
+        .await?
+        .0;
         if let Some(items) = listed.get("items").and_then(Value::as_array) {
             for item in items {
                 let date = item.get("date").and_then(Value::as_str).unwrap_or_default();
@@ -512,33 +905,21 @@ pub(super) async fn delete_images(
                 }
             }
         }
-    } else if let Some(paths) = object.get("paths").and_then(Value::as_array) {
+    } else if let Some(paths) = object.get("paths") {
+        let paths = paths.as_array().ok_or_else(ApiError::validation)?;
         for path in paths {
-            targets.push(
-                image_path_from_value(path)?
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            );
+            let raw = path.as_str().ok_or_else(ApiError::validation)?;
+            if let Some(relative) = safe_relative_path(raw) {
+                targets.push(relative.to_string_lossy().replace('\\', "/"));
+            }
         }
     }
-    let root = image_root(&state);
     let mut removed = 0usize;
     for relative in targets {
-        let Some(safe) = safe_relative_path(&relative) else {
-            continue;
-        };
-        if fs::remove_file(root.join(&safe)).is_ok() {
+        if delete_stored_image(&state, &relative).await? {
             removed += 1;
-            let thumbnail = state
-                .data_dir
-                .join("image-thumbnails")
-                .join(&safe)
-                .with_extension("png");
-            let _ = fs::remove_file(thumbnail);
         }
     }
-    remove_empty_image_dirs(&root);
-    remove_empty_image_dirs(&state.data_dir.join("image-thumbnails"));
     Ok(Json(json!({"removed": removed})))
 }
 
@@ -595,41 +976,52 @@ pub(super) fn zip_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, ApiE
     let mut central = Vec::new();
     let mut file_count = 0usize;
     for (name, payload) in files {
+        if file_count >= usize::from(u16::MAX) {
+            return Err(ApiError::validation());
+        }
         if output.len().saturating_add(payload.len()) > MAX_IMAGE_ARCHIVE_BYTES {
             return Err(ApiError::validation());
         }
         let name_bytes = name.as_bytes();
+        let flags = if name.is_ascii() { 0 } else { 1 << 11 };
         let offset = u32::try_from(output.len()).map_err(|_| ApiError::validation())?;
-        let size = u32::try_from(payload.len()).map_err(|_| ApiError::validation())?;
+        let uncompressed_size = u32::try_from(payload.len()).map_err(|_| ApiError::validation())?;
         let checksum = crc32(&payload);
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&payload)
+            .map_err(|_| ApiError::unavailable())?;
+        let compressed = encoder.finish().map_err(|_| ApiError::unavailable())?;
+        let compressed_size =
+            u32::try_from(compressed.len()).map_err(|_| ApiError::validation())?;
         zip_u32(&mut output, 0x0403_4b50);
         zip_u16(&mut output, 20);
-        zip_u16(&mut output, 0);
-        zip_u16(&mut output, 0);
+        zip_u16(&mut output, flags);
+        zip_u16(&mut output, 8);
         zip_u16(&mut output, 0);
         zip_u16(&mut output, 0);
         zip_u32(&mut output, checksum);
-        zip_u32(&mut output, size);
-        zip_u32(&mut output, size);
+        zip_u32(&mut output, compressed_size);
+        zip_u32(&mut output, uncompressed_size);
         zip_u16(
             &mut output,
             u16::try_from(name_bytes.len()).map_err(|_| ApiError::validation())?,
         );
         zip_u16(&mut output, 0);
         output.extend_from_slice(name_bytes);
-        output.extend_from_slice(&payload);
+        output.extend_from_slice(&compressed);
         file_count = file_count.saturating_add(1);
 
         zip_u32(&mut central, 0x0201_4b50);
         zip_u16(&mut central, 20);
         zip_u16(&mut central, 20);
-        zip_u16(&mut central, 0);
-        zip_u16(&mut central, 0);
+        zip_u16(&mut central, flags);
+        zip_u16(&mut central, 8);
         zip_u16(&mut central, 0);
         zip_u16(&mut central, 0);
         zip_u32(&mut central, checksum);
-        zip_u32(&mut central, size);
-        zip_u32(&mut central, size);
+        zip_u32(&mut central, compressed_size);
+        zip_u32(&mut central, uncompressed_size);
         zip_u16(
             &mut central,
             u16::try_from(name_bytes.len()).map_err(|_| ApiError::validation())?,
@@ -648,8 +1040,7 @@ pub(super) fn zip_archive(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, ApiE
     zip_u32(&mut output, 0x0605_4b50);
     zip_u16(&mut output, 0);
     zip_u16(&mut output, 0);
-    let count =
-        u16::try_from(file_count.min(usize::from(u16::MAX))).map_err(|_| ApiError::validation())?;
+    let count = u16::try_from(file_count).map_err(|_| ApiError::validation())?;
     zip_u16(&mut output, count);
     zip_u16(&mut output, count);
     zip_u32(&mut output, central_size);
@@ -668,18 +1059,54 @@ pub(super) async fn download_images(
     let paths = value
         .get("paths")
         .and_then(Value::as_array)
-        .ok_or_else(ApiError::invalid_request)?;
-    if paths.is_empty() || paths.len() > MAX_IMAGE_ARCHIVE_ITEMS {
+        .ok_or_else(ApiError::validation)?;
+    if paths.iter().any(|path| !path.is_string()) {
         return Err(ApiError::validation());
     }
-    let root = image_root(&state);
+    if paths.is_empty() {
+        return Err(ApiError::management_not_found("no images found"));
+    }
     let mut files = Vec::new();
+    let mut used_names = HashSet::new();
     for item in paths {
         let relative = image_path_from_value(item)?;
-        let name = relative.to_string_lossy().replace('\\', "/");
-        let path = safe_regular_file(&root, &relative)?;
-        let payload = read_bounded(&path, MAX_IMAGE_ARCHIVE_BYTES as u64)?;
+        let mut name = relative
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("image")
+            .to_owned();
+        if used_names.contains(&name) {
+            let stem = relative
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("image");
+            let extension = relative
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            let mut counter = 2usize;
+            loop {
+                let candidate = if extension.is_empty() {
+                    format!("{stem}_{counter}")
+                } else {
+                    format!("{stem}_{counter}.{extension}")
+                };
+                if !used_names.contains(&candidate) {
+                    name = candidate;
+                    break;
+                }
+                counter = counter.saturating_add(1);
+            }
+        }
+        if !image_root(&state).join(&relative).is_file() {
+            continue;
+        }
+        let payload = read_stored_image(&state, &relative).await?;
+        used_names.insert(name.clone());
         files.push((name, payload));
+    }
+    if files.is_empty() {
+        return Err(ApiError::management_not_found("no images found"));
     }
     let archive = zip_archive(files)?;
     Ok((
@@ -703,9 +1130,13 @@ pub(super) async fn download_single_image(
 ) -> Result<Response, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let relative = safe_relative_path(&image_path).ok_or_else(ApiError::invalid_request)?;
-    let path = safe_regular_file(&image_root(&state), &relative)?;
-    let payload = read_bounded(&path, MAX_IMAGE_ARCHIVE_BYTES as u64)?;
-    let filename = path
+    let content_type = if image_root(&state).join(&relative).is_file() {
+        image_content_type(&relative)
+    } else {
+        "image/png"
+    };
+    let payload = read_stored_image(&state, &relative).await?;
+    let filename = relative
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("image.bin")
@@ -714,8 +1145,11 @@ pub(super) async fn download_single_image(
     Ok((
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE, image_content_type(&path)),
+            (header::CONTENT_TYPE, content_type),
             (header::CONTENT_DISPOSITION, disposition.as_str()),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"),
+            (header::ACCESS_CONTROL_ALLOW_HEADERS, "*"),
         ],
         Body::from(payload),
     )
@@ -735,7 +1169,7 @@ fn image_stats(state: &AppState) -> Value {
         };
     let mut image_count = 0_u64;
     let mut image_size = 0_u64;
-    for (_relative, path) in image_files(state) {
+    for path in walk_regular_files(&root) {
         if let Ok(metadata) = fs::metadata(path) {
             image_count += 1;
             image_size = image_size.saturating_add(metadata.len());
@@ -763,14 +1197,33 @@ fn compress_png(path: &Path) -> Result<Option<usize>, ApiError> {
     let original = fs::metadata(path)
         .map_err(|_| ApiError::unavailable())?
         .len() as usize;
-    let image = ImageReader::open(path)
+    let reader = ImageReader::open(path)
         .map_err(|_| ApiError::unavailable())?
-        .decode()
+        .with_guessed_format()
         .map_err(|_| ApiError::unavailable())?;
+    let mut decoder = reader.into_decoder().map_err(|_| ApiError::unavailable())?;
+    let orientation = decoder.orientation().map_err(|_| ApiError::unavailable())?;
+    let mut image =
+        image::DynamicImage::from_decoder(decoder).map_err(|_| ApiError::unavailable())?;
+    image.apply_orientation(orientation);
+    image = if image.has_alpha() {
+        image::DynamicImage::ImageRgba8(image.to_rgba8())
+    } else {
+        image::DynamicImage::ImageRgb8(image.to_rgb8())
+    };
     let mut output = Cursor::new(Vec::new());
-    image
-        .write_to(&mut output, image::ImageFormat::Png)
-        .map_err(|_| ApiError::unavailable())?;
+    image::codecs::png::PngEncoder::new_with_quality(
+        &mut output,
+        image::codecs::png::CompressionType::Best,
+        image::codecs::png::FilterType::Adaptive,
+    )
+    .write_image(
+        image.as_bytes(),
+        image.width(),
+        image.height(),
+        image.color().into(),
+    )
+    .map_err(|_| ApiError::unavailable())?;
     let payload = output.into_inner();
     if payload.len() >= original {
         return Ok(None);
@@ -823,19 +1276,57 @@ pub(super) async fn compress_images(
     })))
 }
 
+fn cleanup_query_target(value: Option<&str>) -> Result<i64, ApiError> {
+    match value {
+        None => Ok(500),
+        Some(value) => super::parse_python_integer_string(value).ok_or_else(ApiError::validation),
+    }
+}
+
+fn cleanup_query_bool(value: Option<&str>) -> Result<bool, ApiError> {
+    value
+        .map(|value| {
+            pydantic_management_bool(&Value::String(value.to_owned()))
+                .ok_or_else(ApiError::validation)
+        })
+        .transpose()
+        .map(|value| value.unwrap_or(false))
+}
+
 pub(super) async fn cleanup_images(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ImageCleanupQuery>,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
-    let target_free_mb = query.target_free_mb.unwrap_or(500);
-    let dry_run = query.dry_run.unwrap_or(false);
-    let root = image_root(&state);
+    let target_free_mb = cleanup_query_target(query.target_free_mb.as_deref())?;
+    let dry_run = cleanup_query_bool(query.dry_run.as_deref())?;
+    Ok(Json(cleanup_images_to_target(
+        &state,
+        target_free_mb,
+        dry_run,
+    )?))
+}
+
+fn cleanup_images_to_target(
+    state: &AppState,
+    target_free_mb: i64,
+    dry_run: bool,
+) -> Result<Value, ApiError> {
+    let target_free = u64::try_from(target_free_mb).unwrap_or_default();
+    let root = image_root(state);
     let current_free_mb = fs2::available_space(&root)
         .map(|value| value / 1024 / 1024)
-        .unwrap_or_default();
-    let mut candidates = image_files(&state)
+        .map_err(|_| ApiError::unavailable())?;
+    if current_free_mb >= target_free && !dry_run {
+        return Ok(json!({
+            "removed": 0,
+            "current_free_mb": current_free_mb,
+            "target_free_mb": target_free_mb,
+            "done": true,
+        }));
+    }
+    let mut candidates = image_files(state)
         .into_iter()
         .filter(|(_, path)| path.extension().and_then(|value| value.to_str()) == Some("png"))
         .filter_map(|(relative, path)| {
@@ -847,24 +1338,63 @@ pub(super) async fn cleanup_images(
     candidates.sort_by_key(|item| item.0);
     let mut removed = 0_u64;
     let mut freed_bytes = 0_u64;
-    for (_modified, _relative, path, size) in candidates {
-        if current_free_mb.saturating_add(freed_bytes / 1024 / 1024) >= target_free_mb {
+    for (_modified, relative, path, size) in candidates {
+        if current_free_mb.saturating_add(freed_bytes / 1024 / 1024) >= target_free {
             break;
         }
-        if !dry_run && fs::remove_file(path).is_ok() {
-            removed += 1;
+        if !dry_run {
+            fs::remove_file(&path).map_err(|_| ApiError::unavailable())?;
+            let safe = safe_relative_path(&relative).ok_or_else(ApiError::invalid_request)?;
+            let thumbnail_root = state.data_dir.join("image-thumbnails");
+            let _ = fs::remove_file(thumbnail_root.join(format!("{relative}.png")));
+            let _ = fs::remove_file(thumbnail_root.join(&safe));
+            super::remove_image_tag_for_path(state, &relative)?;
+            update_image_index(state, |items| {
+                let stored_webdav = items
+                    .get(&relative)
+                    .and_then(|item| item.get("webdav"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if stored_webdav {
+                    if let Some(object) = items.get_mut(&relative).and_then(Value::as_object_mut) {
+                        object.insert("local".to_owned(), json!(false));
+                        object.insert("storage".to_owned(), json!("webdav"));
+                    }
+                } else {
+                    items.remove(&relative);
+                }
+                Ok(())
+            })?;
         }
+        removed += 1;
         freed_bytes = freed_bytes.saturating_add(size);
     }
-    let done = current_free_mb.saturating_add(freed_bytes / 1024 / 1024) >= target_free_mb;
-    Ok(Json(json!({
+    if !dry_run {
+        remove_empty_image_dirs(&root);
+        remove_empty_image_dirs(&state.data_dir.join("image-thumbnails"));
+    }
+    let projected_free = current_free_mb.saturating_add(freed_bytes / 1024 / 1024);
+    let done = projected_free >= target_free;
+    Ok(json!({
         "removed": removed,
         "freed_mb": freed_bytes / 1024 / 1024,
         "target_free_mb": target_free_mb,
-        "current_free_mb": current_free_mb,
+        "current_free_mb": projected_free,
         "done": done,
         "dry_run": dry_run,
-    })))
+    }))
+}
+
+pub(super) fn cleanup_periodic_image_storage(state: &AppState) {
+    cleanup_old_images(state);
+    let root = image_root(state);
+    let Ok(free_bytes) = fs2::available_space(&root) else {
+        return;
+    };
+    let free_mb = free_bytes / 1024 / 1024;
+    if free_mb < 500 {
+        let _ = cleanup_images_to_target(state, 500, false);
+    }
 }
 
 fn public_log_detail(value: &Value) -> Value {
@@ -963,12 +1493,9 @@ fn public_log_detail(value: &Value) -> Value {
 /// Append one public call/account log record. Logging is best-effort: a log
 /// failure must never change the API response or make an upstream request fail.
 pub(super) fn append_log(state: &AppState, log_type: &str, summary: &str, detail: Value) {
-    let timestamp = super::current_timestamp();
+    let timestamp = image_local_timestamp();
     let mut record = Map::new();
-    record.insert(
-        "id".to_owned(),
-        Value::String(format!("log-{}-{}", std::process::id(), now_nanos())),
-    );
+    record.insert("id".to_owned(), Value::String(log_uuid_hex()));
     record.insert("time".to_owned(), Value::String(timestamp));
     record.insert("type".to_owned(), Value::String(log_type.to_owned()));
     record.insert("summary".to_owned(), Value::String(summary.to_owned()));
@@ -997,14 +1524,13 @@ pub(super) fn append_account_log(state: &AppState, summary: &str, detail: Value)
 }
 
 fn log_id(raw: &Map<String, Value>, line: &str, ordinal: usize) -> String {
-    if let Some(id) = raw
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
-    {
-        return id.to_owned();
+    if let Some(value) = raw.get("id") {
+        let id = super::protocol_anthropic::python_text(Some(value));
+        if !id.trim().is_empty() {
+            return id;
+        }
     }
-    let mut hasher = Sha256::new();
+    let mut hasher = Sha1::new();
     hasher.update(ordinal.to_string().as_bytes());
     hasher.update(b":");
     hasher.update(line.as_bytes());
@@ -1088,11 +1614,13 @@ pub(super) async fn delete_logs(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let value = super::account_json_body(body).await?;
-    let ids = value
-        .get("ids")
-        .and_then(Value::as_array)
-        .ok_or_else(ApiError::invalid_request)?;
-    if ids.len() > MAX_LOG_ITEMS * 10 {
+    let object = value.as_object().ok_or_else(ApiError::validation)?;
+    let ids = match object.get("ids") {
+        None => &[][..],
+        Some(Value::Array(ids)) => ids.as_slice(),
+        Some(_) => return Err(ApiError::validation()),
+    };
+    if ids.len() > MAX_LOG_ITEMS * 10 || ids.iter().any(|value| !value.is_string()) {
         return Err(ApiError::validation());
     }
     let wanted = ids
@@ -1111,19 +1639,24 @@ pub(super) async fn delete_logs(
     let mut removed = 0usize;
     for (ordinal, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
         let line = line.trim_end_matches('\r');
-        let Some(projected) = project_log(line, ordinal) else {
+        let Ok(raw) = serde_json::from_str::<Value>(line) else {
             kept.extend_from_slice(line.as_bytes());
             kept.push(b'\n');
             continue;
         };
-        let id = projected
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if wanted.contains(id) {
+        let Some(object) = raw.as_object() else {
+            kept.extend_from_slice(line.as_bytes());
+            kept.push(b'\n');
+            continue;
+        };
+        let id = log_id(object, line, ordinal);
+        if wanted.contains(&id) {
             removed += 1;
         } else {
-            let encoded = serde_json::to_vec(&projected).map_err(|_| ApiError::unavailable())?;
+            let mut preserved = object.clone();
+            preserved.insert("id".to_owned(), Value::String(id));
+            let encoded = serde_json::to_vec(&Value::Object(preserved))
+                .map_err(|_| ApiError::unavailable())?;
             kept.extend_from_slice(&encoded);
             kept.push(b'\n');
         }
@@ -1170,7 +1703,7 @@ fn secret_mask(value: Option<&Value>) -> Value {
 }
 
 fn bool_or(value: Option<&Value>, fallback: bool) -> bool {
-    value.and_then(Value::as_bool).unwrap_or(fallback)
+    super::settings_bool(value, fallback)
 }
 
 fn merge_missing_object(target: &mut Map<String, Value>, defaults: &Map<String, Value>) {
@@ -1197,43 +1730,7 @@ fn runtime_value(state: &AppState) -> Value {
     let mut object = object_or_empty(raw);
     let default_object = object_or_empty(defaults);
     merge_missing_object(&mut object, &default_object);
-    let clearance = object
-        .get("clearance")
-        .cloned()
-        .map(object_or_empty)
-        .unwrap_or_default();
-    let mode = object
-        .get("egress_mode")
-        .and_then(Value::as_str)
-        .filter(|value| matches!(*value, "direct" | "single_proxy"))
-        .unwrap_or("direct");
-    let clearance_mode = clearance
-        .get("mode")
-        .and_then(Value::as_str)
-        .filter(|value| matches!(*value, "none" | "manual" | "flaresolverr"))
-        .unwrap_or("none");
-    json!({
-        "enabled": bool_or(object.get("enabled"), false),
-        "egress_mode": mode,
-        "proxy_url": public_url(object.get("proxy_url")),
-        "resource_proxy_url": public_url(object.get("resource_proxy_url")),
-        "skip_ssl_verify": bool_or(object.get("skip_ssl_verify"), false),
-        "reset_session_status_codes": object.get("reset_session_status_codes").cloned().unwrap_or_else(|| json!([403])),
-        "clearance": {
-            "enabled": bool_or(clearance.get("enabled"), false),
-            "mode": clearance_mode,
-            "cf_cookies": "",
-            "cf_clearance": "",
-            "has_cf_cookies": clearance.get("cf_cookies").and_then(Value::as_str).is_some_and(|value| !value.is_empty()),
-            "has_cf_clearance": clearance.get("cf_clearance").and_then(Value::as_str).is_some_and(|value| !value.is_empty()),
-            "user_agent": clearance.get("user_agent").and_then(Value::as_str).unwrap_or(""),
-            "browser": clearance.get("browser").and_then(Value::as_str).unwrap_or("chrome"),
-            "flaresolverr_url": public_url(clearance.get("flaresolverr_url")),
-            "timeout_sec": clearance.get("timeout_sec").and_then(Value::as_u64).unwrap_or(60),
-            "refresh_interval": clearance.get("refresh_interval").and_then(Value::as_u64).unwrap_or(3600),
-            "warm_up_on_start": bool_or(clearance.get("warm_up_on_start"), false),
-        }
-    })
+    super::normalize_proxy_runtime(Some(&Value::Object(object)), true)
 }
 
 fn runtime_status(state: &AppState) -> Value {
@@ -1242,10 +1739,25 @@ fn runtime_status(state: &AppState) -> Value {
         .get("enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let proxy_url = runtime
-        .get("proxy_url")
+    let egress_mode = runtime
+        .get("egress_mode")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or("direct");
+    let runtime_proxy = if enabled && egress_mode == "single_proxy" {
+        runtime
+            .get("proxy_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    } else {
+        ""
+    };
+    let (proxy_source, has_proxy) = if !runtime_proxy.is_empty() {
+        ("runtime", true)
+    } else if !legacy_proxy_value(state).is_empty() {
+        ("global", true)
+    } else {
+        ("direct", false)
+    };
     let clearance = runtime.get("clearance").unwrap_or(&Value::Null);
     let clearance_enabled = enabled
         && clearance
@@ -1258,25 +1770,18 @@ fn runtime_status(state: &AppState) -> Value {
         );
     json!({
         "enabled": enabled,
-        "egress_mode": runtime.get("egress_mode").cloned().unwrap_or_else(|| json!("direct")),
-        "proxy_source": if !proxy_url.is_empty() { "runtime" } else { "direct" },
-        "has_proxy": !proxy_url.is_empty(),
+        "egress_mode": egress_mode,
+        "proxy_source": proxy_source,
+        "has_proxy": has_proxy,
         "clearance_enabled": clearance_enabled,
         "clearance_mode": clearance.get("mode").cloned().unwrap_or_else(|| json!("none")),
-        "has_clearance_bundle": false,
-        "cached_clearance_hosts": [],
+        "has_clearance_bundle": !state.clearance_store.cached_hosts_now().is_empty(),
+        "cached_clearance_hosts": state.clearance_store.cached_hosts_now(),
     })
 }
 
 pub(super) fn health_proxy_runtime(state: &AppState) -> Value {
-    let status = runtime_status(state);
-    json!({
-        "enabled": status.get("enabled").and_then(Value::as_bool).unwrap_or(false),
-        "clearance_enabled": status
-            .get("clearance_enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    })
+    runtime_status(state)
 }
 
 fn legacy_proxy_value(state: &AppState) -> String {
@@ -1387,7 +1892,8 @@ pub(super) async fn update_proxy_runtime(
             runtime.insert(key.clone(), value.clone());
         }
     }
-    config.insert("proxy_runtime".to_owned(), Value::Object(runtime));
+    let runtime = super::normalize_proxy_runtime(Some(&Value::Object(runtime)), false);
+    config.insert("proxy_runtime".to_owned(), runtime);
     write_json(&config_path(&state), &Value::Object(config))?;
     Ok(Json(
         json!({"runtime": runtime_value(&state), "status": runtime_status(&state)}),
@@ -1410,22 +1916,30 @@ pub(super) async fn test_proxy(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let value = super::account_json_body(body).await?;
-    let input = value
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim();
-    let runtime = object_or_empty(runtime_value(&state));
-    let candidate = if input.is_empty() {
-        runtime
-            .get("proxy_url")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-    } else {
-        input
+    let object = value.as_object().ok_or_else(ApiError::validation)?;
+    let input = match object.get("url") {
+        None => "",
+        Some(Value::String(value)) => value.trim(),
+        Some(_) => return Err(ApiError::validation()),
     };
-    let source = if input.is_empty() { "runtime" } else { "input" };
-    let mut result = proxy_result_base(source, candidate);
+    let runtime = runtime_value(&state);
+    let (candidate, source) = if input.is_empty() {
+        let profile = super::proxy_service::profile_from_runtime(
+            &runtime,
+            None,
+            None,
+            Some(&legacy_proxy_value(&state)),
+            false,
+            true,
+        );
+        (profile.proxy_url, profile.proxy_source)
+    } else {
+        (
+            super::proxy_service::normalize_proxy_url(input),
+            "input".to_owned(),
+        )
+    };
+    let mut result = proxy_result_base(&source, &candidate);
     if candidate.is_empty() {
         result.extend([
             ("ok".to_owned(), json!(false)),
@@ -1433,16 +1947,31 @@ pub(super) async fn test_proxy(
             ("latency_ms".to_owned(), json!(0)),
             ("error".to_owned(), json!("no active proxy configured")),
         ]);
-        return Ok(Json(Value::Object(result)));
+        return Ok(Json(json!({"result": Value::Object(result)})));
     }
     let started = std::time::Instant::now();
-    let proxy = reqwest::Proxy::all(candidate).map_err(|_| ApiError::invalid_request())?;
+    let proxy = match reqwest::Proxy::all(candidate.clone()) {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            result.extend([
+                ("ok".to_owned(), json!(false)),
+                ("status".to_owned(), json!(0)),
+                ("latency_ms".to_owned(), json!(0)),
+                ("error".to_owned(), json!("invalid proxy url")),
+            ]);
+            return Ok(Json(json!({"result": Value::Object(result)})));
+        }
+    };
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .proxy(proxy)
         .build()
         .map_err(|_| ApiError::unavailable())?;
-    let response = client.get("https://chatgpt.com/api/auth/csrf").send().await;
+    let response = client
+        .get("https://chatgpt.com/api/auth/csrf")
+        .header(header::USER_AGENT, "Mozilla/5.0 (chatgpt2api proxy test)")
+        .send()
+        .await;
     let latency = started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
     match response {
         Ok(response) => {
@@ -1470,7 +1999,7 @@ pub(super) async fn test_proxy(
             ]);
         }
     }
-    Ok(Json(Value::Object(result)))
+    Ok(Json(json!({"result": Value::Object(result)})))
 }
 
 pub(super) async fn test_clearance(
@@ -1480,26 +2009,40 @@ pub(super) async fn test_clearance(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let request = super::account_json_body(body).await?;
+    let request = request.as_object().ok_or_else(ApiError::validation)?;
     let runtime = runtime_status(&state);
     let enabled = runtime
         .get("clearance_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let target_url = request
-        .get("target_url")
-        .and_then(Value::as_str)
-        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
-        .unwrap_or("https://chatgpt.com/");
+    let target_url = match request.get("target_url") {
+        None => "https://chatgpt.com".to_owned(),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                "https://chatgpt.com".to_owned()
+            } else {
+                value.to_owned()
+            }
+        }
+        Some(_) => return Err(ApiError::validation()),
+    };
     let config = runtime_value(&state);
     let clearance = config.get("clearance").unwrap_or(&Value::Null);
     let mode = clearance
         .get("mode")
         .and_then(Value::as_str)
         .unwrap_or("none");
-    let proxy_url = config
-        .get("proxy_url")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let legacy_proxy = legacy_proxy_value(&state);
+    let profile = super::proxy_service::profile_from_runtime(
+        &config,
+        None,
+        None,
+        Some(&legacy_proxy),
+        false,
+        true,
+    );
+    let proxy_url = profile.proxy_url;
     let timeout_sec = clearance
         .get("timeout_sec")
         .and_then(Value::as_u64)
@@ -1535,11 +2078,11 @@ pub(super) async fn test_clearance(
             state
                 .clearance_store
                 .put(
-                    proxy_url,
-                    target_url,
+                    &proxy_url,
+                    &target_url,
                     super::proxy_service::ClearanceBundle {
-                        target_host: super::proxy_service::normalize_host(target_url),
-                        proxy_url: super::proxy_service::normalize_proxy_url(proxy_url),
+                        target_host: super::proxy_service::normalize_host(&target_url),
+                        proxy_url: super::proxy_service::normalize_proxy_url(&proxy_url),
                         cookies: cookies_map,
                         user_agent: user_agent.trim().to_owned(),
                         expires_at: None,
@@ -1579,19 +2122,19 @@ pub(super) async fn test_clearance(
             .map_err(|_| ApiError::unavailable())?;
         let response = client
             .post(format!("{flaresolverr_url}/v1"))
-            .json(&flaresolverr_payload(target_url, proxy_url, timeout_sec))
+            .json(&flaresolverr_payload(&target_url, &proxy_url, timeout_sec))
             .send()
             .await;
         let latency_ms = started.elapsed().as_millis();
         match response {
             Ok(response) if response.status().is_success() => {
                 let payload = response.json::<Value>().await.unwrap_or(Value::Null);
-                if let Some(bundle) = parse_flaresolverr_bundle(&payload, target_url, proxy_url) {
+                if let Some(bundle) = parse_flaresolverr_bundle(&payload, &target_url, &proxy_url) {
                     state
                         .clearance_store
                         .put(
-                            proxy_url,
-                            target_url,
+                            &proxy_url,
+                            &target_url,
                             bundle.clone(),
                             clearance
                                 .get("refresh_interval")
@@ -1629,12 +2172,11 @@ pub(super) async fn test_clearance(
 }
 
 fn image_storage_settings(state: &AppState) -> Map<String, Value> {
-    object_or_empty(
-        read_config(state)
-            .get("image_storage")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-    )
+    let config = read_config(state);
+    object_or_empty(super::normalize_image_storage(
+        config.get("image_storage"),
+        false,
+    ))
 }
 
 fn normalized_remote_url(value: Option<&Value>) -> Result<String, ApiError> {
@@ -1677,28 +2219,35 @@ pub(crate) fn recover_unfinished_import_jobs(state: &AppState) {
                 ) {
                     continue;
                 }
-                let total = job.get("total").and_then(Value::as_u64).unwrap_or_default();
-                let added = job.get("added").and_then(Value::as_u64).unwrap_or_default();
-                let skipped = job
-                    .get("skipped")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default();
-                let failed = total.saturating_sub(added.saturating_add(skipped));
-                job.insert("status".to_owned(), Value::String("failed".to_owned()));
-                job.insert("completed".to_owned(), Value::from(total));
-                job.insert("failed".to_owned(), Value::from(failed));
-                job.insert(
-                    "updated_at".to_owned(),
-                    Value::String(iso_timestamp(SystemTime::now())),
-                );
-                job.insert(
-                    "errors".to_owned(),
-                    json!([{"name":"import","error":"导入任务在服务更新时中断"}]),
-                );
+                mark_interrupted_import_job(job, kind == "ccload");
             }
             Ok(())
         });
     }
+}
+
+fn mark_interrupted_import_job(job: &mut Map<String, Value>, rust_extension: bool) {
+    job.insert("status".to_owned(), Value::String("failed".to_owned()));
+    if !rust_extension {
+        return;
+    }
+    let total = job.get("total").and_then(Value::as_u64).unwrap_or_default();
+    let added = job.get("added").and_then(Value::as_u64).unwrap_or_default();
+    let skipped = job
+        .get("skipped")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let failed = total.saturating_sub(added.saturating_add(skipped));
+    job.insert("completed".to_owned(), Value::from(total));
+    job.insert("failed".to_owned(), Value::from(failed));
+    job.insert(
+        "updated_at".to_owned(),
+        Value::String(iso_timestamp(SystemTime::now())),
+    );
+    job.insert(
+        "errors".to_owned(),
+        json!([{"name":"import","error":"导入任务在服务更新时中断"}]),
+    );
 }
 
 fn import_job_is_unfinished(value: &Value) -> bool {
@@ -1755,6 +2304,38 @@ fn public_import_job(value: Option<&Value>) -> Value {
         if let Some(value) = object.get(key) {
             output.insert(key.to_owned(), value.clone());
         }
+    }
+    let now = python_iso_timestamp(SystemTime::now());
+    if output.get("job_id").is_none_or(Value::is_null) {
+        output.insert("job_id".to_owned(), Value::String(random_hex_id(16)));
+    }
+    if output.get("status").is_none_or(Value::is_null) {
+        output.insert("status".to_owned(), Value::String("failed".to_owned()));
+    }
+    if output.get("created_at").is_none_or(Value::is_null) {
+        output.insert("created_at".to_owned(), Value::String(now.clone()));
+    }
+    if output.get("updated_at").is_none_or(Value::is_null) {
+        let created = output
+            .get("created_at")
+            .cloned()
+            .unwrap_or_else(|| Value::String(now.clone()));
+        output.insert("updated_at".to_owned(), created);
+    }
+    for key in [
+        "total",
+        "completed",
+        "added",
+        "skipped",
+        "refreshed",
+        "failed",
+    ] {
+        if output.get(key).is_none_or(Value::is_null) {
+            output.insert(key.to_owned(), Value::from(0));
+        }
+    }
+    if !output.get("errors").is_some_and(Value::is_array) {
+        output.insert("errors".to_owned(), Value::Array(Vec::new()));
     }
     Value::Object(output)
 }
@@ -1862,14 +2443,10 @@ async fn add_model_catalog_stats(
 
 fn public_registry_item(kind: &str, value: &Value) -> Value {
     let object = value.as_object().cloned().unwrap_or_default();
-    let id = object.get("id").cloned().unwrap_or_else(|| json!(""));
-    let name = object.get("name").cloned().unwrap_or_else(|| json!(""));
-    let base_url = object
-        .get("base_url")
-        .and_then(Value::as_str)
-        .map(|value| public_url(Some(&Value::String(value.to_owned()))))
-        .map(|value| Value::String(value.to_owned()))
-        .unwrap_or_else(|| json!(""));
+    let id = Value::String(bounded_public_text(object.get("id"), 256));
+    let name = Value::String(bounded_public_text(object.get("name"), 256));
+    let base_url_text = bounded_public_text(object.get("base_url"), 16 * 1024);
+    let base_url = Value::String(public_url(Some(&Value::String(base_url_text))));
     let job = public_import_job(object.get("import_job"));
     match kind {
         "cpa_pools" => json!({
@@ -1882,16 +2459,16 @@ fn public_registry_item(kind: &str, value: &Value) -> Value {
             "id": id,
             "name": name,
             "base_url": base_url,
-            "email": object.get("email").and_then(Value::as_str).unwrap_or(""),
-            "has_api_key": object.get("api_key").and_then(Value::as_str).is_some_and(|value| !value.is_empty()),
-            "group_id": object.get("group_id").and_then(Value::as_str).unwrap_or(""),
+            "email": bounded_public_text(object.get("email"), 256),
+            "has_api_key": !bounded_public_text(object.get("api_key"), 16 * 1024).is_empty(),
+            "group_id": bounded_public_text(object.get("group_id"), 128),
             "import_job": job,
         }),
         "ccload" => json!({
             "id": id,
             "name": name,
             "base_url": base_url,
-            "has_password": object.get("password").and_then(Value::as_str).is_some_and(|value| !value.is_empty()),
+            "has_password": !bounded_public_text(object.get("password"), 16 * 1024).is_empty(),
             "import_job": job,
         }),
         _ => json!({}),
@@ -1937,6 +2514,20 @@ fn required_name(object: &Map<String, Value>) -> Result<String, ApiError> {
         .ok_or_else(ApiError::invalid_request)
 }
 
+fn optional_display_name(value: Option<&Value>) -> Result<String, ApiError> {
+    match value {
+        None => Ok(String::new()),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.chars().count() > 256 {
+                return Err(ApiError::validation());
+            }
+            Ok(value.to_owned())
+        }
+        Some(_) => Err(ApiError::validation()),
+    }
+}
+
 fn registry_response(kind: &str, item_key: &str, item: Value, state: &AppState) -> Json<Value> {
     let values = public_registry(kind, registry_items(state, kind));
     let mut output = Map::new();
@@ -1967,6 +2558,31 @@ async fn remote_json(
     serde_json::from_slice(&body).map_err(|_| ApiError::upstream())
 }
 
+fn cpa_remote_proxy_profile(state: &AppState) -> ProxyProfile {
+    super::legacy_global_proxy_profile(state)
+}
+
+fn cpa_remote_client(state: &AppState) -> Client {
+    super::legacy_global_proxy_client(state)
+}
+
+async fn remote_import_json(
+    _state: &AppState,
+    request: reqwest::RequestBuilder,
+) -> Result<Value, String> {
+    let response = tokio::time::timeout(std::time::Duration::from_secs(30), request.send())
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status().as_u16()));
+    }
+    let body = super::bounded_response_body(response)
+        .await
+        .map_err(|_| "invalid export payload".to_owned())?;
+    serde_json::from_slice(&body).map_err(|error| error.to_string())
+}
+
 fn remote_array(value: &Value, keys: &[&str]) -> Option<Vec<Value>> {
     if let Some(array) = value.as_array() {
         return Some(array.clone());
@@ -1981,6 +2597,65 @@ fn remote_array(value: &Value, keys: &[&str]) -> Option<Vec<Value>> {
         return remote_array(data, keys);
     }
     None
+}
+
+fn sub2api_page_items(payload: &Value) -> Result<(Vec<Value>, i128), ()> {
+    let inner = match payload.as_object() {
+        Some(object) if object.contains_key("code") && object.contains_key("data") => {
+            &object["data"]
+        }
+        _ => payload,
+    };
+    if let Some(items) = inner.as_array() {
+        return Ok((items.clone(), items.len() as i128));
+    }
+    let Some(object) = inner.as_object() else {
+        return Ok((Vec::new(), 0));
+    };
+    for key in ["items", "data", "list"] {
+        let Some(items) = object.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let total = match object.get("total") {
+            Some(value) if python_truthy(value) => python_integer(value).ok_or(())?,
+            _ => items.len() as i128,
+        };
+        return Ok((items.clone(), total));
+    }
+    Ok((Vec::new(), 0))
+}
+
+fn python_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+fn python_integer(value: &Value) -> Option<i128> {
+    match value {
+        Value::Bool(value) => Some(i128::from(*value)),
+        Value::Number(value) => value
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| value.as_u64().map(i128::from))
+            .or_else(|| value.as_f64().map(|value| value as i128)),
+        Value::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
+}
+fn python_integer_or_zero(value: Option<&Value>) -> Result<i128, ()> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    if !python_truthy(value) {
+        return Ok(0);
+    }
+    python_integer(value).ok_or(())
 }
 
 fn import_job(
@@ -2005,6 +2680,26 @@ fn import_job(
             failed,
         },
         if failed > 0 { "failed" } else { "completed" },
+        errors,
+        None,
+    )
+}
+
+fn access_token_import_job(
+    job_id: &str,
+    progress: ImportProgress,
+    errors: Vec<Value>,
+    imported_count: usize,
+    snapshot_saved: bool,
+) -> Value {
+    progress_job_with_created(
+        job_id,
+        progress,
+        if imported_count > 0 && snapshot_saved {
+            "completed"
+        } else {
+            "failed"
+        },
         errors,
         None,
     )
@@ -2057,7 +2752,7 @@ fn progress_job_with_phase(
     phase_completed: usize,
     phase_total: usize,
 ) -> Value {
-    let timestamp = iso_timestamp(SystemTime::now());
+    let timestamp = python_iso_timestamp(SystemTime::now());
     let created_at = created_at
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(timestamp.as_str());
@@ -2065,7 +2760,7 @@ fn progress_job_with_phase(
         "job_id": job_id,
         "status": status,
         "created_at": created_at,
-        "updated_at": iso_timestamp(SystemTime::now()),
+        "updated_at": python_iso_timestamp(SystemTime::now()),
         "total": progress.total,
         "completed": progress.completed,
         "phase": phase,
@@ -2129,7 +2824,7 @@ fn begin_registry_job(
     })
 }
 
-type CpaDownloadFuture = Pin<Box<dyn Future<Output = (String, Result<String, ApiError>)> + Send>>;
+type CpaDownloadFuture = Pin<Box<dyn Future<Output = (String, Result<String, String>)> + Send>>;
 
 #[allow(clippy::too_many_arguments)]
 fn update_registry_job_progress(
@@ -2197,7 +2892,9 @@ pub(super) async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    authenticated(&headers, &state).await?;
+    authenticated(&headers, &state)
+        .await
+        .map_err(|_| ApiError::management_unauthorized())?;
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -2207,7 +2904,7 @@ pub(super) async fn login(
     let (role, subject_id, name) = if state.config.auth_key.as_deref().is_some_and(|expected| {
         super::constant_time_equal(token.as_bytes(), expected.trim().as_bytes())
     }) {
-        ("admin".to_owned(), "admin".to_owned(), "admin".to_owned())
+        ("admin".to_owned(), "admin".to_owned(), "管理员".to_owned())
     } else {
         let _ = state.auth_store.reload().await;
         state
@@ -2245,7 +2942,8 @@ pub(super) async fn create_cpa_pool(
         .as_object()
         .cloned()
         .ok_or_else(ApiError::invalid_request)?;
-    required_name(&object)?;
+    let name = optional_display_name(object.get("name"))?;
+    object.insert("name".to_owned(), Value::String(name));
     let base_url = normalized_remote_url(object.get("base_url"))?;
     let secret = object
         .get("secret_key")
@@ -2280,16 +2978,19 @@ pub(super) async fn update_cpa_pool(
     let mut object = registry_item(&state, "cpa_pools", &pool_id)
         .and_then(|value| value.as_object().cloned())
         .ok_or_else(ApiError::not_found)?;
-    if updates.contains_key("name") {
-        object.insert("name".to_owned(), Value::String(required_name(&updates)?));
-    }
-    if updates.contains_key("base_url") {
+    if let Some(name) = updates.get("name").filter(|value| !value.is_null()) {
         object.insert(
-            "base_url".to_owned(),
-            Value::String(normalized_remote_url(updates.get("base_url"))?),
+            "name".to_owned(),
+            Value::String(optional_display_name(Some(name))?),
         );
     }
-    if let Some(secret) = updates.get("secret_key") {
+    if let Some(base_url) = updates.get("base_url").filter(|value| !value.is_null()) {
+        object.insert(
+            "base_url".to_owned(),
+            Value::String(normalized_remote_url(Some(base_url))?),
+        );
+    }
+    if let Some(secret) = updates.get("secret_key").filter(|value| !value.is_null()) {
         let secret = secret
             .as_str()
             .map(str::trim)
@@ -2326,25 +3027,36 @@ pub(super) fn cpa_download_future(
     name: String,
 ) -> CpaDownloadFuture {
     Box::pin(async move {
-        let value = remote_json(
-            &state,
-            state
-                .client
-                .get(format!("{base}/v0/management/auth-files/download"))
-                .query(&[("name", name.clone())])
-                .bearer_auth(secret)
-                .header("Accept", "application/json"),
-        )
-        .await;
-        let result = value.and_then(|value| {
-            value
-                .get("access_token")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-                .map(ToOwned::to_owned)
-                .ok_or_else(ApiError::upstream)
-        });
+        let request = cpa_remote_client(&state)
+            .get(format!("{base}/v0/management/auth-files/download"))
+            .query(&[("name", name.clone())])
+            .bearer_auth(secret)
+            .header("Accept", "application/json");
+        let result =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), request.send()).await {
+                Err(error) => Err(error.to_string()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Ok(Ok(response)) if !response.status().is_success() => {
+                    Err(format!("HTTP {}", response.status().as_u16()))
+                }
+                Ok(Ok(response)) => match super::bounded_response_body(response).await {
+                    Err(_) => Err("invalid payload".to_owned()),
+                    Ok(body) => match serde_json::from_slice::<Value>(&body) {
+                        Err(error) => Err(error.to_string()),
+                        Ok(value) if !value.is_object() => Err("invalid payload".to_owned()),
+                        Ok(value) => {
+                            let token =
+                                super::protocol_anthropic::python_text(value.get("access_token"));
+                            let token = token.trim();
+                            if token.is_empty() {
+                                Err("missing access_token".to_owned())
+                            } else {
+                                Ok(token.to_owned())
+                            }
+                        }
+                    },
+                },
+            };
         (name, result)
     })
 }
@@ -2370,38 +3082,43 @@ pub(super) async fn cpa_pool_files(
     }
     let value = remote_json(
         &state,
-        state
-            .client
+        cpa_remote_client(&state)
             .get(format!("{base}/v0/management/auth-files"))
             .bearer_auth(secret)
             .header("Accept", "application/json"),
     )
     .await?;
-    let files = remote_array(&value, &["files"]).ok_or_else(ApiError::upstream)?
-        .into_iter().take(5_000).filter_map(|item| { let object=item.as_object()?; let name=object.get("name").and_then(Value::as_str)?.trim(); if name.is_empty(){return None;} Some(json!({"name":name,"email":object.get("email").and_then(Value::as_str).or_else(||object.get("account").and_then(Value::as_str)).unwrap_or("")})) }).collect::<Vec<_>>();
+    let files = remote_array(&value, &["files"])
+        .ok_or_else(ApiError::upstream)?
+        .into_iter()
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            let name = bounded_public_text(object.get("name"), 16 * 1024);
+            if name.is_empty() {
+                return None;
+            }
+            let email_value = object
+                .get("email")
+                .filter(|value| super::account_pool::account_value_truthy(Some(value)))
+                .or_else(|| object.get("account"));
+            Some(json!({
+                "name": name,
+                "email": bounded_public_text(email_value, 16 * 1024),
+            }))
+        })
+        .collect::<Vec<_>>();
     Ok(Json(json!({"pool_id": pool_id, "files": files})))
 }
 
-async fn execute_cpa_import(
+pub(super) async fn execute_cpa_import(
     state: AppState,
     pool_id: String,
+    base: String,
+    secret: String,
     names: Vec<String>,
     expected_job_id: String,
 ) {
     let batch_stats = Arc::new(super::ImportedModelCatalogBatchStats::default());
-    let Some(pool) = registry_item(&state, "cpa_pools", &pool_id) else {
-        return;
-    };
-    let base = pool
-        .get("base_url")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let secret = pool
-        .get("secret_key")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
     let mut errors = Vec::new();
     let mut successful = 0usize;
     let mut failed = 0usize;
@@ -2446,12 +3163,12 @@ async fn execute_cpa_import(
     while let Some((name, result)) = active.next().await {
         match result {
             Ok(token) => {
-                imported.push(json!({"access_token": token}));
+                imported.push(json!({"access_token": token, "source_type":"codex"}));
                 successful += 1;
             }
             Err(error) => {
                 failed += 1;
-                errors.push(json!({"name": name, "error": error.code()}));
+                errors.push(json!({"name": name, "error": error}));
             }
         }
         let completed = successful + failed;
@@ -2481,12 +3198,12 @@ async fn execute_cpa_import(
         .filter_map(|item| item.get("access_token").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    let (added, skipped, mut failed) =
+    let (added, skipped, failed, snapshot_saved) =
         match state.account_store.merge_import_records(imported).await {
-            Ok((added, skipped)) => (added, skipped, failed),
+            Ok((added, skipped)) => (added, skipped, failed, true),
             Err(_) => {
                 errors.push(json!({"name": "accounts", "error": "账号快照写入失败"}));
-                (0, 0, failed.saturating_add(successful))
+                (0, 0, failed.saturating_add(successful), false)
             }
         };
     let _ = set_registry_job(
@@ -2524,24 +3241,19 @@ async fn execute_cpa_import(
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or_default();
-    let refresh_errors = refresh_result
-        .get("errors")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let refresh_failed = imported_tokens.len().saturating_sub(refreshed);
-    for error in refresh_errors {
-        push_import_error(&mut errors, error);
-    }
-    failed = failed.saturating_add(refresh_failed);
-    let mut job = import_job(
+    let mut job = access_token_import_job(
         &expected_job_id,
-        total,
-        added,
-        skipped,
-        refreshed,
-        failed,
+        ImportProgress {
+            total,
+            completed: total,
+            added,
+            skipped,
+            refreshed,
+            failed,
+        },
         errors,
+        successful,
+        snapshot_saved,
     );
     add_model_catalog_stats(&mut job, &state, &batch_stats).await;
     let _ = set_registry_job(&state, "cpa_pools", &pool_id, job, Some(&expected_job_id));
@@ -2554,24 +3266,27 @@ pub(super) async fn start_cpa_import(
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
-    registry_item(&state, "cpa_pools", &pool_id).ok_or_else(ApiError::not_found)?;
-    let names = super::account_json_body(body)
-        .await?
-        .get("names")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(ApiError::invalid_request)?;
-    if names.len() > 5_000 {
-        return Err(ApiError::validation());
-    }
-    let names = names
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .take(5_000)
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
+    let pool = registry_item(&state, "cpa_pools", &pool_id)
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(ApiError::not_found)?;
+    let value = super::account_json_body(body).await?;
+    let object = value.as_object().ok_or_else(ApiError::validation)?;
+    let names = match object.get("names") {
+        None => Vec::new(),
+        Some(Value::Array(values)) => {
+            if values.iter().any(|value| !value.is_string()) {
+                return Err(ApiError::validation());
+            }
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        }
+        Some(_) => return Err(ApiError::validation()),
+    };
     if names.is_empty() {
         return Err(ApiError::invalid_request());
     }
@@ -2579,8 +3294,8 @@ pub(super) async fn start_cpa_import(
     let job = json!({
         "job_id": job_id.clone(),
         "status": "pending",
-        "created_at": iso_timestamp(SystemTime::now()),
-        "updated_at": iso_timestamp(SystemTime::now()),
+        "created_at": python_iso_timestamp(SystemTime::now()),
+        "updated_at": python_iso_timestamp(SystemTime::now()),
         "total": names.len(),
         "completed": 0,
         "added": 0,
@@ -2590,7 +3305,19 @@ pub(super) async fn start_cpa_import(
         "errors": [],
     });
     let saved = begin_registry_job(&state, "cpa_pools", &pool_id, job)?;
-    tokio::spawn(execute_cpa_import(state, pool_id, names, job_id));
+    let base = pool
+        .get("base_url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let secret = pool
+        .get("secret_key")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    tokio::spawn(execute_cpa_import(
+        state, pool_id, base, secret, names, job_id,
+    ));
     Ok(Json(
         json!({"import_job": public_import_job(saved.get("import_job"))}),
     ))
@@ -2609,12 +3336,18 @@ pub(super) async fn cpa_import_progress(
 }
 
 fn bounded_public_text(value: Option<&Value>, limit: usize) -> String {
-    value
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty() && text.chars().count() <= limit)
-        .unwrap_or_default()
-        .to_owned()
+    let text = super::protocol_anthropic::python_text(value);
+    let text = text.trim();
+    if !text.is_empty() && text.chars().count() <= limit {
+        text.to_owned()
+    } else {
+        String::new()
+    }
+}
+fn python_remote_string_if_present(value: Option<&Value>, limit: usize) -> Option<String> {
+    let value = value.filter(|value| !value.is_null())?;
+    let text = super::account_pool::python_account_value_string(value);
+    (text.chars().count() <= limit).then_some(text)
 }
 
 const MAX_CCLOAD_CHANNEL_ID_LENGTH: usize = 64;
@@ -3050,7 +3783,6 @@ fn sub2api_credentials_present(object: &Map<String, Value>) -> bool {
         || (!bounded_public_text(object.get("email"), 256).is_empty()
             && !bounded_public_text(object.get("password"), 16 * 1024).is_empty())
 }
-
 async fn sub2api_request(
     state: &AppState,
     server: &Map<String, Value>,
@@ -3076,6 +3808,25 @@ async fn sub2api_request(
         .get("password")
         .and_then(Value::as_str)
         .ok_or_else(ApiError::invalid_request)?;
+    let server_id = server
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(base);
+    let identity: [u8; 32] =
+        Sha256::digest(format!("{base}\0{email}\0{password}").as_bytes()).into();
+    if let Some(token) = state
+        .sub2api_login_cache
+        .lock()
+        .await
+        .get(server_id)
+        .filter(|(_, cached_identity, expires_at)| {
+            cached_identity == &identity && *expires_at > std::time::Instant::now()
+        })
+        .map(|(token, _, _)| token.clone())
+    {
+        return Ok(request.bearer_auth(token));
+    }
     let login = remote_json(
         state,
         state
@@ -3084,17 +3835,35 @@ async fn sub2api_request(
             .json(&json!({"email": email, "password": password})),
     )
     .await?;
-    let token = login
+    let login_body = if login.get("code").is_some() && login.get("data").is_some() {
+        login.get("data").unwrap_or(&login)
+    } else {
+        &login
+    };
+    let token = login_body
         .get("access_token")
         .and_then(Value::as_str)
-        .or_else(|| {
-            login
-                .get("data")
-                .and_then(|data| data.get("access_token"))
-                .and_then(Value::as_str)
-        })
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(ApiError::upstream)?;
+        .ok_or_else(ApiError::upstream)?
+        .to_owned();
+    let expires_in = login_body
+        .get("expires_in")
+        .filter(|value| super::account_pool::account_value_truthy(Some(value)))
+        .and_then(super::python_integer_value)
+        .unwrap_or(3600)
+        .max(60) as u64;
+    let refresh_after = expires_in.saturating_sub(5 * 60);
+    let expires_at = std::time::Instant::now() + Duration::from_secs(refresh_after);
+    {
+        let mut cache = state.sub2api_login_cache.lock().await;
+        if cache.len() >= 128
+            && !cache.contains_key(server_id)
+            && let Some(oldest_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest_key);
+        }
+        cache.insert(server_id.to_owned(), (token.clone(), identity, expires_at));
+    }
     Ok(request.bearer_auth(token))
 }
 
@@ -3119,7 +3888,7 @@ pub(super) async fn create_sub2api_server(
         .as_object()
         .cloned()
         .ok_or_else(ApiError::invalid_request)?;
-    let name = required_name(&object)?;
+    let name = optional_display_name(object.get("name"))?;
     let base_url = normalized_remote_url(object.get("base_url"))?;
     object.insert("name".to_owned(), Value::String(name));
     object.insert("base_url".to_owned(), Value::String(base_url));
@@ -3127,10 +3896,11 @@ pub(super) async fn create_sub2api_server(
         return Err(ApiError::invalid_request());
     }
     for key in ["email", "password", "api_key", "group_id"] {
-        if let Some(value) = object.get(key).and_then(Value::as_str)
-            && value.len() > 16 * 1024
-        {
-            return Err(ApiError::validation());
+        if let Some(value) = object.get(key) {
+            let value = value.as_str().ok_or_else(ApiError::validation)?;
+            if value.len() > 16 * 1024 {
+                return Err(ApiError::validation());
+            }
         }
     }
     object.insert("id".to_owned(), Value::String(new_registry_id("sub2api")));
@@ -3154,18 +3924,32 @@ pub(super) async fn update_sub2api_server(
         .as_object()
         .cloned()
         .ok_or_else(ApiError::invalid_request)?;
+    for key in [
+        "name", "base_url", "email", "password", "api_key", "group_id",
+    ] {
+        if let Some(value) = updates.get(key).filter(|value| !value.is_null()) {
+            let value = value.as_str().ok_or_else(ApiError::validation)?;
+            if value.len() > 16 * 1024 {
+                return Err(ApiError::validation());
+            }
+        }
+    }
     let mut candidate = registry_value(&state, "sub2api", &server_id)?;
     for key in [
         "name", "base_url", "email", "password", "api_key", "group_id",
     ] {
-        if let Some(value) = updates.get(key) {
+        if let Some(value) = updates.get(key).filter(|value| !value.is_null()) {
             candidate.insert(key.to_owned(), value.clone());
         }
     }
-    if updates.contains_key("name") {
-        candidate.insert("name".to_owned(), Value::String(required_name(&candidate)?));
+    if updates.get("name").is_some_and(|value| !value.is_null()) {
+        let name = optional_display_name(candidate.get("name"))?;
+        candidate.insert("name".to_owned(), Value::String(name));
     }
-    if updates.contains_key("base_url") {
+    if updates
+        .get("base_url")
+        .is_some_and(|value| !value.is_null())
+    {
         candidate.insert(
             "base_url".to_owned(),
             Value::String(normalized_remote_url(candidate.get("base_url"))?),
@@ -3210,29 +3994,36 @@ pub(super) async fn sub2api_groups(
         .ok_or_else(ApiError::invalid_request)?;
     let mut groups = Vec::new();
     let mut page = 1usize;
-    while groups.len() < 5_000 && page <= 100 {
+    loop {
         let request = state
             .client
             .get(format!("{base}/api/v1/admin/groups"))
             .query(&[("page", page.to_string()), ("page_size", "200".to_owned())]);
         let value = remote_json(&state, sub2api_request(&state, &server, request).await?).await?;
-        let page_items =
-            remote_array(&value, &["items", "groups", "data"]).ok_or_else(ApiError::upstream)?;
+        let (page_items, total) = sub2api_page_items(&value).map_err(|_| ApiError::upstream())?;
         let page_len = page_items.len();
-        groups.extend(page_items.into_iter().take(5_000 - groups.len()).filter_map(|item| {
-            let object = item.as_object()?;
-            let id = bounded_public_text(object.get("id"), 128);
-            (!id.is_empty()).then(|| json!({
+        for item in page_items {
+            let Some(object) = item.as_object() else {
+                continue;
+            };
+            let Some(id) = python_remote_string_if_present(object.get("id"), 128) else {
+                continue;
+            };
+            let account_count = python_integer_or_zero(object.get("account_count"))
+                .map_err(|_| ApiError::upstream())?;
+            let active_account_count = python_integer_or_zero(object.get("active_account_count"))
+                .map_err(|_| ApiError::upstream())?;
+            groups.push(json!({
                 "id": id,
                 "name": bounded_public_text(object.get("name"), 256),
                 "description": bounded_public_text(object.get("description"), 256),
                 "platform": bounded_public_text(object.get("platform"), 64),
                 "status": bounded_public_text(object.get("status"), 64),
-                "account_count": object.get("account_count").and_then(Value::as_u64).unwrap_or(0),
-                "active_account_count": object.get("active_account_count").and_then(Value::as_u64).unwrap_or(0),
-            }))
-        }));
-        if page_len < 200 {
+                "account_count": account_count,
+                "active_account_count": active_account_count,
+            }));
+        }
+        if (page as i128).saturating_mul(200) >= total || page_len < 200 {
             break;
         }
         page += 1;
@@ -3258,7 +4049,7 @@ pub(super) async fn sub2api_accounts(
         .map(ToOwned::to_owned);
     let mut accounts = Vec::new();
     let mut page = 1usize;
-    while accounts.len() < 5_000 && page <= 100 {
+    loop {
         let mut request = state
             .client
             .get(format!("{base}/api/v1/admin/accounts"))
@@ -3272,24 +4063,29 @@ pub(super) async fn sub2api_accounts(
             request = request.query(&[("group", group)]);
         }
         let value = remote_json(&state, sub2api_request(&state, &server, request).await?).await?;
-        let page_items =
-            remote_array(&value, &["items", "accounts", "data"]).ok_or_else(ApiError::upstream)?;
+        let (page_items, total) = sub2api_page_items(&value).map_err(|_| ApiError::upstream())?;
         let page_len = page_items.len();
-        accounts.extend(page_items.into_iter().take(5_000 - accounts.len()).filter_map(|item| {
+        accounts.extend(page_items.into_iter().filter_map(|item| {
             let object = item.as_object()?;
-            let id = bounded_public_text(object.get("id"), 128);
-            if id.is_empty() { return None; }
+            let id = python_remote_string_if_present(object.get("id"), 128)?;
             let credentials = object.get("credentials").and_then(Value::as_object);
+            let name = bounded_public_text(object.get("name"), 256);
+            let email = bounded_public_text(credentials.and_then(|value| value.get("email")), 256);
+            let has_refresh_token = credentials
+                .and_then(|value| value.get("refresh_token"))
+                .map(|value| !super::protocol_anthropic::python_text(Some(value)).trim().is_empty())
+                .unwrap_or(false);
             Some(json!({
                 "id": id,
-                "name": bounded_public_text(object.get("name"), 256),
-                "email": bounded_public_text(credentials.and_then(|value| value.get("email")), 256),
+                "name": name,
+                "email": if email.is_empty() { name } else { email },
                 "plan_type": bounded_public_text(credentials.and_then(|value| value.get("plan_type")), 64),
                 "status": bounded_public_text(object.get("status"), 64),
                 "expires_at": bounded_public_text(credentials.and_then(|value| value.get("expires_at")), 64),
+                "has_refresh_token": has_refresh_token,
             }))
         }));
-        if page_len < 200 {
+        if (page as i128).saturating_mul(200) >= total || page_len < 200 {
             break;
         }
         page += 1;
@@ -3297,9 +4093,10 @@ pub(super) async fn sub2api_accounts(
     Ok(Json(json!({"server_id": server_id, "accounts": accounts})))
 }
 
-async fn execute_sub2api_import(
+pub(super) async fn execute_sub2api_import(
     state: AppState,
     server_id: String,
+    server: Map<String, Value>,
     ids: Vec<String>,
     expected_job_id: String,
 ) {
@@ -3327,9 +4124,6 @@ async fn execute_sub2api_import(
         ),
         Some(&expected_job_id),
     );
-    let Ok(server) = registry_value(&state, "sub2api", &server_id) else {
-        return;
-    };
     let base = server
         .get("base_url")
         .and_then(Value::as_str)
@@ -3342,77 +4136,100 @@ async fn execute_sub2api_import(
             ("timezone", "Asia/Shanghai".to_owned()),
         ]);
     let result = match sub2api_request(&state, &server, request).await {
-        Ok(request) => remote_json(&state, request).await,
-        Err(error) => Err(error),
+        Ok(request) => remote_import_json(&state, request).await,
+        Err(error) => Err(error.code().to_owned()),
     };
     let mut errors = Vec::new();
     let mut successful = 0usize;
-    let mut failed = 0usize;
     let mut imported = Vec::new();
-    let requested_ids = ids.iter().cloned().collect::<HashSet<_>>();
-    let mut returned_ids = HashSet::new();
     match result {
         Ok(value) => {
             let Some(accounts) = remote_array(&value, &["accounts", "data"]) else {
-                errors.push(json!({"name": "Sub2API", "error": "远程账号响应无效"}));
-                let job = import_job(&expected_job_id, ids.len(), 0, 0, 0, ids.len(), errors);
+                errors.extend(
+                    ids.iter()
+                        .map(|id| json!({"name": id, "error": "invalid export payload"})),
+                );
+                let job = access_token_import_job(
+                    &expected_job_id,
+                    ImportProgress {
+                        total: ids.len(),
+                        completed: ids.len(),
+                        added: 0,
+                        skipped: 0,
+                        refreshed: 0,
+                        failed: ids.len(),
+                    },
+                    errors,
+                    0,
+                    true,
+                );
                 let _ =
                     set_registry_job(&state, "sub2api", &server_id, job, Some(&expected_job_id));
                 return;
             };
-            for account in accounts {
-                let object = account.as_object().cloned().unwrap_or_default();
-                let account_id = bounded_public_text(object.get("id"), 128);
-                if account_id.is_empty() || !requested_ids.contains(&account_id) {
+            let returned_count = accounts.len();
+            for account in &accounts {
+                let Some(object) = account.as_object() else {
                     continue;
-                }
-                if !returned_ids.insert(account_id.clone()) {
-                    continue;
-                }
+                };
                 let credentials = object
                     .get("credentials")
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_default();
+                let account_id = [
+                    object.get("id"),
+                    credentials.get("chatgpt_account_id"),
+                    object.get("name"),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|value| super::protocol_anthropic::python_text(Some(value)))
+                .map(|value| value.trim().to_owned())
+                .find(|value| !value.is_empty())
+                .unwrap_or_else(|| "unknown".to_owned());
                 let token = ["access_token", "accessToken", "token"]
                     .into_iter()
-                    .filter_map(|key| credentials.get(key).and_then(Value::as_str))
-                    .map(str::trim)
-                    .find(|value| !value.is_empty())
-                    .map(ToOwned::to_owned);
+                    .filter_map(|key| credentials.get(key))
+                    .map(|value| super::protocol_anthropic::python_text(Some(value)))
+                    .map(|value| value.trim().to_owned())
+                    .find(|value| !value.is_empty());
                 match token {
                     Some(token) => {
-                        imported.push(json!({"access_token": token}));
+                        imported.push(json!({"access_token": token, "source_type":"codex"}));
                         successful += 1;
                     }
                     None => {
-                        failed += 1;
                         errors.push(json!({"name": account_id, "error": "missing access_token"}));
                     }
                 }
             }
-            for missing in requested_ids.difference(&returned_ids) {
-                failed += 1;
-                errors.push(json!({"name": missing, "error": "account not returned"}));
+            if returned_count < ids.len() {
+                errors.push(json!({
+                    "name": ids.join(","),
+                    "error": format!("exported {returned_count}/{} accounts", ids.len())
+                }));
             }
         }
-        Err(_) => {
-            failed = ids.len();
-            errors.push(json!({"name": "Sub2API", "error": "远程账号导入失败"}));
+        Err(error) => {
+            errors.extend(ids.iter().map(|id| json!({"name": id, "error": error})));
         }
     }
-    failed = failed.saturating_add(ids.len().saturating_sub(successful.saturating_add(failed)));
+    // Match 1.7: failed is the number of concrete errors recorded above. A
+    // short export contributes one aggregate "exported x/y" error; it is not
+    // additionally expanded into synthetic per-account failures.
+    let failed = errors.len();
     let imported_tokens = imported
         .iter()
         .filter_map(|item| item.get("access_token").and_then(Value::as_str))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    let (added, skipped, mut failed) =
+    let (added, skipped, failed, snapshot_saved) =
         match state.account_store.merge_import_records(imported).await {
-            Ok((added, skipped)) => (added, skipped, failed),
+            Ok((added, skipped)) => (added, skipped, failed, true),
             Err(_) => {
                 errors.push(json!({"name": "accounts", "error": "账号快照写入失败"}));
-                (0, 0, failed.saturating_add(successful))
+                (0, 0, failed.saturating_add(successful), false)
             }
         };
     let _ = set_registry_job(
@@ -3423,7 +4240,7 @@ async fn execute_sub2api_import(
             &expected_job_id,
             ImportProgress {
                 total: ids.len(),
-                completed: successful.saturating_add(failed),
+                completed: ids.len(),
                 added,
                 skipped,
                 refreshed: 0,
@@ -3450,23 +4267,19 @@ async fn execute_sub2api_import(
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .unwrap_or_default();
-    let refresh_errors = refresh_result
-        .get("errors")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    failed = failed.saturating_add(imported_tokens.len().saturating_sub(refreshed));
-    for error in refresh_errors {
-        push_import_error(&mut errors, error);
-    }
-    let mut job = import_job(
+    let mut job = access_token_import_job(
         &expected_job_id,
-        ids.len(),
-        added,
-        skipped,
-        refreshed,
-        failed,
+        ImportProgress {
+            total: ids.len(),
+            completed: ids.len(),
+            added,
+            skipped,
+            refreshed,
+            failed,
+        },
         errors,
+        successful,
+        snapshot_saved,
     );
     add_model_catalog_stats(&mut job, &state, &batch_stats).await;
     let _ = set_registry_job(&state, "sub2api", &server_id, job, Some(&expected_job_id));
@@ -3479,31 +4292,34 @@ pub(super) async fn start_sub2api_import(
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
-    registry_value(&state, "sub2api", &server_id)?;
-    let ids = super::account_json_body(body)
-        .await?
-        .get("account_ids")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(ApiError::invalid_request)?
-        .into_iter()
-        .filter_map(|value| {
-            value
-                .as_str()
+    let server = registry_value(&state, "sub2api", &server_id)?;
+    let value = super::account_json_body(body).await?;
+    let object = value.as_object().ok_or_else(ApiError::validation)?;
+    let ids = match object.get("account_ids") {
+        None => Vec::new(),
+        Some(Value::Array(values)) => {
+            if values.iter().any(|value| !value.is_string()) {
+                return Err(ApiError::validation());
+            }
+            values
+                .iter()
+                .filter_map(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
-        })
-        .collect::<Vec<_>>();
-    if ids.is_empty() || ids.len() > 5_000 {
+                .collect::<Vec<_>>()
+        }
+        Some(_) => return Err(ApiError::validation()),
+    };
+    if ids.is_empty() {
         return Err(ApiError::invalid_request());
     }
     let job_id = format!("job-{}-{}", std::process::id(), now_nanos());
     let job = json!({
         "job_id": job_id.clone(),
         "status": "pending",
-        "created_at": iso_timestamp(SystemTime::now()),
-        "updated_at": iso_timestamp(SystemTime::now()),
+        "created_at": python_iso_timestamp(SystemTime::now()),
+        "updated_at": python_iso_timestamp(SystemTime::now()),
         "total": ids.len(),
         "completed": 0,
         "added": 0,
@@ -3513,7 +4329,9 @@ pub(super) async fn start_sub2api_import(
         "errors": [],
     });
     let saved = begin_registry_job(&state, "sub2api", &server_id, job)?;
-    tokio::spawn(execute_sub2api_import(state, server_id, ids, job_id));
+    tokio::spawn(execute_sub2api_import(
+        state, server_id, server, ids, job_id,
+    ));
     Ok(Json(
         json!({"import_job": public_import_job(saved.get("import_job"))}),
     ))
@@ -3949,7 +4767,7 @@ async fn load_ccload_channel_models(
             });
             let refresh = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
-                super::refresh_access_token_account(&request_state, &account, None),
+                super::refresh_access_token_account(&request_state, &account),
             )
             .await;
             let (snapshot, refresh_status) = match refresh {
@@ -3957,25 +4775,58 @@ async fn load_ccload_channel_models(
                 Ok(Err(_)) => (None, "failed"),
                 Err(_) => (None, "timeout"),
             };
-            let empty_snapshot = Value::Object(Map::new());
-            let (models, sources) = merge_ccload_account_catalog(
-                None,
-                None,
-                snapshot.as_ref().unwrap_or(&empty_snapshot),
-            );
+            let fetched = if let Some(snapshot) = snapshot.as_ref() {
+                let refreshed_type = snapshot
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .or(account_type.as_deref())
+                    .unwrap_or("free");
+                let account_proxy = credential_value
+                    .and_then(|value| value.get("proxy"))
+                    .and_then(Value::as_str);
+                super::fetch_imported_account_model_catalog(
+                    &request_state,
+                    refreshed_type,
+                    &access,
+                    account_id.as_deref(),
+                    account_proxy,
+                    deadline,
+                    None,
+                )
+                .await
+            } else {
+                None
+            };
+            let (models, sources) = merge_ccload_model_catalog(None, None, fetched.as_deref());
             let has_web = sources.as_object().is_some_and(|sources| {
                 sources
                     .values()
                     .any(|source| source.as_str() == Some("web"))
             });
-            let has_image = sources.as_object().is_some_and(|sources| {
-                sources
-                    .values()
-                    .any(|source| source.as_str() == Some("image"))
-            });
             catalog["models"] = models;
             catalog["model_sources"] = sources;
             catalog["models_loaded"] = Value::Bool(has_web);
+            let image_models = snapshot
+                .as_ref()
+                .filter(|snapshot| {
+                    snapshot
+                        .get("_verified_image_capability")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                        && snapshot
+                            .get("quota")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|quota| quota > 0)
+                })
+                .map(|_| {
+                    super::WEB_IMAGE_MODELS
+                        .iter()
+                        .map(|model| (*model).to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            apply_ccload_image_capability(&mut catalog, &image_models);
+            let has_image = !image_models.is_empty();
             catalog["model_load_status"] = Value::String(
                 if has_web {
                     "loaded"
@@ -4011,8 +4862,8 @@ pub(super) async fn start_ccload_import(
     let job = json!({
         "job_id": job_id.clone(),
         "status": "pending",
-        "created_at": iso_timestamp(SystemTime::now()),
-        "updated_at": iso_timestamp(SystemTime::now()),
+        "created_at": python_iso_timestamp(SystemTime::now()),
+        "updated_at": python_iso_timestamp(SystemTime::now()),
         "total": ids.len(),
         "completed": 0,
         "added": 0,
@@ -4288,6 +5139,49 @@ async fn execute_ccload_import(
     for error in refresh_errors {
         push_import_error(&mut errors, error);
     }
+    let refreshed_records = state.account_store.raw_records();
+    let mut catalog_fetches = FuturesUnordered::new();
+    for candidate in &candidates {
+        let Some(token) = candidate.get("access_token").and_then(Value::as_str) else {
+            continue;
+        };
+        let current = refreshed_records
+            .iter()
+            .find(|record| super::account_token(record).as_deref() == Some(token))
+            .unwrap_or(candidate);
+        let account_type = current
+            .get("type")
+            .and_then(Value::as_str)
+            .or_else(|| candidate.get("type").and_then(Value::as_str))
+            .unwrap_or("free")
+            .to_owned();
+        let account_id = current
+            .get("chatgpt_account_id")
+            .and_then(Value::as_str)
+            .or_else(|| candidate.get("chatgpt_account_id").and_then(Value::as_str))
+            .map(ToOwned::to_owned);
+        let account_proxy = current
+            .get("proxy")
+            .and_then(Value::as_str)
+            .or_else(|| candidate.get("proxy").and_then(Value::as_str))
+            .map(ToOwned::to_owned);
+        let request_state = state.clone();
+        let token = token.to_owned();
+        let batch = batch_stats.clone();
+        catalog_fetches.push(async move {
+            super::fetch_imported_account_model_catalog(
+                &request_state,
+                &account_type,
+                &token,
+                account_id.as_deref(),
+                account_proxy.as_deref(),
+                deadline,
+                Some(batch),
+            )
+            .await
+        });
+    }
+    while catalog_fetches.next().await.is_some() {}
     let refresh_failed = imported_tokens.len().saturating_sub(refreshed);
     publish_progress(
         ids.len(),
@@ -4334,25 +5228,348 @@ pub(super) async fn ccload_import_progress(
     ))
 }
 
+fn webdav_url(settings: &Map<String, Value>, relative: &str) -> Result<Url, ApiError> {
+    let raw = settings
+        .get("webdav_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ApiError::invalid_request)?;
+    let mut url = Url::parse(raw).map_err(|_| ApiError::invalid_request())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ApiError::invalid_request());
+    }
+    let root = settings
+        .get("webdav_root_path")
+        .and_then(Value::as_str)
+        .unwrap_or("chatgpt2api/images")
+        .trim_matches('/');
+    let mut segments = root.split('/').filter(|value| !value.is_empty());
+    let relative = relative.trim_matches('/');
+    let mut path = url
+        .path_segments_mut()
+        .map_err(|_| ApiError::invalid_request())?;
+    path.pop_if_empty();
+    for segment in segments.by_ref() {
+        path.push(segment);
+    }
+    for segment in relative.split('/').filter(|value| !value.is_empty()) {
+        path.push(segment);
+    }
+    drop(path);
+    Ok(url)
+}
+
+fn webdav_auth(
+    request: reqwest::RequestBuilder,
+    settings: &Map<String, Value>,
+) -> reqwest::RequestBuilder {
+    match (
+        settings.get("webdav_username").and_then(Value::as_str),
+        settings.get("webdav_password").and_then(Value::as_str),
+    ) {
+        (Some(username), Some(password)) if !username.is_empty() || !password.is_empty() => {
+            request.basic_auth(username, Some(password))
+        }
+        _ => request,
+    }
+}
+
+async fn webdav_mkcol_tree(
+    client: &Client,
+    settings: &Map<String, Value>,
+    relative: &str,
+) -> Result<(), ApiError> {
+    async fn create_directory(
+        client: &Client,
+        settings: &Map<String, Value>,
+        url: Url,
+    ) -> Result<(), ApiError> {
+        let method = Method::from_bytes(b"MKCOL").map_err(|_| ApiError::invalid_request())?;
+        let response = webdav_auth(client.request(method, url.to_string()), settings)
+            .send()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        if response.status().is_success() || response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            Ok(())
+        } else {
+            Err(ApiError::upstream_detail(format!(
+                "WebDAV MKCOL failed: HTTP {}",
+                response.status().as_u16()
+            )))
+        }
+    }
+
+    let parent = Path::new(relative)
+        .parent()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .trim_matches('/');
+    let raw = settings
+        .get("webdav_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ApiError::invalid_request)?;
+    let mut current = Url::parse(raw).map_err(|_| ApiError::invalid_request())?;
+    let root = settings
+        .get("webdav_root_path")
+        .and_then(Value::as_str)
+        .unwrap_or("chatgpt2api/images")
+        .trim_matches('/');
+    for segment in root
+        .split('/')
+        .chain(parent.split('/'))
+        .filter(|value| !value.is_empty())
+    {
+        {
+            let mut path = current
+                .path_segments_mut()
+                .map_err(|_| ApiError::invalid_request())?;
+            path.pop_if_empty();
+            path.push(segment);
+        }
+        create_directory(client, settings, current.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn webdav_put_image(
+    client: &Client,
+    settings: &Map<String, Value>,
+    relative: &str,
+    bytes: Vec<u8>,
+) -> Result<String, ApiError> {
+    webdav_mkcol_tree(client, settings, relative).await?;
+    let url = webdav_url(settings, relative)?;
+    let response = webdav_auth(client.put(url.to_string()).body(bytes), settings)
+        .header(
+            header::CONTENT_TYPE,
+            image_content_type(Path::new(relative)),
+        )
+        .send()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    if response.status().is_success() {
+        Ok(url.to_string())
+    } else {
+        Err(ApiError::upstream_detail(format!(
+            "WebDAV PUT failed: HTTP {}",
+            response.status().as_u16()
+        )))
+    }
+}
+
+pub(super) async fn store_generated_image(
+    state: &AppState,
+    relative: &str,
+    bytes: Vec<u8>,
+) -> Result<Option<String>, ApiError> {
+    cleanup_old_images(state);
+    let settings = image_storage_settings(state);
+    let enabled = settings
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let raw_mode = settings
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("local");
+    let mode = if enabled {
+        match raw_mode {
+            "webdav" => "webdav",
+            "both" => "both",
+            _ => "local",
+        }
+    } else {
+        "local"
+    };
+    let stored_local = matches!(mode, "local" | "both");
+    let stored_webdav = matches!(mode, "webdav" | "both");
+    let relative = safe_relative_path(relative).ok_or_else(ApiError::invalid_request)?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    if stored_local {
+        let path = image_root(state).join(&relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|_| ApiError::unavailable())?;
+        }
+        super::atomic_replace_checked_with_limit(
+            &path,
+            &bytes,
+            super::MAX_NATIVE_IMAGE_BYTES as u64,
+            false,
+        )?;
+    }
+    let remote_url = if stored_webdav {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|_| ApiError::unavailable())?;
+        webdav_put_image(&client, &settings, &relative, bytes.clone()).await?
+    } else {
+        String::new()
+    };
+    let created_at = image_local_timestamp();
+    let date = relative.split('/').take(3).collect::<Vec<_>>().join("-");
+    let date = if relative.split('/').count() >= 4 {
+        date
+    } else {
+        created_at.get(..10).unwrap_or("1970-01-01").to_owned()
+    };
+    let dimensions = ImageReader::new(Cursor::new(bytes.as_slice()))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.decode().ok())
+        .map(|image| (image.width(), image.height()));
+    let mut item = json!({
+        "rel": relative,
+        "path": relative,
+        "name": Path::new(&relative).file_name().and_then(|value| value.to_str()).unwrap_or("image"),
+        "date": date,
+        "size": bytes.len(),
+        "created_at": created_at,
+        "storage": match (stored_local, stored_webdav) {
+            (true, true) => "both",
+            (false, true) => "webdav",
+            _ => "local",
+        },
+        "local": stored_local,
+        "webdav": stored_webdav,
+        "remote_url": remote_url,
+    });
+    if let Some((width, height)) = dimensions {
+        item["width"] = json!(width);
+        item["height"] = json!(height);
+    }
+    update_image_index(state, |items| {
+        items.insert(relative.clone(), item);
+        Ok(())
+    })?;
+    Ok(settings
+        .get("public_base_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|base| format!("{}/{}", base.trim_end_matches('/'), relative)))
+}
+
+pub(super) async fn read_stored_image(
+    state: &AppState,
+    relative: &Path,
+) -> Result<Vec<u8>, ApiError> {
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    let root = image_root(state);
+    let local_path = root.join(&relative);
+    if fs::symlink_metadata(&local_path).is_ok() {
+        let path = safe_regular_file(&root, Path::new(&relative))?;
+        return read_bounded(&path, MAX_IMAGE_ARCHIVE_BYTES as u64);
+    }
+    let indexed = {
+        let _guard = IMAGE_INDEX_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        read_image_index_unlocked(state)?.get(&relative).cloned()
+    };
+    if !indexed
+        .as_ref()
+        .and_then(|item| item.get("webdav"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::not_found());
+    }
+    let settings = image_storage_settings(state);
+    let url = webdav_url(&settings, &relative)?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|_| ApiError::unavailable())?;
+    let response = webdav_auth(client.get(url.to_string()), &settings)
+        .send()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Err(ApiError::not_found());
+    }
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_IMAGE_ARCHIVE_BYTES as u64)
+    {
+        return Err(ApiError::unavailable());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+    if bytes.len() > MAX_IMAGE_ARCHIVE_BYTES {
+        return Err(ApiError::unavailable());
+    }
+    Ok(bytes.to_vec())
+}
+
+async fn delete_stored_image(state: &AppState, relative: &str) -> Result<bool, ApiError> {
+    let safe = safe_relative_path(relative).ok_or_else(ApiError::invalid_request)?;
+    let relative = safe.to_string_lossy().replace('\\', "/");
+    let root = image_root(state);
+    let path = root.join(&safe);
+    let mut removed = false;
+    if fs::symlink_metadata(&path).is_ok() {
+        let path = safe_regular_file(&root, &safe)?;
+        fs::remove_file(path).map_err(|_| ApiError::unavailable())?;
+        removed = true;
+    }
+    let indexed = {
+        let _guard = IMAGE_INDEX_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        read_image_index_unlocked(state)?.get(&relative).cloned()
+    };
+    let stored_webdav = indexed
+        .as_ref()
+        .and_then(|item| item.get("webdav"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if stored_webdav {
+        let settings = image_storage_settings(state);
+        let url = webdav_url(&settings, &relative)?;
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|_| ApiError::unavailable())?;
+        let response = webdav_auth(client.delete(url.to_string()), &settings)
+            .send()
+            .await
+            .map_err(|_| ApiError::unavailable());
+        match response {
+            Ok(response)
+                if response.status().is_success() || response.status() == StatusCode::NOT_FOUND =>
+            {
+                removed |= response.status() != StatusCode::NOT_FOUND;
+            }
+            Ok(_) | Err(_) if removed => {}
+            Ok(_) | Err(_) => return Err(ApiError::unavailable()),
+        }
+    }
+    update_image_index(state, |items| {
+        items.remove(&relative);
+        Ok(())
+    })?;
+    super::remove_image_tag_for_path(state, &relative)?;
+    let thumbnail_root = state.data_dir.join("image-thumbnails");
+    let _ = fs::remove_file(thumbnail_root.join(format!("{relative}.png")));
+    let _ = fs::remove_file(thumbnail_root.join(&safe));
+    remove_empty_image_dirs(&root);
+    remove_empty_image_dirs(&state.data_dir.join("image-thumbnails"));
+    Ok(removed)
+}
+
 pub(super) async fn test_image_storage(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let settings = image_storage_settings(&state);
-    let enabled = settings
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mode = settings
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("local");
-    if !enabled || mode == "local" {
-        return Ok(Json(
-            json!({"result": {"ok": true, "status": 200, "error": null, "backend": "local"}}),
-        ));
-    }
     let url = settings
         .get("webdav_url")
         .and_then(Value::as_str)
@@ -4360,29 +5577,57 @@ pub(super) async fn test_image_storage(
         .trim();
     if url.is_empty() {
         return Ok(Json(
-            json!({"result": {"ok": false, "status": 0, "error": "WebDAV 未配置"}}),
+            json!({"result": {"ok": false, "status": 0, "error": "WebDAV URL is required"}}),
+        ));
+    }
+    if !Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
+        return Ok(Json(
+            json!({"result": {"ok": false, "status": 0, "error": "invalid WebDAV URL"}}),
         ));
     }
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|_| ApiError::unavailable())?;
-    let request = client.head(url);
-    let request = if let (Some(user), Some(password)) = (
-        settings.get("webdav_username").and_then(Value::as_str),
-        settings.get("webdav_password").and_then(Value::as_str),
-    ) {
-        request.basic_auth(user, Some(password))
-    } else {
-        request
-    };
-    let response = request.send().await.map_err(|_| ApiError::unavailable())?;
-    let status = response.status().as_u16();
-    Ok(Json(json!({"result": {
-        "ok": status < 400,
-        "status": status,
-        "error": if status < 400 { Value::Null } else { json!("WebDAV 测试失败") },
-    }})))
+    let test_path = ".chatgpt2api_webdav_test.txt";
+    let result = async {
+        webdav_mkcol_tree(&client, &settings, test_path).await?;
+        let put_url = webdav_url(&settings, test_path)?;
+        let put = webdav_auth(
+            client
+                .put(put_url.to_string())
+                .body("chatgpt2api webdav test\n"),
+            &settings,
+        )
+        .header(header::CONTENT_TYPE, "text/plain")
+        .send()
+        .await
+        .map_err(|_| ApiError::unavailable())?;
+        if !put.status().is_success() {
+            return Err(ApiError::upstream_detail(format!(
+                "WebDAV PUT failed: HTTP {}",
+                put.status().as_u16()
+            )));
+        }
+        let delete_url = webdav_url(&settings, test_path)?;
+        let delete = webdav_auth(client.delete(delete_url.to_string()), &settings)
+            .send()
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        if delete.status().is_success() || delete.status() == StatusCode::NOT_FOUND {
+            Ok(json!({"ok": true, "status": 200, "error": null}))
+        } else {
+            Err(ApiError::upstream_detail(format!(
+                "WebDAV DELETE failed: HTTP {}",
+                delete.status().as_u16()
+            )))
+        }
+    }
+    .await;
+    let result = result.unwrap_or_else(
+        |error: ApiError| json!({"ok": false, "status": 0, "error": error.message()}),
+    );
+    Ok(Json(json!({"result": result})))
 }
 
 pub(super) async fn sync_image_storage(
@@ -4399,12 +5644,62 @@ pub(super) async fn sync_image_storage(
         .get("mode")
         .and_then(Value::as_str)
         .unwrap_or("local");
-    if enabled && matches!(mode, "webdav" | "both") {
-        return Err(ApiError::unavailable());
+    if !enabled || !matches!(mode, "webdav" | "both") {
+        return Err(ApiError::management_bad_request(
+            "image_storage_disabled",
+            "WebDAV 图片存储未启用",
+        ));
     }
-    let skipped = image_files(&state).len();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|_| ApiError::unavailable())?;
+    let mut uploaded = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let indexed = {
+        let _guard = IMAGE_INDEX_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        read_image_index_unlocked(&state)?
+    };
+    for (relative, path) in image_files(&state) {
+        if indexed
+            .get(&relative)
+            .and_then(|item| item.get("webdav"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            skipped += 1;
+            continue;
+        }
+        match fs::read(&path) {
+            Ok(bytes) => match webdav_put_image(&client, &settings, &relative, bytes).await {
+                Ok(remote_url) => {
+                    let result = update_image_index(&state, |items| {
+                        let previous = items.get(&relative).and_then(Value::as_object).cloned();
+                        let mut item = local_image_index_item(&relative, &path, previous.as_ref())
+                            .ok_or_else(ApiError::unavailable)?;
+                        let object = item.as_object_mut().ok_or_else(ApiError::unavailable)?;
+                        object.insert("storage".to_owned(), json!("both"));
+                        object.insert("webdav".to_owned(), json!(true));
+                        object.insert("remote_url".to_owned(), json!(remote_url));
+                        items.insert(relative.clone(), item);
+                        Ok(())
+                    });
+                    if result.is_ok() {
+                        uploaded += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                Err(_) => failed += 1,
+            },
+            Err(_) => failed += 1,
+        }
+    }
     Ok(Json(
-        json!({"result": {"uploaded": 0, "skipped": skipped, "failed": 0}}),
+        json!({"result": {"uploaded": uploaded, "skipped": skipped, "failed": failed}}),
     ))
 }
 
@@ -4415,39 +5710,8 @@ fn backup_dir(state: &AppState) -> PathBuf {
 fn backup_state_path(state: &AppState) -> PathBuf {
     data_file(state, "backup_state.json")
 }
-
 fn backup_settings(state: &AppState) -> Value {
-    let raw = object_or_empty(
-        read_config(state)
-            .get("backup")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-    );
-    let include_raw = object_or_empty(raw.get("include").cloned().unwrap_or_else(|| json!({})));
-    json!({
-        "enabled": bool_or(raw.get("enabled"), false),
-        "provider": raw.get("provider").and_then(Value::as_str).unwrap_or("local"),
-        "account_id": raw.get("account_id").and_then(Value::as_str).unwrap_or(""),
-        "access_key_id": raw.get("access_key_id").and_then(Value::as_str).unwrap_or(""),
-        "secret_access_key": secret_mask(raw.get("secret_access_key")),
-        "bucket": raw.get("bucket").and_then(Value::as_str).unwrap_or(""),
-        "prefix": raw.get("prefix").and_then(Value::as_str).filter(|value| !value.is_empty()).unwrap_or("backups"),
-        "interval_minutes": raw.get("interval_minutes").and_then(Value::as_u64).unwrap_or(360),
-        "rotation_keep": raw.get("rotation_keep").and_then(Value::as_u64).unwrap_or(10),
-        "encrypt": bool_or(raw.get("encrypt"), false),
-        "passphrase": secret_mask(raw.get("passphrase")),
-        "include": {
-            "config": bool_or(include_raw.get("config"), true),
-            "cpa": bool_or(include_raw.get("cpa"), true),
-            "sub2api": bool_or(include_raw.get("sub2api"), true),
-            "ccload": bool_or(include_raw.get("ccload"), true),
-            "logs": bool_or(include_raw.get("logs"), true),
-            "image_tasks": bool_or(include_raw.get("image_tasks"), true),
-            "accounts_snapshot": bool_or(include_raw.get("accounts_snapshot"), true),
-            "auth_keys_snapshot": bool_or(include_raw.get("auth_keys_snapshot"), true),
-            "images": bool_or(include_raw.get("images"), false),
-        }
-    })
+    super::normalize_backup(read_config(state).get("backup"), true)
 }
 
 fn backup_raw_settings(state: &AppState) -> Map<String, Value> {
@@ -4513,6 +5777,37 @@ fn backup_state_map(state: &AppState) -> Result<Map<String, Value>, ApiError> {
         .cloned()
         .ok_or_else(ApiError::backup_state_invalid)
 }
+fn backup_state_after_restart(current: &Map<String, Value>) -> Option<Value> {
+    let stale_running = current
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || current.get("last_status").and_then(Value::as_str) == Some("running");
+    if !stale_running {
+        return None;
+    }
+    let mut recovered = current.clone();
+    recovered.remove("running");
+    recovered.insert("last_status".to_owned(), json!("idle"));
+    recovered.insert("last_error".to_owned(), Value::Null);
+    recovered.remove("last_error_code");
+    recovered.remove("last_error_status");
+    Some(Value::Object(recovered))
+}
+
+pub(super) fn recover_backup_state_after_restart(state: &AppState) {
+    let path = backup_state_path(state);
+    let Ok(Some(_lock)) = super::try_acquire_path_write_lock_sync(&path) else {
+        return;
+    };
+    let Ok(current) = backup_state_map(state) else {
+        return;
+    };
+    let Some(recovered) = backup_state_after_restart(&current) else {
+        return;
+    };
+    let _ = write_json_unlocked(&path, &recovered);
+}
 
 fn backup_schedule_due(settings: &Value, state: &Map<String, Value>, now: SystemTime) -> bool {
     if !bool_or(settings.get("enabled"), false)
@@ -4556,13 +5851,13 @@ fn backup_running_state(
     target_fingerprint: &str,
 ) -> Value {
     let mut next = current.clone();
-    next.insert("running".to_owned(), Value::Bool(true));
+    next.remove("running");
     next.insert("last_started_at".to_owned(), json!(started));
     next.insert(
         "last_finished_at".to_owned(),
         backup_state_value(current, "last_finished_at"),
     );
-    next.insert("last_status".to_owned(), json!("running"));
+    next.insert("last_status".to_owned(), json!("idle"));
     next.insert("last_error".to_owned(), Value::Null);
     next.remove("last_error_code");
     next.remove("last_error_status");
@@ -4586,7 +5881,7 @@ fn backup_error_state(
     error_code: &str,
 ) -> Value {
     let mut next = current.clone();
-    next.insert("running".to_owned(), Value::Bool(false));
+    next.remove("running");
     next.insert("last_started_at".to_owned(), json!(started));
     next.insert(
         "last_finished_at".to_owned(),
@@ -4627,11 +5922,19 @@ fn backup_error_state_from_api(
     state
 }
 
+fn backup_is_configured(state: &AppState) -> bool {
+    let settings = backup_raw_settings(state);
+    ["account_id", "access_key_id", "secret_access_key", "bucket"]
+        .iter()
+        .all(|key| !backup_raw_text(&settings, key).is_empty())
+}
+
 fn backup_is_remote(state: &AppState) -> bool {
-    backup_settings(state)
+    backup_raw_settings(state)
         .get("provider")
         .and_then(Value::as_str)
-        .is_some_and(|value| value.eq_ignore_ascii_case("cloudflare_r2"))
+        .unwrap_or("cloudflare_r2")
+        .eq_ignore_ascii_case("cloudflare_r2")
 }
 
 #[derive(Clone, Debug)]
@@ -5501,13 +6804,12 @@ fn backup_state(state: &AppState) -> Result<Value, ApiError> {
         _ => "idle",
     };
     Ok(json!({
-        "running": last_status == "running",
+        "running": state.backup_running.load(Ordering::Acquire) || last_status == "running",
         "last_started_at": public_backup_state_text(raw.get("last_started_at"), 128),
         "last_finished_at": public_backup_state_text(raw.get("last_finished_at"), 128),
         "last_status": last_status,
         "last_error": public_backup_error(&raw),
         "last_object_key": public_backup_state_text(raw.get("last_object_key"), 2048),
-        "pending_object_key": public_backup_state_text(raw.get("pending_object_key"), 2048),
     }))
 }
 
@@ -5598,7 +6900,7 @@ fn add_tar_file(
     add_tar_bytes(builder, name, &payload)
 }
 
-async fn build_backup(state: &AppState, key: &str, trigger: &str) -> Result<Vec<u8>, ApiError> {
+async fn build_backup(state: &AppState, _key: &str, trigger: &str) -> Result<Vec<u8>, ApiError> {
     let settings = backup_raw_settings(state);
     let include = object_or_empty(
         settings
@@ -5616,7 +6918,6 @@ async fn build_backup(state: &AppState, key: &str, trigger: &str) -> Result<Vec<
             .as_deref()
             .map(super::storage::StorageBackend::info)
             .unwrap_or_else(|| json!({"type": "json", "description": "本地 JSON 存储"})),
-        "object_key": key,
     });
     let account_snapshot = if bool_or(include.get("accounts_snapshot"), true) {
         let snapshot = if let Some(backend) = state.storage_backend.as_deref() {
@@ -5679,13 +6980,14 @@ async fn build_backup(state: &AppState, key: &str, trigger: &str) -> Result<Vec<
     let optional_files = [
         ("logs", "logs.jsonl", "data/logs.jsonl"),
         ("image_tasks", "image_tasks.json", "data/image_tasks.json"),
+        ("image_tasks", "image_index.json", "data/image_index.json"),
         ("cpa", "cpa_config.json", "data/cpa_config.json"),
         ("sub2api", "sub2api_config.json", "data/sub2api_config.json"),
         ("ccload", "ccload_config.json", "data/ccload_config.json"),
         ("images", "image_tags.json", "data/image_tags.json"),
     ];
     for (flag, filename, archive_name) in optional_files {
-        if bool_or(include.get(flag), flag != "images") {
+        if bool_or(include.get(flag), flag != "images" && flag != "ccload") {
             let path = data_root.join(filename);
             if path.is_file() {
                 add_tar_file(&mut builder, data_root, &path, archive_name)?;
@@ -5842,7 +7144,11 @@ pub(super) async fn list_backups(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let items = if backup_is_remote(&state) {
-        remote_backup_items(&state, &R2Client::from_state(&state)?).await?
+        if !backup_is_configured(&state) {
+            Vec::new()
+        } else {
+            remote_backup_items(&state, &R2Client::from_state(&state)?).await?
+        }
     } else {
         backup_items(&state)?
     };
@@ -5853,7 +7159,20 @@ pub(super) async fn list_backups(
     })))
 }
 
+struct BackupRunningGuard(Arc<AtomicBool>);
+
+impl Drop for BackupRunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 async fn run_backup_impl(state: AppState, trigger: &str) -> Result<Value, ApiError> {
+    state
+        .backup_running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| ApiError::backup_busy())?;
+    let _running_guard = BackupRunningGuard(state.backup_running.clone());
     let remote = backup_is_remote(&state);
     let state_path = backup_state_path(&state);
     let owner_gate = super::backup_owner_gate(&state_path);
@@ -5874,20 +7193,15 @@ async fn run_backup_impl(state: AppState, trigger: &str) -> Result<Value, ApiErr
         .get("pending_object_key")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let object_name = backup_object_name(encryption_enabled);
     let key = format!(
-        "{}/backup-{}-{}.{}",
+        "{}/{}",
         if remote {
             backup_key_prefix(&state)
         } else {
             "backups".to_owned()
         },
-        unix_seconds(SystemTime::now()),
-        now_nanos(),
-        if encryption_enabled {
-            "tar.gz.enc"
-        } else {
-            "tar.gz"
-        }
+        object_name
     );
     let (key, started) = if let Some(pending_key) = pending_raw.as_deref() {
         let valid_key = if remote {
@@ -6013,7 +7327,7 @@ async fn run_backup_impl(state: AppState, trigger: &str) -> Result<Value, ApiErr
                 .as_object()
                 .cloned()
                 .expect("running backup state object");
-            success.insert("running".to_owned(), Value::Bool(false));
+            success.remove("running");
             success.insert("last_status".to_owned(), json!("success"));
             success.insert(
                 "last_finished_at".to_owned(),
@@ -6282,7 +7596,7 @@ fn read_backup_detail_payload(key: &str, payload: Vec<u8>) -> Result<Value, ApiE
     Ok(json!({
         "key": key,
         "name": key.rsplit('/').next().unwrap_or("backup.tar.gz"),
-        "encrypted": false,
+        "encrypted": key.ends_with(".enc"),
         "created_at": created_at,
         "trigger": trigger,
         "app_version": app_version,
@@ -6299,9 +7613,23 @@ pub(super) async fn delete_backup(
 ) -> Result<Json<Value>, ApiError> {
     admin_authenticated(&headers, &state).await?;
     let value = super::account_json_body(body).await?;
-    let key = value.get("key").and_then(Value::as_str).ok_or_else(|| {
-        ApiError::backup_r2_message("backup_key_required", "备份对象 key 不能为空")
-    })?;
+    let object = value.as_object().ok_or_else(ApiError::validation)?;
+    let key = match object.get("key") {
+        None => {
+            return Err(ApiError::backup_r2_message(
+                "backup_key_required",
+                "备份对象 key 不能为空",
+            ));
+        }
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => return Err(ApiError::validation()),
+    };
+    if key.trim().is_empty() {
+        return Err(ApiError::backup_r2_message(
+            "backup_key_required",
+            "备份对象 key 不能为空",
+        ));
+    }
     let state_path = backup_state_path(&state);
     let owner_gate = super::backup_owner_gate(&state_path);
     let _owner_guard = owner_gate
@@ -6442,14 +7770,128 @@ pub(super) async fn download_backup(
 mod tests {
     use super::{
         ApiError, MAX_R2_DOWNLOAD_BYTES, MAX_R2_LIST_RESPONSE_BYTES, Map, R2Client, Value,
-        apply_ccload_image_capability, backup_schedule_due, ccload_model_entries, ccload_model_ids,
-        ccload_model_payload, ccload_recent_refresh_time, merge_ccload_account_catalog,
-        normalized_ccload_credential, parse_r2_list_xml, public_backup_error,
+        apply_ccload_image_capability, backup_schedule_due, bounded_public_text,
+        ccload_model_entries, ccload_model_ids, ccload_model_payload, ccload_recent_refresh_time,
+        cpa_remote_proxy_profile, log_id, log_uuid_hex, merge_ccload_account_catalog,
+        normalized_ccload_credential, parse_r2_list_xml, public_backup_error, public_registry_item,
+        python_integer_or_zero, python_remote_string_if_present, sub2api_page_items,
     };
+
     use crate::model_pool::ModelProvenance;
     use axum::response::IntoResponse;
+    use flate2::read::DeflateDecoder;
     use serde_json::json;
-    use std::time::{Duration, SystemTime};
+    use std::{
+        io::Read,
+        time::{Duration, SystemTime},
+    };
+    #[test]
+    fn remote_group_counts_match_python_int_coercion() {
+        assert_eq!(python_integer_or_zero(Some(&json!(" 7 "))), Ok(7));
+        assert_eq!(python_integer_or_zero(Some(&json!(1.9))), Ok(1));
+        assert_eq!(python_integer_or_zero(Some(&json!(false))), Ok(0));
+        assert!(python_integer_or_zero(Some(&json!({"bad": true}))).is_err());
+        assert_eq!(
+            python_remote_string_if_present(Some(&json!(0)), 128),
+            Some("0".to_owned())
+        );
+        assert_eq!(
+            python_remote_string_if_present(Some(&json!(false)), 128),
+            Some("False".to_owned())
+        );
+        assert_eq!(
+            python_remote_string_if_present(Some(&Value::Null), 128),
+            None
+        );
+    }
+    #[test]
+    fn clearance_test_profile_falls_back_to_legacy_proxy() {
+        let profile = crate::proxy_service::profile_from_runtime(
+            &json!({"enabled": false, "egress_mode": "direct", "proxy_url": ""}),
+            None,
+            None,
+            Some("http://legacy-proxy:8080"),
+            false,
+            true,
+        );
+        assert_eq!(profile.proxy_source, "global");
+        assert_eq!(profile.proxy_url, "http://legacy-proxy:8080");
+    }
+    #[test]
+    fn public_text_projection_matches_python_str_coercion() {
+        assert_eq!(bounded_public_text(Some(&json!(7)), 16), "7");
+        assert_eq!(bounded_public_text(Some(&json!(false)), 16), "");
+        assert_eq!(
+            bounded_public_text(Some(&json!(["a", true])), 32),
+            "['a', True]"
+        );
+    }
+    #[test]
+    fn public_registry_projection_matches_python_clean_values() {
+        let projected = public_registry_item(
+            "sub2api",
+            &json!({
+                "id": 7,
+                "name": true,
+                "base_url": "https://user:pass@example.test/root/",
+                "email": ["a", true],
+                "api_key": 9,
+                "group_id": false,
+            }),
+        );
+        assert_eq!(projected["id"], "7");
+        assert_eq!(projected["name"], "True");
+        assert_eq!(projected["base_url"], "https://example.test/root/");
+        assert_eq!(projected["email"], "['a', True]");
+        assert_eq!(projected["has_api_key"], true);
+        assert_eq!(projected["group_id"], "");
+    }
+
+    #[test]
+    fn legacy_log_id_matches_python_sha1_fixture() {
+        assert_eq!(log_id(&Map::new(), "{}", 0), "7847797acb01758ab281379b");
+    }
+
+    #[test]
+    fn log_uuid_hex_matches_uuid4_hex_shape() {
+        let id = log_uuid_hex();
+        assert_eq!(id.len(), 32);
+        assert!(
+            id.bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        );
+        assert_eq!(&id[12..13], "4");
+        assert!(matches!(id.as_bytes()[16], b'8' | b'9' | b'a' | b'b'));
+    }
+
+    #[test]
+    fn image_zip_uses_deflate_and_marks_utf8_filenames() {
+        let filename = "图片.png";
+        let payload = b"compressible image payload".repeat(64);
+        let archive = super::zip_archive(vec![(filename.to_owned(), payload.clone())])
+            .expect("image archive");
+        assert_eq!(u16::from_le_bytes([archive[6], archive[7]]), 1 << 11);
+        assert_eq!(u16::from_le_bytes([archive[8], archive[9]]), 8);
+        let compressed_size =
+            u32::from_le_bytes(archive[18..22].try_into().expect("compressed size")) as usize;
+        let uncompressed_size =
+            u32::from_le_bytes(archive[22..26].try_into().expect("uncompressed size")) as usize;
+        assert_eq!(uncompressed_size, payload.len());
+        let name_length = u16::from_le_bytes([archive[26], archive[27]]) as usize;
+        let extra_length = u16::from_le_bytes([archive[28], archive[29]]) as usize;
+        assert_eq!(
+            std::str::from_utf8(&archive[30..30 + name_length]).expect("UTF-8 filename"),
+            filename
+        );
+        let data_start = 30 + name_length + extra_length;
+        let mut decoder = DeflateDecoder::new(&archive[data_start..data_start + compressed_size]);
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .expect("inflate image member");
+        assert_eq!(decoded, payload);
+        assert!(compressed_size < uncompressed_size);
+    }
 
     #[test]
     fn backup_schedule_due_matches_python_scheduler_rules() {
@@ -6469,6 +7911,138 @@ mod tests {
         let old = serde_json::from_value(json!({"last_finished_at":"1970-01-12T11:46:40Z"}))
             .expect("old state");
         assert!(backup_schedule_due(&enabled, &old, now));
+    }
+
+    #[test]
+    fn backup_restart_recovery_clears_stale_running_and_preserves_pending_work() {
+        let running = json!({
+            "running": true,
+            "last_status": "running",
+            "pending_object_key": "backups/backup-pending.tar.gz",
+            "pending_target_fingerprint": "target",
+            "last_finished_at": "2026-09-01T00:00:00Z"
+        });
+        let recovered = super::backup_state_after_restart(running.as_object().expect("state"))
+            .expect("stale running backup should recover");
+        assert!(recovered.get("running").is_none());
+        assert_eq!(recovered["last_status"], "idle");
+        assert_eq!(
+            recovered["pending_object_key"],
+            "backups/backup-pending.tar.gz"
+        );
+        assert_eq!(recovered["pending_target_fingerprint"], "target");
+        assert_eq!(recovered["last_finished_at"], "2026-09-01T00:00:00Z");
+        assert!(
+            super::backup_state_after_restart(
+                json!({"last_status":"success"}).as_object().expect("state")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn python_import_restart_recovery_preserves_job_progress_and_errors() {
+        let mut job = json!({
+            "status":"running",
+            "total":12,
+            "completed":7,
+            "added":3,
+            "skipped":2,
+            "failed":1,
+            "errors":[{"name":"a.json","error":"network"}],
+            "updated_at":"2026-09-20T12:00:00Z"
+        })
+        .as_object()
+        .cloned()
+        .expect("import job");
+        super::mark_interrupted_import_job(&mut job, false);
+        assert_eq!(job["status"], "failed");
+        assert_eq!(job["completed"], 7);
+        assert_eq!(job["failed"], 1);
+        assert_eq!(job["errors"], json!([{"name":"a.json","error":"network"}]));
+        assert_eq!(job["updated_at"], "2026-09-20T12:00:00Z");
+    }
+
+    #[test]
+    fn cpa_remote_requests_use_legacy_global_proxy_not_runtime_egress() {
+        let root = std::env::temp_dir().join(format!(
+            "chatgpt2api-rust-cpa-proxy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("CPA proxy test directory");
+        let accounts_path = root.join("accounts.json");
+        std::fs::write(&accounts_path, "[]").expect("empty accounts");
+        std::fs::write(
+            root.join("config.json"),
+            serde_json::to_vec(&json!({
+                "proxy": "http://legacy-proxy:8080",
+                "proxy_runtime": {
+                    "enabled": true,
+                    "egress_mode": "single_proxy",
+                    "proxy_url": "http://runtime-proxy:8081",
+                    "skip_ssl_verify": true
+                }
+            }))
+            .expect("CPA proxy config"),
+        )
+        .expect("write CPA proxy config");
+        let state = crate::AppState::new(crate::AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: vec!["auto".to_owned()],
+            upstream_base_url: Some("https://chatgpt.com".to_owned()),
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(accounts_path),
+            upstream_protocol: crate::UpstreamProtocol::ChatGpt,
+        })
+        .expect("CPA proxy state");
+
+        let profile = cpa_remote_proxy_profile(&state);
+        assert_eq!(profile.proxy_source, "global");
+        assert_eq!(profile.proxy_url, "http://legacy-proxy:8080");
+        assert!(profile.skip_ssl_verify);
+
+        drop(state);
+        std::fs::remove_dir_all(root).expect("CPA proxy test cleanup");
+    }
+
+    #[test]
+    fn sub2api_page_parser_matches_python_paged_shapes_and_totals() {
+        let wrapped = json!({
+            "code": 0,
+            "message": "ok",
+            "data": {
+                "list": [{"id": "first"}, {"id": "second"}],
+                "total": 401
+            }
+        });
+        let (items, total) = sub2api_page_items(&wrapped).expect("wrapped page");
+        assert_eq!(items.len(), 2);
+        assert_eq!(total, 401);
+
+        let zero_total = json!({"items": [{"id": "only"}], "total": 0});
+        let (items, total) = sub2api_page_items(&zero_total).expect("zero total fallback");
+        assert_eq!(items.len(), 1);
+        assert_eq!(total, 1);
+
+        let unwrapped = json!([{"id": "only"}]);
+        let (items, total) = sub2api_page_items(&unwrapped).expect("unwrapped page");
+        assert_eq!(items.len(), 1);
+        assert_eq!(total, 1);
+
+        let unknown = json!({"unexpected": []});
+        let (items, total) = sub2api_page_items(&unknown).expect("unknown shape is empty");
+        assert!(items.is_empty());
+        assert_eq!(total, 0);
+
+        let invalid_total = json!({"data": [], "total": "not-a-number"});
+        assert!(sub2api_page_items(&invalid_total).is_err());
     }
 
     #[test]
@@ -6664,5 +8238,129 @@ mod tests {
         );
         assert_eq!(models, serde_json::json!(["gpt-image-2"]));
         assert_eq!(sources, serde_json::json!({"gpt-image-2":"image"}));
+    }
+    #[test]
+    fn management_json_writers_match_python_pretty_newline_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "chatgpt2api-management-json-{}-{}",
+            std::process::id(),
+            super::unix_seconds(SystemTime::now())
+        ));
+        std::fs::create_dir_all(&root).expect("management JSON test directory");
+        let value = serde_json::json!({"items": {"图片": "image.png"}});
+        let locked = root.join("locked.json");
+        super::write_json(&locked, &value).expect("locked JSON write");
+        assert!(
+            std::fs::read(&locked)
+                .expect("locked JSON bytes")
+                .ends_with(b"\n")
+        );
+        let unlocked = root.join("unlocked.json");
+        super::write_json_unlocked(&unlocked, &value).expect("unlocked JSON write");
+        assert!(
+            std::fs::read(&unlocked)
+                .expect("unlocked JSON bytes")
+                .ends_with(b"\n")
+        );
+        std::fs::remove_dir_all(root).expect("management JSON test cleanup");
+    }
+
+    #[test]
+    fn image_index_mtime_fallback_uses_local_wall_clock() {
+        let offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+        let local = time::OffsetDateTime::from_unix_timestamp(0)
+            .expect("Unix epoch")
+            .to_offset(offset);
+        let expected = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            local.year(),
+            local.month() as u8,
+            local.day(),
+            local.hour(),
+            local.minute(),
+            local.second(),
+        );
+        assert_eq!(super::local_timestamp(SystemTime::UNIX_EPOCH), expected);
+    }
+    #[test]
+    fn malformed_image_index_recovers_like_python() {
+        let root = std::env::temp_dir().join(format!(
+            "chatgpt2api-rust-image-index-recovery-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("image index test directory");
+        let accounts_path = root.join("accounts.json");
+        std::fs::write(&accounts_path, "[]").expect("empty accounts");
+        let state = crate::AppState::new(crate::AppConfig {
+            version: "test".to_owned(),
+            auth_key: None,
+            models: Vec::new(),
+            upstream_base_url: None,
+            upstream_auth: None,
+            auth_keys_path: None,
+            models_path: None,
+            accounts_path: Some(accounts_path),
+            upstream_protocol: crate::UpstreamProtocol::ChatGpt,
+        })
+        .expect("image index state");
+        std::fs::write(super::image_index_path(&state), b"{broken").expect("corrupt index");
+        assert!(
+            super::read_image_index_unlocked(&state)
+                .expect("malformed index recovery")
+                .is_empty()
+        );
+        std::fs::write(
+            super::image_index_path(&state),
+            serde_json::to_vec(&serde_json::json!({
+                "items": {
+                    "invalid.txt": {},
+                    "../escape.png": {},
+                    "valid.png": {}
+                }
+            }))
+            .expect("index JSON"),
+        )
+        .expect("mixed image index");
+        let filtered = super::read_image_index_unlocked(&state).expect("filtered index");
+        assert!(filtered.get("invalid.txt").is_none());
+        assert!(filtered.get("../escape.png").is_none());
+        assert!(filtered.get("valid.png").is_some());
+        drop(state);
+        std::fs::remove_dir_all(root).expect("image index test cleanup");
+    }
+    #[test]
+    fn image_delete_boolean_matches_pydantic_coercion() {
+        for (raw, expected) in [
+            (serde_json::json!(true), true),
+            (serde_json::json!(" YES "), true),
+            (serde_json::json!(1.0), true),
+            (serde_json::json!("off"), false),
+        ] {
+            assert_eq!(super::pydantic_management_bool(&raw), Some(expected));
+        }
+        assert_eq!(
+            super::pydantic_management_bool(&serde_json::json!("maybe")),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_query_coercion_matches_python_query_models() {
+        assert_eq!(
+            super::cleanup_query_target(Some(" 1_000 ")).expect("integer query"),
+            1000
+        );
+        assert_eq!(
+            super::cleanup_query_target(None).expect("default target"),
+            500
+        );
+        assert!(super::cleanup_query_target(Some("1.5")).is_err());
+        assert!(super::cleanup_query_bool(Some(" YES ")).expect("bool query"));
+        assert!(!super::cleanup_query_bool(Some("off")).expect("bool query"));
+        assert!(super::cleanup_query_bool(Some("maybe")).is_err());
     }
 }

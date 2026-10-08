@@ -187,6 +187,7 @@ pub(super) async fn run(mut socket: WebSocket, state: AppState, headers: HeaderM
                     headers.clone(),
                     Body::from(bytes),
                     NATIVE_UPSTREAM_TIMEOUT,
+                    false,
                 )
                 .await;
                 match fallback {
@@ -831,7 +832,7 @@ impl NativeCodexWebSocketTransport {
                     .cloned()
                     .ok_or(TransportError::Protocol)?;
                 if let Some(lease) = self.lease.as_ref()
-                    && !state.account_store.mark_text_used(lease.token())
+                    && !state.account_store.mark_text_used(lease.token()).await
                 {
                     super::AccountStore::note_usage_mark_failure();
                 }
@@ -1665,8 +1666,8 @@ mod tests {
                 .send(Message::Ping(b"idle".to_vec().into()))
                 .await
                 .expect("idle ping");
-            let _ = socket.send(Message::Close(None)).await;
             state.first_idle_sent.notify_one();
+            let _ = socket.send(Message::Close(None)).await;
         } else {
             *state.second_payload.lock().expect("payload lock") = Some(payload);
             socket
@@ -1832,13 +1833,12 @@ mod tests {
     #[tokio::test]
     async fn http_proxy_connect_sends_decoded_auth_and_accepts_no_auth() {
         async fn run_case(proxy_url: String, expected_auth: Option<String>) {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("HTTP proxy listener");
-            let address = listener.local_addr().expect("HTTP proxy address");
+            let proxy = normalize_proxy_url(&proxy_url.replace("PROXY_PORT", "8080"))
+                .expect("HTTP proxy URL");
+            let target = Url::parse("wss://remote.example.test:443").expect("target URL");
+            let (client, mut server_stream) = tokio::io::duplex(64 * 1024);
             let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.expect("HTTP proxy accept");
-                let request = read_proxy_headers(&mut stream)
+                let request = read_proxy_headers(&mut server_stream)
                     .await
                     .expect("HTTP CONNECT request");
                 let request = String::from_utf8(request).expect("HTTP request UTF-8");
@@ -1849,20 +1849,23 @@ mod tests {
                     ),
                     None => assert!(!request.contains("Proxy-Authorization:")),
                 }
-                stream
+                server_stream
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await
                     .expect("HTTP proxy response");
             });
-            let proxy =
-                normalize_proxy_url(&proxy_url.replace("PROXY_PORT", &address.port().to_string()))
-                    .expect("HTTP proxy URL");
-            let target = Url::parse("wss://remote.example.test:443").expect("target URL");
-            let stream = connect_via_proxy(&proxy, &target)
+            let stream = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect_http_proxy(&proxy, &target, client),
+            )
+            .await
+            .expect("HTTP CONNECT deadline")
+            .expect("HTTP CONNECT");
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(5), server)
                 .await
-                .expect("HTTP CONNECT");
-            assert!(matches!(stream, ProxyStream::Tcp(_)));
-            server.await.expect("HTTP proxy server");
+                .expect("HTTP proxy server deadline")
+                .expect("HTTP proxy server");
         }
 
         run_case(
@@ -1886,24 +1889,40 @@ mod tests {
             .expect("HTTP proxy listener");
         let address = listener.local_addr().expect("HTTP proxy address");
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("HTTP proxy accept");
-            let _ = read_proxy_headers(&mut stream).await.expect("HTTP request");
-            stream
-                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
                 .await
-                .expect("HTTP failure response");
+                .expect("HTTP proxy accept deadline")
+                .expect("HTTP proxy accept");
+            let _ = tokio::time::timeout(Duration::from_secs(5), read_proxy_headers(&mut stream))
+                .await
+                .expect("HTTP request deadline")
+                .expect("HTTP request");
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                stream.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"),
+            )
+            .await
+            .expect("HTTP failure response deadline")
+            .expect("HTTP failure response write");
         });
         let proxy = normalize_proxy_url(&format!("http://127.0.0.1:{}", address.port()))
             .expect("HTTP proxy URL");
         let target = Url::parse("wss://remote.example.test:443").expect("target URL");
-        assert!(connect_via_proxy(&proxy, &target).await.is_err());
-        server.await.expect("HTTP proxy server");
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), connect_via_proxy(&proxy, &target))
+                .await
+                .expect("HTTP proxy connect deadline");
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("HTTP proxy server deadline")
+            .expect("HTTP proxy server");
     }
 
     #[tokio::test]
     async fn https_proxy_connect_uses_tls_and_decoded_auth() {
         ensure_rustls_crypto_provider();
-        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
             .expect("proxy certificate");
         let certificate_der = CertificateDer::from(certificate.cert.der().to_vec());
         let private_key = PrivateKeyDer::try_from(certificate.key_pair.serialize_der())
@@ -1936,7 +1955,7 @@ mod tests {
                 .expect("HTTPS proxy response");
         });
         let proxy = normalize_proxy_url(&format!(
-            "https://https-user:https-pass@localhost:{}",
+            "https://https-user:https-pass@127.0.0.1:{}",
             address.port()
         ))
         .expect("HTTPS proxy URL");
@@ -2143,7 +2162,7 @@ mod tests {
         assert!(success.credential_key.is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_ping_close_forces_pre_send_reconnect_and_full_replay() {
         let (account_path, _cleanup) = project_test_file("responses-ws-keepalive-account");
         fs::write(
@@ -2170,7 +2189,9 @@ mod tests {
                 .route("/", get(|| async { "<html></html>" }))
                 .route(
                     "/backend-api/models",
-                    get(|| async { Json(json!({"models":[{"slug":"gpt-test"}]})) }),
+                    get(|| async {
+                        Json(json!({"models":[{"slug":"gpt-test","supported_in_api":true}]}))
+                    }),
                 )
                 .route("/backend-api/codex/responses", websocket);
             axum::serve(fake_listener, app).await.expect("fake server")
@@ -2191,6 +2212,7 @@ mod tests {
         state
             .account_type_catalog
             .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
+        state.account_type_catalog.disable_for_test();
         assert!(
             state
                 .account_store
