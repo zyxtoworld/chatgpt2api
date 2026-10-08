@@ -896,6 +896,12 @@ Rust `cargo test --offline --all-targets -- --test-threads=1` 完成 `578 passed
 
 既有 access-token-only、Rust-only 扩展以及资源/路径/CAS/fail-closed 边界保持不变。
 
+## GitHub 镜像发布前 CI 修复
+
+GitHub Actions run `37799423886` 暴露一项并发回归：PPT 任务仍持有 `AccountLease` 时，`mark_text_used` 的账号快照 reload 会替换 `AccountSlot` 并把文本 `inflight` 计数归零，导致任务尚未发布 artifacts 时健康计数错误为 0。Rust 现将文本 inflight 计数改为可共享原子计数，并在按 token/账号身份重建 snapshot 时复用该计数；图片 inflight 与 last-used runtime state 继续保持同一复用规则。
+
+本地定向回归 `cwd_switch_cross_pressure_native_ppt_task_holds_real_web_lease_until_artifacts_are_persisted` 通过。
+
 ## 再次独立复核
 
 本轮换用 coercion、错误包络、图片输入/任务边界、Chat history、图片 ID 分类、Git 鉴权写回和存储并发视角重新复读 Python v1.7 与 Rust 调用链；未发现新的确定性行为差异。本轮无生产代码修改。

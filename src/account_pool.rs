@@ -72,7 +72,7 @@ pub(super) struct CatalogAccountCandidate {
 
 pub(super) struct AccountSlot {
     pub(super) record: AccountRecord,
-    pub(super) inflight: AtomicUsize,
+    pub(super) inflight: Arc<AtomicUsize>,
     image_inflight: Arc<AtomicUsize>,
     last_used_at: RwLock<Option<String>>,
     #[cfg(test)]
@@ -2066,6 +2066,7 @@ fn remember_runtime_marker(markers: &mut HashMap<String, String>, key: String, v
 #[derive(Clone)]
 struct PreviousAccountRuntime {
     identity: Option<String>,
+    inflight: Arc<AtomicUsize>,
     image_inflight: Arc<AtomicUsize>,
     last_used_at: Option<String>,
 }
@@ -2095,12 +2096,16 @@ fn account_slots_with_runtime_state(
     previous: Option<&[Arc<AccountSlot>]>,
 ) -> Vec<Arc<AccountSlot>> {
     let mut previous_by_token = HashMap::<String, PreviousAccountRuntime>::new();
+    let mut inflight_by_identity = HashMap::<String, Arc<AtomicUsize>>::new();
     let mut image_inflight_by_identity = HashMap::<String, Arc<AtomicUsize>>::new();
     let mut last_used_by_identity = HashMap::<String, String>::new();
     if let Some(previous) = previous {
         for slot in previous {
             let identity = account_identity_key(&slot.record.raw);
             if let Some(identity) = identity.as_ref() {
+                inflight_by_identity
+                    .entry(identity.clone())
+                    .or_insert_with(|| slot.inflight.clone());
                 image_inflight_by_identity
                     .entry(identity.clone())
                     .or_insert_with(|| slot.image_inflight.clone());
@@ -2116,6 +2121,7 @@ fn account_slots_with_runtime_state(
                 slot.record.token.clone(),
                 PreviousAccountRuntime {
                     identity: identity.clone(),
+                    inflight: slot.inflight.clone(),
                     image_inflight: slot.image_inflight.clone(),
                     last_used_at: last_used_at.clone(),
                 },
@@ -2128,11 +2134,20 @@ fn account_slots_with_runtime_state(
     records
         .into_iter()
         .map(|record| {
+            let identity = account_identity_key(&record.raw);
             let persisted_last_used_at = record
                 .raw
                 .get("last_used_at")
                 .and_then(|value| python_clean_last_used_at(Some(value)));
-            let identity = account_identity_key(&record.raw);
+            let inflight = previous_by_token
+                .get(&record.token)
+                .map(|previous| previous.inflight.clone())
+                .or_else(|| {
+                    identity
+                        .as_ref()
+                        .and_then(|identity| inflight_by_identity.get(identity).cloned())
+                })
+                .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
             let image_inflight = previous_by_token
                 .get(&record.token)
                 .map(|previous| previous.image_inflight.clone())
@@ -2159,7 +2174,7 @@ fn account_slots_with_runtime_state(
             };
             Arc::new(AccountSlot {
                 record,
-                inflight: AtomicUsize::new(0),
+                inflight,
                 image_inflight,
                 last_used_at: RwLock::new(last_used_at),
                 #[cfg(test)]
