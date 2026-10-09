@@ -13268,12 +13268,8 @@ async fn native_web_image_request_single(
     }
 }
 
-fn web_image_upstream_model(requested_model: &str) -> &'static str {
-    if requested_model == "gpt-image-2" {
-        "gpt-5-3"
-    } else {
-        "auto"
-    }
+fn web_image_upstream_model(_requested_model: &str) -> &'static str {
+    "auto"
 }
 
 async fn resolve_web_image_upstream_models(
@@ -21377,6 +21373,9 @@ impl AccountTypeCatalog {
     async fn refresh_for_public(&self) {
         self.refresh_with_cold_wait(None).await;
     }
+    async fn refresh_for_public_wait(&self) {
+        self.refresh_inner().await;
+    }
 
     async fn refresh_image_quotas_for_public(&self, state: &AppState) {
         if !self.enabled() || self.protocol != UpstreamProtocol::ChatGpt {
@@ -22681,81 +22680,21 @@ fn ensure_image_model_snapshot(value: &mut Value) {
     }
 }
 
-fn v17_public_model_list(models: &[PublicModel], accounts: &[AccountRecord]) -> Value {
-    let mut data = models
-        .iter()
-        .map(|model| {
-            json!({
-                "id": model.id,
-                "object": "model",
-                "created": model.created,
-                "owned_by": model.owned_by,
-                "permission": [],
-                "root": model.id,
-                "parent": null
-            })
-        })
-        .collect::<Vec<_>>();
-    data.sort_by(|left, right| {
-        left["id"]
-            .as_str()
-            .unwrap_or_default()
-            .cmp(right["id"].as_str().unwrap_or_default())
-    });
-    let mut seen = data
-        .iter()
-        .filter_map(|model| model.get("id")?.as_str().map(ToOwned::to_owned))
-        .collect::<HashSet<_>>();
-
-    let mut dynamic_models = Vec::new();
-    if !accounts.is_empty() {
-        dynamic_models.push("gpt-image-2".to_owned());
-    }
-    let codex_plans = accounts
-        .iter()
-        .filter(|account| account.source_type.eq_ignore_ascii_case("codex"))
-        .map(|account| account.account_type.to_ascii_lowercase())
-        .filter(|plan| matches!(plan.as_str(), "plus" | "team" | "pro"))
-        .collect::<HashSet<_>>();
-    if !codex_plans.is_empty() {
-        dynamic_models.push("codex-gpt-image-2".to_owned());
-        for plan in ["plus", "team", "pro"] {
-            if codex_plans.contains(plan) {
-                dynamic_models.push(format!("{plan}-codex-gpt-image-2"));
-            }
-        }
-    }
-    dynamic_models.sort();
-    for id in dynamic_models {
-        if seen.insert(id.clone()) {
-            data.push(json!({
-                "id": id,
-                "object": "model",
-                "created": 0,
-                "owned_by": "chatgpt2api",
-                "permission": [],
-                "root": id,
-                "parent": null
-            }));
-        }
-    }
-    json!({"object": "list", "data": data})
-}
-
 async fn models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     authenticated(&headers, &state).await?;
     if state.config.upstream_protocol == UpstreamProtocol::ChatGpt {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        state.account_type_catalog.refresh_for_public_wait().await;
+        state
+            .account_type_catalog
+            .refresh_image_quotas_for_public(&state)
+            .await;
         let models = state
             .account_type_catalog
-            .fetch_anonymous_models(deadline)
-            .await
-            .ok_or_else(ApiError::upstream)?;
-        let accounts = state.account_store.records();
-        return Ok(Json(v17_public_model_list(&models, &accounts)));
+            .public_models(Arc::new(Vec::new()));
+        return Ok(Json(json!({ "object": "list", "data": models.as_ref() })));
     }
     if !state.models.reload().await {
         return Err(ApiError::unavailable());
@@ -33251,21 +33190,21 @@ mod tests {
                 .iter()
                 .filter_map(|model| model["id"].as_str())
                 .collect::<Vec<_>>();
-            if model_ids.contains(&"anonymous-model") && model_ids.contains(&"gpt-image-2") {
+            if model_ids.contains(&"gpt-image-2") && model_ids.contains(&"gpt-image-2.5") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(
-            model_ids.contains(&"anonymous-model"),
+            model_ids.contains(&"gpt-image-2"),
             "public model ids: {model_ids:?}; body: {models}"
         );
-        assert!(model_ids.contains(&"gpt-image-2"));
-        assert!(model_ids.contains(&"codex-gpt-image-2"));
-        assert!(model_ids.contains(&"pro-codex-gpt-image-2"));
-        assert!(!model_ids.contains(&"web-page-model"));
-        assert!(!model_ids.contains(&"web-tpp-model"));
-        assert!(!model_ids.contains(&"gpt-5-codex"));
+        assert!(model_ids.contains(&"gpt-image-2.5"));
+        assert!(model_ids.contains(&"web-page-model"));
+        assert!(model_ids.contains(&"web-tpp-model"));
+        assert!(model_ids.contains(&"gpt-5-codex"));
+        assert!(!model_ids.contains(&"codex-gpt-image-2"));
+        assert!(!model_ids.contains(&"pro-codex-gpt-image-2"));
         assert!(!model_ids.contains(&"codex-endpoint-model"));
 
         let hit_text = hits.lock().await.join("\n");
@@ -35786,16 +35725,21 @@ mod tests {
         let public_models = models_value["data"]
             .as_array()
             .expect("public v1.7 model list");
-        assert!(public_models.iter().any(|item| item["id"] == "gpt-public"));
+        assert!(public_models.iter().any(|item| item["id"] == "gpt-pro"));
+        assert!(public_models.iter().any(|item| item["id"] == "gpt-5-5"));
         assert!(public_models.iter().any(|item| item["id"] == "gpt-image-2"));
         assert!(
-            !calls
+            public_models
+                .iter()
+                .any(|item| item["id"] == "gpt-image-2.5")
+        );
+        assert!(
+            calls
                 .lock()
                 .expect("account refresh calls lock")
                 .iter()
                 .any(|call| call.starts_with("GET /backend-api/models"))
         );
-        assert_eq!(calls.lock().expect("account refresh calls lock").len(), 4);
         assert!(
             calls
                 .lock()
@@ -43933,16 +43877,15 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn v17_public_models_use_anonymous_catalog_and_append_legacy_image_models() {
-        let account_path = account_snapshot_path("v17-public-model-list");
+    async fn public_models_merge_authenticated_web_catalog() {
+        let account_path = account_snapshot_path("public-model-list");
         fs::write(
             &account_path,
             r#"[
-                {"access_token":"disabled-web","status":"禁用","source_type":"web","type":"free"},
-                {"access_token":"disabled-plus","status":"禁用","source_type":"codex","type":"plus"},
-                {"access_token":"disabled-team","status":"禁用","source_type":"codex","type":"team"}
+                {"access_token":"web-free","status":"正常","source_type":"web","type":"free","quota":1,"_verified_image_capability":true},
+                {"access_token":"web-plus","status":"正常","source_type":"web","type":"plus","quota":1,"_verified_image_capability":true}
             ]"#
-                .as_bytes(),
+            .as_bytes(),
         )
         .expect("account snapshot");
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -43974,7 +43917,15 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
                 .route("/backend-anon/models", anonymous_models)
                 .route(
                     "/backend-api/models",
-                    get(|| async { Json(json!({"models":[{"slug":"private-model"}]})) }),
+                    get(|| async {
+                        Json(json!({"models":[
+                            {"slug":"gpt-5-5"}, {"slug":"gpt-5-6"}, {"slug":"gpt-5-3-mini"},
+                            {"slug":"gpt-5-5-mini"}, {"slug":"gpt-5-6-mini"}, {"slug":"gpt-5-6-t-mini"},
+                            {"slug":"gpt-5-6-t-mini-mini"}, {"slug":"research"}, {"slug":"gpt-6"},
+                            {"slug":"gpt-6-t-mini"}, {"slug":"gpt-6-mini"}, {"slug":"gpt-6-t-mini-mini"},
+                            {"slug":"auto"}
+                        ]}))
+                    }),
                 );
             let _ = ready_tx.send(());
             axum::serve(listener, app).await.expect("model upstream");
@@ -44027,20 +43978,40 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             upstream.is_finished()
         );
         let value: Value = serde_json::from_slice(&body).expect("models JSON");
+        let ids = value["data"]
+            .as_array()
+            .expect("public model data")
+            .iter()
+            .map(|item| item["id"].as_str().expect("model id"))
+            .collect::<Vec<_>>();
         assert_eq!(
-            value,
-            json!({
-                "object":"list",
-                "data":[
-                    {"id":"a-model","object":"model","created":3,"owned_by":"owner-a","permission":[],"root":"a-model","parent":null},
-                    {"id":"z-model","object":"model","created":9,"owned_by":"owner-z","permission":[],"root":"z-model","parent":null},
-                    {"id":"codex-gpt-image-2","object":"model","created":0,"owned_by":"chatgpt2api","permission":[],"root":"codex-gpt-image-2","parent":null},
-                    {"id":"gpt-image-2","object":"model","created":0,"owned_by":"chatgpt2api","permission":[],"root":"gpt-image-2","parent":null},
-                    {"id":"plus-codex-gpt-image-2","object":"model","created":0,"owned_by":"chatgpt2api","permission":[],"root":"plus-codex-gpt-image-2","parent":null},
-                    {"id":"team-codex-gpt-image-2","object":"model","created":0,"owned_by":"chatgpt2api","permission":[],"root":"team-codex-gpt-image-2","parent":null}
-                ]
-            })
+            ids,
+            vec![
+                "auto",
+                "gpt-5-3-mini",
+                "gpt-5-5",
+                "gpt-5-5-mini",
+                "gpt-5-6",
+                "gpt-5-6-mini",
+                "gpt-5-6-t-mini",
+                "gpt-5-6-t-mini-mini",
+                "gpt-6",
+                "gpt-6-mini",
+                "gpt-6-t-mini",
+                "gpt-6-t-mini-mini",
+                "gpt-image-2",
+                "gpt-image-2.5",
+                "gpt-image-2.5-flare",
+                "gpt-image-2.5-sunburst",
+                "research",
+            ]
         );
+        assert!(value["data"].as_array().unwrap().iter().any(|item| {
+            item["id"] == "gpt-5-5"
+                && item["supported_account_types"]
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|value| value == "free"))
+        }));
         assert_eq!(
             calls.lock().await.as_slice(),
             ["/backend-anon/models?iim=false&is_gizmo=false"]
@@ -48414,10 +48385,15 @@ data: [DONE]
     }
 
     #[test]
-    fn web_image_model_uses_v17_fixed_upstream_mapping() {
-        assert_eq!(web_image_upstream_model("gpt-image-2"), "gpt-5-3");
-        assert_eq!(web_image_upstream_model("gpt-image-2.5"), "auto");
-        assert_eq!(web_image_upstream_model("gpt-image-2.5-sunburst"), "auto");
+    fn web_image_models_share_the_auto_upstream_mapping() {
+        for model in [
+            "gpt-image-2",
+            "gpt-image-2.5",
+            "gpt-image-2.5-flare",
+            "gpt-image-2.5-sunburst",
+        ] {
+            assert_eq!(web_image_upstream_model(model), "auto");
+        }
     }
 
     #[test]
@@ -52350,112 +52326,6 @@ data: [DONE]
             vec!["web-catalog-without-sentinel"]
         );
         assert_eq!(sentinel_calls.load(Ordering::SeqCst), 0);
-
-        state.account_type_catalog.shutdown().await;
-        upstream_task.abort();
-        let _ = upstream_task.await;
-        fs::remove_file(account_path).expect("cleanup");
-    }
-
-    #[tokio::test]
-    async fn public_models_reads_only_the_v17_anonymous_catalog() {
-        let account_path = test_tmp_dir().join(format!(
-            "chatgpt2api-rust-native-public-cold-{}-{}.json",
-            std::process::id(),
-            NATIVE_MESSAGE_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(
-            &account_path,
-            r#"[
-                {"access_token":"plus-a","status":"正常","type":"plus"},
-                {"access_token":"team-a","status":"正常","type":"team"}
-            ]"#,
-        )
-        .expect("account snapshot");
-
-        let model_fetches = Arc::new(AtomicUsize::new(0));
-        let model_fetches_for_anon = model_fetches.clone();
-        let model_paths = Arc::new(Mutex::new(Vec::<String>::new()));
-        let model_paths_for_anon = model_paths.clone();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener");
-        let address = listener.local_addr().expect("address");
-        let upstream_task = tokio::spawn(async move {
-            let anonymous_models = get(move |headers: HeaderMap, uri: axum::http::Uri| {
-                let counter = model_fetches_for_anon.clone();
-                let paths = model_paths_for_anon.clone();
-                async move {
-                    assert!(headers.get(header::AUTHORIZATION).is_none());
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    paths.lock().await.push(uri.to_string());
-                    Json(json!({"models":[{"slug":"anonymous-v17-model","created":17}]}))
-                }
-            });
-            axum::serve(
-                listener,
-                Router::new()
-                    .route("/", get(|| async { Html("<html></html>") }))
-                    .route("/backend-anon/models", anonymous_models)
-                    .route(
-                        "/backend-api/models",
-                        get(|| async { Json(json!({"models":[{"slug":"private-model"}]})) }),
-                    ),
-            )
-            .await
-            .expect("native upstream");
-        });
-
-        let state = AppState::new(AppConfig {
-            version: "test".to_owned(),
-            auth_key: Some("client".to_owned()),
-            models: vec!["static-model".to_owned()],
-            upstream_base_url: Some(format!("http://{address}")),
-            upstream_auth: None,
-            auth_keys_path: None,
-            models_path: None,
-            accounts_path: Some(account_path.clone()),
-            upstream_protocol: UpstreamProtocol::ChatGpt,
-        })
-        .expect("state");
-        state
-            .account_type_catalog
-            .set_codex_client_version_for_test(Some("0.147.0".to_owned()));
-        let request = || {
-            axum::http::Request::builder()
-                .uri("/v1/models")
-                .header(header::AUTHORIZATION, "Bearer client")
-                .body(Body::empty())
-                .expect("request")
-        };
-        let first = state
-            .router()
-            .oneshot(request())
-            .await
-            .expect("first response");
-        let second = state
-            .router()
-            .oneshot(request())
-            .await
-            .expect("second response");
-        assert_eq!(first.status(), StatusCode::OK);
-        assert_eq!(second.status(), StatusCode::OK);
-        assert_eq!(model_fetches.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            model_paths.lock().await.as_slice(),
-            ["/backend-anon/models?iim=false&is_gizmo=false"; 2]
-        );
-        for response in [first, second] {
-            let body = response
-                .into_body()
-                .collect()
-                .await
-                .expect("model body")
-                .to_bytes();
-            let value: Value = serde_json::from_slice(&body).expect("model JSON");
-            assert_eq!(value["data"][0]["id"], "anonymous-v17-model");
-            assert!(value.to_string().find("private-model").is_none());
-        }
 
         state.account_type_catalog.shutdown().await;
         upstream_task.abort();
@@ -56875,7 +56745,7 @@ data: [DONE]
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn native_image_models_match_v17_dynamic_model_listing() {
+    async fn native_image_models_match_public_web_image_listing() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener");
@@ -56959,20 +56829,27 @@ data: [DONE]
                 .find(|item| item["id"].as_str() == Some(id))
                 .unwrap_or_else(|| panic!("missing model {id}: {data:?}"))
         };
-        assert_eq!(model("gpt-image-2")["object"], "model");
-        assert!(model("codex-gpt-image-2").is_object());
-        assert!(model("plus-codex-gpt-image-2").is_object());
-        assert!(model("team-codex-gpt-image-2").is_object());
-        assert!(model("pro-codex-gpt-image-2").is_object());
+        for id in [
+            "gpt-image-2",
+            "gpt-image-2.5",
+            "gpt-image-2.5-flare",
+            "gpt-image-2.5-sunburst",
+        ] {
+            assert_eq!(model(id)["object"], "model");
+        }
+        for id in [
+            "codex-gpt-image-2",
+            "plus-codex-gpt-image-2",
+            "team-codex-gpt-image-2",
+            "pro-codex-gpt-image-2",
+        ] {
+            assert!(data.iter().all(|item| item["id"] != id));
+        }
         assert!(
-            data.iter()
-                .all(|item| item.get("supported_account_types").is_none())
+            model("gpt-image-2")["supported_account_types"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "free"))
         );
-        assert!(data.iter().all(|item| {
-            item["id"]
-                .as_str()
-                .is_none_or(|id| !id.starts_with("gpt-image-2.5"))
-        }));
         state.account_type_catalog.shutdown().await;
         upstream.abort();
         let _ = upstream.await;

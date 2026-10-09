@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-+ [修复] `/v1/models` 汇总各账号类型的官方模型列表，文本请求按模型权限选择账号。
++ [修复] ChatGPT 模式 `/v1/models` 改为汇总账号可访问的认证网页模型目录，不再只返回匿名目录；保留 Codex endpoint 与网页图片能力的来源隔离。
++ [调整] 网页图片别名统一映射到公开目录中的 `auto` 路由，避免依赖未出现在当前网页模型目录中的隐藏 `gpt-5-3`；Codex 图片模型不受影响。
++ [修复] 网页图片能力支持 `gpt-image-2`、`gpt-image-2.5` 及其网页图片别名；通过上游 `image_gen` quota 能力确认，不把 Codex 图片模型混入网页目录。
 + [架构] Rust release 二进制成为 Docker/Compose 的唯一生产运行时入口，私有 `config.json` 保持外置挂载。
 + [修复] `/v1/images/edits` 接受并返回受约束的 `client_task_id`，同时保持 generation 接口 fail-closed。
 + [修复] Docker 多架构构建在 build platform 交叉编译 Rust，避免 arm64 QEMU 冷编译悬挂。

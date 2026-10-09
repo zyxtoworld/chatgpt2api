@@ -7,7 +7,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
 ### 公共 API
 
-- `/v1/models`：ChatGPT 模式按 v1.7 无 token 的 `/backend-anon/models?iim=false&is_gizmo=false` 投影模型，并追加原版动态图片模型；不会拿各账号目录替换公开列表。OpenAI-compatible 上游模式的账号类型目录属于 Rust 扩展。
+- `/v1/models`：ChatGPT 模式同时刷新匿名目录和账号认证的 `/backend-api/models?iim=false&is_gizmo=false&supports_model_picker_upgrade_presets=true` 网页目录，合并各账号类型可用模型；Codex endpoint 不进入公共列表，网页图片模型仍按已验证的 `image_gen` 能力投影。
 - `/v1/chat/completions`：普通文本（包括 Codex 来源账号）统一走 v1.7 的 `/backend-api/conversation`，无账号时走匿名 conversation；账号选号不依赖缓存模型目录，也会尝试限流/延迟确认账号。网页搜索和图片仍走各自专用链路；Codex Responses 不用于普通文本。
 - `/v1/responses`：普通 Responses 按 v1.7 转换到 Chat/conversation，再投影响应及 SSE；网页搜索/工具走原版适配器。仅 Codex 图片生成工具使用 `/backend-api/codex/responses` 图片专用路径。
 - `/v1/messages`：按 v1.7 走文本 Chat/conversation 链路；Anthropic tools 写入 system prompt 并用 XML 编码历史/输出，不作为 OpenAI function tools 或 Responses web-search 工具发送。图片按 ChatGPT conversation 文件上传链路处理；直接 OpenAI-compatible 模式映射到 `/v1/chat/completions`。
@@ -18,7 +18,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
 - 账号快照会做规范化、文件版本校验、原子替换和并发重载；新生成的 `created_at` 按 Python 1.7 使用 UTC，`last_used_at` 按 Python 使用本地时间，格式均为 `YYYY-MM-DD HH:mm:ss`；状态文本保留原值；`source_type` 与 Python 一样 trim/lower。普通文本选号按 v1.7 只排除禁用/异常账号，不按 `invalid_count`、本地 `models` 或 `source_type` 预先跳过账号。Web/Codex 图片选号按 Python 只排除 `禁用/限流/异常`，再检查正 quota 和各自的 source/type 条件。
 - 图片账号在真正发起图片请求前按账号单独刷新 `/backend-api/me`、conversation init、账号检查和图片能力/额度；只有验证成功的账号进入图片请求。`image_account_concurrency` 只限制每账号在途请求数，quota 仅用于资格筛选，不额外把在途数压到剩余 quota 数值。
-- 网页图片模型 `gpt-image-2` 固定映射为 v1.7 的 `gpt-5-3`；其它网页图片模型使用 `auto`。`default_upstream_model_name`/默认思考强度是 tag 后配置，不覆盖 v1.7 图片及普通对话请求。
+- 网页图片模型通过 `image_gen` 能力和 quota 资格确认；当前支持 `gpt-image-2`、`gpt-image-2.5`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`。上游 `conversation/init` 返回能力/额度而非图片模型目录，因此这些别名仍需由本地能力投影；所有网页图片别名统一映射到公开目录中的 `auto` 路由，Codex 图片模型保持独立链路。
 - ccLoad 导入会校验频道、OAuth 类型和 access token、计划类型及账号 ID；频道模型浏览和导入都只接受当前 access token 通过两个 canonical Web endpoint 刷新的目录与同一 token 的图片 capability/quota，Codex 模型不会误当作网页模型。
 
 ### 管理页面和持久化
