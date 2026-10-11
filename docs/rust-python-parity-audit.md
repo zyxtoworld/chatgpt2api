@@ -18,7 +18,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
 - 账号快照会做规范化、文件版本校验、原子替换和并发重载；新生成的 `created_at` 按 Python 1.7 使用 UTC，`last_used_at` 按 Python 使用本地时间，格式均为 `YYYY-MM-DD HH:mm:ss`；状态文本保留原值；`source_type` 与 Python 一样 trim/lower。普通文本选号按 v1.7 只排除禁用/异常账号，不按 `invalid_count`、本地 `models` 或 `source_type` 预先跳过账号。Web/Codex 图片选号按 Python 只排除 `禁用/限流/异常`，再检查正 quota 和各自的 source/type 条件。
 - 图片账号在真正发起图片请求前按账号单独刷新 `/backend-api/me`、conversation init、账号检查和图片能力/额度；只有验证成功的账号进入图片请求。`image_account_concurrency` 只限制每账号在途请求数，quota 仅用于资格筛选，不额外把在途数压到剩余 quota 数值。
-- 网页图片模型通过 `image_gen` 能力和 quota 资格确认；当前支持 `gpt-image-2`、`gpt-image-2.5`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`。上游 `conversation/init` 返回能力/额度而非图片模型目录，因此这些别名仍需由本地能力投影；所有网页图片别名统一映射到公开目录中的 `auto` 路由，Codex 图片模型保持独立链路。
+- `/v1/models` 向下游提供 LobeHub 可识别的 `functionCall`、`reasoning`、`vision`、`search`、`video`、`imageOutput`、`contextWindowTokens`、`maxOutput` 字段；上游若返回同名能力字段则实时透传，并读取网页目录的 `enabled_tools`、`thinking_efforts`、`max_tokens`；缺失时仅对 ChatGPT Web GPT-5/GPT-6 文本模型使用兼容档案，Codex 目录不继承该档案。
 - ccLoad 导入会校验频道、OAuth 类型和 access token、计划类型及账号 ID；频道模型浏览和导入都只接受当前 access token 通过两个 canonical Web endpoint 刷新的目录与同一 token 的图片 capability/quota，Codex 模型不会误当作网页模型。
 
 ### 管理页面和持久化

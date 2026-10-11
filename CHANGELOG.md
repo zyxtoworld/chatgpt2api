@@ -4,6 +4,8 @@
 
 + [修复] ChatGPT 模式 `/v1/models` 改为汇总账号可访问的认证网页模型目录，不再只返回匿名目录；保留 Codex endpoint 与网页图片能力的来源隔离。
 + [调整] 网页图片别名统一映射到公开目录中的 `auto` 路由，避免依赖未出现在当前网页模型目录中的隐藏 `gpt-5-3`；Codex 图片模型不受影响。
++ [修复] `/v1/models` 向下游补充 `functionCall`、`reasoning`、`vision`、`search`、`video`、`imageOutput` 等模型能力字段；优先透传上游字段，缺失时对 ChatGPT Web GPT-5/GPT-6 文本模型使用兼容能力档案。
++ [修复] 读取网页模型目录的 `enabled_tools`、`thinking_efforts`、`max_tokens` 元数据，映射为下游 `functionCall`、`search`、`reasoning` 和 `maxOutput`；上游显式能力字段优先级更高。
 + [修复] 网页图片能力支持 `gpt-image-2`、`gpt-image-2.5` 及其网页图片别名；通过上游 `image_gen` quota 能力确认，不把 Codex 图片模型混入网页目录。
 + [架构] Rust release 二进制成为 Docker/Compose 的唯一生产运行时入口，私有 `config.json` 保持外置挂载。
 + [修复] `/v1/images/edits` 接受并返回受约束的 `client_task_id`，同时保持 generation 接口 fail-closed。

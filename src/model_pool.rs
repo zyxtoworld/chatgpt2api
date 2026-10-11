@@ -12,8 +12,7 @@ use tokio::sync::Mutex;
 
 use super::{
     AppInitError, MAX_MODEL_SNAPSHOT_BYTES, MAX_MODEL_TEXT_LENGTH, MAX_MODELS, bounded_text,
-    normalized_list, normalized_reasoning_efforts, parse_created, read_bounded_validated_file,
-    validated_file_version,
+    read_bounded_validated_file, validated_file_version,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,8 +234,129 @@ pub(super) struct PublicModel {
     pub(super) supported_account_types: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) supported_reasoning_efforts: Vec<String>,
+    #[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
+    pub(super) function_call: Option<bool>,
+    #[serde(rename = "imageOutput", skip_serializing_if = "Option::is_none")]
+    pub(super) image_output: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) search: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) video: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) vision: Option<bool>,
+    #[serde(
+        rename = "contextWindowTokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) context_window_tokens: Option<u64>,
+    #[serde(rename = "maxOutput", skip_serializing_if = "Option::is_none")]
+    pub(super) max_output: Option<u64>,
     #[serde(skip)]
     pub(super) provenance: ModelProvenance,
+}
+
+fn model_bool(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_bool))
+}
+fn model_tool_enabled(object: &serde_json::Map<String, Value>, names: &[&str]) -> Option<bool> {
+    object
+        .get("enabled_tools")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|item| names.iter().any(|name| item.eq_ignore_ascii_case(name)))
+        })
+}
+
+fn model_u64(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        object.get(*key).and_then(|value| {
+            value.as_u64().or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| text.trim().parse::<u64>().ok())
+            })
+        })
+    })
+}
+
+fn model_capabilities(
+    object: &serde_json::Map<String, Value>,
+    id: &str,
+    provenance: ModelProvenance,
+) -> PublicModel {
+    let mut model = PublicModel {
+        id: id.to_owned(),
+        object: "model",
+        created: super::parse_created(object.get("created")),
+        owned_by: super::bounded_text(object.get("owned_by"), super::MAX_MODEL_TEXT_LENGTH)
+            .unwrap_or_else(|| "chatgpt".to_owned()),
+        permission: Vec::new(),
+        root: super::bounded_text(object.get("root"), super::MAX_MODEL_TEXT_LENGTH)
+            .unwrap_or_else(|| id.to_owned()),
+        parent: super::bounded_text(object.get("parent"), super::MAX_MODEL_TEXT_LENGTH),
+        allow_anonymous: object
+            .get("allow_anonymous")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        supported_account_types: super::normalized_list(object.get("supported_account_types"), 64),
+        supported_reasoning_efforts: super::normalized_reasoning_efforts(object),
+        function_call: None,
+        image_output: None,
+        reasoning: None,
+        search: None,
+        video: None,
+        vision: None,
+        context_window_tokens: None,
+        max_output: None,
+        provenance,
+    };
+    refresh_model_capabilities(&mut model, object);
+    model
+}
+fn refresh_model_capabilities(model: &mut PublicModel, object: &serde_json::Map<String, Value>) {
+    let inferred = matches!(model.provenance, ModelProvenance::Web)
+        && model.id.to_ascii_lowercase().starts_with("gpt-")
+        && !model.id.to_ascii_lowercase().starts_with("gpt-image-");
+    let profile = inferred.then_some((true, false, true, false, false, true));
+    model.function_call = model_bool(
+        object,
+        &["functionCall", "function_call", "supports_function_calling"],
+    )
+    .or_else(|| model_tool_enabled(object, &["tools", "tools2"]))
+    .or_else(|| profile.map(|value| value.0));
+    model.image_output = model_bool(
+        object,
+        &["imageOutput", "image_output", "supports_image_generation"],
+    )
+    .or_else(|| profile.map(|value| value.1));
+    model.reasoning = model_bool(object, &["reasoning", "supports_reasoning"])
+        .or_else(|| (!super::normalized_reasoning_efforts(object).is_empty()).then_some(true))
+        .or_else(|| profile.map(|value| value.2));
+    model.search = model_bool(object, &["search", "supports_search"])
+        .or_else(|| model_tool_enabled(object, &["search"]))
+        .or_else(|| profile.map(|value| value.3));
+    model.video =
+        model_bool(object, &["video", "supports_video"]).or_else(|| profile.map(|value| value.4));
+    model.vision =
+        model_bool(object, &["vision", "supports_vision"]).or_else(|| profile.map(|value| value.5));
+    model.context_window_tokens = model_u64(
+        object,
+        &[
+            "contextWindowTokens",
+            "context_window_tokens",
+            "context_length",
+        ],
+    );
+    model.max_output = model_u64(
+        object,
+        &["maxOutput", "max_output", "max_output_tokens", "max_tokens"],
+    );
 }
 
 #[derive(Clone)]
@@ -388,32 +508,8 @@ impl ModelCatalog {
     pub(super) fn project(item: &Value) -> Option<PublicModel> {
         let object = item.as_object()?;
         let id = bounded_text(object.get("id"), MAX_MODEL_TEXT_LENGTH)?;
-        let owned_by = bounded_text(object.get("owned_by"), MAX_MODEL_TEXT_LENGTH)
-            .unwrap_or_else(|| "chatgpt".to_owned());
-        let root =
-            bounded_text(object.get("root"), MAX_MODEL_TEXT_LENGTH).unwrap_or_else(|| id.clone());
-        let parent = bounded_text(object.get("parent"), MAX_MODEL_TEXT_LENGTH);
-        let created = parse_created(object.get("created"));
-        let mut supported_account_types =
-            normalized_list(object.get("supported_account_types"), 64);
-        supported_account_types.sort();
-        let supported_reasoning_efforts = normalized_reasoning_efforts(object);
-        Some(PublicModel {
-            id,
-            object: "model",
-            created,
-            owned_by,
-            permission: Vec::new(),
-            root,
-            parent,
-            allow_anonymous: object
-                .get("allow_anonymous")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            supported_account_types,
-            supported_reasoning_efforts,
-            provenance: model_provenance_from_object(object, ModelProvenance::Configured),
-        })
+        let provenance = model_provenance_from_object(object, ModelProvenance::Configured);
+        Some(model_capabilities(object, &id, provenance))
     }
 }
 
@@ -483,6 +579,9 @@ pub(super) fn project_remote_model_list_with_provenance(
         };
         if model.provenance == ModelProvenance::Web && is_web_image_model_id(&model.id) {
             model.provenance = ModelProvenance::Image;
+        }
+        if let Some(object) = item.as_object() {
+            refresh_model_capabilities(&mut model, object);
         }
         model.allow_anonymous = allow_anonymous;
         model.supported_account_types = account_type

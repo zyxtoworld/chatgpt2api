@@ -22269,6 +22269,14 @@ impl AccountTypeCatalog {
                         allow_anonymous: false,
                         supported_account_types: supported,
                         supported_reasoning_efforts: Vec::new(),
+                        function_call: None,
+                        image_output: Some(true),
+                        reasoning: None,
+                        search: None,
+                        video: None,
+                        vision: None,
+                        context_window_tokens: None,
+                        max_output: None,
                         provenance: ModelProvenance::Image,
                     });
                 }
@@ -27593,6 +27601,14 @@ mod tests {
             allow_anonymous: false,
             supported_account_types: Vec::new(),
             supported_reasoning_efforts: Vec::new(),
+            function_call: None,
+            image_output: None,
+            reasoning: None,
+            search: None,
+            video: None,
+            vision: None,
+            context_window_tokens: None,
+            max_output: None,
             provenance,
         }
     }
@@ -43270,6 +43286,14 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             allow_anonymous: false,
             supported_account_types: Vec::new(),
             supported_reasoning_efforts: Vec::new(),
+            function_call: None,
+            image_output: None,
+            reasoning: None,
+            search: None,
+            video: None,
+            vision: None,
+            context_window_tokens: None,
+            max_output: None,
             provenance,
         };
         let models = state.account_type_catalog.public_models(Arc::new(vec![
@@ -43919,9 +43943,11 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
                     "/backend-api/models",
                     get(|| async {
                         Json(json!({"models":[
-                            {"slug":"gpt-5-5"}, {"slug":"gpt-5-6"}, {"slug":"gpt-5-3-mini"},
+                            {"slug":"gpt-5-5", "functionCall":false, "reasoning":false, "vision":false},
+                            {"slug":"gpt-5-6"}, {"slug":"gpt-5-3-mini"},
                             {"slug":"gpt-5-5-mini"}, {"slug":"gpt-5-6-mini"}, {"slug":"gpt-5-6-t-mini"},
-                            {"slug":"gpt-5-6-t-mini-mini"}, {"slug":"research"}, {"slug":"gpt-6"},
+                            {"slug":"gpt-5-6-t-mini-mini"}, {"slug":"research"},
+                            {"slug":"gpt-6", "enabled_tools":["tools","tools2","search"], "max_tokens":34834},
                             {"slug":"gpt-6-t-mini"}, {"slug":"gpt-6-mini"}, {"slug":"gpt-6-t-mini-mini"},
                             {"slug":"auto"}
                         ]}))
@@ -44012,6 +44038,28 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
                     .as_array()
                     .is_some_and(|types| types.iter().any(|value| value == "free"))
         }));
+        let gpt6 = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "gpt-6")
+            .expect("gpt-6 model metadata");
+        assert_eq!(gpt6["functionCall"], true);
+        assert_eq!(gpt6["reasoning"], true);
+        assert_eq!(gpt6["vision"], true);
+        assert_eq!(gpt6["search"], true);
+        assert_eq!(gpt6["maxOutput"], 34834);
+        assert_eq!(gpt6["video"], false);
+        assert_eq!(gpt6["imageOutput"], false);
+        let gpt55 = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "gpt-5-5")
+            .expect("gpt-5-5 model metadata");
+        assert_eq!(gpt55["functionCall"], false);
+        assert_eq!(gpt55["reasoning"], false);
+        assert_eq!(gpt55["vision"], false);
         assert_eq!(
             calls.lock().await.as_slice(),
             ["/backend-anon/models?iim=false&is_gizmo=false"]
@@ -50299,11 +50347,16 @@ data: [DONE]
                 allow_anonymous: true,
                 supported_account_types: Vec::new(),
                 supported_reasoning_efforts: Vec::new(),
+                function_call: None,
+                image_output: None,
+                reasoning: None,
+                search: None,
+                video: None,
+                vision: None,
+                context_window_tokens: None,
+                max_output: None,
                 provenance: ModelProvenance::Web,
             }]);
-            snapshot.anonymous_ready = true;
-            snapshot.anonymous_expires_at = Instant::now() + Duration::from_secs(60);
-            snapshot.anonymous_retry_at = Instant::now();
         }
 
         let response = tokio::time::timeout(
@@ -54846,6 +54899,14 @@ data: [DONE]
             allow_anonymous: false,
             supported_account_types: vec!["pro".to_owned()],
             supported_reasoning_efforts: Vec::new(),
+            function_call: None,
+            image_output: None,
+            reasoning: None,
+            search: None,
+            video: None,
+            vision: None,
+            context_window_tokens: None,
+            max_output: None,
             provenance: ModelProvenance::Web,
         };
         {
