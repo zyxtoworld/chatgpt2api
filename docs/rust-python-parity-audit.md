@@ -86,6 +86,8 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 - `image_retention_days`、备份 `interval_minutes` 不再只是设置项，已经接入服务生命周期调度。
 - `ai_review.fail_open` 已接入审核异常处理。
 
+- 公共图片模型目录按账号已验证的 Web `image_gen` capability/quota 投影，`source_type=codex` 仅表示账号来源，不再阻断 CPA/Sub2API 导入账号的网页图片模型；公开模型 ID 仍只允许 `WEB_IMAGE_MODELS`，Codex 图片别名不会进入 `/v1/models`。
+
 ### P1：需要继续关注的差异
 
 1. `global_system_prompt`：Rust 已接入 Chat、Responses、Web 图片和 Anthropic Chat 转换；Anthropic `system` 文本块折叠、XML tool prompt 顺序有回归覆盖。Python 的搜索和 editable 链路本身不注入该全局提示词，Rust 同样保持不注入。

@@ -180,22 +180,17 @@ fn image_quota(value: Option<&serde_json::Value>) -> Option<u64> {
 }
 
 fn has_verified_web_image_capability(record: &AccountRecord) -> bool {
-    if record.status != "正常"
-        || !is_request_eligible_record(record)
-        || record
+    // The capability proof comes from the ChatGPT Web metadata refresh. The
+    // import source is account provenance, not the image upstream selected by
+    // a public `gpt-image-*` model.
+    record.status == "正常"
+        && is_request_eligible_record(record)
+        && record
             .raw
             .get("_verified_image_capability")
             .and_then(serde_json::Value::as_bool)
-            != Some(true)
-        || image_quota(record.raw.get("quota")).is_none()
-    {
-        return false;
-    }
-    record.source_type != "codex"
-        || record
-            .raw
-            .as_object()
-            .is_some_and(super::account_model_source_proof)
+            == Some(true)
+        && image_quota(record.raw.get("quota")).is_some()
 }
 
 pub(super) struct AccountLease {
@@ -2316,6 +2311,12 @@ mod tests {
         assert!(!is_request_eligible_record(&record("异常", 0)));
     }
 
+    #[test]
+    fn codex_source_with_verified_web_image_capability_is_eligible() {
+        let mut record = record("正常", 0);
+        record.source_type = "codex".to_owned();
+        assert!(has_verified_web_image_capability(&record));
+    }
     #[test]
     fn image_pool_excludes_only_python_blocked_statuses() {
         for status in ["正常", "unknown", " 异常 "] {

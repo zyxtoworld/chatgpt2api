@@ -22614,13 +22614,7 @@ fn image_quota_refresh_tokens(records: Vec<Value>) -> Vec<String> {
                 .and_then(Value::as_bool)
                 == Some(true)
                 && image_quota_from_value(record.get("quota")).is_some();
-            let source_type = record
-                .get("source_type")
-                .and_then(Value::as_str)
-                .unwrap_or("web");
-            let web_provenance_verified =
-                record.as_object().is_some_and(account_model_source_proof);
-            !capability_verified || (source_type == "codex" && !web_provenance_verified)
+            !capability_verified
         })
         .filter_map(|record| {
             let account_type = record
@@ -43578,6 +43572,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             json!({"access_token":"free-web-2","type":"FREE","source_type":"web","status":"正常"}),
             json!({"access_token":"free-codex-1","type":"free","source_type":"codex","status":"正常"}),
             json!({"access_token":"free-codex-2","type":"free","source_type":"codex","status":"正常"}),
+            json!({"access_token":"free-codex-verified","type":"free","source_type":"codex","status":"正常","quota":1,"_verified_image_capability":true}),
             json!({"access_token":"limited-pro","type":"pro","source_type":"web","status":"限流"}),
             json!({"access_token":"disabled-pro","type":"pro","source_type":"web","status":"禁用"}),
         ]);
@@ -56910,6 +56905,11 @@ data: [DONE]
             model("gpt-image-2")["supported_account_types"]
                 .as_array()
                 .is_some_and(|types| types.iter().any(|value| value == "free"))
+        );
+        assert!(
+            model("gpt-image-2")["supported_account_types"]
+                .as_array()
+                .is_some_and(|types| types.iter().any(|value| value == "team"))
         );
         state.account_type_catalog.shutdown().await;
         upstream.abort();

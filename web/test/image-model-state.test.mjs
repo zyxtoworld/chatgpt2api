@@ -90,6 +90,18 @@ test("a ready model state only exposes public web image models", () => {
   );
 });
 
+test("an empty prompt keeps the image submit disabled", () => {
+  assert.equal(
+    canSubmitImage({
+      prompt: "   ",
+      model: "gpt-image-2",
+      models: ["gpt-image-2"],
+      status: "ready",
+    }),
+    false,
+  );
+});
+
 test("image model filtering does not stringify container ids", () => {
   const canary = "image-model-container-canary";
   const state = resolveImageModelLoadSuccess({
