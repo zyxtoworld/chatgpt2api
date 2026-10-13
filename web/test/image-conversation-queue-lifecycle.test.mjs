@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createConversationQueueGate } from "../src/lib/image-conversation-queue-gate.js";
+import { createConversationQueueGate } from "../src/lib/image-conversation-queue-gate";
 
 test("invalidating a conversation rejects a late queue callback", () => {
   const gate = createConversationQueueGate();

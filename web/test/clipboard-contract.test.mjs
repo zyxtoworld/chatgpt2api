@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { writeClipboardText } from "../src/lib/clipboard.js";
-import { maskToken } from "../src/lib/token-display.js";
+import { writeClipboardText } from "../src/lib/clipboard";
+import { maskToken } from "../src/lib/token-display";
 
 const accountsSource = readFileSync(new URL("../src/app/accounts/page.tsx", import.meta.url), "utf8");
 const imageManagerSource = readFileSync(new URL("../src/app/image-manager/page.tsx", import.meta.url), "utf8");

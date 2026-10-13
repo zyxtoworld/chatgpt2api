@@ -69,7 +69,7 @@ jobs:
 
       - name: Web tests
         working-directory: web
-        run: node --test test/*.test.mjs
+        run: node --experimental-strip-types --import ./test/register-ts-source-loader.mjs --test test/*.test.mjs
 
       - name: Web type check
         working-directory: web

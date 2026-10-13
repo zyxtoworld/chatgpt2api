@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
-import { runLogoutAfterClear } from "../src/lib/logout-action.js";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
+import { runLogoutAfterClear } from "../src/lib/logout-action";
 
 const source = readFileSync(new URL("../src/components/top-nav.tsx", import.meta.url), "utf8");
 

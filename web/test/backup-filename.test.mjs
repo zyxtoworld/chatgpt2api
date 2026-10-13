@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { filenameFromContentDisposition } from "../src/lib/content-disposition.js";
+import { filenameFromContentDisposition } from "../src/lib/content-disposition";
 
 test("malformed UTF-8 filename escapes do not throw", () => {
   const header = "attachment; filename*=UTF-8''%";

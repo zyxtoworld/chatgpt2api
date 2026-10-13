@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createDownloadAbortRegistry } from "../src/lib/download-lifecycle.js";
+import { createDownloadAbortRegistry } from "../src/lib/download-lifecycle";
 
 test("unmount cancellation aborts every active image download", () => {
   const registry = createDownloadAbortRegistry();

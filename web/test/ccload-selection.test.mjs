@@ -13,7 +13,7 @@ import {
   normalizeCCLoadChannels,
   resetCCLoadModelState,
   toggleAllCCLoadChannels,
-} from "../src/lib/ccload-selection.js";
+} from "../src/lib/ccload-selection";
 
 const channels = [
   { id: "1", enabled: true },

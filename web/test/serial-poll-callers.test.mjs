@@ -63,7 +63,7 @@ test("all serial poll callers retain an owned abort path", () => {
   assert.match(settingsStore, /const data = await fetchCPAPools\(signal\);/);
 
   const editable = readSource("app/debug/components/editable-file-panel.tsx");
-  const editablePolling = readSource("lib/editable-task-polling.js");
+  const editablePolling = readSource("lib/editable-task-polling.ts");
   assert.match(editable, /fetchTasks = useCallback\(async \(ids: string\[\] = \[\], parentSignal\?: AbortSignal\)/);
   assert.match(editable, /createEditableTaskPollingLifecycle\(/);
   assert.match(editable, /taskPollingLifecycleRef\.current\?\.dispose\(\)/);

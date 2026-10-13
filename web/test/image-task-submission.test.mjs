@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { settleImageTaskSubmissions } from "../src/lib/image-task-submission.js";
+import { settleImageTaskSubmissions } from "../src/lib/image-task-submission";
 
 const imagePageSource = readFileSync(
   new URL("../src/app/image/page.tsx", import.meta.url),

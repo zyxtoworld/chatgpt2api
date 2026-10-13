@@ -4,9 +4,9 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import vm from "node:vm";
 
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
-import * as releaseFetch from "../src/lib/version-release-fetch.js";
-import { fetchReleaseText } from "../src/lib/version-release-fetch.js";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
+import * as releaseFetch from "../src/lib/version-release-fetch";
+import { fetchReleaseText } from "../src/lib/version-release-fetch";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/hooks/use-version-check.ts", import.meta.url)),

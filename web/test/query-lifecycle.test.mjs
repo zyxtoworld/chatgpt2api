@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createMutationRequestGate } from "../src/lib/mutation-request-gate.js";
-import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "../src/lib/query-lifecycle.js";
+import { createMutationRequestGate } from "../src/lib/mutation-request-gate";
+import { createOwnedQueryLoader, scheduleOwnedMicrotask } from "../src/lib/query-lifecycle";
 
 function deferred() {
   let resolve;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { filenameFromUrl } from "../src/lib/file-display.js";
+import { filenameFromUrl } from "../src/lib/file-display";
 
 test("malformed URL percent escapes do not crash filename display", () => {
   const url = "https://example.test/files/%";

@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   mergeDeletedEditableFileIds,
   resolveDeletedEditableFileIds,
-} from "../src/lib/editable-file-history-state.js";
+} from "../src/lib/editable-file-history-state";
 
 test("rapid delete updates preserve every deleted task id", () => {
   let deleted = new Set();

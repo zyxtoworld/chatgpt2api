@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createMutationRequestGate } from "../src/lib/mutation-request-gate.js";
-import { finishMutationAndRefresh } from "../src/lib/mutation-refresh-controller.js";
+import { createMutationRequestGate } from "../src/lib/mutation-request-gate";
+import { finishMutationAndRefresh } from "../src/lib/mutation-refresh-controller";
 
 const source = readFileSync(fileURLToPath(new URL("../src/app/logs/page.tsx", import.meta.url)), "utf8");
 

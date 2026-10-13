@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 
-import { createReplaceableTimeout } from "../src/lib/replaceable-timeout.js";
+import { createReplaceableTimeout } from "../src/lib/replaceable-timeout";
 
 const componentSource = readFileSync(
   new URL("../src/components/ui/dia-text-reveal.tsx", import.meta.url),

@@ -6,7 +6,7 @@ import {
   readOptionalStorageItem,
   removeOptionalStorageItem,
   writeOptionalStorageItem,
-} from "../src/lib/optional-storage.js";
+} from "../src/lib/optional-storage";
 
 const imagePageSource = readFileSync(new URL("../src/app/image/page.tsx", import.meta.url), "utf8");
 const themeToggleSource = readFileSync(

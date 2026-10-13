@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { toggleDocumentTheme } from "../src/lib/theme-toggle-state.js";
+import { toggleDocumentTheme } from "../src/lib/theme-toggle-state";
 
 const themeToggleSource = readFileSync(
   new URL("../src/components/ui/animated-theme-toggler.tsx", import.meta.url),

@@ -14,7 +14,7 @@ import webConfig from "@/constants/common-env";
 import { fetchBackupDetail, getBackupDownloadUrl, type BackupDetail, type BackupInclude } from "@/lib/api";
 import { filenameFromContentDisposition } from "@/lib/content-disposition";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
-import { downloadBlobFile } from "@/lib/download-text.js";
+import { downloadBlobFile } from "@/lib/download-text";
 import { createAbortableLifecycleOwner, runBackupDownload } from "@/lib/backup-download-lifecycle";
 import { runBackupMutation } from "@/lib/backup-detail-lifecycle";
 import { requestErrorMessage } from "@/lib/request-error-message";

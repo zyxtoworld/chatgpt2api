@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatElapsedSeconds, getElapsedSeconds } from "../src/lib/elapsed-display.js";
+import { formatElapsedSeconds, getElapsedSeconds } from "../src/lib/elapsed-display";
 
 test("stale clock never reduces the persisted elapsed value", () => {
   assert.equal(getElapsedSeconds(12, 2_000, 1_000), 12);

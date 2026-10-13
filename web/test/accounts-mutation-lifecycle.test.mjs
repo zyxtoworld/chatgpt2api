@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createMutationRequestGate } from "../src/lib/mutation-request-gate.js";
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import { createMutationRequestGate } from "../src/lib/mutation-request-gate";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
 
 test("account list mutation admission rejects a second write and invalidates the old list query", () => {
   const gate = createMutationRequestGate();

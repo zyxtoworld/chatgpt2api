@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/debug/components/search-panel.tsx", import.meta.url)),

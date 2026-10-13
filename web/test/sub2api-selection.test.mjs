@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizeSub2APIRemoteAccounts } from "../src/lib/sub2api-selection.js";
+import { normalizeSub2APIRemoteAccounts } from "../src/lib/sub2api-selection";
 
 test("Sub2API account normalization does not stringify container fields", () => {
   const canary = "sub2api-frontend-container-canary";

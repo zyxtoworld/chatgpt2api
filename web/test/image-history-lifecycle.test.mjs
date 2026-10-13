@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { applyImageConversationUpdate } from "../src/lib/image-conversation-update.js";
-import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner.js";
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import { applyImageConversationUpdate } from "../src/lib/image-conversation-update";
+import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
 
 const source = readFileSync(new URL("../src/app/image/page.tsx", import.meta.url), "utf8");
 
@@ -188,7 +188,7 @@ test("the production rename handler updates the authoritative conversation snaps
 });
 
 test("timeout continuation resolves the exact clicked task across conversations", async () => {
-  const helpers = await import("../src/lib/image-conversation-update.js");
+  const helpers = await import("../src/lib/image-conversation-update");
   assert.equal(typeof helpers.findImageTaskConversation, "function");
 
   const conversations = [

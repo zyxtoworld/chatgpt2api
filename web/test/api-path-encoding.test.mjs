@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { encodeApiPath } from "../src/lib/api-path.js";
+import { encodeApiPath } from "../src/lib/api-path";
 
 const apiSource = readFileSync(new URL("../src/lib/api.ts", import.meta.url), "utf8");
 

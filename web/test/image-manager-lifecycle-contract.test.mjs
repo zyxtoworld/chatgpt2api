@@ -3,13 +3,13 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createMutationRequestGate } from "../src/lib/mutation-request-gate.js";
-import { finishMutationAndRefresh } from "../src/lib/mutation-refresh-controller.js";
-import { createReplaceableTimeout } from "../src/lib/replaceable-timeout.js";
+import { createMutationRequestGate } from "../src/lib/mutation-request-gate";
+import { finishMutationAndRefresh } from "../src/lib/mutation-refresh-controller";
+import { createReplaceableTimeout } from "../src/lib/replaceable-timeout";
 
 const pagePath = fileURLToPath(new URL("../src/app/image-manager/page.tsx", import.meta.url));
 const pageSource = readFileSync(pagePath, "utf8");
-const coordinatorSource = readFileSync(fileURLToPath(new URL("../src/lib/mutation-refresh-controller.js", import.meta.url)), "utf8");
+const coordinatorSource = readFileSync(fileURLToPath(new URL("../src/lib/mutation-refresh-controller.ts", import.meta.url)), "utf8");
 
 test("image manager routes writes through one mutation owner and cancels it on unmount", () => {
   assert.match(pageSource, /createMutationRequestGate/);

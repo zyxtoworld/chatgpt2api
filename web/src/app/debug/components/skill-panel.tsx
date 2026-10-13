@@ -7,8 +7,8 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import webConfig from "@/constants/common-env";
 import { fetchSettingsConfig } from "@/lib/api";
-import { downloadTextFile } from "@/lib/download-text.js";
-import { normalizeSkillBaseUrl } from "@/lib/skill-base-url.js";
+import { downloadTextFile } from "@/lib/download-text";
+import { normalizeSkillBaseUrl } from "@/lib/skill-base-url";
 
 const API_KEY_PLACEHOLDER = "<YOUR_API_KEY>";
 

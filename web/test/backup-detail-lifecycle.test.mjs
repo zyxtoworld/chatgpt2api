@@ -3,14 +3,14 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner.js";
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
-import { runBackupMutation } from "../src/lib/backup-detail-lifecycle.js";
+import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
+import { runBackupMutation } from "../src/lib/backup-detail-lifecycle";
 import {
   createAbortableLifecycleOwner,
   releaseStaleResponse,
   runBackupDownload,
-} from "../src/lib/backup-download-lifecycle.js";
+} from "../src/lib/backup-download-lifecycle";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/settings/components/backup-settings-card.tsx", import.meta.url)),

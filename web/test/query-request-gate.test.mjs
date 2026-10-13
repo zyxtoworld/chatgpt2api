@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createRequestGate } from "../src/lib/query-request-gate.js";
+import { createRequestGate } from "../src/lib/query-request-gate";
 
 test("a stale mutation refresh cannot commit after the query changes", () => {
   const gate = createRequestGate("A");

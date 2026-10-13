@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
-import { scheduleOwnedMicrotask } from "../src/lib/query-lifecycle.js";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
+import { scheduleOwnedMicrotask } from "../src/lib/query-lifecycle";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/image/page.tsx", import.meta.url)),

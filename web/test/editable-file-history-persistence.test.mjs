@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { createEditableFileHistoryWriteCoordinator } from "../src/lib/editable-file-history-write-coordinator.js";
-import { commitSynchronousSnapshot } from "../src/lib/synchronous-snapshot.js";
+import { createEditableFileHistoryWriteCoordinator } from "../src/lib/editable-file-history-write-coordinator";
+import { commitSynchronousSnapshot } from "../src/lib/synchronous-snapshot";
 
 const storeSource = readFileSync(new URL("../src/store/editable-file-history.ts", import.meta.url), "utf8");
 const panelSource = readFileSync(new URL("../src/app/debug/components/editable-file-panel.tsx", import.meta.url), "utf8");

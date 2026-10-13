@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createChatPanelRequestGate } from "../src/lib/chat-panel-request-gate.js";
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import { createChatPanelRequestGate } from "../src/lib/chat-panel-request-gate";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/debug/components/chat-panel.tsx", import.meta.url)),

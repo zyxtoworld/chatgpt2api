@@ -1,6 +1,6 @@
 import { httpRequest, request } from "@/lib/request";
 import { encodeApiPath } from "@/lib/api-path";
-import { downloadBlobFile } from "@/lib/download-text.js";
+import { downloadBlobFile } from "@/lib/download-text";
 
 export type AccountType = string;
 export type AccountStatus = "正常" | "限流" | "异常" | "禁用";

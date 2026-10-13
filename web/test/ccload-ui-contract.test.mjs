@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createMutationRequestGate } from "../src/lib/mutation-request-gate.js";
+import { createMutationRequestGate } from "../src/lib/mutation-request-gate";
 
 const componentSource = readFileSync(
   fileURLToPath(new URL("../src/app/settings/components/ccload-connections.tsx", import.meta.url)),

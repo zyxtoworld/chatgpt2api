@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createScrollCleanupSnapshot } from "../src/lib/image-scroll-cleanup.js";
+import { createScrollCleanupSnapshot } from "../src/lib/image-scroll-cleanup";
 
 const pageSource = readFileSync(
   fileURLToPath(new URL("../src/app/image/page.tsx", import.meta.url)),

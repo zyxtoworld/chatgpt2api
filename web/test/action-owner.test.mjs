@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
 
 test("latest action owner rejects a late result after the candidate changes", () => {
   const owner = createLatestActionOwner();

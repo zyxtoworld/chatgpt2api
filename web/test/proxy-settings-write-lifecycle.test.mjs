@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createProxySettingsWriteGate } from "../src/lib/proxy-settings-write-gate.js";
+import { createProxySettingsWriteGate } from "../src/lib/proxy-settings-write-gate";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 

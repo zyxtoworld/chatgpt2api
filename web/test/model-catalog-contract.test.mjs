@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { parseModelList } from "../src/lib/model-catalog.js";
+import { parseModelList } from "../src/lib/model-catalog";
 
 const apiSource = readFileSync(new URL("../src/lib/api.ts", import.meta.url), "utf8");
 const requestSource = readFileSync(new URL("../src/lib/request.ts", import.meta.url), "utf8");

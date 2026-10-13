@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createLoginRequestGate } from "../src/lib/login-request-gate.js";
+import { createLoginRequestGate } from "../src/lib/login-request-gate";
 
 test("a duplicate login is rejected without invalidating the admitted request", () => {
   let authEpoch = 0;

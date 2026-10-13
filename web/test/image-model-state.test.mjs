@@ -7,7 +7,7 @@ import {
   resolveImageModelLoadError,
   resolveImageModelLoadSuccess,
   selectImageModel,
-} from "../src/lib/image-model-state.js";
+} from "../src/lib/image-model-state";
 
 const composerSource = readFileSync(
   new URL("../src/app/image/components/image-composer.tsx", import.meta.url),

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-import { downloadBlobFile, downloadTextFile } from "../src/lib/download-text.js";
+import { downloadBlobFile, downloadTextFile } from "../src/lib/download-text";
 
 test("all one-shot browser downloads use the shared delayed-release helper", () => {
   const callers = [

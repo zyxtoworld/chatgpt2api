@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createCancelableProgress, createSerialPoller, isProgressTerminal } from "../src/lib/serial-poll.js";
-import { createEditableTaskPollingLifecycle } from "../src/lib/editable-task-polling.js";
+import { createCancelableProgress, createSerialPoller, isProgressTerminal } from "../src/lib/serial-poll";
+import { createEditableTaskPollingLifecycle } from "../src/lib/editable-task-polling";
 
 function deferred() {
   let resolve;

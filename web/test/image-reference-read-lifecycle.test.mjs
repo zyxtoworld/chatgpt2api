@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner.js";
+import { createLifecycleActionOwner } from "../src/lib/lifecycle-action-owner";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/image/page.tsx", import.meta.url)),

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { commitSynchronousSnapshot } from "../src/lib/synchronous-snapshot.js";
+import { commitSynchronousSnapshot } from "../src/lib/synchronous-snapshot";
 
 test("synchronous snapshot commit updates identity before a React update is scheduled", () => {
   const ref = { current: [{ id: "old" }] };

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createMutationRequestGate } from "../src/lib/mutation-request-gate.js";
+import { createMutationRequestGate } from "../src/lib/mutation-request-gate";
 
 test("mutation blocks new queries and invalidates an in-flight query", () => {
   const gate = createMutationRequestGate();

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createAuthStorageCoordinator } from "../src/lib/auth-storage-coordinator.js";
-import { normalizeStoredAuthSession } from "../src/lib/auth-storage-record.js";
+import { createAuthStorageCoordinator } from "../src/lib/auth-storage-coordinator";
+import { normalizeStoredAuthSession } from "../src/lib/auth-storage-record";
 
 function createMemoryStorage() {
   const values = new Map([

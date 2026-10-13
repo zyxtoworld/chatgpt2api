@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { settleAccountJsonFiles } from "../src/lib/account-json-file-selection.js";
+import { settleAccountJsonFiles } from "../src/lib/account-json-file-selection";
 
 const importDialogSource = readFileSync(
   new URL("../src/app/accounts/components/account-import-dialog.tsx", import.meta.url),

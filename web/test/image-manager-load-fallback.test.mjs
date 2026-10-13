@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { loadManagedImagesWithTags } from "../src/lib/image-manager-load.js";
+import { loadManagedImagesWithTags } from "../src/lib/image-manager-load";
 
 const imageManagerSource = readFileSync(
   new URL("../src/app/image-manager/page.tsx", import.meta.url),

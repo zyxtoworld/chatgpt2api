@@ -8,7 +8,7 @@ const source = readFileSync(
 );
 
 test("stored base64 images use a stable data URL without process-lifetime caches", async () => {
-  const { getStoredImageSrc } = await import("../src/lib/stored-image-source.js");
+  const { getStoredImageSrc } = await import("../src/lib/stored-image-source");
 
   assert.equal(
     getStoredImageSrc({ b64_json: "aGVsbG8=", url: "https://ignored.example/image.png" }),
@@ -22,7 +22,7 @@ test("stored base64 images use a stable data URL without process-lifetime caches
 });
 
 test("stored image URLs reject executable and protocol-relative schemes", async () => {
-  const { getStoredImageSrc } = await import("../src/lib/stored-image-source.js");
+  const { getStoredImageSrc } = await import("../src/lib/stored-image-source");
 
   assert.equal(getStoredImageSrc({ url: "javascript:alert('image-url-canary')" }), "");
   assert.equal(getStoredImageSrc({ url: "//attacker.example/image.png" }), "");

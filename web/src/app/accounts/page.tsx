@@ -56,7 +56,7 @@ import {
 } from "@/lib/api";
 import { createSerialPoller } from "@/lib/serial-poll";
 import { writeClipboardText } from "@/lib/clipboard";
-import { downloadTextFile } from "@/lib/download-text.js";
+import { downloadTextFile } from "@/lib/download-text";
 import { createLatestActionOwner } from "@/lib/latest-action-owner";
 import { createMutationRequestGate } from "@/lib/mutation-request-gate";
 import { parseModelList } from "@/lib/model-catalog";

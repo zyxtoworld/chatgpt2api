@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
 
 const sourcePath = fileURLToPath(new URL("../src/app/accounts/page.tsx", import.meta.url));
 const importDialogPath = fileURLToPath(new URL("../src/app/accounts/components/account-import-dialog.tsx", import.meta.url));

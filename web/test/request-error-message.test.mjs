@@ -6,7 +6,7 @@ import {
   PUBLIC_NETWORK_ERROR_MESSAGE,
   PUBLIC_SERVER_ERROR_MESSAGE,
   requestErrorMessage,
-} from "../src/lib/request-error-message.js";
+} from "../src/lib/request-error-message";
 
 const requestSource = readFileSync(new URL("../src/lib/request.ts", import.meta.url), "utf8");
 const backupSettingsSource = readFileSync(
@@ -14,7 +14,7 @@ const backupSettingsSource = readFileSync(
   "utf8",
 );
 const backupDownloadLifecycleSource = readFileSync(
-  new URL("../src/lib/backup-download-lifecycle.js", import.meta.url),
+  new URL("../src/lib/backup-download-lifecycle.ts", import.meta.url),
   "utf8",
 );
 

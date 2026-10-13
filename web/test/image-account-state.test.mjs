@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatAvailableImageQuota } from "../src/lib/image-account-state.js";
+import { formatAvailableImageQuota } from "../src/lib/image-account-state";
 
 test("available image quota matches the backend image-account predicate", () => {
   assert.equal(

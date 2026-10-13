@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { fetchImageAsFile } from "../src/lib/image-download.js";
+import { fetchImageAsFile } from "../src/lib/image-download";
 
 test("aborting an owned image fetch cancels the response body", async () => {
   const originalFetch = globalThis.fetch;

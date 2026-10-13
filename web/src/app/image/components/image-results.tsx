@@ -4,9 +4,9 @@ import { memo, useEffect, useRef, useState } from "react";
 import { Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { createDownloadAbortRegistry } from "@/lib/download-lifecycle.js";
-import { downloadBlobFile } from "@/lib/download-text.js";
-import { fetchImageAsFile } from "@/lib/image-download.js";
+import { createDownloadAbortRegistry } from "@/lib/download-lifecycle";
+import { downloadBlobFile } from "@/lib/download-text";
+import { fetchImageAsFile } from "@/lib/image-download";
 import { getElapsedSeconds } from "@/lib/elapsed-display";
 import { setImageDimension } from "@/lib/image-dimensions";
 import { getStoredImageSrc, normalizeStoredImageUrl } from "@/lib/stored-image-source";

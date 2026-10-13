@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildThirdPartyHref, formatThirdPartyDisplayHref } from "../src/lib/third-party-url.js";
+import { buildThirdPartyHref, formatThirdPartyDisplayHref } from "../src/lib/third-party-url";
 
 test("malformed percent in a configured URL does not throw while displaying", () => {
   const href = "https://example.test/%";

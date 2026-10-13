@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { createConversationQueueGate } from "../src/lib/image-conversation-queue-gate.js";
-import { applyImageConversationUpdate } from "../src/lib/image-conversation-update.js";
-import { createImageConversationWriteCoordinator } from "../src/lib/image-conversation-write-coordinator.js";
+import { createConversationQueueGate } from "../src/lib/image-conversation-queue-gate";
+import { applyImageConversationUpdate } from "../src/lib/image-conversation-update";
+import { createImageConversationWriteCoordinator } from "../src/lib/image-conversation-write-coordinator";
 
 function deferred() {
   let resolve;

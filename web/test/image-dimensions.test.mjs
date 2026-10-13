@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { setImageDimension } from "../src/lib/image-dimensions.js";
+import { setImageDimension } from "../src/lib/image-dimensions";
 
 test("image dimensions update produces renderable state without mutating the previous map", () => {
   const previous = {};

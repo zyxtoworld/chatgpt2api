@@ -6,8 +6,8 @@ import test from "node:test";
 import {
   createLifecycleActionOwner,
   observeLifecycleAction,
-} from "../src/lib/lifecycle-action-owner.js";
-import { createLatestActionOwner } from "../src/lib/latest-action-owner.js";
+} from "../src/lib/lifecycle-action-owner";
+import { createLatestActionOwner } from "../src/lib/latest-action-owner";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/debug/components/editable-file-panel.tsx", import.meta.url)),

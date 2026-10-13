@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { normalizeSearchSources } from "../src/lib/search-source-url.js";
-import { normalizeSkillBaseUrl } from "../src/lib/skill-base-url.js";
+import { normalizeSearchSources } from "../src/lib/search-source-url";
+import { normalizeSkillBaseUrl } from "../src/lib/skill-base-url";
 
 const source = readFileSync(
   fileURLToPath(new URL("../src/app/debug/components/search-panel.tsx", import.meta.url)),

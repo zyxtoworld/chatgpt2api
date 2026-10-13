@@ -5,7 +5,7 @@ import test from "node:test";
 import {
   observeViewTransition,
   startObservedViewTransition,
-} from "../src/lib/view-transition-lifecycle.js";
+} from "../src/lib/view-transition-lifecycle";
 
 const themeToggleSource = readFileSync(
   new URL("../src/components/ui/animated-theme-toggler.tsx", import.meta.url),

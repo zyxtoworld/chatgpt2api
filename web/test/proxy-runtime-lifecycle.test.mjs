@@ -7,7 +7,7 @@ import {
   createProxyRuntimeRequestGate,
   runCurrentProxyFollowup,
   runProxyRuntimeSave,
-} from "../src/lib/proxy-runtime-request-gate.js";
+} from "../src/lib/proxy-runtime-request-gate";
 
 function deferred() {
   let resolve;

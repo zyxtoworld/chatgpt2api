@@ -12,9 +12,7 @@ function candidates(filePath) {
     filePath,
     `${filePath}.ts`,
     `${filePath}.tsx`,
-    `${filePath}.js`,
     path.join(filePath, "index.ts"),
-    path.join(filePath, "index.js"),
   ];
 }
 
