@@ -2685,6 +2685,14 @@ fn import_job(
     )
 }
 
+fn import_job_status(imported_count: usize, snapshot_saved: bool) -> &'static str {
+    if imported_count > 0 && snapshot_saved {
+        "completed"
+    } else {
+        "failed"
+    }
+}
+
 fn access_token_import_job(
     job_id: &str,
     progress: ImportProgress,
@@ -2695,11 +2703,7 @@ fn access_token_import_job(
     progress_job_with_created(
         job_id,
         progress,
-        if imported_count > 0 && snapshot_saved {
-            "completed"
-        } else {
-            "failed"
-        },
+        import_job_status(imported_count, snapshot_saved),
         errors,
         None,
     )
@@ -5227,7 +5231,7 @@ async fn execute_ccload_import(
     );
 
     let failed = fetch_failed.saturating_add(refresh_failed).min(ids.len());
-    let status = if failed > 0 { "failed" } else { "completed" };
+    let status = import_job_status(imported_tokens.len(), true);
     let mut job = progress_job_with_created(
         &expected_job_id,
         ImportProgress {
@@ -7815,6 +7819,13 @@ mod tests {
         io::Read,
         time::{Duration, SystemTime},
     };
+    #[test]
+    fn mixed_import_results_remain_completed_when_snapshot_saved() {
+        assert_eq!(super::import_job_status(1_368, true), "completed");
+        assert_eq!(super::import_job_status(0, true), "failed");
+        assert_eq!(super::import_job_status(1_368, false), "failed");
+    }
+
     #[test]
     fn remote_group_counts_match_python_int_coercion() {
         assert_eq!(python_integer_or_zero(Some(&json!(" 7 "))), Ok(7));
