@@ -4,6 +4,7 @@ import { AlertCircle, CheckCircle2, LoaderCircle } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import type { CPAImportJob } from "@/lib/api";
+import { formatLocalTimestamp } from "@/lib/local-timestamp";
 
 const phaseLabels: Record<string, string> = {
   pending: "等待开始",
@@ -29,6 +30,7 @@ function statusLabel(status: CPAImportJob["status"]) {
 }
 
 export function ImportProgressCard({ job }: { job: CPAImportJob }) {
+  const updatedAt = formatLocalTimestamp(job.updated_at || job.created_at);
   const phase = job.phase || (job.status === "completed" ? "completed" : job.status);
   const phaseTotal = Math.max(0, job.phase_total ?? job.total);
   const phaseCompleted = clamp(job.phase_completed ?? job.completed, phaseTotal);
@@ -68,7 +70,7 @@ export function ImportProgressCard({ job }: { job: CPAImportJob }) {
               总任务 <span className="font-semibold text-stone-700">{job.completed}/{job.total}</span>
             </div>
             <div className="mt-1 truncate text-xs text-stone-400">
-              任务 {job.job_id.slice(0, 8)} · 更新于 {job.updated_at || job.created_at}
+              任务 {job.job_id.slice(0, 8)} · 更新于 {updatedAt}
             </div>
           </div>
           <Badge
