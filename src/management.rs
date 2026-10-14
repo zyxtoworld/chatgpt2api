@@ -37,7 +37,7 @@ use serde_json::{Map, Value, json};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use url::Url;
 
 use super::model_pool::{
@@ -5119,13 +5119,43 @@ async fn execute_ccload_import(
         "running",
         &errors,
     );
-    let refresh_result = super::refresh_imported_accounts_with_batch_until(
-        &state,
-        &imported_tokens,
-        batch_stats.clone(),
-        deadline,
-    )
-    .await;
+    let (refresh_progress_tx, mut refresh_progress_rx) = mpsc::unbounded_channel();
+    let refresh_task_state = state.clone();
+    let refresh_task_tokens = imported_tokens.clone();
+    let refresh_task_batch = batch_stats.clone();
+    let refresh_task = tokio::spawn(async move {
+        super::refresh_imported_accounts_with_batch_until_progress(
+            &refresh_task_state,
+            &refresh_task_tokens,
+            refresh_task_batch,
+            deadline,
+            Some(refresh_progress_tx),
+        )
+        .await
+    });
+    let mut refresh_processed = 0usize;
+    let mut refresh_count = 0usize;
+    while let Some(event) = refresh_progress_rx.recv().await {
+        refresh_processed = refresh_processed.saturating_add(1);
+        if event.refreshed {
+            refresh_count = refresh_count.saturating_add(1);
+        }
+        publish_progress(
+            ids.len(),
+            "refreshing_accounts",
+            refresh_processed,
+            imported_tokens.len(),
+            added,
+            skipped,
+            refresh_count,
+            fetch_failed.saturating_add(refresh_processed.saturating_sub(refresh_count)),
+            "running",
+            &errors,
+        );
+    }
+    let refresh_result = refresh_task
+        .await
+        .unwrap_or_else(|_| json!({"refreshed": refresh_count, "errors": []}));
     let refreshed = refresh_result
         .get("refreshed")
         .and_then(Value::as_u64)
@@ -5186,7 +5216,7 @@ async fn execute_ccload_import(
     publish_progress(
         ids.len(),
         "refreshing_accounts",
-        refreshed,
+        refresh_processed.min(imported_tokens.len()),
         imported_tokens.len(),
         added,
         skipped,

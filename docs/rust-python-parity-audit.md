@@ -104,7 +104,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 
 1. CPA：Rust `execute_cpa_import` 最多 16 个并发下载、逐文件更新进度；已对齐启动配置快照、HTTP 状态/缺 access token 错误文本、重复文件名请求、token-key 合并和 `source_type=codex`，并有本地 mock 回归。CPA 文件列表和导入请求不再额外限制 5000 条，和 Python 请求模型一致。Python 删除 pool 后 job 记录随 pool 一同删除，Rust 同样不保留独立 job 历史；已启动 worker 继续用启动时配置完成导入。
 2. Sub2API：Rust 管理端账号/分组现在按 Python 的每页 200 条和 `total`/短页条件循环，兼容 `{code,data:{items|data|list,total}}`、`{data:[...]}`、裸数组；不再额外截断 5000 条。导入已对齐启动配置快照、HTTP 失败逐 ID 记录、返回数汇总错误、`code` envelope 下 partial `data.accounts` 解析、处理响应中的全部 token 和 `source_type=codex`，并有本地 mock 回归；分页 `list` 形状及 5200 条/26 页已有定向覆盖。
-3. ccLoad：Rust 已实现登录、频道 editor 中的 OAuth access token 提取、逐频道 canonical 目录刷新和逐频道进度；不会从旧账号快照、其它同套餐频道或 editor 模型字段借用目录。这是当前三种导入中最接近 Python/实际页面需求的一条，但它是 Rust 扩展逻辑，Python baseline 中没有同名服务文件可直接逐行对照。
+3. ccLoad：Rust 已实现登录、频道 editor 中的 OAuth access token 提取、逐频道 canonical 目录刷新和逐频道进度；导入后的刷新阶段现在按每个 access token 持续更新 `phase_completed/refreshed/failed`，不会停在 `0/N`。账号元数据刷新只使用导入的 access token 请求 Web `/backend-api/me`、conversation init 和 account check，不读取或交换 refresh/id token；不会从旧账号快照、其它同套餐频道或 editor 模型字段借用目录。这是当前三种导入中最接近 Python/实际页面需求的一条，但它是 Rust 扩展逻辑，Python baseline 中没有同名服务文件可直接逐行对照。
 
 ### 资源与安全边界
 

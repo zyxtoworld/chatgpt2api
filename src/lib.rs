@@ -130,7 +130,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sha3::Sha3_512;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 #[cfg(test)]
@@ -4879,6 +4879,7 @@ async fn api_accounts_refresh(
             None,
             None,
             Some(sink),
+            None,
             false,
         )
         .await;
@@ -4927,7 +4928,7 @@ async fn refresh_accounts_now(
     requested: &[String],
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
 ) -> Result<Value, ApiError> {
-    refresh_accounts_now_with_deadline(state, requested, batch, None, None, true).await
+    refresh_accounts_now_with_deadline(state, requested, batch, None, None, None, true).await
 }
 
 fn account_refresh_interval(state: &AppState) -> Duration {
@@ -5191,6 +5192,7 @@ async fn refresh_accounts_now_with_deadline(
     _batch: Option<Arc<ImportedModelCatalogBatchStats>>,
     deadline: Option<Instant>,
     progress_sink: Option<AccountRefreshProgressSink>,
+    progress_events: Option<mpsc::UnboundedSender<AccountRefreshProgressEvent>>,
     defer_invalid_removal: bool,
 ) -> Result<Value, ApiError> {
     // Refresh account metadata with the existing access token only. Never
@@ -5272,6 +5274,11 @@ async fn refresh_accounts_now_with_deadline(
         if let Some(sink) = &progress_sink {
             sink.record(&token, account_known, &result, removed_by_policy)
                 .await;
+        }
+        if let Some(sender) = &progress_events {
+            let _ = sender.send(AccountRefreshProgressEvent {
+                refreshed: result.is_ok() && account_known && !removed_by_policy,
+            });
         }
         match result {
             Ok(updated) => {
@@ -5376,14 +5383,32 @@ pub(crate) async fn refresh_imported_accounts_with_batch_until(
     batch: Arc<ImportedModelCatalogBatchStats>,
     deadline: Instant,
 ) -> Value {
+    refresh_imported_accounts_with_batch_until_progress(state, tokens, batch, deadline, None).await
+}
+
+pub(crate) async fn refresh_imported_accounts_with_batch_until_progress(
+    state: &AppState,
+    tokens: &[String],
+    batch: Arc<ImportedModelCatalogBatchStats>,
+    deadline: Instant,
+    progress_events: Option<mpsc::UnboundedSender<AccountRefreshProgressEvent>>,
+) -> Value {
     if tokens.is_empty() {
         return json!({"refreshed": 0, "errors": [], "items": public_accounts(state)["items"]});
     }
-    refresh_accounts_now_with_deadline(state, tokens, Some(batch), Some(deadline), None, true)
-        .await
-        .unwrap_or_else(
-            |_| json!({"refreshed": 0, "errors": [], "items": public_accounts(state)["items"]}),
-        )
+    refresh_accounts_now_with_deadline(
+        state,
+        tokens,
+        Some(batch),
+        Some(deadline),
+        None,
+        progress_events,
+        true,
+    )
+    .await
+    .unwrap_or_else(
+        |_| json!({"refreshed": 0, "errors": [], "items": public_accounts(state)["items"]}),
+    )
 }
 
 #[allow(dead_code)]
@@ -13111,6 +13136,7 @@ async fn native_web_image_request_single(
             None,
             Some(validation_deadline),
             None,
+            None,
             true,
         )
         .await
@@ -14458,6 +14484,7 @@ async fn acquire_native_codex_image_lease(
                 std::slice::from_ref(&token),
                 None,
                 Some(validation_deadline),
+                None,
                 None,
                 true,
             )
@@ -20478,6 +20505,11 @@ const PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE: Duration = Duration::from_secs(8);
 type AccountRefreshFuture =
     Pin<Box<dyn Future<Output = (String, bool, Result<Value, &'static str>)> + Send>>;
 
+#[derive(Clone, Debug)]
+pub(crate) struct AccountRefreshProgressEvent {
+    pub(crate) refreshed: bool,
+}
+
 #[derive(Clone)]
 struct AccountRefreshProgressSink {
     state: AppState,
@@ -21397,9 +21429,16 @@ impl AccountTypeCatalog {
             return;
         }
         let deadline = Instant::now() + PUBLIC_IMAGE_QUOTA_REFRESH_DEADLINE;
-        let _ =
-            refresh_accounts_now_with_deadline(state, &tokens, None, Some(deadline), None, true)
-                .await;
+        let _ = refresh_accounts_now_with_deadline(
+            state,
+            &tokens,
+            None,
+            Some(deadline),
+            None,
+            None,
+            true,
+        )
+        .await;
         if let Ok(mut last) = self.image_quota_refreshed_at.lock() {
             *last = Some(Instant::now());
         }
