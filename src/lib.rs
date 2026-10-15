@@ -13486,7 +13486,7 @@ async fn native_web_image_attempt(
     if let Some(callback) = request.progress_callback.as_ref() {
         callback("preparing_conversation");
     }
-    let mut prepare = native_browser_headers_with_clearance(
+    let prepare = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{prepare_path}")),
         &context,
         &format!("{base_url}/"),
