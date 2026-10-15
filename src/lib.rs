@@ -5927,6 +5927,8 @@ fn append_api_call_log_with_account_and_identity(
             .map(ToOwned::to_owned),
         conversation_id: None,
         urls: Vec::new(),
+        failure_stage: None,
+        failure_status: None,
     };
     append_api_call_log_with_metadata_and_identity(
         state,
@@ -5985,6 +5987,8 @@ struct NativeImageLogMetadata {
     account_email: Option<String>,
     conversation_id: Option<String>,
     urls: Vec<String>,
+    failure_stage: Option<String>,
+    failure_status: Option<u16>,
 }
 
 type NativeImageLogContext = Arc<StdMutex<NativeImageLogMetadata>>;
@@ -6019,6 +6023,18 @@ fn set_native_image_log_account(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
     metadata.conversation_id = None;
+}
+fn set_native_image_failure_stage(
+    context: Option<&NativeImageLogContext>,
+    stage: &str,
+    status: Option<u16>,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    let mut metadata = context.lock().expect("native image log context lock");
+    metadata.failure_stage = Some(stage.to_owned());
+    metadata.failure_status = status;
 }
 
 fn update_native_image_log_context(
@@ -6201,6 +6217,16 @@ fn append_api_call_log_with_metadata_identity(
                 "conversation_id".to_owned(),
                 Value::String(conversation_id.to_owned()),
             );
+        }
+        if let Some(stage) = metadata
+            .failure_stage
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            detail.insert("failure_stage".to_owned(), Value::String(stage.to_owned()));
+        }
+        if let Some(status) = metadata.failure_status {
+            detail.insert("failure_status".to_owned(), Value::from(status));
         }
         let mut urls = Vec::new();
         for url in metadata
@@ -10947,6 +10973,8 @@ fn native_image_log_metadata(
             .filter(|value| !value.trim().is_empty())
             .map(ToOwned::to_owned),
         urls,
+        failure_stage: None,
+        failure_status: None,
     };
     native_image_collect_internal_metadata(&values, &mut metadata);
     metadata
@@ -13387,6 +13415,7 @@ async fn native_web_image_attempt(
         .stream
         .then(|| Arc::new(StdMutex::new(Vec::<NativeImageProgressEvent>::new())));
     let upstream_prompt = native_image_upstream_prompt(state, request);
+    set_native_image_failure_stage(log_context, "upload", None);
     if let Some(callback) = request.progress_callback.as_ref() {
         callback("uploading");
     }
@@ -13406,6 +13435,7 @@ async fn native_web_image_attempt(
             .map_err(|error| (error, false))?,
         );
     }
+    set_native_image_failure_stage(log_context, "bootstrap", None);
     if let Some(callback) = request.progress_callback.as_ref() {
         callback("bootstrapping");
     }
@@ -13420,6 +13450,7 @@ async fn native_web_image_attempt(
     if let Some(callback) = request.progress_callback.as_ref() {
         callback("getting_token");
     }
+    set_native_image_failure_stage(log_context, "requirements", None);
     let requirements = native_chat_requirements_with_resources_for_route_context(
         &client,
         base_url,
@@ -13451,6 +13482,7 @@ async fn native_web_image_attempt(
         "supported_encodings": ["v1"],
         "client_contextual_info": {"app_name": "chatgpt.com"},
     });
+    set_native_image_failure_stage(log_context, "prepare", None);
     if let Some(callback) = request.progress_callback.as_ref() {
         callback("preparing_conversation");
     }
@@ -13478,6 +13510,11 @@ async fn native_web_image_attempt(
         .map_err(|_| (ApiError::upstream_detail("operation timed out"), true))?
         .map_err(|error| (ApiError::upstream_detail(error.to_string()), true))?;
     if !prepare.status().is_success() {
+        set_native_image_failure_stage(
+            log_context,
+            "prepare_http",
+            Some(prepare.status().as_u16()),
+        );
         if prepare.status() == StatusCode::UNAUTHORIZED {
             return Err(native_image_unauthorized_failure(prepare, false).await);
         }
@@ -13486,6 +13523,7 @@ async fn native_web_image_attempt(
             native_stage_retryable(prepare.status(), true),
         ));
     }
+    set_native_image_failure_stage(log_context, "prepare_body", None);
     let prepare_body = bounded_response_body(prepare)
         .await
         .map_err(|error| (error, true))?;
@@ -13563,6 +13601,7 @@ async fn native_web_image_attempt(
     if let Some(callback) = request.progress_callback.as_ref() {
         callback("starting_generation");
     }
+    set_native_image_failure_stage(log_context, "run", None);
     let mut run = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{run_path}")),
         &context,
@@ -13602,6 +13641,7 @@ async fn native_web_image_attempt(
         .map_err(|_| (ApiError::upstream_detail("operation timed out"), true))?
         .map_err(|error| (ApiError::upstream_detail(error.to_string()), true))?;
     if !response.status().is_success() {
+        set_native_image_failure_stage(log_context, "run_http", Some(response.status().as_u16()));
         if response.status() == StatusCode::UNAUTHORIZED {
             return Err(native_image_unauthorized_failure(response, false).await);
         }
@@ -13610,6 +13650,7 @@ async fn native_web_image_attempt(
             native_stage_retryable(response.status(), true),
         ));
     }
+    set_native_image_failure_stage(log_context, "stream", None);
     if let Some(callback) = request.progress_callback.as_ref() {
         callback("generating");
     }
@@ -55737,10 +55778,16 @@ data: [DONE]
             Some("second@example.test")
         );
         assert_eq!(metadata.conversation_id, None);
+        set_native_image_failure_stage(Some(&context), "prepare_http", Some(400));
+        let metadata = snapshot_native_image_log_context(&context);
+        assert_eq!(metadata.failure_stage.as_deref(), Some("prepare_http"));
+        assert_eq!(metadata.failure_status, Some(400));
         clear_native_image_log_context(Some(&context));
         let metadata = snapshot_native_image_log_context(&context);
         assert_eq!(metadata.account_email, None);
         assert_eq!(metadata.conversation_id, None);
+        assert_eq!(metadata.failure_stage, None);
+        assert_eq!(metadata.failure_status, None);
     }
 
     #[test]
