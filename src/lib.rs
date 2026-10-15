@@ -13373,7 +13373,7 @@ fn web_image_upstream_candidates(requested_model: &str) -> Vec<String> {
     let upstream_model = web_image_upstream_model(requested_model);
     let mut candidates = vec![upstream_model.to_owned()];
     if upstream_model == "gpt-5-3" {
-        candidates.push("auto".to_owned());
+        candidates.extend(["auto".to_owned(), "gpt-5-5".to_owned()]);
     }
     candidates
 }
@@ -48618,10 +48618,14 @@ data: [DONE]
         }
     }
     #[test]
-    fn web_image_gpt_image_two_falls_back_to_auto_only_after_model_failure() {
+    fn web_image_gpt_image_two_falls_back_after_model_retirement() {
         assert_eq!(
             web_image_upstream_candidates("gpt-image-2"),
-            vec!["gpt-5-3".to_owned(), "auto".to_owned()]
+            vec![
+                "gpt-5-3".to_owned(),
+                "auto".to_owned(),
+                "gpt-5-5".to_owned()
+            ]
         );
         assert_eq!(
             web_image_upstream_candidates("gpt-image-2.5"),
