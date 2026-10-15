@@ -915,3 +915,14 @@ GitHub Actions run `37799423886` 暴露一项并发回归：PPT 任务仍持有 
 - 既有 Rust `cargo check`、Clippy、fmt、metadata 和 diff 检查结果保持有效；本轮没有触碰生产实现。
 
 既有 access-token-only、Rust-only 扩展以及资源/路径/CAS/fail-closed 边界保持不变。
+
+## 2026-10-16 线上图片生成回归修复
+
+用户线上截图复现 `/v1/images/generations` 返回 `502`。服务器只读诊断确认失败发生在 ChatGPT Web 图片 SSE 启动请求，`/backend-api/f/conversation` 返回 `404`；旧 Rust 实现只把它投影为通用 upstream error，无法确认失效的底层 model slug。
+
+- Web 图片请求头按 Python v1.7 对齐：不再额外发送 Python 未发送的 `ChatGPT-Account-ID`；run 请求 Referer 使用站点根路径 `/`。
+- 图片 conversation payload 按 Python 构造：generation 请求不带空的 `attachments`，客户端上下文尺寸恢复 `page_height=900`、`page_width=1400`、`pixel_ratio=2`。
+- 对图片 prepare/run 的非成功响应增加有界失败阶段/状态/模型候选诊断；不记录响应原文或 token。
+- `gpt-image-2` 仍先使用 Python v1.7 的 `gpt-5-3`，仅在上游明确返回 model-not-found 时按候选顺序尝试 `auto`、`gpt-5-5`、`gpt-5-5-thinking`、`gpt-5-5-max`，不对任意 404 静默重试。
+
+验证：GitHub Actions run `38816349678` 完成 Rust/Web 检查、测试、审计和多架构镜像构建；线上容器 revision `7a5c0f0d` 为 `running/healthy`。使用真实线上 `/v1/images/generations` 请求复验返回 HTTP 200，响应含 `data[0].url`，容器 health 为 healthy。
