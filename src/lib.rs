@@ -12912,6 +12912,11 @@ fn reset_native_image_attempts_for_retry(
         false
     }
 }
+fn native_image_account_retryable(error: &ApiError, retryable: bool) -> bool {
+    retryable
+        || error.message() == INVALID_UPSTREAM_TOKEN_MARKER
+        || error.code() == "invalid_api_key"
+}
 
 async fn combine_native_web_image_responses(
     responses: Vec<(usize, Response)>,
@@ -13102,6 +13107,9 @@ async fn native_web_image_request_single(
     let mut tls_retry_count = 0usize;
     let mut connection_timeout_retry_count = 0usize;
     loop {
+        if let Some(callback) = request.progress_callback.as_ref() {
+            callback("getting_account");
+        }
         if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(last_error.unwrap_or_else(ApiError::upstream));
         }
@@ -13232,8 +13240,12 @@ async fn native_web_image_request_single(
                 drop(lease);
                 return Ok(data);
             }
-            Err((error, _retryable)) => {
+            Err((error, retryable)) => {
                 last_error = Some(error);
+                let retry_account = native_image_account_retryable(
+                    last_error.as_ref().expect("image retry error recorded"),
+                    retryable,
+                );
                 let invalid_token = last_error
                     .as_ref()
                     .is_some_and(|error| error.message() == INVALID_UPSTREAM_TOKEN_MARKER);
@@ -13263,11 +13275,10 @@ async fn native_web_image_request_single(
                         deadline = deadline.max(Instant::now() + native_image_poll_timeout(&state));
                     }
                 }
-                if invalid_token
-                    || last_error
-                        .as_ref()
-                        .is_some_and(|error| error.code() == "invalid_api_key")
-                {
+                let invalid_api_key = last_error
+                    .as_ref()
+                    .is_some_and(|error| error.code() == "invalid_api_key");
+                if invalid_token || invalid_api_key {
                     let config = fs::read(state.config_path.as_ref())
                         .ok()
                         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -13285,6 +13296,9 @@ async fn native_web_image_request_single(
                     &mut attempted_tokens,
                 ) {
                     continue;
+                }
+                if !retry_account {
+                    return Err(last_error.expect("non-retryable image failure recorded"));
                 }
                 if attempted_tokens.len() >= NATIVE_IMAGE_MAX_ACCOUNT_ATTEMPTS {
                     return Err(last_error.expect("image failure recorded"));
@@ -14556,6 +14570,9 @@ async fn native_codex_image_request_single(
     let mut tls_retry_count = 0usize;
     let mut connection_timeout_retry_count = 0usize;
     for _ in 0..request.n {
+        if let Some(callback) = request.progress_callback.as_ref() {
+            callback("getting_account");
+        }
         let deadline = Instant::now() + native_image_operation_timeout(&state);
         let mut attempted_tokens = HashSet::new();
         let mut lease = acquire_native_codex_image_lease(
@@ -17464,7 +17481,6 @@ async fn run_image_task(
         Some(String::new()),
         None,
     );
-    let _ = update_image_task_progress(&state, &owner, &task_id, "getting_account", false);
     let endpoint = if mode == "edit" {
         "images/edits"
     } else {
@@ -55739,6 +55755,23 @@ data: [DONE]
             &mut attempted_tokens
         ));
         assert_eq!(attempted_tokens, HashSet::from(["only-account".to_owned()]));
+    }
+
+    #[test]
+    fn image_account_retry_requires_retryable_or_invalid_token_error() {
+        assert!(!native_image_account_retryable(
+            &ApiError::upstream(),
+            false
+        ));
+        assert!(native_image_account_retryable(&ApiError::upstream(), true));
+        assert!(!native_image_account_retryable(
+            &ApiError::image_content_policy("blocked"),
+            false,
+        ));
+        assert!(native_image_account_retryable(
+            &ApiError::upstream_detail(INVALID_UPSTREAM_TOKEN_MARKER),
+            false,
+        ));
     }
 
     #[test]
