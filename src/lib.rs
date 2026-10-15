@@ -13610,7 +13610,7 @@ async fn native_web_image_attempt(
     let mut run = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{run_path}")),
         &context,
-        &format!("{base_url}/c/"),
+        &format!("{base_url}/"),
         Some(&state.clearance_store),
         Some(&proxy_runtime_value(state)),
         lease.proxy_url().unwrap_or_default(),
