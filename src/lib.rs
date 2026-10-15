@@ -13502,9 +13502,6 @@ async fn native_web_image_attempt(
     .header("X-OpenAI-Target-Route", prepare_path)
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .json(&prepare_payload);
-    if let Some(account_id) = lease.chatgpt_account_id() {
-        prepare = prepare.header("ChatGPT-Account-ID", account_id);
-    }
     let prepare = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), prepare.send())
         .await
         .map_err(|_| (ApiError::upstream_detail("operation timed out"), true))?
@@ -13624,9 +13621,6 @@ async fn native_web_image_attempt(
     )
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .json(&run_payload);
-    if let Some(account_id) = lease.chatgpt_account_id() {
-        run = run.header("ChatGPT-Account-ID", account_id);
-    }
     if let Some(value) = requirements.so_token {
         run = run.header("OpenAI-Sentinel-SO-Token", value);
     }
