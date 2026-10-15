@@ -13552,7 +13552,7 @@ async fn native_web_image_attempt(
         let class = native_image_upstream_failure_class(&body);
         set_native_image_failure_stage(
             log_context,
-            &format!("prepare_http_{class}"),
+            &format!("prepare_http_{}_{}", model_settings.upstream_model, class),
             Some(status.as_u16()),
         );
         let error = if class == "model_not_found" {
@@ -13694,7 +13694,7 @@ async fn native_web_image_attempt(
         let class = native_image_upstream_failure_class(&body);
         set_native_image_failure_stage(
             log_context,
-            &format!("run_http_{class}"),
+            &format!("run_http_{}_{}", model_settings.upstream_model, class),
             Some(status.as_u16()),
         );
         let error = if class == "model_not_found" {
