@@ -13597,9 +13597,31 @@ async fn native_web_image_attempt(
         Some(value) => value.to_owned(),
         None => {
             let class = native_image_upstream_failure_class(&prepare_body);
+            let shape = match &prepare_value {
+                Value::Object(object) => object
+                    .keys()
+                    .take(8)
+                    .map(|key| {
+                        key.chars()
+                            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                            .collect::<String>()
+                    })
+                    .filter(|key| !key.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                Value::Array(_) => "array".to_owned(),
+                Value::String(_) => "string".to_owned(),
+                Value::Number(_) => "number".to_owned(),
+                Value::Bool(_) => "bool".to_owned(),
+                Value::Null => "null".to_owned(),
+            };
+            let class = native_image_upstream_failure_class(&prepare_body);
             set_native_image_failure_stage(
                 log_context,
-                &format!("prepare_body_{}_{}", model_settings.upstream_model, class),
+                &format!(
+                    "prepare_body_{}_{}_keys_{shape}",
+                    model_settings.upstream_model, class
+                ),
                 None,
             );
             return Err((ApiError::upstream_model_not_found(), false));
