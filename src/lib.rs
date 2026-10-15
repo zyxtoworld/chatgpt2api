@@ -55765,7 +55765,7 @@ data: [DONE]
         ));
         assert!(native_image_account_retryable(&ApiError::upstream(), true));
         assert!(!native_image_account_retryable(
-            &ApiError::image_content_policy("blocked"),
+            &ApiError::image_content_policy("blocked".to_owned()),
             false,
         ));
         assert!(native_image_account_retryable(
