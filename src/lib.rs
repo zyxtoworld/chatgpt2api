@@ -13566,18 +13566,27 @@ async fn native_web_image_attempt(
         };
         return Err((error, native_stage_retryable(status, true)));
     }
-    set_native_image_failure_stage(log_context, "prepare_body", None);
+    set_native_image_failure_stage(
+        log_context,
+        &format!("prepare_body_{}", model_settings.upstream_model),
+        None,
+    );
     let prepare_body = bounded_response_body(prepare)
         .await
         .map_err(|error| (error, true))?;
-    let conduit = serde_json::from_slice::<Value>(&prepare_body)
-        .map_err(|_| (ApiError::upstream(), false))?
+    let prepare_value = match serde_json::from_slice::<Value>(&prepare_body) {
+        Ok(value) => value,
+        Err(_) => return Err((ApiError::upstream_model_not_found(), false)),
+    };
+    let conduit = match prepare_value
         .get("conduit_token")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty() && value.len() <= 4096)
-        .ok_or_else(|| (ApiError::upstream(), false))?
-        .to_owned();
+    {
+        Some(value) => value.to_owned(),
+        None => return Err((ApiError::upstream_model_not_found(), false)),
+    };
     let mut parts = Vec::new();
     for upload in &uploads {
         parts.push(json!({
