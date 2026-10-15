@@ -13549,6 +13549,28 @@ async fn native_web_image_attempt(
         json!({"content_type":"multimodal_text","parts":parts})
     };
     let run_path = "/backend-api/f/conversation";
+    let mut message_metadata = json!({
+        "developer_mode_connector_ids": [],
+        "selected_github_repos": [],
+        "selected_all_github_repos": false,
+        "system_hints": ["picture_v2"],
+        "serialization_metadata": {"custom_symbol_offsets": []},
+    });
+    if !uploads.is_empty() {
+        message_metadata["attachments"] = json!(
+            uploads
+                .iter()
+                .map(|upload| json!({
+                    "id": upload.file_id,
+                    "mimeType": upload.mime_type,
+                    "name": upload.file_name,
+                    "size": upload.file_size,
+                    "width": upload.width,
+                    "height": upload.height,
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
     let run_payload = json!({
         "action": "next",
         "messages": [{
@@ -13556,21 +13578,7 @@ async fn native_web_image_attempt(
             "author": {"role": "user"},
             "create_time": native_created(),
             "content": content,
-            "metadata": {
-                "developer_mode_connector_ids": [],
-                "selected_github_repos": [],
-                "selected_all_github_repos": false,
-                "system_hints": ["picture_v2"],
-                "serialization_metadata": {"custom_symbol_offsets": []},
-                "attachments": uploads.iter().map(|upload| json!({
-                    "id": upload.file_id,
-                    "mimeType": upload.mime_type,
-                    "name": upload.file_name,
-                    "size": upload.file_size,
-                    "width": upload.width,
-                    "height": upload.height,
-                })).collect::<Vec<_>>(),
-            }
+            "metadata": message_metadata,
         }],
         "parent_message_id": native_message_id(),
         "model": upstream_model,
@@ -13585,9 +13593,9 @@ async fn native_web_image_attempt(
         "client_contextual_info": {
             "is_dark_mode": false,
             "time_since_loaded": 1200,
-            "page_height": 1072,
-            "page_width": 1724,
-            "pixel_ratio": 1.2,
+            "page_height": 900,
+            "page_width": 1400,
+            "pixel_ratio": 2,
             "screen_height": 1440,
             "screen_width": 2560,
             "app_name": "chatgpt.com",
@@ -56626,6 +56634,15 @@ data: [DONE]
         let run_payload = captured_run_payload.lock().await.clone();
         assert_eq!(run_payload["model"], "gpt-5-3");
         assert!(run_payload.get("thinking_effort").is_none());
+        assert!(
+            run_payload["messages"][0]["metadata"]
+                .get("attachments")
+                .is_none(),
+            "generation requests omit Python's optional attachments field"
+        );
+        assert_eq!(run_payload["client_contextual_info"]["page_height"], 900);
+        assert_eq!(run_payload["client_contextual_info"]["page_width"], 1400);
+        assert_eq!(run_payload["client_contextual_info"]["pixel_ratio"], 2);
         let initial_calls = calls.lock().await;
         assert_eq!(initial_calls.len(), 14);
         let mut metadata_calls = initial_calls[..3].to_vec();
