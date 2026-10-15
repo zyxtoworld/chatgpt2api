@@ -34,7 +34,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 - Rust 服务启动后会按 `refresh_account_interval_minute` 周期刷新正常/限流 access token 账号，并在关闭时停止 watcher；同时恢复图片保留清理和 R2 备份调度。
 - 图片 `n>1` 已按 1.7 的 `image_parallel_generation`、账号级 `image_account_concurrency`、串行/并行结果合并和 `image_check_before_hit_enabled` 运行；Web/Codex 图片入口都经过同一多图调度边界。
 - 图片流已按 1.7 输出 `image.generation.result` 数据块和单一 `[DONE]`，多图会保留 `index/total`；图片 usage 会计算文本、输入图片和输出图片 token。
-- 图片后台任务已把 `getting_account`、`image_stream_resolve_start`、`receiving_image` 进度写入任务，`resume-poll` 会读取并使用 `extra_timeout_secs`。
+- 图片后台任务已按 Python v1.7 写入完整阶段：`getting_account`、`uploading`、`bootstrapping`、`getting_token`、`preparing_conversation`、`starting_generation`、`generating`、`image_stream_resolve_start`、`receiving_image`；`resume-poll` 会读取并使用 `extra_timeout_secs`。
 - Chat、Responses、Messages、Search 调用日志现在记录请求文本摘要和图片/消息结构统计；WebDAV 图片存储按 `local/webdav/both` 落盘并持久化索引，覆盖生成、测试、同步、读取、列表、归档和删除，支持 `public_base_url`，启用时缺少 URL 或密码会按 1.7 拒绝配置；图片管理列表支持日期筛选和 `YYYY-MM-DD HH:mm:ss` 创建时间。
 - 管理 API 的跨域预检与 Python `CORSMiddleware` 对齐；图片删除和低磁盘清理会清理标签、缩略图及索引，备份包含图片索引。
 - ccLoad 导入最终进度会合并账号刷新阶段的失败数与错误列表，不再把“凭据获取成功但刷新失败”显示成成功。

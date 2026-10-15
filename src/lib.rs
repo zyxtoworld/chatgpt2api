@@ -13369,6 +13369,9 @@ async fn native_web_image_attempt(
         .stream
         .then(|| Arc::new(StdMutex::new(Vec::<NativeImageProgressEvent>::new())));
     let upstream_prompt = native_image_upstream_prompt(state, request);
+    if let Some(callback) = request.progress_callback.as_ref() {
+        callback("uploading");
+    }
     let mut uploads = Vec::new();
     for (index, image) in request.images.iter().enumerate() {
         uploads.push(
@@ -13385,6 +13388,9 @@ async fn native_web_image_attempt(
             .map_err(|error| (error, false))?,
         );
     }
+    if let Some(callback) = request.progress_callback.as_ref() {
+        callback("bootstrapping");
+    }
     let resources = native_bootstrap_with_timeout_context(
         &client,
         base_url,
@@ -13393,6 +13399,9 @@ async fn native_web_image_attempt(
         &context,
     )
     .await?;
+    if let Some(callback) = request.progress_callback.as_ref() {
+        callback("getting_token");
+    }
     let requirements = native_chat_requirements_with_resources_for_route_context(
         &client,
         base_url,
@@ -13424,6 +13433,9 @@ async fn native_web_image_attempt(
         "supported_encodings": ["v1"],
         "client_contextual_info": {"app_name": "chatgpt.com"},
     });
+    if let Some(callback) = request.progress_callback.as_ref() {
+        callback("preparing_conversation");
+    }
     let mut prepare = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{prepare_path}")),
         &context,
@@ -13530,6 +13542,9 @@ async fn native_web_image_attempt(
         "paragen_cot_summary_display_override": "allow",
         "force_parallel_switch": "auto",
     });
+    if let Some(callback) = request.progress_callback.as_ref() {
+        callback("starting_generation");
+    }
     let mut run = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{run_path}")),
         &context,
@@ -13576,6 +13591,9 @@ async fn native_web_image_attempt(
             ApiError::upstream(),
             native_stage_retryable(response.status(), true),
         ));
+    }
+    if let Some(callback) = request.progress_callback.as_ref() {
+        callback("generating");
     }
     let (remove_always, remove_after_result) = native_image_cleanup_flags(state);
     let observed_conversation_id = Arc::new(StdMutex::new(None));
