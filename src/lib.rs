@@ -13373,11 +13373,15 @@ fn web_image_upstream_candidates(requested_model: &str) -> Vec<String> {
     let upstream_model = web_image_upstream_model(requested_model);
     let mut candidates = vec![upstream_model.to_owned()];
     if upstream_model == "gpt-5-3" {
-        candidates.extend(["auto".to_owned(), "gpt-5-5".to_owned()]);
+        candidates.extend([
+            "auto".to_owned(),
+            "gpt-5-5".to_owned(),
+            "gpt-5-5-thinking".to_owned(),
+            "gpt-5-5-max".to_owned(),
+        ]);
     }
     candidates
 }
-
 async fn resolve_web_image_upstream_models(
     _state: &AppState,
     requested_model: &str,
@@ -48624,7 +48628,9 @@ data: [DONE]
             vec![
                 "gpt-5-3".to_owned(),
                 "auto".to_owned(),
-                "gpt-5-5".to_owned()
+                "gpt-5-5".to_owned(),
+                "gpt-5-5-thinking".to_owned(),
+                "gpt-5-5-max".to_owned()
             ]
         );
         assert_eq!(
