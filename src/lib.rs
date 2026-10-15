@@ -13308,8 +13308,12 @@ async fn native_web_image_request_single(
     }
 }
 
-fn web_image_upstream_model(_requested_model: &str) -> &'static str {
-    "auto"
+fn web_image_upstream_model(requested_model: &str) -> &'static str {
+    if requested_model.eq_ignore_ascii_case("gpt-image-2") {
+        "gpt-5-3"
+    } else {
+        "auto"
+    }
 }
 
 async fn resolve_web_image_upstream_models(
@@ -48501,14 +48505,21 @@ data: [DONE]
     }
 
     #[test]
-    fn web_image_models_share_the_auto_upstream_mapping() {
+    fn web_image_models_use_python_upstream_mapping() {
         for model in [
             "gpt-image-2",
             "gpt-image-2.5",
             "gpt-image-2.5-flare",
             "gpt-image-2.5-sunburst",
         ] {
-            assert_eq!(web_image_upstream_model(model), "auto");
+            assert_eq!(
+                web_image_upstream_model(model),
+                if model == "gpt-image-2" {
+                    "gpt-5-3"
+                } else {
+                    "auto"
+                }
+            );
         }
     }
 

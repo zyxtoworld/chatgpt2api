@@ -82,6 +82,7 @@ Rust 版本以当前 `main` 分支为准。这里的“已对齐”表示已经�
 - `image_account_concurrency` 不按剩余 quota 数再加一层在途限制；Python 1.7 只要求 quota 大于零并单独检查账号并发，Rust lease 与对应回归现同样处理。
 - 图片轮询超时和模型文本回复的跨账号重试按 Python v1.7 的 4 次/3 次预算执行；重试会重置账号排除集，单账号池也可再次尝试。内容策略错误不重置账号集、不触发该类重试。
 - 图片上游非可重试错误（内容策略、畸形响应和其它确定性失败）不再跨账号重复上传/启动生成；仅保留 Python 1.7 对齐的 token 失效、TLS/连接超时、轮询超时和模型文本回复重试。
+- Web 图片底层 model slug 按 Python 1.7 对齐：请求 `gpt-image-2` 时发送 `gpt-5-3`，其它 Rust 扩展的网页图片别名仍使用 `auto`；不再把 `gpt-image-2` 一律发送为 `auto`。
 - Web 生图轮询初始等待增加 Python 1.7 的 `random.uniform(0, min(2s, initial_wait * 0.2))`，HTTP/网络重试增加 `random.uniform(0, 0.5s)`；Retry-After、指数退避基数和 deadline 规则保持一致。
 - `refresh_account_interval_minute` 不再只是设置项，已经接入后台账号 watcher。
 - `image_retention_days`、备份 `interval_minutes` 不再只是设置项，已经接入服务生命周期调度。
