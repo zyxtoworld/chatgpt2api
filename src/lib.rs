@@ -56338,6 +56338,10 @@ data: [DONE]
             let prepare = post(move |request: AxumRequest| {
                 let calls = calls_for_prepare.clone();
                 let captured_prepare_payload = captured_prepare_payload.clone();
+                assert!(
+                    request.headers().get("ChatGPT-Account-ID").is_none(),
+                    "web image requests must match Python and omit ChatGPT-Account-ID"
+                );
                 async move {
                     calls.lock().await.push("image_prepare".to_owned());
                     let body = request
@@ -56357,6 +56361,10 @@ data: [DONE]
                 let calls = calls_for_run.clone();
                 let captured_run_payload = captured_run_payload.clone();
                 let block_next_image_run = block_next_image_run_for_upstream.clone();
+                assert!(
+                    request.headers().get("ChatGPT-Account-ID").is_none(),
+                    "web image requests must match Python and omit ChatGPT-Account-ID"
+                );
                 async move {
                     calls.lock().await.push("image_run".to_owned());
                     let body = request
@@ -56467,7 +56475,7 @@ data: [DONE]
         fs::write(
             &account_path,
             r#"[
-                {"access_token":"image-codex-token","email":"image@example.test","status":"正常","source_type":"web","type":"free","quota":1},
+                {"access_token":"image-codex-token","email":"image@example.test","status":"正常","source_type":"web","type":"free","quota":1,"chatgpt_account_id":"image-account"},
                 {"access_token":"image-web-token","status":"禁用","source_type":"web","type":"free","quota":1},
                 {"access_token":"image-failure-token","email":"image-failure@example.test","status":"正常","source_type":"web","type":"free","quota":1}
             ]"#,
