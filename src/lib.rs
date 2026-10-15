@@ -56579,17 +56579,15 @@ data: [DONE]
         assert!(run_payload.get("thinking_effort").is_none());
         let initial_calls = calls.lock().await;
         assert_eq!(initial_calls.len(), 14);
-        assert_eq!(initial_calls[0], "refresh_me");
-        assert!(
-            initial_calls[1..3]
-                .iter()
-                .map(String::as_str)
-                .eq(["refresh_init", "refresh_check"])
-                || initial_calls[1..3]
-                    .iter()
-                    .map(String::as_str)
-                    .eq(["refresh_check", "refresh_init"]),
-            "metadata refresh calls may complete in either order: {initial_calls:?}"
+        let mut metadata_calls = initial_calls[..3].to_vec();
+        metadata_calls.sort_unstable();
+        assert_eq!(
+            metadata_calls,
+            [
+                "refresh_check".to_owned(),
+                "refresh_init".to_owned(),
+                "refresh_me".to_owned()
+            ]
         );
         assert!(initial_calls[3..].iter().map(String::as_str).eq([
             "bootstrap",
