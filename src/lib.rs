@@ -13596,7 +13596,6 @@ async fn native_web_image_attempt(
     {
         Some(value) => value.to_owned(),
         None => {
-            let class = native_image_upstream_failure_class(&prepare_body);
             let shape = match &prepare_value {
                 Value::Object(object) => object
                     .keys()
