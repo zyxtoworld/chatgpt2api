@@ -56174,6 +56174,7 @@ data: [DONE]
         fs::remove_dir_all(root).expect("image download test cleanup");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn native_web_image_generation_uses_conversation_and_file_download_flow() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
