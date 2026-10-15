@@ -300,6 +300,17 @@ impl ApiError {
             detail_status: None,
         }
     }
+    pub(super) fn upstream_model_not_found() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            kind: "server_error",
+            code: "upstream_model_not_found",
+            message: Cow::Borrowed(PUBLIC_SERVER_ERROR),
+            retry_after: None,
+            python_detail: false,
+            detail_status: None,
+        }
+    }
 
     pub(super) fn image_poll_timeout() -> Self {
         Self {

@@ -13275,6 +13275,13 @@ async fn native_web_image_request_single(
                         index,
                         attempted_tokens.len(),
                     );
+                    if !result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|(error, _)| error.code() == "upstream_model_not_found")
+                    {
+                        break;
+                    }
                 }
                 result
             }
@@ -13362,6 +13369,15 @@ fn web_image_upstream_model(requested_model: &str) -> &'static str {
     }
 }
 
+fn web_image_upstream_candidates(requested_model: &str) -> Vec<String> {
+    let upstream_model = web_image_upstream_model(requested_model);
+    let mut candidates = vec![upstream_model.to_owned()];
+    if upstream_model == "gpt-5-3" {
+        candidates.push("auto".to_owned());
+    }
+    candidates
+}
+
 async fn resolve_web_image_upstream_models(
     _state: &AppState,
     requested_model: &str,
@@ -13370,12 +13386,14 @@ async fn resolve_web_image_upstream_models(
     let settings = RuntimeModelSettings {
         upstream_model: upstream_model.to_owned(),
     };
+    let candidates = web_image_upstream_candidates(requested_model);
     log::info!(
-        "native Web image upstream model selected: requested={}, selected_candidate={}, reason=v1.7_model_mapping",
+        "native Web image upstream model selected: requested={}, selected_candidate={}, candidates={:?}, reason=v1.7_model_mapping",
         requested_model,
         upstream_model,
+        candidates,
     );
-    Ok((settings, vec![upstream_model.to_owned()]))
+    Ok((settings, candidates))
 }
 
 fn native_image_upstream_prompt(state: &AppState, request: &NativeImageRequest) -> String {
@@ -13537,7 +13555,12 @@ async fn native_web_image_attempt(
             &format!("prepare_http_{class}"),
             Some(status.as_u16()),
         );
-        return Err((ApiError::upstream(), native_stage_retryable(status, true)));
+        let error = if class == "model_not_found" {
+            ApiError::upstream_model_not_found()
+        } else {
+            ApiError::upstream()
+        };
+        return Err((error, native_stage_retryable(status, true)));
     }
     set_native_image_failure_stage(log_context, "prepare_body", None);
     let prepare_body = bounded_response_body(prepare)
@@ -13674,7 +13697,12 @@ async fn native_web_image_attempt(
             &format!("run_http_{class}"),
             Some(status.as_u16()),
         );
-        return Err((ApiError::upstream(), native_stage_retryable(status, true)));
+        let error = if class == "model_not_found" {
+            ApiError::upstream_model_not_found()
+        } else {
+            ApiError::upstream()
+        };
+        return Err((error, native_stage_retryable(status, true)));
     }
     set_native_image_failure_stage(log_context, "stream", None);
     if let Some(callback) = request.progress_callback.as_ref() {
@@ -48588,6 +48616,17 @@ data: [DONE]
                 }
             );
         }
+    }
+    #[test]
+    fn web_image_gpt_image_two_falls_back_to_auto_only_after_model_failure() {
+        assert_eq!(
+            web_image_upstream_candidates("gpt-image-2"),
+            vec!["gpt-5-3".to_owned(), "auto".to_owned()]
+        );
+        assert_eq!(
+            web_image_upstream_candidates("gpt-image-2.5"),
+            vec!["auto".to_owned()]
+        );
     }
 
     #[test]
