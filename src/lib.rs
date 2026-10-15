@@ -13576,7 +13576,17 @@ async fn native_web_image_attempt(
         .map_err(|error| (error, true))?;
     let prepare_value = match serde_json::from_slice::<Value>(&prepare_body) {
         Ok(value) => value,
-        Err(_) => return Err((ApiError::upstream_model_not_found(), false)),
+        Err(_) => {
+            set_native_image_failure_stage(
+                log_context,
+                &format!(
+                    "prepare_body_{}_invalid_json",
+                    model_settings.upstream_model
+                ),
+                None,
+            );
+            return Err((ApiError::upstream_model_not_found(), false));
+        }
     };
     let conduit = match prepare_value
         .get("conduit_token")
@@ -13585,7 +13595,15 @@ async fn native_web_image_attempt(
         .filter(|value| !value.is_empty() && value.len() <= 4096)
     {
         Some(value) => value.to_owned(),
-        None => return Err((ApiError::upstream_model_not_found(), false)),
+        None => {
+            let class = native_image_upstream_failure_class(&prepare_body);
+            set_native_image_failure_stage(
+                log_context,
+                &format!("prepare_body_{}_{}", model_settings.upstream_model, class),
+                None,
+            );
+            return Err((ApiError::upstream_model_not_found(), false));
+        }
     };
     let mut parts = Vec::new();
     for upload in &uploads {
