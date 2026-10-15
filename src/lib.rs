@@ -6036,6 +6036,24 @@ fn set_native_image_failure_stage(
     metadata.failure_stage = Some(stage.to_owned());
     metadata.failure_status = status;
 }
+fn native_image_upstream_failure_class(body: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if text.contains("model")
+        && (text.contains("not found")
+            || text.contains("not_supported")
+            || text.contains("unknown"))
+    {
+        "model_not_found"
+    } else if text.contains("route") || text.contains("endpoint") || text.contains("not found") {
+        "route_not_found"
+    } else if text.contains("cloudflare") || text.contains("cf-chl") || text.contains("challenge") {
+        "clearance"
+    } else if text.contains("unauthorized") || text.contains("invalid token") {
+        "auth"
+    } else {
+        "unknown"
+    }
+}
 
 fn update_native_image_log_context(
     context: Option<&NativeImageLogContext>,
@@ -13507,18 +13525,19 @@ async fn native_web_image_attempt(
         .map_err(|_| (ApiError::upstream_detail("operation timed out"), true))?
         .map_err(|error| (ApiError::upstream_detail(error.to_string()), true))?;
     if !prepare.status().is_success() {
-        set_native_image_failure_stage(
-            log_context,
-            "prepare_http",
-            Some(prepare.status().as_u16()),
-        );
-        if prepare.status() == StatusCode::UNAUTHORIZED {
+        let status = prepare.status();
+        if status == StatusCode::UNAUTHORIZED {
+            set_native_image_failure_stage(log_context, "prepare_http", Some(status.as_u16()));
             return Err(native_image_unauthorized_failure(prepare, false).await);
         }
-        return Err((
-            ApiError::upstream(),
-            native_stage_retryable(prepare.status(), true),
-        ));
+        let body = bounded_response_body(prepare).await.unwrap_or_default();
+        let class = native_image_upstream_failure_class(&body);
+        set_native_image_failure_stage(
+            log_context,
+            &format!("prepare_http_{class}"),
+            Some(status.as_u16()),
+        );
+        return Err((ApiError::upstream(), native_stage_retryable(status, true)));
     }
     set_native_image_failure_stage(log_context, "prepare_body", None);
     let prepare_body = bounded_response_body(prepare)
@@ -13643,14 +13662,19 @@ async fn native_web_image_attempt(
         .map_err(|_| (ApiError::upstream_detail("operation timed out"), true))?
         .map_err(|error| (ApiError::upstream_detail(error.to_string()), true))?;
     if !response.status().is_success() {
-        set_native_image_failure_stage(log_context, "run_http", Some(response.status().as_u16()));
-        if response.status() == StatusCode::UNAUTHORIZED {
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            set_native_image_failure_stage(log_context, "run_http", Some(status.as_u16()));
             return Err(native_image_unauthorized_failure(response, false).await);
         }
-        return Err((
-            ApiError::upstream(),
-            native_stage_retryable(response.status(), true),
-        ));
+        let body = bounded_response_body(response).await.unwrap_or_default();
+        let class = native_image_upstream_failure_class(&body);
+        set_native_image_failure_stage(
+            log_context,
+            &format!("run_http_{class}"),
+            Some(status.as_u16()),
+        );
+        return Err((ApiError::upstream(), native_stage_retryable(status, true)));
     }
     set_native_image_failure_stage(log_context, "stream", None);
     if let Some(callback) = request.progress_callback.as_ref() {
@@ -55992,6 +56016,21 @@ data: [DONE]
         assert!(!native_image_is_text_reply(
             r#"Tool input: {"size":"square","n":1}"#
         ));
+    }
+    #[test]
+    fn native_image_upstream_failure_classifies_route_and_model_errors() {
+        assert_eq!(
+            native_image_upstream_failure_class(br#"{"detail":"Not Found"}"#),
+            "route_not_found"
+        );
+        assert_eq!(
+            native_image_upstream_failure_class(br#"{"error":"model gpt-5-3 not found"}"#),
+            "model_not_found"
+        );
+        assert_eq!(
+            native_image_upstream_failure_class(b"<html>Cloudflare challenge</html>"),
+            "clearance"
+        );
     }
 
     #[test]
