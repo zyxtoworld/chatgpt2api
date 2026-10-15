@@ -56578,25 +56578,32 @@ data: [DONE]
         assert_eq!(run_payload["model"], "gpt-5-3");
         assert!(run_payload.get("thinking_effort").is_none());
         let initial_calls = calls.lock().await;
-        assert_eq!(
-            initial_calls.as_slice(),
-            [
-                "refresh_me",
-                "refresh_init",
-                "refresh_check",
-                "bootstrap",
-                "requirements_prepare",
-                "requirements_finalize",
-                "image_prepare",
-                "image_run",
-                "recent_conversations",
-                "image_poll",
-                "image_file_meta",
-                "image_poll",
-                "image_file_meta",
-                "image_download"
-            ]
+        assert_eq!(initial_calls.len(), 14);
+        assert_eq!(initial_calls[0], "refresh_me");
+        assert!(
+            initial_calls[1..3]
+                .iter()
+                .map(String::as_str)
+                .eq(["refresh_init", "refresh_check"])
+                || initial_calls[1..3]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["refresh_check", "refresh_init"]),
+            "metadata refresh calls may complete in either order: {initial_calls:?}"
         );
+        assert!(initial_calls[3..].iter().map(String::as_str).eq([
+            "bootstrap",
+            "requirements_prepare",
+            "requirements_finalize",
+            "image_prepare",
+            "image_run",
+            "recent_conversations",
+            "image_poll",
+            "image_file_meta",
+            "image_poll",
+            "image_file_meta",
+            "image_download"
+        ]));
         drop(initial_calls);
 
         block_next_image_run.store(true, Ordering::SeqCst);
