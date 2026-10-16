@@ -11652,7 +11652,7 @@ async fn native_upload_image_with_file_name(
         .as_deref()
         .ok_or_else(ApiError::unavailable)?
         .trim_end_matches('/');
-    let mut request = native_browser_headers_with_clearance(
+    let request = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{path}")),
         context,
         &format!("{base_url}/"),
@@ -11673,9 +11673,6 @@ async fn native_upload_image_with_file_name(
         "width": width,
         "height": height,
     }));
-    if let Some(account_id) = lease.chatgpt_account_id() {
-        request = request.header("ChatGPT-Account-ID", account_id);
-    }
     let response = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send())
         .await
         .map_err(|_| ApiError::upstream())?
@@ -11769,7 +11766,7 @@ async fn native_upload_image_with_file_name(
         return Err(ApiError::upstream());
     }
     let uploaded_path = format!("/backend-api/files/{file_id}/uploaded");
-    let mut confirm = native_browser_headers_with_clearance(
+    let confirm = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{uploaded_path}")),
         context,
         &format!("{base_url}/"),
@@ -11784,9 +11781,6 @@ async fn native_upload_image_with_file_name(
     .header(header::ACCEPT, "application/json")
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .body("{}");
-    if let Some(account_id) = lease.chatgpt_account_id() {
-        confirm = confirm.header("ChatGPT-Account-ID", account_id);
-    }
     let response = tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, confirm.send())
         .await
         .map_err(|_| ApiError::upstream())?
@@ -12051,6 +12045,7 @@ fn native_collect_image_message_ids(value: &Value, ids: &mut Vec<String>, depth:
         .and_then(Value::as_object)
         .and_then(|author| author.get("role"))
         .and_then(Value::as_str)
+        .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_default();
     let metadata = message.get("metadata").unwrap_or(&Value::Null);
     let content = message.get("content").unwrap_or(&Value::Null);
@@ -12228,7 +12223,7 @@ async fn native_query_image_task_error(
     {
         return None;
     }
-    let mut request = native_browser_headers_with_clearance(
+    let request = native_browser_headers_with_clearance(
         client.get(format!("{base_url}{path}")),
         context,
         &format!("{base_url}/"),
@@ -12243,9 +12238,6 @@ async fn native_query_image_task_error(
     .header("X-OpenAI-Target-Path", path)
     .header("X-OpenAI-Target-Route", path)
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
-    if let Some(account_id) = lease.chatgpt_account_id() {
-        request = request.header("ChatGPT-Account-ID", account_id);
-    }
     let response = tokio::time::timeout_at(
         tokio::time::Instant::from_std(check_deadline),
         request.send(),
@@ -12390,7 +12382,7 @@ async fn native_recover_image_conversation_id(
     {
         return None;
     }
-    let mut request = native_browser_headers_with_clearance(
+    let request = native_browser_headers_with_clearance(
         client.get(format!("{base_url}{path}")),
         context,
         &format!("{base_url}/"),
@@ -12405,9 +12397,6 @@ async fn native_recover_image_conversation_id(
     .header("X-OpenAI-Target-Path", path)
     .header("X-OpenAI-Target-Route", path)
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
-    if let Some(account_id) = lease.chatgpt_account_id() {
-        request = request.header("ChatGPT-Account-ID", account_id);
-    }
     let response = tokio::time::timeout_at(
         tokio::time::Instant::from_std(check_deadline),
         request.send(),
@@ -12561,7 +12550,7 @@ async fn native_poll_image_file_ids(
         }
         let path = format!("/backend-api/conversation/{conversation_id}");
         let referer = format!("{base_url}/c/{conversation_id}");
-        let mut request = native_browser_headers_with_clearance(
+        let request = native_browser_headers_with_clearance(
             client.get(format!("{base_url}{path}")),
             context,
             &referer,
@@ -12576,9 +12565,6 @@ async fn native_poll_image_file_ids(
         .header("X-OpenAI-Target-Path", path.as_str())
         .header("X-OpenAI-Target-Route", path.as_str())
         .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
-        if let Some(account_id) = lease.chatgpt_account_id() {
-            request = request.header("ChatGPT-Account-ID", account_id);
-        }
         let response =
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send()).await;
         let response = match response {
@@ -12664,7 +12650,6 @@ async fn native_download_image_files(
         .ok_or_else(ApiError::unavailable)?
         .trim_end_matches('/');
     let mut outputs = Vec::new();
-    let mut missing_output = false;
     for id in ids {
         let candidates = if let Some(attachment_id) = id.strip_prefix("sediment://") {
             vec![
@@ -12713,9 +12698,6 @@ async fn native_download_image_files(
             if with_file_query {
                 request = request.query(&[("post_id", ""), ("inline", "false")]);
             }
-            if let Some(account_id) = lease.chatgpt_account_id() {
-                request = request.header("ChatGPT-Account-ID", account_id);
-            }
             let response = match tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
                 request.send(),
@@ -12758,9 +12740,6 @@ async fn native_download_image_files(
             if url.starts_with(base_url) {
                 blob_request =
                     blob_request.header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
-                if let Some(account_id) = lease.chatgpt_account_id() {
-                    blob_request = blob_request.header("ChatGPT-Account-ID", account_id);
-                }
             }
             let response = tokio::time::timeout_at(
                 tokio::time::Instant::from_std(deadline),
@@ -12770,21 +12749,16 @@ async fn native_download_image_files(
             .map_err(|_| ApiError::upstream())?
             .map_err(|_| ApiError::upstream())?;
             if !response.status().is_success() {
-                continue;
+                return Err(ApiError::upstream());
             }
             downloaded = Some(bounded_response_body(response).await?);
             break;
         }
-        if let Some(downloaded) = downloaded {
-            if !outputs.contains(&downloaded) {
-                outputs.push(downloaded);
-            }
-        } else {
-            missing_output = true;
+        if let Some(downloaded) = downloaded
+            && !outputs.contains(&downloaded)
+        {
+            outputs.push(downloaded);
         }
-    }
-    if missing_output && !outputs.is_empty() {
-        return Err(ApiError::upstream());
     }
     Ok(outputs)
 }
@@ -12836,13 +12810,12 @@ fn native_spawn_image_cleanup(
     let proxy_url = lease.proxy_url().unwrap_or_default().to_owned();
     let base_url = state.config.upstream_base_url.clone().unwrap_or_default();
     let token = lease.token().to_owned();
-    let account_id = lease.chatgpt_account_id().map(ToOwned::to_owned);
     let context = context.clone();
     let conversation_id = conversation_id.to_owned();
     tokio::spawn(async move {
         let base_url = base_url.trim_end_matches('/');
         let path = format!("/backend-api/conversation/{conversation_id}");
-        let mut request = native_browser_headers_with_clearance(
+        let request = native_browser_headers_with_clearance(
             client.patch(format!("{base_url}{path}")),
             &context,
             &format!("{base_url}/c/{conversation_id}"),
@@ -12859,9 +12832,6 @@ fn native_spawn_image_cleanup(
         .header("X-OpenAI-Target-Route", path.as_str())
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
         .json(&json!({"is_visible": false}));
-        if let Some(account_id) = account_id {
-            request = request.header("ChatGPT-Account-ID", account_id);
-        }
         match tokio::time::timeout(NATIVE_UPSTREAM_TIMEOUT, request.send()).await {
             Ok(Ok(response)) if response.status().is_success() => {
                 log::info!("image conversation hidden: conversation_id={conversation_id}");
@@ -13275,10 +13245,10 @@ async fn native_web_image_request_single(
                         index,
                         attempted_tokens.len(),
                     );
-                    if !result
+                    if result
                         .as_ref()
                         .err()
-                        .is_some_and(|(error, _)| error.code() == "upstream_model_not_found")
+                        .is_none_or(|(error, _)| error.code() != "upstream_model_not_found")
                     {
                         break;
                     }
@@ -13687,9 +13657,9 @@ async fn native_web_image_attempt(
         "client_contextual_info": {
             "is_dark_mode": false,
             "time_since_loaded": 1200,
-            "page_height": 900,
-            "page_width": 1400,
-            "pixel_ratio": 2,
+            "page_height": 1072,
+            "page_width": 1724,
+            "pixel_ratio": 1.2,
             "screen_height": 1440,
             "screen_width": 2560,
             "app_name": "chatgpt.com",
@@ -15489,7 +15459,7 @@ async fn native_search_attempt(
         "client_contextual_info": {"app_name": "chatgpt.com"}
     });
     let client = upstream_client_for_lease(state, lease, false);
-    let mut request = native_browser_headers_with_clearance(
+    let request = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{prepare_path}")),
         &context,
         &format!("{base_url}/"),
@@ -15506,9 +15476,6 @@ async fn native_search_attempt(
     .header("X-OpenAI-Target-Route", prepare_path)
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .json(&prepare_payload);
-    if let Some(account_id) = lease.chatgpt_account_id() {
-        request = request.header("ChatGPT-Account-ID", account_id);
-    }
     let prepare = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
         .await
         .map_err(|_| (ApiError::upstream(), false))?
@@ -15621,9 +15588,6 @@ async fn native_search_attempt(
     )
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .json(&run_payload);
-    if let Some(account_id) = lease.chatgpt_account_id() {
-        request = request.header("ChatGPT-Account-ID", account_id);
-    }
     if let Some(value) = requirements.so_token {
         request = request.header("OpenAI-Sentinel-SO-Token", value);
     }
@@ -15654,7 +15618,6 @@ async fn native_search_attempt(
         client: &client,
         base_url,
         token: lease.token(),
-        account_id: lease.chatgpt_account_id(),
         context: &context,
         conversation_id,
         deadline,
@@ -15669,7 +15632,6 @@ struct NativeSearchPollRequest<'a> {
     client: &'a Client,
     base_url: &'a str,
     token: &'a str,
-    account_id: Option<&'a str>,
     context: &'a NativeRequestContext,
     conversation_id: String,
     deadline: Instant,
@@ -15690,7 +15652,6 @@ async fn native_search_poll(
         state,
         base_url,
         token,
-        account_id,
         context,
         conversation_id,
         deadline,
@@ -15705,7 +15666,7 @@ async fn native_search_poll(
         }
         let poll_path = format!("/backend-api/conversation/{conversation_id}");
         let referer = format!("{base_url}/c/{conversation_id}");
-        let mut request = native_browser_headers_with_clearance(
+        let request = native_browser_headers_with_clearance(
             client.get(format!("{base_url}{poll_path}")),
             context,
             &referer,
@@ -15720,9 +15681,6 @@ async fn native_search_poll(
         .header("X-OpenAI-Target-Path", poll_path.as_str())
         .header("X-OpenAI-Target-Route", poll_path.as_str())
         .header(header::AUTHORIZATION, format!("Bearer {token}"));
-        if let Some(account_id) = account_id {
-            request = request.header("ChatGPT-Account-ID", account_id);
-        }
         let poll =
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send()).await;
         let poll = match poll {
@@ -20984,9 +20942,6 @@ async fn fetch_native_model_catalog_with_outcome(
         .header("X-OpenAI-Target-Path", target_path)
         .header("X-OpenAI-Target-Route", target_path);
         request = request.header(header::AUTHORIZATION, format!("Bearer {}", identity.token));
-        if let Some(account_id) = identity.account_id {
-            request = request.header("ChatGPT-Account-ID", account_id);
-        }
         let response =
             match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
                 .await
@@ -29985,12 +29940,6 @@ mod tests {
                         );
                         assert_eq!(
                             headers
-                                .get("ChatGPT-Account-ID")
-                                .and_then(|value| value.to_str().ok()),
-                            Some("acct-editable-pro")
-                        );
-                        assert_eq!(
-                            headers
                                 .get("X-Conduit-Token")
                                 .and_then(|value| value.to_str().ok()),
                             Some("no-token")
@@ -30030,12 +29979,6 @@ mod tests {
                         );
                         assert_eq!(
                             headers
-                                .get("ChatGPT-Account-ID")
-                                .and_then(|value| value.to_str().ok()),
-                            Some("acct-editable-pro")
-                        );
-                        assert_eq!(
-                            headers
                                 .get("OpenAI-Sentinel-Chat-Requirements-Token")
                                 .and_then(|value| value.to_str().ok()),
                             Some("requirements-token")
@@ -30071,12 +30014,6 @@ mod tests {
                                     .get(header::AUTHORIZATION)
                                     .and_then(|value| value.to_str().ok()),
                                 Some("Bearer editable-pro-web")
-                            );
-                            assert_eq!(
-                                headers
-                                    .get("ChatGPT-Account-ID")
-                                    .and_then(|value| value.to_str().ok()),
-                                Some("acct-editable-pro")
                             );
                             assert_eq!(
                                 headers
@@ -30135,12 +30072,6 @@ mod tests {
                             );
                             assert_eq!(
                                 headers
-                                    .get("ChatGPT-Account-ID")
-                                    .and_then(|value| value.to_str().ok()),
-                                Some("acct-editable-pro")
-                            );
-                            assert_eq!(
-                                headers
                                     .get("X-OpenAI-Target-Route")
                                     .and_then(|value| value.to_str().ok()),
                                 Some(
@@ -30171,12 +30102,6 @@ mod tests {
                                         .get(header::AUTHORIZATION)
                                         .and_then(|value| value.to_str().ok()),
                                     Some("Bearer editable-pro-web")
-                                );
-                                assert_eq!(
-                                    headers
-                                        .get("ChatGPT-Account-ID")
-                                        .and_then(|value| value.to_str().ok()),
-                                    Some("acct-editable-pro")
                                 );
                                 assert_eq!(
                                     headers
@@ -30592,12 +30517,6 @@ mod tests {
                                 .and_then(|value| value.to_str().ok()),
                             Some("Bearer editable-team-web")
                         );
-                        assert_eq!(
-                            headers
-                                .get("ChatGPT-Account-ID")
-                                .and_then(|value| value.to_str().ok()),
-                            Some("acct-editable-team")
-                        );
                         for name in ["X-OpenAI-Target-Path", "X-OpenAI-Target-Route"] {
                             assert_eq!(
                                 headers.get(name).and_then(|value| value.to_str().ok()),
@@ -30783,7 +30702,7 @@ mod tests {
                 let metadata_calls = calls.clone();
                 let metadata =
                     get(
-                        move |headers: HeaderMap,
+                        move |_headers: HeaderMap,
                               AxumPath((conversation_id, artifact_id)): AxumPath<(
                             String,
                             String,
@@ -30792,12 +30711,6 @@ mod tests {
                             async move {
                                 assert_eq!(conversation_id, "editable-psd-conversation");
                                 assert!(matches!(artifact_id.as_str(), "file-psd" | "file-layers"));
-                                assert_eq!(
-                                    headers
-                                        .get("ChatGPT-Account-ID")
-                                        .and_then(|value| value.to_str().ok()),
-                                    Some("acct-editable-team")
-                                );
                                 calls.lock().await.push(format!("metadata:{artifact_id}"));
                                 Json(json!({
                                     "download_url":format!("http://{address}/artifact/{artifact_id}")
@@ -51138,17 +51051,6 @@ data: [DONE]
                                 assert!(authorization
                                     .as_deref()
                                     .is_some_and(|value| value.starts_with("Bearer ")));
-                                let expected_account_id = match authorization.as_deref() {
-                                    Some("Bearer codex-token") => Some("codex-account"),
-                                    _ => None,
-                                };
-                                assert_eq!(
-                                    request
-                                        .headers()
-                                        .get("ChatGPT-Account-ID")
-                                        .and_then(|value| value.to_str().ok()),
-                                    expected_account_id
-                                );
                                 auth_model_authorizations_for_upstream
                                     .lock()
                                     .expect("auth model calls lock")
@@ -51550,11 +51452,7 @@ data: [DONE]
                             .get("X-OpenAI-Target-Route")
                             .and_then(|value| value.to_str().ok())
                             == Some("/backend-api/models")
-                        && request
-                            .headers()
-                            .get("ChatGPT-Account-ID")
-                            .and_then(|value| value.to_str().ok())
-                            == Some("account-id");
+                        && request.headers().get("ChatGPT-Account-ID").is_none();
                     checks.lock().expect("checks lock").push(valid);
                     Json(json!({"models":[
                         {"slug":"web-catalog-model"},
@@ -51668,13 +51566,6 @@ data: [DONE]
                             .and_then(|value| value.to_str().ok()),
                         Some("Bearer representative")
                     );
-                    assert_eq!(
-                        request
-                            .headers()
-                            .get("ChatGPT-Account-ID")
-                            .and_then(|value| value.to_str().ok()),
-                        Some("account-id")
-                    );
                     Json(json!({"models":[
                         {"slug":"web-catalog-model"},
                         {"slug":"gpt-5-codex"},
@@ -51694,13 +51585,6 @@ data: [DONE]
                             .get(header::AUTHORIZATION)
                             .and_then(|value| value.to_str().ok()),
                         Some("Bearer representative")
-                    );
-                    assert_eq!(
-                        request
-                            .headers()
-                            .get("ChatGPT-Account-ID")
-                            .and_then(|value| value.to_str().ok()),
-                        Some("account-id")
                     );
                     Json(json!({"models":[
                         {"slug":"tpp-model"},
@@ -55726,6 +55610,22 @@ data: [DONE]
             ]
         );
     }
+    #[test]
+    fn native_image_result_ids_normalize_python_message_role() {
+        let mut ids = Vec::new();
+        native_collect_image_message_ids(
+            &json!({
+                "message": {
+                    "author": {"role": " Assistant "},
+                    "metadata": {"async_task_type": "image_gen"},
+                    "content": {"parts": ["file-service://generated-image"]}
+                }
+            }),
+            &mut ids,
+            0,
+        );
+        assert_eq!(ids, ["generated-image"]);
+    }
 
     #[test]
     fn native_chat_image_values_normalize_python_user_role() {
@@ -56253,7 +56153,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_image_download_rejects_mixed_failure_and_deduplicates_bodies() {
+    async fn native_image_download_skips_missing_and_deduplicates_bodies() {
         let root = account_snapshot_path("native-image-download-mixture").with_extension("dir");
         fs::create_dir_all(&root).expect("image download test root");
         let accounts_path = root.join("accounts.json");
@@ -56333,10 +56233,8 @@ data: [DONE]
         )
         .await;
         assert_eq!(
-            mixed
-                .expect_err("mixed download success and failure must fail")
-                .code(),
-            "upstream_error"
+            mixed.expect("Python skips missing URLs and keeps successful image bytes"),
+            vec![b"same-image-bytes".to_vec()]
         );
 
         let identical = native_download_image_files(
@@ -56776,9 +56674,9 @@ data: [DONE]
                 .is_none(),
             "generation requests omit Python's optional attachments field"
         );
-        assert_eq!(run_payload["client_contextual_info"]["page_height"], 900);
-        assert_eq!(run_payload["client_contextual_info"]["page_width"], 1400);
-        assert_eq!(run_payload["client_contextual_info"]["pixel_ratio"], 2);
+        assert_eq!(run_payload["client_contextual_info"]["page_height"], 1072);
+        assert_eq!(run_payload["client_contextual_info"]["page_width"], 1724);
+        assert_eq!(run_payload["client_contextual_info"]["pixel_ratio"], 1.2);
         let initial_calls = calls.lock().await;
         assert_eq!(initial_calls.len(), 14);
         let mut metadata_calls = initial_calls[..3].to_vec();
@@ -60181,7 +60079,6 @@ data: [DONE]
             client: &client,
             base_url: &base_url,
             token: "search-token",
-            account_id: None,
             context: &context,
             conversation_id: "poll-conversation".to_owned(),
             deadline: Instant::now() + deadline_duration,
@@ -60251,7 +60148,6 @@ data: [DONE]
             client: &client,
             base_url: &base_url,
             token: "search-token",
-            account_id: None,
             context: &context,
             conversation_id: "poll-conversation".to_owned(),
             deadline: Instant::now() + Duration::from_secs(1),

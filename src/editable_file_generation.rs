@@ -882,7 +882,7 @@ async fn authenticated_request(
     path: &str,
     route: &str,
 ) -> RequestBuilder {
-    let request = native_browser_headers_with_clearance(
+    native_browser_headers_with_clearance(
         request,
         context,
         referer,
@@ -899,11 +899,7 @@ async fn authenticated_request(
     .await
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .header("X-OpenAI-Target-Path", path)
-    .header("X-OpenAI-Target-Route", route);
-    match lease.chatgpt_account_id() {
-        Some(account_id) => request.header("ChatGPT-Account-ID", account_id),
-        None => request,
-    }
+    .header("X-OpenAI-Target-Route", route)
 }
 
 fn editable_image_input(value: &str) -> Result<(Vec<u8>, String, u32, u32), TaskFailure> {

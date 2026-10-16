@@ -165,19 +165,15 @@ fn proxy_runtime_defaults_with(get: &impl Fn(&str) -> Option<String>) -> Value {
     let clearance_mode = if !clearance_enabled {
         "none".to_owned()
     } else {
-        match text_or(
-            get("CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE"),
-            "flaresolverr",
-        )
-        .to_ascii_lowercase()
-        .as_str()
+        match text_or(get("CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE"), "none")
+            .to_ascii_lowercase()
+            .as_str()
         {
-            "none" | "manual" | "flaresolverr" => text_or(
-                get("CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE"),
-                "flaresolverr",
-            )
-            .to_ascii_lowercase(),
-            _ => "flaresolverr".to_owned(),
+            "none" | "manual" | "flaresolverr" => {
+                text_or(get("CHATGPT2API_PROXY_RUNTIME_CLEARANCE_MODE"), "none")
+                    .to_ascii_lowercase()
+            }
+            _ => "none".to_owned(),
         }
     };
     let egress_mode = match text_or(get("CHATGPT2API_PROXY_RUNTIME_EGRESS_MODE"), "direct")
@@ -351,6 +347,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_runtime_clearance_enabled_defaults_to_none_like_python() {
+        let runtime = proxy_runtime_defaults_with(&|name| match name {
+            "CHATGPT2API_PROXY_RUNTIME_CLEARANCE_ENABLED" => Some("true".to_owned()),
+            _ => None,
+        });
+        assert_eq!(runtime["clearance"]["enabled"], true);
+        assert_eq!(runtime["clearance"]["mode"], "none");
+    }
     #[test]
     fn proxy_runtime_defaults_are_safe_when_warp_environment_is_absent() {
         let runtime = proxy_runtime_defaults_with(&|_| None);
