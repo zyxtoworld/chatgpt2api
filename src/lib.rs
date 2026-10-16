@@ -12650,6 +12650,7 @@ async fn native_download_image_files(
         .ok_or_else(ApiError::unavailable)?
         .trim_end_matches('/');
     let mut outputs = Vec::new();
+    let mut missing_output = false;
     for id in ids {
         let candidates = if let Some(attachment_id) = id.strip_prefix("sediment://") {
             vec![
@@ -12749,16 +12750,21 @@ async fn native_download_image_files(
             .map_err(|_| ApiError::upstream())?
             .map_err(|_| ApiError::upstream())?;
             if !response.status().is_success() {
-                return Err(ApiError::upstream());
+                continue;
             }
             downloaded = Some(bounded_response_body(response).await?);
             break;
         }
-        if let Some(downloaded) = downloaded
-            && !outputs.contains(&downloaded)
-        {
-            outputs.push(downloaded);
+        if let Some(downloaded) = downloaded {
+            if !outputs.contains(&downloaded) {
+                outputs.push(downloaded);
+            }
+        } else {
+            missing_output = true;
         }
+    }
+    if missing_output && !outputs.is_empty() {
+        return Err(ApiError::upstream());
     }
     Ok(outputs)
 }
@@ -56153,7 +56159,7 @@ data: [DONE]
     }
 
     #[tokio::test]
-    async fn native_image_download_skips_missing_and_deduplicates_bodies() {
+    async fn native_image_download_rejects_mixed_failure_and_deduplicates_bodies() {
         let root = account_snapshot_path("native-image-download-mixture").with_extension("dir");
         fs::create_dir_all(&root).expect("image download test root");
         let accounts_path = root.join("accounts.json");
@@ -56233,8 +56239,10 @@ data: [DONE]
         )
         .await;
         assert_eq!(
-            mixed.expect("Python skips missing URLs and keeps successful image bytes"),
-            vec![b"same-image-bytes".to_vec()]
+            mixed
+                .expect_err("mixed download success and failure must fail")
+                .code(),
+            "upstream_error"
         );
 
         let identical = native_download_image_files(
