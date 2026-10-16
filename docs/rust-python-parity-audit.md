@@ -933,4 +933,6 @@ GitHub Actions run `37799423886` 暴露一项并发回归：PPT 任务仍持有 
 
 新增/更新图片 header、浮点 create time 和 search tie-break 回归；未改变 access-token-only、Rust-only Codex/WebSocket/ccLoad、错误脱敏或资源/路径/CAS/fail-closed 边界。
 
-本轮最终本地验证：`cargo test --workspace --offline -- --test-threads=1` 为 Rust lib `588 passed / 0 failed / 5 ignored`、file-identity `6 passed`，main/doc-tests 无失败；`cargo clippy --workspace --offline --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo check --workspace --offline` 和 `git diff --check` 通过。Web Node runner `376 passed / 0 failed`，本地 `tsc --noEmit` 和 Next production build 通过。GitHub Actions 镜像构建、部署和真实线上请求尚未执行。
+本轮最终本地验证：`cargo test --workspace --offline -- --test-threads=1` 为 Rust lib `588 passed / 0 failed / 5 ignored`、file-identity `6 passed`，main/doc-tests 无失败；`cargo clippy --workspace --offline --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo check --workspace --offline` 和 `git diff --check` 通过。Web Node runner `376 passed / 0 failed`，本地 `tsc --noEmit` 和 Next production build 通过。
+
+GitHub Actions run `38854709232` 对 commit `f35b6f7c` 完成 verify 与 amd64/arm64 Docker build/push。随后通过生产 SSH deployment wrapper 更新 `chatgpt2api`；远程 probe 验证容器 revision 为 `f35b6f7c`、状态 `running/true/healthy`，并验证 `/health?format=json`、`/version` 与 `/v1/images/generations` 返回成功。公网 health/version 复验均 HTTP 200，version 为 `1.8.0`。
