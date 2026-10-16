@@ -40,9 +40,9 @@ use super::{
     atomic_replace_checked_with_limit, authenticated_subject, bounded_response_body,
     editable_capability_digest, editable_file_tasks_path, editable_relative_path,
     native_bootstrap_with_timeout_context, native_browser_headers_with_clearance,
-    native_chat_requirements_with_resources_for_route_context, native_created, native_image_input,
-    native_message_id, read_editable_task_records, read_editable_task_records_at,
-    search_conversation_id_from_response, valid_editable_task_id,
+    native_chat_requirements_with_resources_for_route_context, native_created_f64,
+    native_image_input, native_message_id, read_editable_task_records,
+    read_editable_task_records_at, search_conversation_id_from_response, valid_editable_task_id,
 };
 
 const MAX_EDITABLE_REFERENCE_IMAGES: usize = 16;
@@ -882,7 +882,7 @@ async fn authenticated_request(
     path: &str,
     route: &str,
 ) -> RequestBuilder {
-    native_browser_headers_with_clearance(
+    let mut request = native_browser_headers_with_clearance(
         request,
         context,
         referer,
@@ -897,9 +897,13 @@ async fn authenticated_request(
         None,
     )
     .await
-    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
-    .header("X-OpenAI-Target-Path", path)
-    .header("X-OpenAI-Target-Route", route)
+    .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()));
+    if let Some(account_id) = lease.chatgpt_account_id() {
+        request = request.header("ChatGPT-Account-ID", account_id);
+    }
+    request
+        .header("X-OpenAI-Target-Path", path)
+        .header("X-OpenAI-Target-Route", route)
 }
 
 fn editable_image_input(value: &str) -> Result<(Vec<u8>, String, u32, u32), TaskFailure> {
@@ -1133,7 +1137,7 @@ async fn run_editable_conversation(
     let mut message = json!({
         "id": native_message_id(),
         "author": {"role":"user"},
-        "create_time": native_created(),
+        "create_time": native_created_f64(),
     });
     if uploads.is_empty() {
         message["content"] = json!({"content_type":"text","parts":[prompt]});
@@ -1217,14 +1221,8 @@ async fn run_editable_conversation(
         requirements.token,
     )
     .json(&payload);
-    if let Some(value) = requirements.so_token {
-        request = request.header("OpenAI-Sentinel-SO-Token", value);
-    }
     if let Some(value) = requirements.proof_token {
         request = request.header("OpenAI-Sentinel-Proof-Token", value);
-    }
-    if let Some(value) = requirements.turnstile_token {
-        request = request.header("OpenAI-Sentinel-Turnstile-Token", value);
     }
     let response = send_before_deadline(request, deadline).await?;
     if !response.status().is_success() {

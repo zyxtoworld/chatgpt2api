@@ -926,3 +926,11 @@ GitHub Actions run `37799423886` 暴露一项并发回归：PPT 任务仍持有 
 - `gpt-image-2` 仍先使用 Python v1.7 的 `gpt-5-3`，仅在上游明确返回 model-not-found 时按候选顺序尝试 `auto`、`gpt-5-5`、`gpt-5-5-thinking`、`gpt-5-5-max`，不对任意 404 静默重试。
 
 验证：GitHub Actions run `38816349678` 完成 Rust/Web 检查、测试、审计和多架构镜像构建；线上容器 revision `7a5c0f0d` 为 `running/healthy`。使用真实线上 `/v1/images/generations` 请求复验返回 HTTP 200，响应含 `data[0].url`，容器 health 为 healthy。
+
+## 2026-10-16 第五十一轮纯人工复核：匿名模型目录与协议请求边界
+
+本轮继续只用 `read` 逐段对照 Python v1.7 的 `openai_v1_models.py`、`openai_backend_api.py`、`openai_search.py`、`conversation.py`、`editable_file_task_service.py` 与 Rust 对应路由。Rust 账号类型模型目录、Chat/搜索暂态 failover 等已存在的 Rust 扩展保持不动；确认并修复的实际共享链路差异为：图片 prepare 请求补齐 Python `_image_headers` 所需 requirements/proof 头，图片/search/editable run 请求移除 Python 未发送的 SO/turnstile 头；普通图片、搜索和 editable 消息时间戳使用 Python 的浮点 epoch；搜索相同时间 assistant 结果按 Python `max` 的先出现项保留。现有来源凭据过滤、图片混合下载失败边界及 Rust 账号目录能力投影保持不变。
+
+新增/更新图片 header、浮点 create time 和 search tie-break 回归；未改变 access-token-only、Rust-only Codex/WebSocket/ccLoad、错误脱敏或资源/路径/CAS/fail-closed 边界。
+
+本轮最终本地验证：`cargo test --workspace --offline -- --test-threads=1` 为 Rust lib `588 passed / 0 failed / 5 ignored`、file-identity `6 passed`，main/doc-tests 无失败；`cargo clippy --workspace --offline --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo check --workspace --offline` 和 `git diff --check` 通过。Web Node runner `376 passed / 0 failed`，本地 `tsc --noEmit` 和 Next production build 通过。GitHub Actions 镜像构建、部署和真实线上请求尚未执行。

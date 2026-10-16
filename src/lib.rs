@@ -13502,7 +13502,7 @@ async fn native_web_image_attempt(
     if let Some(callback) = request.progress_callback.as_ref() {
         callback("preparing_conversation");
     }
-    let prepare = native_browser_headers_with_clearance(
+    let mut prepare = native_browser_headers_with_clearance(
         client.post(format!("{base_url}{prepare_path}")),
         &context,
         &format!("{base_url}/"),
@@ -13516,8 +13516,15 @@ async fn native_web_image_attempt(
     .header(header::ACCEPT, "*/*")
     .header("X-OpenAI-Target-Path", prepare_path)
     .header("X-OpenAI-Target-Route", prepare_path)
+    .header(
+        "OpenAI-Sentinel-Chat-Requirements-Token",
+        requirements.token.as_str(),
+    )
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .json(&prepare_payload);
+    if let Some(value) = requirements.proof_token.as_deref() {
+        prepare = prepare.header("OpenAI-Sentinel-Proof-Token", value);
+    }
     let prepare = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), prepare.send())
         .await
         .map_err(|_| (ApiError::upstream_detail("operation timed out"), true))?
@@ -13646,7 +13653,7 @@ async fn native_web_image_attempt(
         "messages": [{
             "id": native_message_id(),
             "author": {"role": "user"},
-            "create_time": native_created(),
+            "create_time": native_created_f64(),
             "content": content,
             "metadata": message_metadata,
         }],
@@ -13699,14 +13706,8 @@ async fn native_web_image_attempt(
     )
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .json(&run_payload);
-    if let Some(value) = requirements.so_token {
-        run = run.header("OpenAI-Sentinel-SO-Token", value);
-    }
     if let Some(value) = requirements.proof_token {
         run = run.header("OpenAI-Sentinel-Proof-Token", value);
-    }
-    if let Some(value) = requirements.turnstile_token {
-        run = run.header("OpenAI-Sentinel-Turnstile-Token", value);
     }
     let response = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), run.send())
         .await
@@ -15538,7 +15539,7 @@ async fn native_search_attempt(
         "messages": [{
             "id": native_message_id(),
             "author": {"role": "user"},
-            "create_time": native_created(),
+            "create_time": native_created_f64(),
             "content": {"content_type": "text", "parts": [prompt]},
             "metadata": {
                 "developer_mode_connector_ids": [],
@@ -15594,14 +15595,8 @@ async fn native_search_attempt(
     )
     .header(header::AUTHORIZATION, format!("Bearer {}", lease.token()))
     .json(&run_payload);
-    if let Some(value) = requirements.so_token {
-        request = request.header("OpenAI-Sentinel-SO-Token", value);
-    }
     if let Some(value) = requirements.proof_token {
         request = request.header("OpenAI-Sentinel-Proof-Token", value);
-    }
-    if let Some(value) = requirements.turnstile_token {
-        request = request.header("OpenAI-Sentinel-Turnstile-Token", value);
     }
     let run = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
         .await
@@ -16266,7 +16261,7 @@ fn extract_search_result(conversation_id: &str, conversation: &Value) -> Value {
                 .and_then(Value::as_f64)
                 .filter(|value| value.is_finite() && *value >= 0.0)
                 .unwrap_or(0.0);
-            if selected.is_none() || create_time >= selected_time {
+            if selected.is_none() || create_time > selected_time {
                 selected = Some(message);
                 selected_time = create_time;
             }
@@ -20860,6 +20855,7 @@ struct NativeModelIdentity<'a> {
     token: &'a str,
     account_type: Option<&'a str>,
     account_id: Option<&'a str>,
+    send_account_id: bool,
 }
 
 enum NativeModelCatalogFetchOutcome {
@@ -20948,6 +20944,11 @@ async fn fetch_native_model_catalog_with_outcome(
         .header("X-OpenAI-Target-Path", target_path)
         .header("X-OpenAI-Target-Route", target_path);
         request = request.header(header::AUTHORIZATION, format!("Bearer {}", identity.token));
+        if identity.send_account_id
+            && let Some(account_id) = identity.account_id.filter(|value| !value.trim().is_empty())
+        {
+            request = request.header("ChatGPT-Account-ID", account_id);
+        }
         let response =
             match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), request.send())
                 .await
@@ -21039,6 +21040,7 @@ pub(crate) async fn fetch_imported_model_catalog(
         account_type: account_type.to_owned(),
         token: token.to_owned(),
         account_id: account_id.map(ToOwned::to_owned),
+        send_account_id: false,
         deadline,
         batch: None,
         retry: true,
@@ -21067,6 +21069,7 @@ pub(crate) async fn fetch_imported_account_model_catalog(
         account_type: account_type.to_owned(),
         token: token.to_owned(),
         account_id: account_id.map(ToOwned::to_owned),
+        send_account_id: true,
         deadline,
         batch,
         retry: true,
@@ -21082,6 +21085,7 @@ struct ImportedModelCatalogRequest {
     account_type: String,
     token: String,
     account_id: Option<String>,
+    send_account_id: bool,
     deadline: Instant,
     batch: Option<Arc<ImportedModelCatalogBatchStats>>,
     retry: bool,
@@ -21098,6 +21102,7 @@ async fn fetch_imported_model_catalog_request(
         account_type,
         token,
         account_id,
+        send_account_id,
         deadline,
         batch,
         retry,
@@ -21119,6 +21124,7 @@ async fn fetch_imported_model_catalog_request(
                 account_type,
                 token,
                 account_id,
+                send_account_id,
             })
             .await
         } else {
@@ -21131,6 +21137,7 @@ async fn fetch_imported_model_catalog_request(
                     token: &token,
                     account_type: Some(account_type.as_str()),
                     account_id: account_id.as_deref(),
+                    send_account_id,
                 },
                 "",
                 deadline,
@@ -21165,6 +21172,7 @@ struct NativeModelCatalogRetryRequest {
     account_type: String,
     token: String,
     account_id: Option<String>,
+    send_account_id: bool,
 }
 
 async fn fetch_imported_native_model_catalog_with_retry(
@@ -21180,6 +21188,7 @@ async fn fetch_imported_native_model_catalog_with_retry(
         account_type,
         token,
         account_id,
+        send_account_id,
     } = request;
     for attempt in 0..IMPORTED_MODEL_CATALOG_MAX_ATTEMPTS {
         cache.record_attempt(&key).await;
@@ -21195,6 +21204,7 @@ async fn fetch_imported_native_model_catalog_with_retry(
                 token: &token,
                 account_type: Some(account_type.as_str()),
                 account_id: account_id.as_deref(),
+                send_account_id,
             },
             "",
             deadline,
@@ -22111,6 +22121,7 @@ impl AccountTypeCatalog {
                         account_type: account_group.clone(),
                         token: candidate.token.clone(),
                         account_id: candidate.chatgpt_account_id.clone(),
+                        send_account_id: false,
                         deadline,
                         batch: None,
                         retry: false,
@@ -22245,6 +22256,7 @@ impl AccountTypeCatalog {
                 token,
                 account_type,
                 account_id,
+                send_account_id: false,
             },
             &proxy_url,
             deadline,
@@ -23021,6 +23033,12 @@ fn native_created() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+fn native_created_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 fn account_export_timestamp() -> String {
@@ -36054,6 +36072,7 @@ mod tests {
                 account_type: "pro".to_owned(),
                 token: "access-only".to_owned(),
                 account_id: None,
+                send_account_id: false,
             })
             .await;
         assert!(result.is_none());
@@ -44202,7 +44221,6 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             calls.lock().await.as_slice(),
             ["/backend-anon/models?iim=false&is_gizmo=false"]
         );
-
         state.account_type_catalog.shutdown().await;
         upstream.abort();
         let _ = upstream.await;
@@ -56392,6 +56410,13 @@ data: [DONE]
                     request.headers().get("ChatGPT-Account-ID").is_none(),
                     "web image requests must match Python and omit ChatGPT-Account-ID"
                 );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("OpenAI-Sentinel-Chat-Requirements-Token")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("requirements-token")
+                );
                 async move {
                     calls.lock().await.push("image_prepare".to_owned());
                     let body = request
@@ -56414,6 +56439,13 @@ data: [DONE]
                 assert!(
                     request.headers().get("ChatGPT-Account-ID").is_none(),
                     "web image requests must match Python and omit ChatGPT-Account-ID"
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("OpenAI-Sentinel-Chat-Requirements-Token")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("requirements-token")
                 );
                 async move {
                     calls.lock().await.push("image_run".to_owned());
