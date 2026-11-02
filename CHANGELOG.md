@@ -3,10 +3,10 @@
 ## Unreleased
 
 + [修复] ChatGPT 模式 `/v1/models` 改为汇总账号可访问的认证网页模型目录，不再只返回匿名目录；保留 Codex endpoint 与网页图片能力的来源隔离。
-+ [调整] 网页图片别名统一映射到公开目录中的 `auto` 路由，避免依赖未出现在当前网页模型目录中的隐藏 `gpt-5-3`；Codex 图片模型不受影响。
++ [调整] 网页图片能力目录只公开 `gpt-image-2.5`；Codex 图片模型仍独立于网页模型目录。
 + [修复] `/v1/models` 向下游补充 `functionCall`、`reasoning`、`vision`、`search`、`video`、`imageOutput` 等模型能力字段；优先透传上游字段，缺失时对 ChatGPT Web GPT-5/GPT-6 文本模型使用兼容能力档案。
 + [修复] 读取网页模型目录的 `enabled_tools`、`thinking_efforts`、`max_tokens` 元数据，映射为下游 `functionCall`、`search`、`reasoning` 和 `maxOutput`；上游显式能力字段优先级更高。
-+ [修复] 网页图片能力支持 `gpt-image-2`、`gpt-image-2.5` 及其网页图片别名；通过上游 `image_gen` quota 能力确认，不把 Codex 图片模型混入网页目录。
++ [修复] 网页图片请求统一使用 `gpt-image-2.5`，并将其映射到上游 `gpt-6`；不再尝试其它图片别名或 GPT-5 上游模型。
 + [修复] `/v1/models` 不再列出经线上重复请求确认不支持普通 Chat Completions 的 `gpt-5.6-luna-wm`、`gpt-5.6-terra-wm`，也不再为这两个条目推断通用 GPT 文本能力。图片模型仍独立按账号 capability/quota 展示，并已逐个验证生成。
 + [安全] 更新 `rustls-webpki`、`webpki-root-certs`、Tokio 与 Zstd 补丁版本，修复当前 RustSec 数据库报告的传递依赖漏洞。
 + [架构] Rust release 二进制成为 Docker/Compose 的唯一生产运行时入口，私有 `config.json` 保持外置挂载。

@@ -138,7 +138,7 @@ environment:
 - 支持通过 `n` 返回多张生成结果
 - 支持生成可编辑 PPT 文件
 - 支持生成可编辑 PSD 文件
-- 公开图片模型仅来自当前账号已验证的 Web image capability；当前允许的官方集合为 `gpt-image-2`、`gpt-image-2.5`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`，不会在 `/v1/models`、在线图片选择器或 API 文档中宣传 Codex 图片别名，也不会为公开模型目录请求 Codex 模型目录
+- 公开网页图片模型仅为 `gpt-image-2.5`，由上游 GPT-6 执行；`gpt-image-2`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst` 已下线。图片模型仅在当前账号已验证 Web image capability 时出现在 `/v1/models`，Codex 图片模型保持独立，不混入网页目录。
 
 ### 在线画图功能
 
@@ -248,7 +248,7 @@ curl http://localhost:8000/v1/images/generations \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "gpt-image-2.5",
     "prompt": "一只漂浮在太空里的猫",
     "n": 1,
     "response_format": "b64_json",
@@ -263,10 +263,10 @@ curl http://localhost:8000/v1/images/generations \
 
 | 字段                   | 说明                                                                  |
 |:---------------------|:--------------------------------------------------------------------|
-| `model`              | 图片模型，当前可用值以 `/v1/models` 返回结果为准，推荐使用 `gpt-image-2`          |
+| `model`              | 图片模型，当前可用值以 `/v1/models` 返回结果为准，推荐使用 `gpt-image-2.5`        |
 | `prompt`             | 图片生成提示词                                                             |
 | `n`                  | 生成数量，遵循官方图片接口范围 `1-10`                                             |
-| `size`               | `auto`、标准尺寸，或 `gpt-image-2` 的 `WIDTHxHEIGHT`；宽高须为 16 的倍数、比例在 `1:3-3:1`，最大边界为 `3840x2160` |
+| `size`               | `auto`、标准尺寸，或 `gpt-image-2.5` 的 `WIDTHxHEIGHT`；宽高须为 16 的倍数、比例在 `1:3-3:1`，最大边界为 `3840x2160` |
 | `quality`            | `auto`（默认）、`low`、`medium` 或 `high`                                 |
 | `response_format`    | `b64_json`（默认）或 `url`；流式请求只支持 `b64_json`                            |
 | `output_format`      | `png`（默认）、`jpeg` 或 `webp`                                            |
@@ -291,7 +291,7 @@ OpenAI 兼容图片编辑接口，可上传图片文件，也可按 JSON 格式�
 ```bash
 curl http://localhost:8000/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
-  -F "model=gpt-image-2" \
+  -F "model=gpt-image-2.5" \
   -F "prompt=把这张图改成赛博朋克夜景风格" \
   -F "n=1" \
   -F "image=@./input.png"
@@ -304,7 +304,7 @@ curl http://localhost:8000/v1/images/edits \
   -H "Authorization: Bearer <auth-key>" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "gpt-image-2.5",
     "prompt": "把这张图改成赛博朋克夜景风格",
     "images": [
       {"image_url": "data:image/png;base64,<base64-image-data>"}
@@ -316,7 +316,7 @@ curl http://localhost:8000/v1/images/edits \
 
 ```json
 {
-  "model": "gpt-image-2",
+  "model": "gpt-image-2.5",
   "prompt": "把这张图改成赛博朋克夜景风格",
   "images": [
     {"image_url": "https://cdn.example.com/input.png"}
@@ -330,7 +330,7 @@ curl http://localhost:8000/v1/images/edits \
 
 | 字段                   | 说明                                                          |
 |:---------------------|:------------------------------------------------------------|
-| `model`              | 图片模型，`gpt-image-2`                                           |
+| `model`              | 图片模型，`gpt-image-2.5`                                        |
 | `prompt`             | 图片编辑提示词                                                     |
 | `n`                  | 生成数量，遵循官方图片接口范围 `1-10`                                 |
 | `image`              | 需要编辑的图片文件，使用 multipart/form-data 上传                         |
@@ -366,7 +366,7 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <auth-key>" \
   -d '{
-    "model": "gpt-image-2",
+    "model": "gpt-image-2.5",
     "messages": [
       {
         "role": "user",
@@ -430,7 +430,7 @@ curl http://localhost:8000/v1/responses \
 
 | 字段       | 说明                                                                                      |
 |:---------|:----------------------------------------------------------------------------------------|
-| `model`  | Responses 编排模型并原样回显；图片工具的图片模型由 `tools[].model` 指定，省略时使用 `gpt-image-2`                           |
+| `model`  | Responses 编排模型并原样回显；图片工具的图片模型由 `tools[].model` 指定，省略时使用 `gpt-image-2.5`                           |
 | `input`  | 支持字符串、单个输入对象或对象数组；EasyInputMessage 可省略 `type`，支持 `user/assistant/system/developer` 角色，`phase` 仅用于 assistant。Codex 原生链严格验证并保留音频、四种图片 detail 及 reasoning/tool/web/image/compaction 历史项，顶层原生多模态 part 会规范化为用户 message；图片生成需能解析出提示词。固定上游没有 `input_file`、`file_id`、caller 或 content part 级缓存断点，这些字段及未知/畸形 item/part 明确返回 `400` |
 | `instructions` | 可选顶层指令；文本及 Codex 原生工具链按对应上游合同传递，图片生成链路传入时明确返回 `400`                             |
 | `context_management` | Codex 文本/原生工具链支持官方 compaction 数组；当前只接受 `type=compaction`，`compact_threshold` 至少为 `1000` |

@@ -979,4 +979,12 @@ Rust 当前模型投影没有独立的 Chat Completions 能力位，因此加入
 
 Release commit `437c0b2f` was pushed, but its Docker publish workflow failed before the image job: the refreshed RustSec database identified advisories in locked `rustls-webpki 0.103.15`, `webpki-root-certs 1.0.9`, `tokio 1.53.1`, and `zstd`/`zstd-safe`/`zstd-sys`. Updated only those transitive lockfile packages to patched releases (`0.103.16`, `1.0.11`, `1.54.1`, `0.13.4`, `7.4.0`, `2.1.2`).
 
-`cargo audit --deny warnings --ignore RUSTSEC-2023-0071 --file Cargo.lock` and `cargo deny --manifest-path Cargo.toml --locked check all` pass locally after the lockfile update. `cargo test --workspace --locked --offline -- --test-threads=1` passes: 595 passed, 5 ignored. Replacement workflow pending; production was not deployed by the failed run.
+`cargo audit --deny warnings --ignore RUSTSEC-2023-0071 --file Cargo.lock` and `cargo deny --manifest-path Cargo.toml --locked check all` passed locally after the lockfile update. The serial full workspace suite passed: 595 passed, 5 ignored. Replacement workflow `41440551824` succeeded on `1a5802c5a0a69ddbc1841c8ba2bec93318cc0918`, including verify and Docker publish. Production now runs that image at revision `1a5802c5a0a69ddbc1841c8ba2bec93318cc0918`, state running/healthy, with `/health` and `/version` both HTTP 200. Live `/v1/models` filtering remains unverified: available runtime and legacy config auth credentials received HTTP 401; no config or account key was changed.
+
+## 2026-11-02 Web image model cutover
+
+The public Web image catalog and image-generation UI now expose only `gpt-image-2.5`; the former `gpt-image-2`, `gpt-image-2.5-flare`, and `gpt-image-2.5-sunburst` aliases are filtered from account/model catalogs and rejected by the native image request validator. Missing or retired Web image IDs in stored browser conversations normalize to `gpt-image-2.5` so regeneration and continued edits remain usable. Codex-specific image model IDs and their separate Responses route are unchanged.
+
+Web image generation and editing now send upstream model `gpt-6` for the public `gpt-image-2.5` alias; the former GPT-5 fallback candidate list was removed so the request cannot silently switch to another model. The selected public model, API defaults/examples, capabilities, importer projection, and image history migration were updated together.
+
+本地验证：`cargo test --workspace --locked --offline image -- --test-threads=1` 通过，125 passed；`remote_model_projection_preserves_web_ids_and_tags_codex_provenance` 与 `ccload_channel_catalog_uses_only_the_current_token_catalog` 各 1 passed。Web 全量测试 376 passed，`bun x tsc --noEmit`、`cargo fmt --all -- --check`、部署 verifier 的 `sh -n` 均通过。

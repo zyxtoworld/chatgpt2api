@@ -24,17 +24,18 @@ pub(super) enum ModelProvenance {
     Codex,
 }
 
-pub(super) const WEB_IMAGE_MODELS: &[&str] = &[
-    "gpt-image-2",
-    "gpt-image-2.5",
-    "gpt-image-2.5-flare",
-    "gpt-image-2.5-sunburst",
-];
+pub(super) const WEB_IMAGE_MODELS: &[&str] = &["gpt-image-2.5"];
 
 pub(super) fn is_web_image_model_id(id: &str) -> bool {
     WEB_IMAGE_MODELS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(id.trim()))
+}
+
+pub(super) fn is_web_image_model_family_id(id: &str) -> bool {
+    id.trim()
+        .get(..10)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("gpt-image-"))
 }
 
 // Live Chat probes confirmed these catalog aliases are not text-chat capable.
@@ -582,6 +583,12 @@ pub(super) fn project_remote_model_list_with_provenance(
         let Some(mut model) = ModelCatalog::project(&item) else {
             continue;
         };
+        if native_chatgpt
+            && is_web_image_model_family_id(&model.id)
+            && !is_web_image_model_id(&model.id)
+        {
+            continue;
+        }
         model.provenance = if provenance == ModelProvenance::Codex {
             ModelProvenance::Codex
         } else {

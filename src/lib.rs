@@ -47,9 +47,10 @@ pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
 use model_pool::{
     ModelCatalog, ModelProvenance, ModelStore, PublicModel, WEB_IMAGE_MODELS,
-    is_web_chat_completion_compatible_model, is_web_image_model_id, model_provenance_is_untrusted,
-    model_provenance_label, model_provenance_rank, project_account_model_entries,
-    project_remote_model_list, project_remote_model_list_with_provenance,
+    is_web_chat_completion_compatible_model, is_web_image_model_family_id, is_web_image_model_id,
+    model_provenance_is_untrusted, model_provenance_label, model_provenance_rank,
+    project_account_model_entries, project_remote_model_list,
+    project_remote_model_list_with_provenance,
 };
 #[cfg(test)]
 use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
@@ -7572,12 +7573,12 @@ async fn image_proxy_request_log_context(
             return None;
         }
         let model = match object.get("model") {
-            None | Some(Value::Null) if endpoint == "images/edits" => "gpt-image-2".to_owned(),
-            None => "gpt-image-2".to_owned(),
+            None | Some(Value::Null) if endpoint == "images/edits" => "gpt-image-2.5".to_owned(),
+            None => "gpt-image-2.5".to_owned(),
             Some(Value::String(model)) if endpoint == "images/edits" => {
                 let model = model.trim();
                 if model.is_empty() {
-                    "gpt-image-2".to_owned()
+                    "gpt-image-2.5".to_owned()
                 } else {
                     model.to_owned()
                 }
@@ -7627,7 +7628,7 @@ async fn image_proxy_request_log_context(
         let model = model
             .map(|model| model.trim().to_owned())
             .filter(|model| !model.is_empty())
-            .unwrap_or_else(|| "gpt-image-2".to_owned());
+            .unwrap_or_else(|| "gpt-image-2.5".to_owned());
         let filter_text = prompt.trim().to_owned();
         (model, prompt, filter_text)
     } else {
@@ -8026,7 +8027,7 @@ impl NativeImageRequest {
 
 fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<String>), ApiError> {
     let model = match value {
-        None => "gpt-image-2".to_owned(),
+        None => "gpt-image-2.5".to_owned(),
         Some(Value::String(value)) => value.trim().to_ascii_lowercase(),
         Some(_) => return Err(ApiError::invalid_request()),
     };
@@ -8045,7 +8046,7 @@ fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<Str
         Err(ApiError::invalid_request())
     } else {
         let supported = [
-            "gpt-image-2",
+            "gpt-image-2.5",
             "codex-gpt-image-2",
             "plus-codex-gpt-image-2",
             "team-codex-gpt-image-2",
@@ -8059,7 +8060,7 @@ fn native_image_model(value: Option<&Value>) -> Result<(String, bool, Option<Str
 }
 
 fn is_native_image_model_id(id: &str) -> bool {
-    is_web_image_model_id(id)
+    is_web_image_model_family_id(id)
         || id.eq_ignore_ascii_case("codex-gpt-image-2")
         || ["plus", "team", "pro"]
             .iter()
@@ -8476,8 +8477,8 @@ async fn native_chat_image_request_from_object(
     object: &Map<String, Value>,
 ) -> Result<NativeImageRequest, ApiError> {
     let model = match object.get("model") {
-        None | Some(Value::Null) => "gpt-image-2".to_owned(),
-        Some(Value::String(model)) if model.trim().is_empty() => "gpt-image-2".to_owned(),
+        None | Some(Value::Null) => "gpt-image-2.5".to_owned(),
+        Some(Value::String(model)) if model.trim().is_empty() => "gpt-image-2.5".to_owned(),
         Some(Value::String(model)) => model.trim().to_ascii_lowercase(),
         Some(_) => return Err(ApiError::invalid_request()),
     };
@@ -8815,7 +8816,7 @@ async fn native_responses_image_request_from_object(
         .get("model")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("gpt-image-2")
+        .unwrap_or("gpt-image-2.5")
         .to_owned();
     let (model, codex, plan_type) = native_image_model(Some(&Value::String(model)))?;
     let mut prompt = Vec::new();
@@ -10435,9 +10436,9 @@ fn native_image_request_from_parts_with_task_id(
     allow_task_id: bool,
 ) -> Result<NativeImageRequest, ApiError> {
     let editing = endpoint == "images/edits";
-    let model = native_image_contract_string(object, "model", "gpt-image-2", editing)?;
+    let model = native_image_contract_string(object, "model", "gpt-image-2.5", editing)?;
     let model = if model.trim().is_empty() {
-        "gpt-image-2".to_owned()
+        "gpt-image-2.5".to_owned()
     } else {
         model
     };
@@ -13189,82 +13190,65 @@ async fn native_web_image_request_single(
             drop(lease);
             continue;
         }
-        let result = match resolve_web_image_upstream_models(&state, &request.model).await {
-            Ok((_, candidates)) => {
-                let mut result = Err((ApiError::upstream(), false));
-                for (index, candidate) in candidates.iter().enumerate() {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    let settings = RuntimeModelSettings {
-                        upstream_model: candidate.clone(),
-                    };
-                    loop {
-                        result = native_web_image_attempt(
-                            &state,
-                            &lease,
-                            &request,
-                            endpoint,
-                            &settings,
-                            deadline,
-                            log_context.as_ref(),
-                        )
-                        .await;
-                        let Some(kind) = result
-                            .as_ref()
-                            .err()
-                            .and_then(|(error, _)| native_image_transport_retry_kind(error))
-                        else {
-                            break;
-                        };
-                        let retry_count = match kind {
-                            NativeImageTransportRetryKind::Tls => &mut tls_retry_count,
-                            NativeImageTransportRetryKind::ConnectionTimeout => {
-                                &mut connection_timeout_retry_count
-                            }
-                        };
-                        if *retry_count >= 3 {
-                            return Err(result.expect_err("transport failure").0);
-                        }
-                        *retry_count += 1;
-                        if !sleep_search_poll_with_interval(
-                            deadline,
-                            native_image_transport_retry_delay(kind, *retry_count),
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                    if result.is_ok() {
-                        log::info!(
-                            "native Web image upstream model selected: requested={}, selected={}, candidate_index={}, account_attempt={}",
-                            request.model,
-                            candidate,
-                            index,
-                            attempted_tokens.len(),
-                        );
-                        break;
-                    }
-                    log::warn!(
-                        "native Web image upstream model failed: requested={}, candidate={}, candidate_index={}, account_attempt={}",
-                        request.model,
-                        candidate,
-                        index,
-                        attempted_tokens.len(),
-                    );
-                    if result
-                        .as_ref()
-                        .err()
-                        .is_none_or(|(error, _)| error.code() != "upstream_model_not_found")
-                    {
-                        break;
-                    }
-                }
-                result
-            }
-            Err(error) => Err((error, false)),
+        let upstream_model = web_image_upstream_model();
+        let settings = RuntimeModelSettings {
+            upstream_model: upstream_model.to_owned(),
         };
+        let mut result = Err((ApiError::upstream(), false));
+        if Instant::now() < deadline {
+            loop {
+                result = native_web_image_attempt(
+                    &state,
+                    &lease,
+                    &request,
+                    endpoint,
+                    &settings,
+                    deadline,
+                    log_context.as_ref(),
+                )
+                .await;
+                let Some(kind) = result
+                    .as_ref()
+                    .err()
+                    .and_then(|(error, _)| native_image_transport_retry_kind(error))
+                else {
+                    break;
+                };
+                let retry_count = match kind {
+                    NativeImageTransportRetryKind::Tls => &mut tls_retry_count,
+                    NativeImageTransportRetryKind::ConnectionTimeout => {
+                        &mut connection_timeout_retry_count
+                    }
+                };
+                if *retry_count >= 3 {
+                    return Err(result.expect_err("transport failure").0);
+                }
+                *retry_count += 1;
+                if !sleep_search_poll_with_interval(
+                    deadline,
+                    native_image_transport_retry_delay(kind, *retry_count),
+                )
+                .await
+                {
+                    break;
+                }
+            }
+        }
+        if result.is_ok() {
+            log::info!(
+                "native Web image upstream model selected: requested={}, selected={}, account_attempt={}",
+                request.model,
+                upstream_model,
+                attempted_tokens.len(),
+            );
+        } else {
+            log::warn!(
+                "native Web image upstream model failed: requested={}, selected={}, account_attempt={}",
+                request.model,
+                upstream_model,
+                attempted_tokens.len(),
+            );
+        }
         match result {
             Ok(data) => {
                 record_native_image_result(&state, &token, true).await;
@@ -13339,43 +13323,8 @@ async fn native_web_image_request_single(
     }
 }
 
-fn web_image_upstream_model(requested_model: &str) -> &'static str {
-    if requested_model.eq_ignore_ascii_case("gpt-image-2") {
-        "gpt-5-3"
-    } else {
-        "auto"
-    }
-}
-
-fn web_image_upstream_candidates(requested_model: &str) -> Vec<String> {
-    let upstream_model = web_image_upstream_model(requested_model);
-    let mut candidates = vec![upstream_model.to_owned()];
-    if upstream_model == "gpt-5-3" {
-        candidates.extend([
-            "auto".to_owned(),
-            "gpt-5-5".to_owned(),
-            "gpt-5-5-thinking".to_owned(),
-            "gpt-5-5-max".to_owned(),
-        ]);
-    }
-    candidates
-}
-async fn resolve_web_image_upstream_models(
-    _state: &AppState,
-    requested_model: &str,
-) -> Result<(RuntimeModelSettings, Vec<String>), ApiError> {
-    let upstream_model = web_image_upstream_model(requested_model);
-    let settings = RuntimeModelSettings {
-        upstream_model: upstream_model.to_owned(),
-    };
-    let candidates = web_image_upstream_candidates(requested_model);
-    log::info!(
-        "native Web image upstream model selected: requested={}, selected_candidate={}, candidates={:?}, reason=v1.7_model_mapping",
-        requested_model,
-        upstream_model,
-        candidates,
-    );
-    Ok((settings, candidates))
+fn web_image_upstream_model() -> &'static str {
+    "gpt-6"
 }
 
 fn native_image_upstream_prompt(state: &AppState, request: &NativeImageRequest) -> String {
@@ -17239,7 +17188,7 @@ fn normalize_loaded_image_tasks(tasks: &mut Vec<Value>) -> bool {
         );
         task.insert(
             "model".to_owned(),
-            Value::String(python_image_task_text(object.get("model"), "gpt-image-2")),
+            Value::String(python_image_task_text(object.get("model"), "gpt-image-2.5")),
         );
         task.insert(
             "size".to_owned(),
@@ -18384,7 +18333,7 @@ fn image_task_resume_context(task: &Value) -> Result<(String, String, String, St
     let model = object
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("gpt-image-2")
+        .unwrap_or("gpt-image-2.5")
         .to_owned();
     let mode = object
         .get("mode")
@@ -27273,7 +27222,7 @@ async fn native_chat_image_completion(
         .get("model")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("gpt-image-2")
+        .unwrap_or("gpt-image-2.5")
         .to_owned();
     let stream_requested = object
         .get("stream")
@@ -27338,7 +27287,7 @@ async fn native_chat_image_completion(
     }
     let completion_id = response["id"].as_str().unwrap_or("chatcmpl-rust");
     let created = response["created"].as_i64().unwrap_or_else(native_created);
-    let model = response["model"].as_str().unwrap_or("gpt-image-2");
+    let model = response["model"].as_str().unwrap_or("gpt-image-2.5");
     let role = json!({
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -31440,7 +31389,7 @@ mod tests {
                     let image_model = if account_id == "cc-free-account" {
                         "free-image-model"
                     } else {
-                        "gpt-image-2"
+                        "gpt-image-2.5"
                     };
                     Json(json!({"data": [{"id": "gpt-5-5"}, {"id": "gpt-5-5"}, {"id": "gpt-5-6"}, {"id": image_model}]}))
                 }
@@ -31482,7 +31431,7 @@ mod tests {
                     let image_model = if account_id == "cc-free-account" {
                         "free-image-model"
                     } else {
-                        "gpt-image-2"
+                        "gpt-image-2.5"
                     };
                     hits.lock().await.push(format!(
                         "GET {} target_path={} target_route={} auth={}",
@@ -32127,7 +32076,7 @@ mod tests {
             "文生图",
             json!({
                 "endpoint": "/v1/images/generations",
-                "model": "gpt-image-2",
+                "model": "gpt-image-2.5",
                 "status": "success",
                 "duration_ms": 12,
                 "request_text": "draw a test image",
@@ -32390,24 +32339,9 @@ mod tests {
             assert_eq!(
                 channel_models_body["channels"][index]["models"],
                 if index == 2 {
-                    json!([
-                        "gpt-5-5",
-                        "gpt-5-6",
-                        "free-image-model",
-                        "gpt-image-2",
-                        "gpt-image-2.5",
-                        "gpt-image-2.5-flare",
-                        "gpt-image-2.5-sunburst"
-                    ])
+                    json!(["gpt-5-5", "gpt-5-6", "free-image-model", "gpt-image-2.5"])
                 } else {
-                    json!([
-                        "gpt-5-5",
-                        "gpt-5-6",
-                        "gpt-image-2",
-                        "gpt-image-2.5",
-                        "gpt-image-2.5-flare",
-                        "gpt-image-2.5-sunburst"
-                    ])
+                    json!(["gpt-5-5", "gpt-5-6", "gpt-image-2.5"])
                 }
             );
         }
@@ -32999,7 +32933,7 @@ mod tests {
                     {"slug":"web-page-model"},
                     {"slug":"gpt-5-codex"},
                     {"slug":"auto"},
-                    {"slug":"gpt-image-2"},
+                    {"slug":"gpt-image-2.5"},
                     {"slug":"gpt-image-2.5"},
                     {"slug":"gpt-image-2.5-flare"},
                     {"slug":"web-page-model"}
@@ -33232,7 +33166,7 @@ mod tests {
             );
         }
         assert!(!channel_model_ids.contains(&"configured-model"));
-        assert!(channel_model_ids.contains(&"gpt-image-2"));
+        assert!(channel_model_ids.contains(&"gpt-image-2.5"));
         assert!(
             !channel_model_ids.contains(&"codex-endpoint-model"),
             "unexpected channel models: {channel_models}"
@@ -33283,17 +33217,21 @@ mod tests {
         assert_eq!(channel_models.status(), StatusCode::OK);
         let channel_models = json_response(channel_models).await;
         let channel_models = &channel_models["channels"][0];
-        assert!(channel_models["models"].as_array().is_some_and(|models| {
-            ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare"]
+        let channel_model_ids = channel_models["models"].as_array().expect("catalog models");
+        assert!(
+            channel_model_ids
                 .iter()
-                .all(|expected| models.iter().any(|model| model == expected))
-        }));
-        assert_eq!(channel_models["model_sources"]["gpt-image-2"], "image");
-        assert_eq!(channel_models["model_sources"]["gpt-image-2.5"], "image");
-        assert_eq!(
-            channel_models["model_sources"]["gpt-image-2.5-flare"],
-            "image"
+                .any(|model| model == "gpt-image-2.5")
         );
+        for retired in [
+            "gpt-image-2",
+            "gpt-image-2.5-flare",
+            "gpt-image-2.5-sunburst",
+        ] {
+            assert!(channel_model_ids.iter().all(|model| model != retired));
+            assert!(channel_models["model_sources"].get(retired).is_none());
+        }
+        assert_eq!(channel_models["model_sources"]["gpt-image-2.5"], "image");
 
         let accounts =
             management_request(&state, "GET", "/api/accounts", None, Some("admin")).await;
@@ -33377,13 +33315,13 @@ mod tests {
                 .iter()
                 .filter_map(|model| model["id"].as_str())
                 .collect::<Vec<_>>();
-            if model_ids.contains(&"gpt-image-2") && model_ids.contains(&"gpt-image-2.5") {
+            if model_ids.contains(&"gpt-image-2.5") && model_ids.contains(&"gpt-image-2.5") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(
-            model_ids.contains(&"gpt-image-2"),
+            model_ids.contains(&"gpt-image-2.5"),
             "public model ids: {model_ids:?}; body: {models}"
         );
         assert!(model_ids.contains(&"gpt-image-2.5"));
@@ -35756,7 +35694,6 @@ mod tests {
                 Json(json!({"models":[
                     {"slug":"gpt-pro"},
                     {"slug":"gpt-5-5"},
-                    {"slug":"gpt-image-2"},
                     {"slug":"gpt-image-2.5"}
                 ]}))
             }
@@ -35914,11 +35851,18 @@ mod tests {
             .expect("public v1.7 model list");
         assert!(public_models.iter().any(|item| item["id"] == "gpt-pro"));
         assert!(public_models.iter().any(|item| item["id"] == "gpt-5-5"));
-        assert!(public_models.iter().any(|item| item["id"] == "gpt-image-2"));
         assert!(
             public_models
                 .iter()
                 .any(|item| item["id"] == "gpt-image-2.5")
+        );
+        assert!(
+            public_models
+                .iter()
+                .all(
+                    |item| !is_web_image_model_family_id(item["id"].as_str().unwrap_or_default())
+                        || item["id"] == "gpt-image-2.5"
+                )
         );
         assert!(
             calls
@@ -36177,15 +36121,15 @@ mod tests {
     #[test]
     fn imported_image_catalog_isolated_by_account_capability() {
         let fetched = Some(vec![test_public_model(
-            "gpt-image-2",
+            "gpt-image-2.5",
             ModelProvenance::Image,
         )]);
         let without_capability = merge_account_models(&json!({}), fetched.clone(), false);
         assert!(without_capability.is_none());
         let with_capability = merge_account_models(&json!({}), fetched, true)
             .expect("positive capability keeps image model");
-        assert_eq!(with_capability.0, vec!["gpt-image-2".to_owned()]);
-        assert_eq!(with_capability.1["gpt-image-2"], "image");
+        assert_eq!(with_capability.0, vec!["gpt-image-2.5".to_owned()]);
+        assert_eq!(with_capability.1["gpt-image-2.5"], "image");
     }
 
     #[test]
@@ -36261,10 +36205,10 @@ mod tests {
             "models": [
                 "configured-model",
                 "web-model",
-                "gpt-image-2",
+                "gpt-image-2.5",
                 "configured-model"
             ],
-            "model_sources": {"web-model":"web", "gpt-image-2":"image"},
+            "model_sources": {"web-model":"web", "gpt-image-2.5":"image"},
             "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]]
         });
         assert_eq!(merge_account_models(&raw, None, false), None);
@@ -37005,7 +36949,7 @@ mod tests {
                         "owner_id":"owner",
                         "status":"running",
                         "mode":"edit",
-                        "model":"gpt-image-2",
+                        "model":"gpt-image-2.5",
                         "created_at":now,
                         "updated_at":now,
                         "created_ts":1.0,
@@ -37030,7 +36974,7 @@ mod tests {
                         "owner_id":"owner",
                         "status":"success",
                         "mode":"generate",
-                        "model":"gpt-image-2",
+                        "model":"gpt-image-2.5",
                         "created_at":"2020-01-01 00:00:00",
                         "updated_at":"2020-01-01 00:00:00",
                         "data":[]
@@ -37040,7 +36984,7 @@ mod tests {
                         "owner_id":"owner",
                         "status":"success",
                         "mode":"generate",
-                        "model":"gpt-image-2",
+                        "model":"gpt-image-2.5",
                         "created_at":now,
                         "updated_at":now,
                         "updated_ts":2.0,
@@ -37266,13 +37210,13 @@ mod tests {
                 "status":"error",
                 "error":"generation 超时",
                 "conversation_id":"resume-conversation",
-                "model":"gpt-image-2",
+                "model":"gpt-image-2.5",
                 "mode":"edit"
             }))
             .expect("resumable task"),
             (
                 "resume-conversation".to_owned(),
-                "gpt-image-2".to_owned(),
+                "gpt-image-2.5".to_owned(),
                 "edit".to_owned(),
                 String::new()
             )
@@ -37306,7 +37250,7 @@ mod tests {
                 "updated_at":"2026-09-28 12:00:00",
                 "created_ts":1790596800.0,
                 "updated_ts":1790596800.0,
-                "model":"gpt-image-2",
+                "model":"gpt-image-2.5",
                 "mode":"generate",
                 "prompt":"a test image",
                 "error":""
@@ -37387,7 +37331,7 @@ mod tests {
                 "owner_id":"admin",
                 "status":"error",
                 "mode":"generate",
-                "model":"gpt-image-2",
+                "model":"gpt-image-2.5",
                 "prompt":"draw a cat",
                 "conversation_id":"resume-timeout-conversation",
                 "error":"generation 超时",
@@ -37560,7 +37504,7 @@ mod tests {
             log_items[0]["detail"]["endpoint"],
             "/api/image-tasks/generations"
         );
-        assert_eq!(log_items[0]["detail"]["model"], "gpt-image-2");
+        assert_eq!(log_items[0]["detail"]["model"], "gpt-image-2.5");
         assert_eq!(log_items[0]["detail"]["request_text"], "blocked-task-term");
         assert!(!root.join("image_tasks.json").exists());
 
@@ -43377,7 +43321,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
                 "models": [
                     {"slug": "gpt-5-codex"},
                     {"slug": "auto"},
-                    {"slug": "gpt-image-2"},
+                    {"slug": "gpt-image-2.5"},
                     {"slug": "gpt-image-2.5"},
                     {"slug": "gpt-image-2.5-flare"}
                 ]
@@ -43394,13 +43338,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             web.iter()
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
-            vec![
-                "gpt-5-codex",
-                "auto",
-                "gpt-image-2",
-                "gpt-image-2.5",
-                "gpt-image-2.5-flare"
-            ]
+            vec!["gpt-5-codex", "auto", "gpt-image-2.5"]
         );
         assert!(
             web.iter()
@@ -43504,7 +43442,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             model("auto", ModelProvenance::Web),
             model("codex-endpoint-model", ModelProvenance::Codex),
             model("auto", ModelProvenance::Configured),
-            model("gpt-image-2", ModelProvenance::Web),
+            model("gpt-image-2.5", ModelProvenance::Web),
         ]));
         let ids = models
             .iter()
@@ -43515,13 +43453,13 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         assert!(!ids.contains(&"GPT-5.6-TERRA-WM"));
         assert!(ids.contains(&"gpt-5-codex"));
         assert!(ids.contains(&"auto"), "Web provenance must win for auto");
-        assert!(ids.contains(&"gpt-image-2"));
+        assert!(ids.contains(&"gpt-image-2.5"));
         assert!(!ids.contains(&"codex-endpoint-model"));
         assert_eq!(ids.iter().filter(|id| **id == "auto").count(), 1);
         assert_eq!(
             models
                 .iter()
-                .find(|model| model.id == "gpt-image-2")
+                .find(|model| model.id == "gpt-image-2.5")
                 .map(|model| model.provenance),
             Some(ModelProvenance::Image)
         );
@@ -43697,28 +43635,20 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             "_model_source_version": 1,
             "_verified_web_model_paths": [AUTHENTICATED_NATIVE_MODEL_PATHS[0]],
             "_verified_image_capability": true,
-            "models": ["gpt-5-5", "gpt-image-2", "gpt-image-2.5"]
-            ,"model_sources":{"gpt-5-5":"web","gpt-image-2":"image","gpt-image-2.5":"image"}
+            "models": ["gpt-5-5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"],
+            "model_sources":{"gpt-5-5":"web","gpt-image-2":"image","gpt-image-2.5-flare":"image","gpt-image-2.5-sunburst":"image"}
         });
         ensure_image_model_snapshot(&mut refreshed);
         let canonical = canonicalize_account_item(&refreshed).expect("canonical account");
-        assert_eq!(
-            canonical["models"],
-            json!([
-                "gpt-5-5",
-                "gpt-image-2",
-                "gpt-image-2.5",
-                "gpt-image-2.5-flare",
-                "gpt-image-2.5-sunburst"
-            ])
-        );
-        assert_eq!(canonical["model_sources"]["gpt-image-2"], "image");
+        assert_eq!(canonical["models"], json!(["gpt-5-5", "gpt-image-2.5"]));
         assert_eq!(canonical["model_sources"]["gpt-image-2.5"], "image");
-        assert_eq!(canonical["model_sources"]["gpt-image-2.5-flare"], "image");
-        assert_eq!(
-            canonical["model_sources"]["gpt-image-2.5-sunburst"],
-            "image"
-        );
+        for retired in [
+            "gpt-image-2",
+            "gpt-image-2.5-flare",
+            "gpt-image-2.5-sunburst",
+        ] {
+            assert!(canonical["model_sources"].get(retired).is_none());
+        }
 
         let mut capability_only = json!({
             "access_token": "account-token",
@@ -43727,16 +43657,8 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             "quota": 3
         });
         ensure_image_model_snapshot(&mut capability_only);
-        assert_eq!(
-            capability_only["models"],
-            json!([
-                "gpt-image-2",
-                "gpt-image-2.5",
-                "gpt-image-2.5-flare",
-                "gpt-image-2.5-sunburst"
-            ])
-        );
-        assert_eq!(capability_only["model_sources"]["gpt-image-2"], "image");
+        assert_eq!(capability_only["models"], json!(["gpt-image-2.5"]));
+        assert_eq!(capability_only["model_sources"]["gpt-image-2.5"], "image");
 
         let without_quota = canonicalize_account_item(&json!({
             "access_token": "account-token",
@@ -43749,7 +43671,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         assert!(
             !without_quota["models"]
                 .as_array()
-                .is_some_and(|models| models.iter().any(|model| model == "gpt-image-2"))
+                .is_some_and(|models| models.iter().any(|model| model == "gpt-image-2.5"))
         );
     }
 
@@ -44040,7 +43962,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned(), "image-aware-chat".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned(), "image-aware-chat".to_owned()],
             upstream_base_url: None,
             upstream_auth: None,
             auth_keys_path: None,
@@ -44054,7 +43976,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             .account_type_catalog
             .public_models(state.models.current());
         assert!(
-            models.iter().all(|model| model.id != "gpt-image-2"),
+            models.iter().all(|model| model.id != "gpt-image-2.5"),
             "an image model is not requestable without an upstream base URL"
         );
         assert!(
@@ -44077,7 +43999,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned(), "image-aware-chat".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned(), "image-aware-chat".to_owned()],
             upstream_base_url: Some("http://127.0.0.1:1".to_owned()),
             upstream_auth: None,
             auth_keys_path: None,
@@ -44090,7 +44012,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         let models = state
             .account_type_catalog
             .public_models(state.models.current());
-        assert!(models.iter().all(|model| model.id != "gpt-image-2"));
+        assert!(models.iter().all(|model| model.id != "gpt-image-2.5"));
         assert!(models.iter().all(|model| model.id != "image-aware-chat"));
 
         state.account_type_catalog.shutdown().await;
@@ -44232,10 +44154,7 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
                 "gpt-6-mini",
                 "gpt-6-t-mini",
                 "gpt-6-t-mini-mini",
-                "gpt-image-2",
                 "gpt-image-2.5",
-                "gpt-image-2.5-flare",
-                "gpt-image-2.5-sunburst",
                 "research",
             ]
         );
@@ -48639,39 +48558,19 @@ data: [DONE]
     }
 
     #[test]
-    fn web_image_models_use_python_upstream_mapping() {
+    fn web_image_model_maps_to_gpt6_without_fallbacks() {
+        assert_eq!(web_image_upstream_model(), "gpt-6");
+    }
+
+    #[test]
+    fn retired_web_image_aliases_are_rejected() {
         for model in [
             "gpt-image-2",
-            "gpt-image-2.5",
             "gpt-image-2.5-flare",
             "gpt-image-2.5-sunburst",
         ] {
-            assert_eq!(
-                web_image_upstream_model(model),
-                if model == "gpt-image-2" {
-                    "gpt-5-3"
-                } else {
-                    "auto"
-                }
-            );
+            assert!(native_image_model(Some(&json!(model))).is_err(), "{model}");
         }
-    }
-    #[test]
-    fn web_image_gpt_image_two_falls_back_after_model_retirement() {
-        assert_eq!(
-            web_image_upstream_candidates("gpt-image-2"),
-            vec![
-                "gpt-5-3".to_owned(),
-                "auto".to_owned(),
-                "gpt-5-5".to_owned(),
-                "gpt-5-5-thinking".to_owned(),
-                "gpt-5-5-max".to_owned()
-            ]
-        );
-        assert_eq!(
-            web_image_upstream_candidates("gpt-image-2.5"),
-            vec!["auto".to_owned()]
-        );
     }
 
     #[test]
@@ -48706,7 +48605,7 @@ data: [DONE]
             "\n\n",
             "data: [DONE]\n\n"
         );
-        let response = native_chat_image_stream_completion("gpt-image-2", source.as_bytes())
+        let response = native_chat_image_stream_completion("gpt-image-2.5", source.as_bytes())
             .expect("chat image stream");
         assert_eq!(
             response.headers()[header::CONTENT_TYPE],
@@ -48745,7 +48644,7 @@ data: [DONE]
         let first = format!("data:image/png;base64,{encoded}");
         let last = format!("data:image/png;name=last;base64,{encoded}");
         let object = json!({
-            "model":"gpt-image-2",
+            "model":"gpt-image-2.5",
             "tools":[{"type":"image_generation","model":"codex-gpt-image-2","output_format":"jpeg","output_compression":72,"size":1024,"quality":7}],
             "input":[
                 {"role":"assistant","content":[{"type":"input_image","image_url":first,"detail":"low"}]},
@@ -48764,7 +48663,7 @@ data: [DONE]
         .await
         .expect("first Responses image input");
         assert_eq!(request.images.len(), 1);
-        assert_eq!(request.model, "gpt-image-2");
+        assert_eq!(request.model, "gpt-image-2.5");
         assert!(!request.codex);
         assert_eq!(request.usage_images.as_ref().map(Vec::len), Some(4));
         assert_eq!(request.usage_image_details.as_ref().map(Vec::len), Some(4));
@@ -48814,7 +48713,7 @@ data: [DONE]
         )
         .await
         .expect("default Responses image model");
-        assert_eq!(request.model, "gpt-image-2");
+        assert_eq!(request.model, "gpt-image-2.5");
         assert!(!request.codex);
         state.account_type_catalog.shutdown().await;
         fs::remove_file(account_path).expect("cleanup");
@@ -55717,7 +55616,7 @@ data: [DONE]
     #[test]
     fn native_image_url_only_usage_uses_requested_size_fallback() {
         let request = parse_native_image_request(
-            br#"{"model":"gpt-image-2","prompt":"draw","size":"1024x1024","response_format":"url"}"#,
+            br#"{"model":"gpt-image-2.5","prompt":"draw","size":"1024x1024","response_format":"url"}"#,
             "images/generations",
         )
         .expect("image request");
@@ -56113,7 +56012,7 @@ data: [DONE]
     fn native_chat_image_message_errors_follow_python_route_boundary() {
         let chat_error = native_image_message_error(
             &NativeImageRequest {
-                model: "gpt-image-2".to_owned(),
+                model: "gpt-image-2.5".to_owned(),
                 client_task_id: None,
                 codex: false,
                 plan_type: None,
@@ -56143,7 +56042,7 @@ data: [DONE]
 
         let direct_error = native_image_message_error(
             &NativeImageRequest {
-                model: "gpt-image-2".to_owned(),
+                model: "gpt-image-2.5".to_owned(),
                 client_task_id: None,
                 codex: false,
                 plan_type: None,
@@ -56216,7 +56115,7 @@ data: [DONE]
                     .uri("/v1/images/generations")
                     .header(header::AUTHORIZATION, "Bearer client")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"model":"gpt-image-2","prompt":"draw"}"#))
+                    .body(Body::from(r#"{"model":"gpt-image-2.5","prompt":"draw"}"#))
                     .expect("no-quota image request"),
             )
             .await
@@ -56680,7 +56579,7 @@ data: [DONE]
                     .header(header::HOST, "images.example.test")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"model":"gpt-image-2","prompt":"draw a cat"}"#,
+                        r#"{"model":"gpt-image-2.5","prompt":"draw a cat"}"#,
                     ))
                     .expect("request"),
             ),
@@ -56756,7 +56655,7 @@ data: [DONE]
             .find(|item| item["type"] == "call" && item["summary"] == "文生图")
             .expect("native image call log");
         assert_eq!(image_call["detail"]["endpoint"], "/v1/images/generations");
-        assert_eq!(image_call["detail"]["model"], "gpt-image-2");
+        assert_eq!(image_call["detail"]["model"], "gpt-image-2.5");
         assert_eq!(image_call["detail"]["account_email"], "image@example.test");
         assert_eq!(
             image_call["detail"]["conversation_id"],
@@ -56792,10 +56691,10 @@ data: [DONE]
         assert_eq!(image_account.raw["success"], json!(1));
         assert_eq!(image_account.status, "限流");
         let prepare_payload = captured_prepare_payload.lock().await.clone();
-        assert_eq!(prepare_payload["model"], "gpt-5-3");
+        assert_eq!(prepare_payload["model"], "gpt-6");
         assert!(prepare_payload.get("thinking_effort").is_none());
         let run_payload = captured_run_payload.lock().await.clone();
-        assert_eq!(run_payload["model"], "gpt-5-3");
+        assert_eq!(run_payload["model"], "gpt-6");
         assert!(run_payload.get("thinking_effort").is_none());
         assert!(
             run_payload["messages"][0]["metadata"]
@@ -56844,7 +56743,7 @@ data: [DONE]
                     .header(header::HOST, "images.example.test")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"model":"gpt-image-2","prompt":"blocked cat"}"#,
+                        r#"{"model":"gpt-image-2.5","prompt":"blocked cat"}"#,
                     ))
                     .expect("blocked image request"),
             )
@@ -57221,13 +57120,16 @@ data: [DONE]
                 .find(|item| item["id"].as_str() == Some(id))
                 .unwrap_or_else(|| panic!("missing model {id}: {data:?}"))
         };
+        assert_eq!(model("gpt-image-2.5")["object"], "model");
         for id in [
             "gpt-image-2",
-            "gpt-image-2.5",
             "gpt-image-2.5-flare",
             "gpt-image-2.5-sunburst",
         ] {
-            assert_eq!(model(id)["object"], "model");
+            assert!(
+                data.iter().all(|item| item["id"] != id),
+                "retired model {id} leaked"
+            );
         }
         for id in [
             "codex-gpt-image-2",
@@ -57238,12 +57140,12 @@ data: [DONE]
             assert!(data.iter().all(|item| item["id"] != id));
         }
         assert!(
-            model("gpt-image-2")["supported_account_types"]
+            model("gpt-image-2.5")["supported_account_types"]
                 .as_array()
                 .is_some_and(|types| types.iter().any(|value| value == "free"))
         );
         assert!(
-            model("gpt-image-2")["supported_account_types"]
+            model("gpt-image-2.5")["supported_account_types"]
                 .as_array()
                 .is_some_and(|types| types.iter().any(|value| value == "team"))
         );
@@ -57406,11 +57308,11 @@ data: [DONE]
     #[test]
     fn native_image_request_matches_python_v17_fields_and_ignores_extensions() {
         let request = parse_native_image_request(
-            br#"{"model":"gpt-image-2","prompt":"  draw  ","n":"2","size":"portrait-ish","quality":"cinematic","response_format":"custom","stream":"yes","history_disabled":false,"output_format":"jpeg","output_compression":80,"background":"transparent","style":"vivid","user":"ignored","vendor_extension":true}"#,
+            br#"{"model":"gpt-image-2.5","prompt":"  draw  ","n":"2","size":"portrait-ish","quality":"cinematic","response_format":"custom","stream":"yes","history_disabled":false,"output_format":"jpeg","output_compression":80,"background":"transparent","style":"vivid","user":"ignored","vendor_extension":true}"#,
             "images/generations",
         )
         .expect("Python v1.7 ignores fields outside its image schema");
-        assert_eq!(request.model, "gpt-image-2");
+        assert_eq!(request.model, "gpt-image-2.5");
         assert_eq!(request.n, 2);
         assert_eq!(request.prompt, "  draw  ");
         assert_eq!(request.size.as_deref(), Some("portrait-ish"));
@@ -57430,7 +57332,7 @@ data: [DONE]
             "images/edits",
         )
         .expect("edit payloads are projected through Python image_inputs fields");
-        assert_eq!(request.model, "gpt-image-2");
+        assert_eq!(request.model, "gpt-image-2.5");
         assert_eq!(request.prompt, "edit cat");
         assert_eq!(request.n, 2);
         assert_eq!(request.size.as_deref(), Some("unusual"));
@@ -57445,7 +57347,7 @@ data: [DONE]
     fn native_image_task_edit_keeps_python_option_validation_before_overrides() {
         let image = NativeImageSource::Text("aW1hZ2U=".to_owned());
         let mut count_object = json!({
-            "model": "gpt-image-2",
+            "model": "gpt-image-2.5",
             "prompt": "edit",
             "n": 5,
         })
@@ -57509,7 +57411,7 @@ data: [DONE]
     fn native_image_request_has_no_extra_python_prompt_length_cap() {
         let prompt = "x".repeat(32_001);
         let request = parse_native_image_request(
-            json!({"model":"gpt-image-2","prompt":prompt})
+            json!({"model":"gpt-image-2.5","prompt":prompt})
                 .to_string()
                 .as_bytes(),
             "images/generations",
@@ -57526,7 +57428,7 @@ data: [DONE]
             conversation_id: Some("conversation-1".to_owned()),
         }];
         let response = native_image_stream_response(
-            "gpt-image-2",
+            "gpt-image-2.5",
             &[json!({
                 "url":"/images/result.png",
                 "_stream_account_email":"result@example.test",
@@ -57571,7 +57473,7 @@ data: [DONE]
     #[tokio::test]
     async fn multi_image_partial_results_keep_original_indices() {
         let request = NativeImageRequest {
-            model: "gpt-image-2".to_owned(),
+            model: "gpt-image-2.5".to_owned(),
             client_task_id: None,
             codex: true,
             plan_type: None,
@@ -57665,7 +57567,7 @@ data: [DONE]
     #[tokio::test]
     async fn native_multi_image_usage_counts_input_once() {
         let request = parse_native_image_request(
-            br#"{"model":"gpt-image-2","prompt":"draw","n":2,"size":"1024x1024","response_format":"url"}"#,
+            br#"{"model":"gpt-image-2.5","prompt":"draw","n":2,"size":"1024x1024","response_format":"url"}"#,
             "images/generations",
         )
         .expect("multi-image request");
@@ -58453,7 +58355,7 @@ data: [DONE]
         ] {
             let mut request = parse_native_image_request(
                 json!({
-                    "model": "gpt-image-2",
+                    "model": "gpt-image-2.5",
                     "prompt": "edit",
                     "image": source.clone(),
                 })
@@ -58489,7 +58391,7 @@ data: [DONE]
             .expect("oversized pixel fixture");
         let mut request = parse_native_image_request(
             json!({
-                "model": "gpt-image-2",
+                "model": "gpt-image-2.5",
                 "prompt": "edit",
                 "image": source,
             })
@@ -58556,7 +58458,7 @@ data: [DONE]
         );
         let request = parse_native_image_request(
             json!({
-                "model": "gpt-image-2",
+                "model": "gpt-image-2.5",
                 "prompt": "edit",
                 "images": [source_one, source_two],
                 "mask": [mask_one, mask_two],
@@ -58635,7 +58537,7 @@ data: [DONE]
         mask_handle.read_observer = Some(mask_reads.clone());
 
         let request = NativeImageRequest {
-            model: "gpt-image-2".to_owned(),
+            model: "gpt-image-2.5".to_owned(),
             client_task_id: None,
             codex: false,
             plan_type: None,
@@ -58748,7 +58650,7 @@ data: [DONE]
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned()],
             upstream_base_url: None,
             upstream_auth: None,
             auth_keys_path: None,
@@ -58781,7 +58683,7 @@ data: [DONE]
     #[tokio::test]
     async fn native_image_json_keeps_general_body_limit() {
         let body = json!({
-            "model": "gpt-image-2",
+            "model": "gpt-image-2.5",
             "prompt": "x".repeat(MAX_REQUEST_BODY_BYTES),
         })
         .to_string();
@@ -58789,7 +58691,7 @@ data: [DONE]
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned()],
             upstream_base_url: None,
             upstream_auth: None,
             auth_keys_path: None,
@@ -58822,7 +58724,7 @@ data: [DONE]
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned()],
             upstream_base_url: None,
             upstream_auth: None,
             auth_keys_path: None,
@@ -58840,7 +58742,7 @@ data: [DONE]
                     .header(header::AUTHORIZATION, "Bearer client")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        json!({"prompt": "edit a cat", "model": "gpt-image-2"}).to_string(),
+                        json!({"prompt": "edit a cat", "model": "gpt-image-2.5"}).to_string(),
                     ))
                     .expect("request"),
             )
@@ -58936,7 +58838,7 @@ data: [DONE]
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned()],
             upstream_base_url: None,
             upstream_auth: None,
             auth_keys_path: None,
@@ -59043,7 +58945,7 @@ data: [DONE]
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned()],
             upstream_base_url: None,
             upstream_auth: None,
             auth_keys_path: None,
@@ -59096,7 +58998,7 @@ data: [DONE]
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned()],
             upstream_base_url: Some(format!("http://{address}")),
             upstream_auth: None,
             auth_keys_path: None,
@@ -59208,7 +59110,7 @@ data: [DONE]
     #[test]
     fn native_image_request_ignores_unknown_format_and_background_options() {
         let models = [
-            ("gpt-image-2", false),
+            ("gpt-image-2.5", false),
             ("codex-gpt-image-2", true),
             ("plus-codex-gpt-image-2", true),
             ("team-codex-gpt-image-2", true),
@@ -59384,13 +59286,13 @@ data: [DONE]
         );
         assert!(
             parse_native_image_request(
-                br#"{"model":"gpt-image-2","prompt":"draw","quality":{}}"#,
+                br#"{"model":"gpt-image-2.5","prompt":"draw","quality":{}}"#,
                 "images/generations"
             )
             .is_err()
         );
         let request = parse_native_image_request(
-            br#"{"model":"gpt-image-2","prompt":"draw","client_task_id":"task-1","extra":true}"#,
+            br#"{"model":"gpt-image-2.5","prompt":"draw","client_task_id":"task-1","extra":true}"#,
             "images/generations",
         )
         .expect("Python ImageGenerationRequest ignores extra fields");
@@ -59408,7 +59310,7 @@ data: [DONE]
     #[test]
     fn native_image_json_response_matches_python_v17_projection() {
         let request = parse_native_image_request(
-            br#"{"model":"gpt-image-2","prompt":"edit","client_task_id":"edit-task-1","image":"aW1hZ2U="}"#,
+            br#"{"model":"gpt-image-2.5","prompt":"edit","client_task_id":"edit-task-1","image":"aW1hZ2U="}"#,
             "images/edits",
         )
         .expect("ordinary image edit parser ignores task-only fields");
@@ -61992,7 +61894,7 @@ data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"
         let state = AppState::new(AppConfig {
             version: "test".to_owned(),
             auth_key: Some("client".to_owned()),
-            models: vec!["gpt-image-2".to_owned()],
+            models: vec!["gpt-image-2.5".to_owned()],
             upstream_base_url: None,
             upstream_auth: None,
             auth_keys_path: None,

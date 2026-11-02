@@ -41,8 +41,8 @@ use tokio::sync::{Semaphore, mpsc};
 use url::Url;
 
 use super::model_pool::{
-    ModelProvenance, is_web_image_model_id, model_provenance_label, model_provenance_rank,
-    project_account_model_entries, project_imported_model_entries,
+    ModelProvenance, is_web_image_model_family_id, is_web_image_model_id, model_provenance_label,
+    model_provenance_rank, project_account_model_entries, project_imported_model_entries,
 };
 use super::proxy_service::{ProxyProfile, flaresolverr_payload, parse_flaresolverr_bundle};
 use super::{
@@ -3666,7 +3666,9 @@ fn merge_ccload_model_catalog(
     let mut indexes: HashMap<String, usize> = HashMap::new();
     if let Some(fetched) = fetched {
         for model in fetched {
-            if !ccload_model_allowed(model.provenance) {
+            if !ccload_model_allowed(model.provenance)
+                || (is_web_image_model_family_id(&model.id) && !is_web_image_model_id(&model.id))
+            {
                 continue;
             }
             if let Some(index) = indexes.get(&model.id).copied() {
@@ -3700,7 +3702,9 @@ fn merge_ccload_account_catalog(
         .map(|object| project_account_model_entries(object, ModelProvenance::Unknown))
         .unwrap_or_default();
     for (id, provenance) in snapshot_entries {
-        if !ccload_model_allowed(provenance) {
+        if !ccload_model_allowed(provenance)
+            || (is_web_image_model_family_id(&id) && !is_web_image_model_id(&id))
+        {
             continue;
         }
         if let Some(index) = indexes.get(&id).copied() {
@@ -8237,8 +8241,8 @@ mod tests {
     #[test]
     fn ccload_image_projection_requires_a_refreshed_positive_quota() {
         let mut without_capability = serde_json::json!({
-            "models": ["web-model", "gpt-image-2"],
-            "model_sources": {"web-model":"web", "gpt-image-2":"web"}
+            "models": ["web-model", "gpt-image-2.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"],
+            "model_sources": {"web-model":"web", "gpt-image-2.5":"web", "gpt-image-2":"web", "gpt-image-2.5-flare":"web", "gpt-image-2.5-sunburst":"web"}
         });
         apply_ccload_image_capability(&mut without_capability, &[]);
         assert_eq!(
@@ -8252,19 +8256,38 @@ mod tests {
         );
 
         let mut with_capability = serde_json::json!({
-            "models": ["web-model", "GPT-IMAGE-2", "gpt-image-2.5"],
-            "model_sources": {"web-model":"web", "GPT-IMAGE-2":"web", "gpt-image-2.5":"web"}
+            "models": ["web-model", "GPT-IMAGE-2.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"],
+            "model_sources": {"web-model":"web", "GPT-IMAGE-2.5":"web", "gpt-image-2":"web", "gpt-image-2.5-flare":"web", "gpt-image-2.5-sunburst":"web"}
         });
         apply_ccload_image_capability(
             &mut with_capability,
-            &["gpt-image-2".to_owned(), "gpt-image-2.5".to_owned()],
+            &[
+                "gpt-image-2.5".to_owned(),
+                "gpt-image-2".to_owned(),
+                "gpt-image-2.5-flare".to_owned(),
+                "gpt-image-2.5-sunburst".to_owned(),
+            ],
         );
         assert_eq!(
             with_capability["models"],
-            serde_json::json!(["web-model", "gpt-image-2", "gpt-image-2.5"])
+            serde_json::json!(["web-model", "gpt-image-2.5"])
         );
-        assert_eq!(with_capability["model_sources"]["gpt-image-2"], "image");
         assert_eq!(with_capability["model_sources"]["gpt-image-2.5"], "image");
+        assert!(
+            with_capability["model_sources"]
+                .get("gpt-image-2")
+                .is_none()
+        );
+        assert!(
+            with_capability["model_sources"]
+                .get("gpt-image-2.5-flare")
+                .is_none()
+        );
+        assert!(
+            with_capability["model_sources"]
+                .get("gpt-image-2.5-sunburst")
+                .is_none()
+        );
     }
 
     #[test]
@@ -8273,12 +8296,12 @@ mod tests {
             Some(&serde_json::json!(["gpt-5-5"])),
             Some(&serde_json::json!({"gpt-5-5":"web"})),
             &serde_json::json!({
-                "models": ["gpt-image-2"],
-                "model_sources": {"gpt-image-2":"image"}
+                "models": ["gpt-image-2.5", "gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"],
+                "model_sources": {"gpt-image-2.5":"image", "gpt-image-2":"image", "gpt-image-2.5-flare":"image", "gpt-image-2.5-sunburst":"image"}
             }),
         );
-        assert_eq!(models, serde_json::json!(["gpt-image-2"]));
-        assert_eq!(sources, serde_json::json!({"gpt-image-2":"image"}));
+        assert_eq!(models, serde_json::json!(["gpt-image-2.5"]));
+        assert_eq!(sources, serde_json::json!({"gpt-image-2.5":"image"}));
     }
     #[test]
     fn management_json_writers_match_python_pretty_newline_contract() {

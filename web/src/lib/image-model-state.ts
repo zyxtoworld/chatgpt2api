@@ -1,17 +1,12 @@
 // @ts-nocheck
-const PUBLIC_IMAGE_MODEL_IDS = new Set([
-  "gpt-image-2",
-  "gpt-image-2.5",
-  "gpt-image-2.5-flare",
-  "gpt-image-2.5-sunburst",
-]);
+const PUBLIC_IMAGE_MODEL_ID = "gpt-image-2.5";
 
 export function filterImageModels(items) {
   return (Array.isArray(items) ? items : [])
     .map((item) => (typeof item?.id === "string" ? item.id.trim() : ""))
     .filter(
       (id, index, list) =>
-        PUBLIC_IMAGE_MODEL_IDS.has(id) && list.indexOf(id) === index,
+        id === PUBLIC_IMAGE_MODEL_ID && list.indexOf(id) === index,
     );
 }
 
@@ -36,6 +31,11 @@ export function selectImageModel(value, models) {
   return normalized && availableModels.includes(normalized)
     ? normalized
     : availableModels[0] || "";
+}
+
+export function normalizeImageModel(value) {
+  const model = String(value || "").trim();
+  return model === PUBLIC_IMAGE_MODEL_ID ? model : PUBLIC_IMAGE_MODEL_ID;
 }
 
 export function canSubmitImage({ prompt, model, models, status }) {

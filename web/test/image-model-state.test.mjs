@@ -25,7 +25,7 @@ test("an empty model response leaves no fake model and blocks submit", () => {
   assert.equal(
     canSubmitImage({
       prompt: "a red apple",
-      model: "gpt-image-2",
+      model: "gpt-image-2.5",
       models: state.models,
       status: state.status,
     }),
@@ -40,7 +40,7 @@ test("a failed model request leaves no fake model and blocks submit", () => {
   assert.equal(
     canSubmitImage({
       prompt: "a red apple",
-      model: "gpt-image-2",
+      model: "gpt-image-2.5",
       models: state.models,
       status: state.status,
     }),
@@ -60,16 +60,18 @@ test("a ready model state only exposes public web image models", () => {
     ],
   });
 
-  assert.deepEqual(state, {
-    status: "ready",
-    models: [
-      "gpt-image-2",
-      "gpt-image-2.5",
-      "gpt-image-2.5-flare",
-      "gpt-image-2.5-sunburst",
-    ],
-  });
-  assert.equal(selectImageModel("missing-image-model", state.models), "gpt-image-2");
+  assert.deepEqual(state, { status: "ready", models: ["gpt-image-2.5"] });
+  assert.equal(selectImageModel("gpt-image-2", state.models), "gpt-image-2.5");
+  assert.equal(selectImageModel("gpt-image-2.5-flare", state.models), "gpt-image-2.5");
+  assert.equal(
+    canSubmitImage({
+      prompt: "a red apple",
+      model: "gpt-image-2.5",
+      models: state.models,
+      status: state.status,
+    }),
+    true,
+  );
   assert.equal(
     canSubmitImage({
       prompt: "a red apple",
@@ -77,7 +79,7 @@ test("a ready model state only exposes public web image models", () => {
       models: state.models,
       status: state.status,
     }),
-    true,
+    false,
   );
   assert.equal(
     canSubmitImage({
@@ -94,8 +96,8 @@ test("an empty prompt keeps the image submit disabled", () => {
   assert.equal(
     canSubmitImage({
       prompt: "   ",
-      model: "gpt-image-2",
-      models: ["gpt-image-2"],
+      model: "gpt-image-2.5",
+      models: ["gpt-image-2.5"],
       status: "ready",
     }),
     false,
@@ -110,13 +112,12 @@ test("image model filtering does not stringify container ids", () => {
       { id: { secret: canary } },
       { id: "gpt-image-2" },
       { id: "gpt-image-2.5" },
+      { id: "gpt-image-2.5-flare" },
+      { id: "gpt-image-2.5-sunburst" },
     ],
   });
 
-  assert.deepEqual(state, {
-    status: "ready",
-    models: ["gpt-image-2", "gpt-image-2.5"],
-  });
+  assert.deepEqual(state, { status: "ready", models: ["gpt-image-2.5"] });
   assert.equal(JSON.stringify(state).includes(canary), false);
 });
 

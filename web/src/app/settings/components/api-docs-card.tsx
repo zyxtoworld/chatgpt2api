@@ -70,7 +70,7 @@ const docs: ApiDoc[] = [
     path: "/v1/responses",
     icon: FileText,
     input: [
-      ["model", "string", "Responses 编排模型；图片模型由 image_generation.model 指定，默认 gpt-image-2。"],
+      ["model", "string", "Responses 编排模型；图片模型由 image_generation.model 指定，默认 gpt-image-2.5。"],
       ["input", "string | array | object", "用户输入；EasyInputMessage 可省略 type，支持 user/assistant/system/developer，phase 仅用于 assistant；原生历史 item 严格校验。顶层多模态 part 会规范化为用户 message；input_file、file_id、caller、content part 缓存断点及未知/畸形 item/part 返回 400。"],
       ["instructions", "string", "可选顶层指令；文本及 Codex 原生工具链会透传给上游，图片工具请求传入时返回 400。"],
       ["context_management", "array", "Codex 文本/原生工具支持 compaction；compact_threshold 至少为 1000。"],
@@ -93,7 +93,7 @@ const docs: ApiDoc[] = [
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/responses \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
-  -d '{"model":"gpt-5-mini","input":"生成一张未来城市图片","tools":[{"type":"image_generation","model":"gpt-image-2"}]}'`,
+  -d '{"model":"gpt-5-mini","input":"生成一张未来城市图片","tools":[{"type":"image_generation","model":"gpt-image-2.5"}]}'`,
   },
   {
     title: "搜索",
@@ -119,9 +119,9 @@ const docs: ApiDoc[] = [
     icon: FileArchive,
     input: [
       ["prompt", "string", "图片生成提示词。"],
-      ["model", "string", "可选，默认 gpt-image-2。"],
+      ["model", "string", "可选，默认 gpt-image-2.5。"],
       ["n", "number", "可选，生成数量，官方范围 1-10。"],
-      ["size", "string", "可选，auto、标准尺寸或合法 WIDTHxHEIGHT；gpt-image-2 最大支持 3840x2160 边界。"],
+      ["size", "string", "可选，auto、标准尺寸或合法 WIDTHxHEIGHT；gpt-image-2.5 最大支持 3840x2160 边界。"],
       ["quality", "string", "可选，auto（默认）、low、medium 或 high。"],
       ["response_format", "string", "可选，默认 b64_json。"],
       ["output_format", "string", "可选，png（默认）、jpeg 或 webp。"],
@@ -139,7 +139,7 @@ const docs: ApiDoc[] = [
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/generations \\
   -H "Content-Type: application/json" \\
   -H "Authorization: Bearer ${key}" \\
-  -d '{"model":"gpt-image-2","prompt":"一张极简产品海报","n":1}'`,
+  -d '{"model":"gpt-image-2.5","prompt":"一张极简产品海报","n":1}'`,
   },
   {
     title: "图片编辑",
@@ -150,7 +150,7 @@ const docs: ApiDoc[] = [
       ["image / images", "file | file[] | reference[]", "参考图，支持上传、data URL 或经 SSRF 校验的公开 HTTP(S) URL，最多 16 张。"],
       ["mask", "file | reference", "可选单张遮罩；须与第一张输入图格式、尺寸一致并包含 alpha 通道。"],
       ["prompt", "string", "编辑提示词。"],
-      ["model", "string", "可选，默认 gpt-image-2。"],
+      ["model", "string", "可选，默认 gpt-image-2.5。"],
       ["n", "number", "可选，生成数量，官方范围 1-10。"],
       ["size", "string", "可选，auto、1024x1024、1536x1024 或 1024x1536。"],
       ["quality", "string", "可选，auto（默认）、low、medium 或 high。"],
@@ -168,7 +168,7 @@ const docs: ApiDoc[] = [
     ],
     example: (baseUrl: string, key: string) => `curl ${baseUrl}/images/edits \\
   -H "Authorization: Bearer ${key}" \\
-  -F "model=gpt-image-2" \\
+  -F "model=gpt-image-2.5" \\
   -F "prompt=改成赛博朋克夜景" \\
   -F "image=@./input.png"`,
   },
@@ -246,7 +246,7 @@ const docs: ApiDoc[] = [
   },
 ];
 
-const usableModels = ["gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst", "auto", "gpt-5", "gpt-5-1", "gpt-5-2", "gpt-5-mini"];
+const usableModels = ["gpt-image-2.5", "auto", "gpt-5", "gpt-5-1", "gpt-5-2", "gpt-5-mini"];
 
 function ParamTable({ rows }: { rows: ParamRow[] }) {
   return (

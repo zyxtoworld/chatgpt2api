@@ -52,6 +52,7 @@ test("persisted image normalization drops malformed render fields before they re
 
   const [conversation] = await listImageConversations();
   const [image] = conversation.turns[0].images;
+  assert.equal(conversation.turns[0].model, "gpt-image-2.5");
 
   assert.equal(image.url, "/images/fallback.png");
   assert.equal(image.b64_json, undefined);
