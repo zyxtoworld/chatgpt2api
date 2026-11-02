@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   canSubmitImage,
+  normalizeImageModel,
   resolveImageModelLoadError,
   resolveImageModelLoadSuccess,
   selectImageModel,
@@ -17,6 +18,14 @@ const imagePageSource = readFileSync(
   new URL("../src/app/image/page.tsx", import.meta.url),
   "utf8",
 );
+
+test("legacy Web image aliases migrate while Codex image models stay unchanged", () => {
+  for (const retired of ["gpt-image-2", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]) {
+    assert.equal(normalizeImageModel(retired), "gpt-image-2.5");
+  }
+  assert.equal(normalizeImageModel("codex-gpt-image-2"), "codex-gpt-image-2");
+  assert.equal(normalizeImageModel("team-codex-gpt-image-2"), "team-codex-gpt-image-2");
+});
 
 test("an empty model response leaves no fake model and blocks submit", () => {
   const state = resolveImageModelLoadSuccess({ data: [{ id: "gpt-5" }] });

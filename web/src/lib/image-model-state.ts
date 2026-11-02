@@ -35,7 +35,10 @@ export function selectImageModel(value, models) {
 
 export function normalizeImageModel(value) {
   const model = String(value || "").trim();
-  return model === PUBLIC_IMAGE_MODEL_ID ? model : PUBLIC_IMAGE_MODEL_ID;
+  if (!model || model === "gpt-image-2" || model === "gpt-image-2.5-flare" || model === "gpt-image-2.5-sunburst") {
+    return PUBLIC_IMAGE_MODEL_ID;
+  }
+  return model;
 }
 
 export function canSubmitImage({ prompt, model, models, status }) {
