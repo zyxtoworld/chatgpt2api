@@ -134,7 +134,7 @@ environment:
 - Chat Completions 与 Responses 支持官方函数工具调用格式；函数调用和显式网页搜索通过 Codex Responses 上游原生执行，需要可用的 Codex OAuth 账号
 - 兼容 Responses WebSocket 模式：连接 `ws(s)://<host>/v1/responses` 后连续发送 `response.create`；`previous_response_id` 仅引用当前连接内最近一次完成响应
 - 图片生成与编辑支持 `png`、`jpeg`、`webp` 输出；流式响应分别使用官方 `image_generation.completed` / `image_edit.completed` SSE 事件，不发送 `[DONE]`
-- `GET /v1/models` 按当前可用账号、账号类型和上游模型目录动态返回模型；图片模型只有在对应账号能力可用时才会出现，普通模型由上游目录提供
+- `GET /v1/models` 按当前可用账号、账号类型和上游目录返回模型，并排除已实测不能用于普通 Chat Completions 的网页模型；图片模型独立按账号 capability 和正 quota 筛选
 - 支持通过 `n` 返回多张生成结果
 - 支持生成可编辑 PPT 文件
 - 支持生成可编辑 PSD 文件
@@ -193,7 +193,7 @@ Authorization: Bearer <auth-key>
 <summary><code>GET /v1/models</code></summary>
 <br>
 
-返回当前账号池和上游模型目录确认可用的模型列表；图片模型会随账号可用性动态变化。
+返回当前账号池、账号类型及上游模型目录对应的可用模型；已实测不支持普通 Chat Completions 的网页模型不列出。图片模型按账号 capability 与额度动态变化。
 
 ```bash
 curl http://localhost:8000/v1/models \
@@ -206,7 +206,7 @@ curl http://localhost:8000/v1/models \
 
 | 字段   | 说明                                                                                                         |
 |:-----|:-----------------------------------------------------------------------------------------------------------|
-| 返回模型 | 由当前可用账号、账号类型和上游模型目录动态决定；对应图片账号不可用时不返回图片模型 |
+| 返回模型 | 普通模型来自网页目录，并排除已实测不能用于 Chat Completions 的条目；图片模型依据当前账号 Web image capability 与 quota |
 | 接入场景 | 可接入 Cherry Studio、New API 等上游或客户端                                                                          |
 
 <br>

@@ -37,6 +37,17 @@ pub(super) fn is_web_image_model_id(id: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(id.trim()))
 }
 
+// Live Chat probes confirmed these catalog aliases are not text-chat capable.
+// The Rust catalog has no retained Chat Completions capability bit, so do not
+// infer one for these models from the shared `gpt-` prefix.
+const WEB_MODELS_WITHOUT_CHAT_COMPLETIONS: &[&str] = &["gpt-5.6-luna-wm", "gpt-5.6-terra-wm"];
+
+pub(super) fn is_web_chat_completion_compatible_model(id: &str) -> bool {
+    !WEB_MODELS_WITHOUT_CHAT_COMPLETIONS
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(id.trim()))
+}
+
 fn model_provenance_from_object(
     object: &serde_json::Map<String, Value>,
     default: ModelProvenance,
@@ -321,6 +332,7 @@ fn model_capabilities(
 }
 fn refresh_model_capabilities(model: &mut PublicModel, object: &serde_json::Map<String, Value>) {
     let inferred = matches!(model.provenance, ModelProvenance::Web)
+        && is_web_chat_completion_compatible_model(&model.id)
         && model.id.to_ascii_lowercase().starts_with("gpt-")
         && !model.id.to_ascii_lowercase().starts_with("gpt-image-");
     let profile = inferred.then_some((true, false, true, false, false, true));

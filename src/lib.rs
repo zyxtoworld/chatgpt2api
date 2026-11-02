@@ -47,9 +47,9 @@ pub use config::{AppConfig, AppInitError, UpstreamProtocol};
 use errors::ApiError;
 use model_pool::{
     ModelCatalog, ModelProvenance, ModelStore, PublicModel, WEB_IMAGE_MODELS,
-    is_web_image_model_id, model_provenance_is_untrusted, model_provenance_label,
-    model_provenance_rank, project_account_model_entries, project_remote_model_list,
-    project_remote_model_list_with_provenance,
+    is_web_chat_completion_compatible_model, is_web_image_model_id, model_provenance_is_untrusted,
+    model_provenance_label, model_provenance_rank, project_account_model_entries,
+    project_remote_model_list, project_remote_model_list_with_provenance,
 };
 #[cfg(test)]
 use native_pow::{NativePowConfigInputs, native_pow_config_from_inputs};
@@ -9051,7 +9051,7 @@ fn is_public_chatgpt_model(model: &PublicModel) -> bool {
         ModelProvenance::Unknown => false,
         ModelProvenance::Codex => false,
         ModelProvenance::Image => is_public_chatgpt_image_model_id(&model.id),
-        ModelProvenance::Web => true,
+        ModelProvenance::Web => is_web_chat_completion_compatible_model(&model.id),
         ModelProvenance::Configured => false,
     }
 }
@@ -12680,6 +12680,7 @@ async fn native_download_image_files(
             )]
         };
         let mut downloaded = None;
+        let mut resolved_url = false;
         for (path, referer, with_file_query) in candidates {
             let mut request = native_browser_headers_with_clearance(
                 client.get(format!("{base_url}{path}")),
@@ -12726,6 +12727,7 @@ async fn native_download_image_files(
             else {
                 continue;
             };
+            resolved_url = true;
             let blob_referer = format!("{base_url}/c/{conversation_id}");
             let mut blob_request = native_browser_headers_with_clearance(
                 client.get(url),
@@ -12759,11 +12761,11 @@ async fn native_download_image_files(
             if !outputs.contains(&downloaded) {
                 outputs.push(downloaded);
             }
-        } else {
+        } else if resolved_url {
             missing_output = true;
         }
     }
-    if missing_output && !outputs.is_empty() {
+    if missing_output {
         return Err(ApiError::upstream());
     }
     Ok(outputs)
@@ -13828,7 +13830,7 @@ async fn native_web_image_attempt(
         first_poll_deadline
     };
     let resolved = async {
-        if initial_image_ids.is_empty() && initial_image_state.blocked {
+        if initial_image_ids.is_empty() && initial_image_state.blocked && !message.is_empty() {
             let _ = sleep_search_poll_with_interval(resolution_deadline, Duration::from_secs(2))
                 .await;
             let detailed_error = native_query_image_task_error(
@@ -13892,14 +13894,20 @@ async fn native_web_image_attempt(
             && !should_poll_for_image
             && !text_reply
         {
-            return Err((
-                native_image_message_error(
-                    request,
-                    "Image generation started upstream but the response was incomplete. Please try again."
-                        .to_owned(),
-                ),
+            let _ = sleep_search_poll_with_interval(resolution_deadline, Duration::from_secs(1)).await;
+            if let Some(detailed_error) = native_query_image_task_error(
+                state,
+                &client,
+                lease,
+                &context,
+                &conversation_id,
                 false,
-            ));
+                resolution_deadline,
+            )
+            .await
+            {
+                return Err((native_image_message_error(request, detailed_error), false));
+            }
         }
         let poll_result = if conversation_id.is_empty() {
             Ok(initial_image_ids.clone())
@@ -13994,7 +14002,7 @@ async fn native_web_image_attempt(
             },
         )
         .await
-        .map_err(|error| (error, true))?;
+        .map_err(|error| (error, false))?;
         let retry_missing_result =
             (!message.is_empty() && text_reply && !text_reply_recovery_used)
                 || (message.is_empty() && should_poll_for_image);
@@ -14039,7 +14047,7 @@ async fn native_web_image_attempt(
                             retry_deadline,
                         )
                         .await
-                        .map_err(|error| (error, true))?;
+                        .map_err(|error| (error, false))?;
                         break;
                     }
                     Err(error)
@@ -15861,6 +15869,21 @@ fn native_sse_image_id_context(event: &Value, tool_invoked: bool) -> (bool, Opti
     (collect, next_tool_invoked)
 }
 
+fn native_image_sse_message_text(content: &Map<String, Value>) -> String {
+    if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+        let text = parts.iter().filter_map(Value::as_str).collect::<String>();
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    content
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 fn native_image_sse_assistant_message(event: &Value) -> Option<String> {
     for candidate in [Some(event), event.get("v")].into_iter().flatten() {
         let Some(message) = candidate.get("message").and_then(Value::as_object) else {
@@ -15901,16 +15924,9 @@ fn native_image_sse_assistant_message(event: &Value) -> Option<String> {
             continue;
         }
         let content = message.get("content")?.as_object()?;
-        if let Some(parts) = content.get("parts").and_then(Value::as_array) {
-            let text = parts.iter().filter_map(Value::as_str).collect::<String>();
-            if !text.is_empty() {
-                return Some(text);
-            }
-        }
-        if let Some(text) = content.get("text").and_then(Value::as_str)
-            && !text.is_empty()
-        {
-            return Some(text.to_owned());
+        let text = native_image_sse_message_text(content);
+        if !text.is_empty() {
+            return Some(text);
         }
     }
     None
@@ -16148,7 +16164,7 @@ where
                         .and_then(Value::as_str)
                         == Some("assistant")
                 })
-                .map(search_message_text)
+                .map(native_image_sse_message_text)
                 .map(|text| native_sanitize_text(&text))
                 .unwrap_or_default();
             let text = if full_text.is_empty()
@@ -43410,9 +43426,37 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         assert_eq!(codex[0].id, "gpt-5-codex");
         assert_eq!(codex[0].provenance, ModelProvenance::Codex);
     }
+    #[test]
+    fn non_chat_web_models_do_not_inherit_gpt_capability_profile() {
+        let models = project_remote_model_list_with_provenance(
+            &json!({"models":[{"slug":"gpt-5.6-luna-wm"},{"slug":"gpt-5-6"}]}),
+            "models",
+            false,
+            Some("free"),
+            true,
+            false,
+            ModelProvenance::Web,
+        )
+        .expect("web catalog");
+        let unsupported = models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-luna-wm")
+            .expect("catalog keeps compatibility metadata internally");
+        assert_eq!(unsupported.function_call, None);
+        assert_eq!(unsupported.reasoning, None);
+        assert_eq!(unsupported.vision, None);
+        assert_eq!(unsupported.search, None);
+        assert!(!is_public_chatgpt_model(unsupported));
+        let supported = models
+            .iter()
+            .find(|model| model.id == "gpt-5-6")
+            .expect("supported text model");
+        assert_eq!(supported.function_call, Some(true));
+        assert!(is_public_chatgpt_model(supported));
+    }
 
     #[tokio::test]
-    async fn public_chatgpt_models_filter_by_provenance_not_model_id() {
+    async fn public_chatgpt_models_filter_by_provenance_and_chat_capability() {
         let account_path = account_snapshot_path("public-model-provenance");
         fs::write(
             &account_path,
@@ -43454,6 +43498,9 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
         };
         let models = state.account_type_catalog.public_models(Arc::new(vec![
             model("gpt-5-codex", ModelProvenance::Web),
+            model("gpt-5-6", ModelProvenance::Web),
+            model("gpt-5.6-luna-wm", ModelProvenance::Web),
+            model("GPT-5.6-TERRA-WM", ModelProvenance::Web),
             model("auto", ModelProvenance::Web),
             model("codex-endpoint-model", ModelProvenance::Codex),
             model("auto", ModelProvenance::Configured),
@@ -43463,6 +43510,9 @@ data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
             .iter()
             .map(|model| model.id.as_str())
             .collect::<Vec<_>>();
+        assert!(ids.contains(&"gpt-5-6"));
+        assert!(!ids.contains(&"gpt-5.6-luna-wm"));
+        assert!(!ids.contains(&"GPT-5.6-TERRA-WM"));
         assert!(ids.contains(&"gpt-5-codex"));
         assert!(ids.contains(&"auto"), "Web provenance must win for auto");
         assert!(ids.contains(&"gpt-image-2"));
@@ -56004,6 +56054,11 @@ data: [DONE]
         });
         native_update_image_sse_state(&mut state, &hidden, &hidden.to_string());
         assert!(state.raw_message.is_empty());
+        let text_precedence = json!({"text":"fallback","parts":["visible"]});
+        assert_eq!(
+            native_image_sse_message_text(text_precedence.as_object().unwrap()),
+            "visible"
+        );
 
         let final_message = json!({
             "message": {
@@ -56198,7 +56253,13 @@ data: [DONE]
             get(
                 move |axum::extract::Path(id): axum::extract::Path<String>| {
                     let url = format!("{base_url}/blob/{id}");
-                    async move { Json(json!({"download_url":url})) }
+                    async move {
+                        if id == "metadata-missing" {
+                            (StatusCode::NOT_FOUND, Body::empty()).into_response()
+                        } else {
+                            Json(json!({"download_url":url})).into_response()
+                        }
+                    }
                 },
             )
         };
@@ -56262,6 +56323,34 @@ data: [DONE]
                 .code(),
             "upstream_error"
         );
+        let only_missing = native_download_image_files(
+            &state,
+            &client,
+            &lease,
+            &context,
+            "image-conversation",
+            &["missing".to_owned()],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            only_missing
+                .expect_err("all image download failures must fail")
+                .code(),
+            "upstream_error"
+        );
+        let metadata_missing = native_download_image_files(
+            &state,
+            &client,
+            &lease,
+            &context,
+            "image-conversation",
+            &["metadata-missing".to_owned()],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("metadata lookup failure should be skipped");
+        assert!(metadata_missing.is_empty());
 
         let identical = native_download_image_files(
             &state,

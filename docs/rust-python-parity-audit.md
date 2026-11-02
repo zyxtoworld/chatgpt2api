@@ -936,3 +936,41 @@ GitHub Actions run `37799423886` 暴露一项并发回归：PPT 任务仍持有 
 本轮最终本地验证：`cargo test --workspace --offline -- --test-threads=1` 为 Rust lib `588 passed / 0 failed / 5 ignored`、file-identity `6 passed`，main/doc-tests 无失败；`cargo clippy --workspace --offline --all-targets -- -D warnings`、`cargo fmt --all -- --check`、`cargo check --workspace --offline` 和 `git diff --check` 通过。Web Node runner `376 passed / 0 failed`，本地 `tsc --noEmit` 和 Next production build 通过。
 
 GitHub Actions run `38854709232` 对 commit `f35b6f7c` 完成 verify 与 amd64/arm64 Docker build/push。随后通过生产 SSH deployment wrapper 更新 `chatgpt2api`；远程 probe 验证容器 revision 为 `f35b6f7c`、状态 `running/true/healthy`，并验证 `/health?format=json`、`/version` 与 `/v1/images/generations` 返回成功。公网 health/version 复验均 HTTP 200，version 为 `1.8.0`。
+
+## 2026-10-16 第五十二轮人工复核：图片失败与 SSE 边界收口
+
+本轮继续以 `v1.7.0` 的 `services/protocol/conversation.py` 和 `services/openai_backend_api.py` 为唯一 Python 基线，确认并修复三处共享图片链路差异：
+
+- `native_download_image_files` 现在区分“下载地址元数据未解析”与“已解析地址的 blob 下载失败”。前者继续返回空结果，让 Python 的 URL 解析/后续轮询兜底生效；后者（包括全部结果或混合结果失败）返回 `upstream_error`。Web 图片调用方不把该普通下载失败误当成可换账号的 token/轮询重试，符合 Python `download_image_bytes` 的异常边界。现有混合失败/重复 body 回归扩展为同时覆盖全部 blob 失败和纯 metadata 查询失败。
+- 图片 SSE 可见文本提取恢复 Python 的 `parts` 优先于 `content.text` 规则；progress 与最终 assistant 文本共享同一规则，结构化 parts 不再被搜索结果文本 helper 的额外字段拼接污染。
+- SSE 已有 conversation、无图片 ID、无可见消息且无 `turn_use_case` 时，先按 Python 等待并查询 `/backend-api/tasks` 的结构化错误；没有任务错误才进入 conversation 轮询，不再立即伪造“response incomplete”。有 moderation 文本时仍保留 Python 的直接拒绝分支。
+
+本轮本地验证：`cargo fmt --all -- --check` 通过。尝试执行定向 Rust 回归 `native_image_download_rejects_mixed_failure_and_deduplicates_bodies`（并使用临时 LLVM 路径）时，`btls-sys` 的 bindgen 构建仍因环境不存在 `clang.dll`/`libclang.dll` 退出码 `101`；因此本轮不宣称新增定向测试或完整 cargo suite 通过。此前审计记录的已通过测试不被本次环境失败覆盖。
+
+access-token-only、Rust-only Codex/WebSocket/ccLoad、错误脱敏、资源/路径/CAS/fail-closed 边界保持不变；未连接真实图片上游、代理、TLS 或供应商环境。
+
+## 2026-10-16 第五十三轮全范围重做：无新增确定差异
+
+按用户要求重新开始本轮人工复核，不沿用上一轮结论作为证据。当前工作区没有本地 `v1.7.0` Git ref；本轮以工作区 `.local/reference/python-v1.7/VERSION` 的 `1.7.0` 和对应 Python 源文件为基线，逐段重读 Rust 公共路由、Chat/Responses/Messages/Search、图片输入/上传/SSE/轮询/任务、账号池/刷新、代理/config、管理 CRUD、JSON/Database/Git storage、日志/backup 和 shutdown 生命周期。
+
+本轮未发现新的、确定且不属于既有 access-token-only、Rust-only 或资源/路径/CAS/fail-closed 安全边界的行为差异。现有 Rust 图片下载失败分类、SSE 文本 precedence、任务错误查询、账号导入 coercion、图片 mask/usage、管理 writer 和存储 CAS 逻辑保持不变；本轮没有新增生产实现修改。
+
+本轮验证：`cargo fmt --all -- --check`、离线 `cargo metadata --no-deps --format-version 1` 和 `git diff --check` 可执行并通过（仅有 Git LF/CRLF 提示）。本轮未重复声称完整 cargo suite 通过；未配置 LLVM 动态库路径时，Windows `btls-sys` bindgen 会找不到 `clang.dll`/`libclang.dll`；本地工具链已归档在 `.local/toolchains/llvm`，本轮未重新触发 Rust 测试编译。
+
+## 2026-10-16 第五十四轮全范围重做：模型目录 Rust 扩展边界确认
+
+本轮再次从基线重新读取 Python `api/app.py`、`api/ai.py`、`api/accounts.py`、Chat/Responses/Messages/Search、图片、账号、配置、代理、storage、backup、日志、editable 和 shutdown 代码，再读取当前 Rust 对应实现；没有把上一轮审计文字当作实现证据，也没有使用自动 diff 或脚本比较代码。
+
+唯一需要明确记录的表面差异是 Python v1.7 的 `openai_v1_models.list_models()` 会按账号列表追加 `gpt-image-2` 及 Codex 图片别名，而 Rust 当前公共目录按已验证 Web image capability/quota 投影 Web 图片模型，并排除 Codex 图片别名。这是当前已记录的 Rust-only 模型目录/能力边界，不在本轮回退；其它协议、图片、管理、存储、日志和生命周期路径未发现新的确定差异。
+
+本轮未新增生产代码修改。验证仍以可执行检查为限：fmt、离线 metadata 和 diff check 可通过；Rust 测试重编译继续受 Windows 环境缺少 `clang.dll`/`libclang.dll` 的 `btls-sys` bindgen 失败阻断，未宣称完整测试通过。
+
+## 2026-11-02 线上模型能力筛选修正
+
+按用户授权使用 SSH 只读诊断 wrapper 查询生产 `/v1/models` 并逐个发起小型 Chat 请求。生产目录返回 18 个模型；14 个非图片模型中 12 个 Chat 请求成功，`gpt-5.6-luna-wm`、`gpt-5.6-terra-wm` 在初测、复测及各五次追加样本中均返回 HTTP 502/`upstream_error`。`gpt-5-6`、GPT-6 系列、`research`、`auto` 和 reserved-gate 项均得到 HTTP 200 与有效 `choices`。线上投影仍把两个失败项按 `gpt-` 前缀推断成 `functionCall/reasoning/vision/search=true`，属于过度推断。
+
+四个公开 Web 图片模型 `gpt-image-2`、`gpt-image-2.5`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst` 均实测 HTTP 200、各返回一张图片；测试文件随后逐项删除，图片列表数量前后均为 24。由于请求实际打到生产账号池，API 调用日志与账号成功/额度统计可能保留测试调用记录。
+
+Rust 当前模型投影没有独立的 Chat Completions 能力位，因此加入仅覆盖上述两个已实测失败 alias 的兼容性过滤：不公开，也不再套用 `gpt-` 通用文本能力档案；其它模型和按 capability/quota 筛选的图片集合保持不变。
+
+本地验证：`cargo fmt --all -- --check`、`git diff --check` 通过；`public_chatgpt_models_filter_by_provenance_and_chat_capability` 与 `non_chat_web_models_do_not_inherit_gpt_capability_profile` 各 `1 passed`。

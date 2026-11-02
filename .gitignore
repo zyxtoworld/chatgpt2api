@@ -1,48 +1,44 @@
-# Local build and generated files
+# Rust and web build output
 target/
-/rust/target/
-/rust/.local/
-/rust/data/
 web_dist/
-web/.next/
-web/out/
+/web/.next/
+/web/out/
+/web/node_modules/
+/web/next-env.d.ts
+*.tsbuildinfo
+
+# Python caches and local environments
 __pycache__/
 *.py[oc]
 .venv/
 .ruff_cache/
-.idea
-data
+
+# Local project data and configuration
+data/
 /config.json
 /chatgpt2api-config/
-edit
-
-docker-compose-local.yml
-
-.claude/settings.local.json
-
-# Environment variables
 .env
-.env.local
-
-# Database files
+.env.*
+!.env.example
 *.db
 *.sqlite
 *.sqlite3
 
-# Git cache
+# IDE and dependency caches
+.idea/
+.claude/settings.local.json
 git_cache/
 
-# 调试/测试输出目录
+# Local debugging output
 loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
-
-# Local Rust migration/test evidence (never runtime or release assets)
 rust-*.log
 rust-*.log.exit
 
-# Project-local Codex artifacts, temporary files, recovery copies, and secrets
+# Worktree and agent-local state, temporary artifacts, and secrets
 /.local/
+/.pi/
 /.reasonix/
 /.codex-aiarm-*
 /codex-aiarm-askpass.go

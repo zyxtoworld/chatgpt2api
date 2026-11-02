@@ -7,6 +7,7 @@
 + [修复] `/v1/models` 向下游补充 `functionCall`、`reasoning`、`vision`、`search`、`video`、`imageOutput` 等模型能力字段；优先透传上游字段，缺失时对 ChatGPT Web GPT-5/GPT-6 文本模型使用兼容能力档案。
 + [修复] 读取网页模型目录的 `enabled_tools`、`thinking_efforts`、`max_tokens` 元数据，映射为下游 `functionCall`、`search`、`reasoning` 和 `maxOutput`；上游显式能力字段优先级更高。
 + [修复] 网页图片能力支持 `gpt-image-2`、`gpt-image-2.5` 及其网页图片别名；通过上游 `image_gen` quota 能力确认，不把 Codex 图片模型混入网页目录。
++ [修复] `/v1/models` 不再列出经线上重复请求确认不支持普通 Chat Completions 的 `gpt-5.6-luna-wm`、`gpt-5.6-terra-wm`，也不再为这两个条目推断通用 GPT 文本能力。图片模型仍独立按账号 capability/quota 展示，并已逐个验证生成。
 + [架构] Rust release 二进制成为 Docker/Compose 的唯一生产运行时入口，私有 `config.json` 保持外置挂载。
 + [修复] `/v1/images/edits` 接受并返回受约束的 `client_task_id`，同时保持 generation 接口 fail-closed。
 + [修复] Docker 多架构构建在 build platform 交叉编译 Rust，避免 arm64 QEMU 冷编译悬挂。
